@@ -38,13 +38,13 @@ echo "新 Android 版本: $NEW_ANDROID_NAME (Code: $NEW_ANDROID_CODE)"
 # === Update iOS project.pbxproj ===
 echo ""
 echo "更新 iOS 版本号..."
-sed -i '' "s/MARKETING_VERSION = .*/MARKETING_VERSION = $NEW_IOS_MARKETING;/g" "$PROJECT_FILE"
-sed -i '' "s/CURRENT_PROJECT_VERSION = .*/CURRENT_PROJECT_VERSION = $NEW_IOS_BUILD;/g" "$PROJECT_FILE"
+sed -i.bak "s/MARKETING_VERSION = .*/MARKETING_VERSION = $NEW_IOS_MARKETING;/g" "$PROJECT_FILE" && rm -f "$PROJECT_FILE.bak"
+sed -i.bak "s/CURRENT_PROJECT_VERSION = .*/CURRENT_PROJECT_VERSION = $NEW_IOS_BUILD;/g" "$PROJECT_FILE" && rm -f "$PROJECT_FILE.bak"
 
 # === Update Android build.gradle.kts ===
 echo "更新 Android 版本号..."
-sed -i "s/versionCode = .*/versionCode = $NEW_ANDROID_CODE/g" "$GRADLE_FILE"
-sed -i "s/versionName = .*/versionName = \"$NEW_ANDROID_NAME\"/g" "$GRADLE_FILE"
+sed -i.bak "s/versionCode = .*/versionCode = $NEW_ANDROID_CODE/g" "$GRADLE_FILE" && rm -f "$GRADLE_FILE.bak"
+sed -i.bak "s/versionName = .*/versionName = \"$NEW_ANDROID_NAME\"/g" "$GRADLE_FILE" && rm -f "$GRADLE_FILE.bak"
 
 # === Write version file for other jobs to read ===
 echo "$NEW_IOS_MARKETING" > "$VERSION_FILE"
