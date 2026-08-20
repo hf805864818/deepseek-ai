@@ -62,15 +62,31 @@ jobs:
 
       - name: Setup cache for native deps
         uses: actions/cache@v4
+        id: native-deps-cache
         with:
           path: |
+            # Final outputs (used by Xcode)
+            deps/frameworks
+            deps/libs
+            deps/include
+            deps/resources
+            # Intermediate build dirs (faster incremental builds)
             deps/lame-build
-            deps/ffmpeg-build
-            deps/ish/build
-            deps/alpine-rootfs
-          key: ios-native-deps-${{ hashFiles('deps/*.sh', '.gitmodules') }}
+            deps/ffmpeg-6.1.2/build-ios
+            deps/ish/build-ios
+            # Downloaded source (skip re-download)
+            deps/ffmpeg-6.1.2
+          key: ios-native-deps-${{ runner.os }}-${{ hashFiles('deps/*.sh', 'deps/ffmpeg-patch/**', '.gitmodules') }}
           restore-keys: |
-            ios-native-deps-
+            ios-native-deps-${{ runner.os }}-
+
+      - name: Cache status
+        run: |
+          if [ "${{ steps.native-deps-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "✅ Native deps cache HIT - skipping full rebuild"
+          else
+            echo "⚠️  Native deps cache MISS - will do full build"
+          fi
 
       - name: Install build dependencies
         run: brew install ninja llvm libarchive pkg-config meson lld ldid
@@ -201,12 +217,24 @@ jobs:
 
       - name: Setup cache for native deps
         uses: actions/cache@v4
+        id: android-native-deps-cache
         with:
           path: |
-            deps/proot-build
-          key: android-native-deps-${{ hashFiles('deps/*.sh', '.gitmodules') }}
+            deps/build/proot-android
+            src/android/app/src/main/assets/proot-aarch64
+          key: android-native-deps-${{ runner.os }}-${{ hashFiles('deps/build_proot.sh', '.gitmodules') }}
           restore-keys: |
-            android-native-deps-
+            android-native-deps-${{ runner.os }}-
+
+      - name: Setup Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-gradle-${{ hashFiles('src/android/**/*.gradle*', 'src/android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            android-gradle-
 
       - name: Setup Java
         uses: actions/setup-java@v4
