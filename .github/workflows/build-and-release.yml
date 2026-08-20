@@ -73,7 +73,7 @@ jobs:
             ios-native-deps-
 
       - name: Install build dependencies
-        run: brew install ninja llvm libarchive pkg-config meson lld
+        run: brew install ninja llvm libarchive pkg-config meson lld ldid
 
       - name: Prepare Xcode config
         run: |
@@ -110,9 +110,72 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
-          # Package as IPA
+          # Find the .app bundle
           app_path=$(find ./DerivedData -name "*.app" -type d | head -1)
           echo "Found app at: $app_path"
+          app_name=$(basename "$app_path" .app)
+          binary_path="$app_path/$app_name"
+
+          # Function: inject entitlements into a binary
+          inject_entitlements() {
+            local binary="$1"
+            local entitlements_file="$2"
+            local label="$3"
+            if [ -f "$entitlements_file" ] && [ -f "$binary" ]; then
+              echo "Injecting entitlements for $label..."
+              ldid -S"$entitlements_file" "$binary"
+              echo "  Done. Verifying:"
+              ldid -e "$binary" 2>&1 | head -20
+              echo "  ---"
+            else
+              echo "WARNING: Skipping $label - entitlements or binary not found"
+              [ -f "$entitlements_file" ] || echo "  Missing: $entitlements_file"
+              [ -f "$binary" ] || echo "  Missing: $binary"
+            fi
+          }
+
+          # Inject main app entitlements
+          inject_entitlements "$binary_path" "Minis.entitlements" "Main App ($app_name)"
+
+          # Function: inject entitlements into an app extension
+          inject_appex_entitlements() {
+            local appex_path="$1"
+            local entitlements_file="$2"
+            local label="$3"
+            if [ ! -d "$appex_path" ]; then
+              echo "WARNING: $label appex not found at $appex_path"
+              return
+            fi
+            # Read the binary name from Info.plist
+            local binary_name=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$appex_path/Info.plist" 2>/dev/null)
+            if [ -z "$binary_name" ]; then
+              echo "WARNING: Could not read CFBundleExecutable for $label"
+              return
+            fi
+            local binary="$appex_path/$binary_name"
+            inject_entitlements "$binary" "$entitlements_file" "$label"
+          }
+
+          # Inject app extension entitlements
+          plugins_dir="$app_path/PlugIns"
+          if [ -d "$plugins_dir" ]; then
+            echo "Found PlugIns directory, processing app extensions..."
+
+            # Share Extension
+            inject_appex_entitlements "$plugins_dir/MinisShare.appex" "ShareExtension/ShareExtension.entitlements" "Share Extension"
+
+            # File Provider Extension
+            inject_appex_entitlements "$plugins_dir/MinisFileProvider.appex" "FileProvider/FileProvider.entitlements" "File Provider Extension"
+
+            # Agent Widget Extension
+            inject_appex_entitlements "$plugins_dir/AgentWidgetExtension.appex" "AgentWidget/AgentWidget.entitlements" "Agent Widget Extension"
+          else
+            echo "No PlugIns directory found - skipping extension entitlements injection"
+          fi
+
+          echo "All entitlements injection complete."
+
+          # Package as IPA
           mkdir -p Payload
           cp -r "$app_path" Payload/
           zip -r -q Minis.ipa Payload
@@ -204,7 +267,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
-          name: "Minis v${{ needs.prepare.outputs.version }}"
+          name: "龙虾Ai v${{ needs.prepare.outputs.version }}"
           body: ${{ needs.prepare.outputs.changelog }}
           files: |
             artifacts/Minis.ipa
