@@ -1,3 +1,3 @@
-1.0.2
-build=4
-android_code=26
+1.0.3
+build=5
+android_code=27
