@@ -75,6 +75,13 @@ jobs:
       - name: Install build dependencies
         run: brew install ninja llvm libarchive pkg-config meson lld
 
+      - name: Prepare Xcode config
+        run: |
+          if [ -f src/ios/Configs/ProviderCustomization.xcconfig.example ] && [ ! -f src/ios/Configs/ProviderCustomization.xcconfig ]; then
+            cp src/ios/Configs/ProviderCustomization.xcconfig.example src/ios/Configs/ProviderCustomization.xcconfig
+            echo "Created ProviderCustomization.xcconfig from example"
+          fi
+
       - name: Build LAME
         run: ./deps/build_lame.sh
         working-directory: ${{ github.workspace }}
