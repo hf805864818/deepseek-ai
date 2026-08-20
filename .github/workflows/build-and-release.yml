@@ -1,0 +1,206 @@
+name: Build IPA and APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # === Step 1: Increment version and generate changelog ===
+  prepare:
+    name: Prepare Version & Changelog
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Increment version numbers
+        id: version
+        run: |
+          chmod +x scripts/increment-version.sh
+          bash scripts/increment-version.sh
+          VERSION=$(head -1 VERSION.txt)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          chmod +x scripts/generate-changelog.sh
+          CHANGELOG=$(bash scripts/generate-changelog.sh "${{ steps.version.outputs.version }}")
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Commit version bump
+        run: |
+          git config user.name "Build Bot"
+          git config user.email "bot@deepseek-ai.local"
+          git add -A
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push
+
+  # === Step 2: Build iOS IPA (TrollStore compatible) ===
+  build-ios:
+    name: Build iOS IPA (TrollStore)
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup cache for native deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/lame-build
+            deps/ffmpeg-build
+            deps/ish/build
+            deps/alpine-rootfs
+          key: ios-native-deps-${{ hashFiles('deps/*.sh', '.gitmodules') }}
+          restore-keys: |
+            ios-native-deps-
+
+      - name: Install build dependencies
+        run: brew install ninja llvm libarchive pkg-config meson lld
+
+      - name: Build LAME
+        run: ./deps/build_lame.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Build FFmpeg
+        run: ./deps/build_ffmpeg.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Build iSH
+        run: ./deps/build_ish.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Prepare Alpine rootfs
+        run: ./deps/prepare_alpine_rootfs.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Build IPA (unsigned, TrollStore compatible)
+        run: |
+          cd src/ios
+          xcodebuild -project Minis.xcodeproj -scheme Minis \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ./DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          # Package as IPA
+          app_path=$(find ./DerivedData -name "*.app" -type d | head -1)
+          echo "Found app at: $app_path"
+          mkdir -p Payload
+          cp -r "$app_path" Payload/
+          zip -r -q Minis.ipa Payload
+          echo "IPA created: $(ls -lh Minis.ipa)"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minis-ipa
+          path: src/ios/Minis.ipa
+          retention-days: 30
+
+  # === Step 3: Build Android APK ===
+  build-android:
+    name: Build Android APK
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup cache for native deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/proot-build
+          key: android-native-deps-${{ hashFiles('deps/*.sh', '.gitmodules') }}
+          restore-keys: |
+            android-native-deps-
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+
+      - name: Build PRoot
+        run: ./deps/build_proot.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Prepare Android sandbox
+        run: |
+          chmod +x scripts/prepare_android_sandbox.sh
+          bash scripts/prepare_android_sandbox.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Build APK
+        run: |
+          cd src/android
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minis-apk
+          path: src/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+  # === Step 4: Create GitHub Release ===
+  release:
+    name: Create Release
+    needs: [prepare, build-ios, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Minis-ipa
+          path: artifacts
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Minis-apk
+          path: artifacts
+
+      - name: Display artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: "Minis v${{ needs.prepare.outputs.version }}"
+          body: ${{ needs.prepare.outputs.changelog }}
+          files: |
+            artifacts/Minis.ipa
+            artifacts/app-debug.apk
+          draft: false
+          prerelease: false
