@@ -46,11 +46,11 @@ $COMMITS
 
 **iOS (TrollStore 安装):**
 1. 确保设备已安装 TrollStore
-2. 下载 Minis.ipa 文件
+2. 下载 龙虾Ai-v$VERSION.ipa 文件
 3. 通过 TrollStore 打开安装
 
 **Android:**
-1. 下载 app-debug.apk 文件
+1. 下载 龙虾Ai-v$VERSION.apk 文件
 2. 允许未知来源安装
 3. 点击安装
 

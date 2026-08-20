@@ -3777,7 +3777,7 @@ struct ContentView: View {
                 .padding(.bottom, 4)
 
             VStack(spacing: 8) {
-                Text("Welcome to Minis")
+                Text("Welcome to Minis", comment: "Onboarding title")
                     .font(.title2.bold())
                 Text("Your first On-Device Agent is almost ready.")
                     .font(.subheadline)
@@ -7461,7 +7461,7 @@ private struct SettingsSheet: View {
                         AboutView()
                     } label: {
                         Label {
-                            Text("About Minis")
+                            Text("About Minis", comment: "Settings about section title")
                         } icon: {
                             Image(systemName: "info")
                                 .font(.system(size: 9))

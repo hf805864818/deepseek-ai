@@ -194,8 +194,8 @@ final class ConfigConfirmationGate: ObservableObject {
             content.body = caption
         } else {
             content.body = change.items.count > 1
-                ? "\(change.items.count) changes need your review — open Minis to approve or reject."
-                : "A change needs your review — open Minis to approve or reject."
+                ? String(localized: "\(change.items.count) changes need your review — open Minis to approve or reject.", comment: "Notification body (plural)")
+                : String(localized: "A change needs your review — open Minis to approve or reject.", comment: "Notification body (singular)")
         }
         content.sound = .default
         content.categoryIdentifier = Self.notifyCategoryId

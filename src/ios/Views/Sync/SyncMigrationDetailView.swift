@@ -300,7 +300,7 @@ struct SyncMigrationDetailView: View {
                         HStack(spacing: 8) {
                             Image(systemName: "pause.circle.fill")
                                 .foregroundStyle(.orange)
-                            Text("Paused — reopen Minis to continue")
+                            Text("Paused — reopen Minis to continue", comment: "Migration paused state")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }

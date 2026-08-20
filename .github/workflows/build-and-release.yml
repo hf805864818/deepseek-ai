@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
+      android_code: ${{ steps.version.outputs.android_code }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
       - name: Checkout code
@@ -29,8 +31,12 @@ jobs:
           chmod +x scripts/increment-version.sh
           bash scripts/increment-version.sh
           VERSION=$(head -1 VERSION.txt)
+          BUILD=$(grep '^build=' VERSION.txt | cut -d= -f2)
+          ANDROID_CODE=$(grep '^android_code=' VERSION.txt | cut -d= -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+          echo "android_code=$ANDROID_CODE" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION (Build: $BUILD, Android Code: $ANDROID_CODE)"
 
       - name: Generate changelog
         id: changelog
@@ -115,12 +121,19 @@ jobs:
         working-directory: ${{ github.workspace }}
 
       - name: Build IPA (unsigned, TrollStore compatible)
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          APP_BUILD: ${{ needs.prepare.outputs.build }}
         run: |
           cd src/ios
+
+          # Build with version override (fixes version mismatch between Release tag and app binary)
           xcodebuild -project Minis.xcodeproj -scheme Minis \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath ./DerivedData \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="$APP_BUILD" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -131,6 +144,13 @@ jobs:
           echo "Found app at: $app_path"
           app_name=$(basename "$app_path" .app)
           binary_path="$app_path/$app_name"
+
+          # Update CFBundleDisplayName in Info.plist to 龙虾Ai
+          # (in case it's generated and not from our Info.plist)
+          plist_path="$app_path/Info.plist"
+          if [ -f "$plist_path" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 龙虾Ai" "$plist_path" 2>/dev/null || true
+          fi
 
           # Function: inject entitlements into a binary
           inject_entitlements() {
@@ -191,17 +211,18 @@ jobs:
 
           echo "All entitlements injection complete."
 
-          # Package as IPA
+          # Package as IPA (rename to 龙虾Ai + version)
           mkdir -p Payload
           cp -r "$app_path" Payload/
-          zip -r -q Minis.ipa Payload
-          echo "IPA created: $(ls -lh Minis.ipa)"
+          IPA_NAME="龙虾Ai-v${APP_VERSION}.ipa"
+          zip -r -q "$IPA_NAME" Payload
+          echo "IPA created: $(ls -lh "$IPA_NAME")"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Minis-ipa
-          path: src/ios/Minis.ipa
+          name: 龙虾Ai-ipa
+          path: src/ios/龙虾Ai-v${{ needs.prepare.outputs.version }}.ipa
           retention-days: 30
 
   # === Step 3: Build Android APK ===
@@ -258,16 +279,33 @@ jobs:
         working-directory: ${{ github.workspace }}
 
       - name: Build APK
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          APP_ANDROID_CODE: ${{ needs.prepare.outputs.android_code }}
         run: |
           cd src/android
+
+          # Override version in build.gradle.kts (fixes version mismatch)
+          sed -i "s/versionCode = .*/versionCode = $APP_ANDROID_CODE/" app/build.gradle.kts
+          sed -i "s/versionName = .*/versionName = \"$APP_VERSION\"/" app/build.gradle.kts
+          echo "Android version set to $APP_VERSION (code: $APP_ANDROID_CODE)"
+
           chmod +x gradlew
           ./gradlew :app:assembleDebug --no-daemon
+
+          # Rename APK to include app name and version
+          APK_SRC="app/build/outputs/apk/debug/app-debug.apk"
+          APK_DST="app/build/outputs/apk/debug/龙虾Ai-v${APP_VERSION}.apk"
+          if [ -f "$APK_SRC" ]; then
+            mv "$APK_SRC" "$APK_DST"
+            echo "APK renamed to: $(ls -lh "$APK_DST")"
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Minis-apk
-          path: src/android/app/build/outputs/apk/debug/app-debug.apk
+          name: 龙虾Ai-apk
+          path: src/android/app/build/outputs/apk/debug/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
           retention-days: 30
 
   # === Step 4: Create GitHub Release ===
@@ -279,13 +317,13 @@ jobs:
       - name: Download IPA artifact
         uses: actions/download-artifact@v4
         with:
-          name: Minis-ipa
+          name: 龙虾Ai-ipa
           path: artifacts
 
       - name: Download APK artifact
         uses: actions/download-artifact@v4
         with:
-          name: Minis-apk
+          name: 龙虾Ai-apk
           path: artifacts
 
       - name: Display artifacts
@@ -298,7 +336,7 @@ jobs:
           name: "龙虾Ai v${{ needs.prepare.outputs.version }}"
           body: ${{ needs.prepare.outputs.changelog }}
           files: |
-            artifacts/Minis.ipa
-            artifacts/app-debug.apk
+            artifacts/龙虾Ai-v${{ needs.prepare.outputs.version }}.ipa
+            artifacts/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
           draft: false
           prerelease: false
