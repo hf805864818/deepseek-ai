@@ -12,14 +12,14 @@ private let logger = AppLogger(category: "AskMinisIntent")
 /// existing `.openSessionFromIntent` navigation path — no separate agent logic.
 /// New session when `session` is nil; follow-up when a `SessionEntity` is given.
 struct AskMinisIntent: AppIntent {
-    static var title: LocalizedStringResource = "Ask Minis"
-    static var description = IntentDescription("Opens Minis, sends your prompt, and shows the conversation. Starts a new session, or continues an existing one when you pick a session.")
+    static var title: LocalizedStringResource = "问问龙虾Ai"
+    static var description = IntentDescription("打开龙虾Ai，发送提示并显示对话。可开启新会话，或选择已有会话继续。")
 
     // Open the app and land in the conversation (the Siri experience). The send
     // itself still goes through the normal in-app pipeline.
     static var openAppWhenRun = true
 
-    @Parameter(title: "Prompt", requestValueDialog: "What would you like to ask Minis?")
+    @Parameter(title: "Prompt", requestValueDialog: "你想问龙虾Ai什么？")
     var prompt: String
 
     @Parameter(title: "Session", description: "Existing session to continue. Leave empty to start a new session.")

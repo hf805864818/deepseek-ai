@@ -23,7 +23,7 @@ struct SoulMetadata: Equatable {
     var displayEmoji: String { "✨" }
 
     static let `default` = SoulMetadata(
-        name: "Minis",
+        name: "龙虾Ai",
         // Default emoji is intentionally empty — the UI uses the fixed
         // `displayEmoji` sparkle and serialize() no longer writes the
         // `emoji:` line. Kept on the struct only so the parser can
@@ -245,7 +245,7 @@ enum SoulStore {
     /// style / lang) is seeded.
     static let defaultContent: String = """
     ---
-    name: "Minis"
+    name: "龙虾Ai"
     style: ""
     lang: "auto"
     ---

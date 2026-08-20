@@ -528,7 +528,7 @@ struct MinisApp: App {
 
     private static let fileProviderDomain = NSFileProviderDomain(
         identifier: NSFileProviderDomainIdentifier("com.openminis.app.files"),
-        displayName: "Minis"
+        displayName: "龙虾Ai"
     )
 
     /// Bumped when we need to force-rebuild the FileProvider domain on next launch

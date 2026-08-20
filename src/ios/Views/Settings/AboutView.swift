@@ -23,12 +23,12 @@ struct AboutView: View {
                                     .stroke(Color(UIColor.separator), lineWidth: 0.5)
                             )
                     }
-                    Text("Minis")
+                    Text("龙虾Ai")
                         .font(.title2.bold())
                     Text("Version \(appVersion)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Text("Minis is Your Fully Local, Fully Private On-Device Agent.")
+                    Text("龙虾Ai 是完全本地、完全私密的设备端 Agent。")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
