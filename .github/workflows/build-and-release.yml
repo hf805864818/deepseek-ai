@@ -329,9 +329,11 @@ jobs:
       - name: Display artifacts
         run: ls -lh artifacts/
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release on Lobster-APP
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.LOBSTER_APP_TOKEN }}
+          repository: vbox-Ai/Lobster-APP
           tag_name: v${{ needs.prepare.outputs.version }}
           name: "龙虾Ai v${{ needs.prepare.outputs.version }}"
           body: ${{ needs.prepare.outputs.changelog }}
