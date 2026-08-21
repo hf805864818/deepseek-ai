@@ -207,6 +207,15 @@ private let folderEdgeHighlight = Color(UIColor { traits in
         : UIColor(white: 0, alpha: 0.08)
 })
 
+/// List page background — intentionally darker than `systemGroupedBackground`
+/// (#F2F2F7) so white cards and floating pills clearly separate from the
+/// "lower layer" they sit on. Dark mode stays pure black to match the system.
+private let listPageBackground = Color(UIColor { traits in
+    traits.userInterfaceStyle == .dark
+        ? UIColor(red: 0, green: 0, blue: 0, alpha: 1)
+        : UIColor(red: 229/255, green: 229/255, blue: 234/255, alpha: 1)
+})
+
 /// Background for the expanded FAB search bar. Liquid Glass capsule on iOS 26+,
 /// the original opaque capsule + hand-rolled shadow below it.
 ///
@@ -359,6 +368,10 @@ private struct FolderSurface: ViewModifier {
                     .stroke(folderEdgeHighlight, lineWidth: 0.75)
             }
         }
+        .shadow(color: kind == .lone ? .black.opacity(0.06) : .clear,
+                radius: kind == .lone ? 6 : 0,
+                x: 0,
+                y: kind == .lone ? 2 : 0)
     }
 }
 
@@ -2719,7 +2732,7 @@ struct ContentView: View {
                                 if group.folderId != nil {
                                     FolderMemberRowBackground(isLast: sessionId == group.ids.last)
                                 } else {
-                                    Color(.systemGroupedBackground)
+                                    listPageBackground
                                 }
                             })
                             .contextMenu {
@@ -2741,6 +2754,9 @@ struct ContentView: View {
                     // group only — the "Groups" divider label.
                     if group.folderId == nil || isSelecting {
                         sectionHeader(index: index, group: group)
+                            .listRowInsets(EdgeInsets())
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
                     } else if group.showsGroupsHeader {
                         Text("Groups")
                             .font(.subheadline.weight(.semibold))
@@ -2752,6 +2768,7 @@ struct ContentView: View {
 
         }
         .listStyle(.plain)
+        .scrollContentBackground(listPageBackground)
         #if DEBUG
         // TEMPORARY scroll-phase markers to bracket the jitter window in the
         // log. Pair with the [ROWH] probe: a [ROWH] line appearing during
@@ -2912,7 +2929,7 @@ struct ContentView: View {
                                             RoundedRectangle(cornerRadius: 10, style: .continuous)
                                                 .fill(isSessionHighlighted(session.id)
                                                       ? Color(red: 183/255.0, green: 175/255.0, blue: 150/255.0).opacity(0.3)
-                                                      : Color(.systemGroupedBackground))
+                                                      : listPageBackground)
                                                 .padding(.horizontal, 6)
                                                 .padding(.vertical, 2)
                                         }
@@ -3677,7 +3694,7 @@ struct ContentView: View {
                         }
                         .listRowInsets(EdgeInsets())
                         .listRowSeparator(.hidden)
-                        .listRowBackground(Color(.systemGroupedBackground))
+                        .listRowBackground(listPageBackground)
                         .contextMenu {
                             Button {
                                 // [T-ios-state-publish-offmain-crash] @MainActor
@@ -4423,8 +4440,13 @@ struct ContentView: View {
             .padding(.vertical, 4)
             .background(
                 Capsule()
-                    .fill(dropTargetFolderId == "" ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground))
+                    .fill(dropTargetFolderId == "" ? Color.accentColor.opacity(0.18) : Color(.systemBackground))
             )
+            .overlay(
+                Capsule()
+                    .stroke(Color(UIColor.separator).opacity(0.3), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.08), radius: 4, x: 0, y: 2)
             .padding(.bottom, 4)
             .padding(.top, 2)
             // Dropping on a date-bucket header moves the sessions OUT of any
