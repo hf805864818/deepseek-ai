@@ -213,7 +213,7 @@ private let folderEdgeHighlight = Color(UIColor { traits in
 private let listPageBackground = Color(UIColor { traits in
     traits.userInterfaceStyle == .dark
         ? UIColor(red: 0, green: 0, blue: 0, alpha: 1)
-        : UIColor(red: 229/255, green: 229/255, blue: 234/255, alpha: 1)
+        : UIColor(red: 222/255, green: 222/255, blue: 227/255, alpha: 1)
 })
 
 /// Background for the expanded FAB search bar. Liquid Glass capsule on iOS 26+,
@@ -368,10 +368,10 @@ private struct FolderSurface: ViewModifier {
                     .stroke(folderEdgeHighlight, lineWidth: 0.75)
             }
         }
-        .shadow(color: kind == .lone ? .black.opacity(0.06) : .clear,
-                radius: kind == .lone ? 6 : 0,
+        .shadow(color: kind == .lone ? .black.opacity(0.12) : .clear,
+                radius: kind == .lone ? 8 : 0,
                 x: 0,
-                y: kind == .lone ? 2 : 0)
+                y: kind == .lone ? 3 : 0)
     }
 }
 
@@ -4446,7 +4446,7 @@ struct ContentView: View {
                 Capsule()
                     .stroke(Color(UIColor.separator).opacity(0.3), lineWidth: 0.5)
             )
-            .shadow(color: .black.opacity(0.08), radius: 4, x: 0, y: 2)
+            .shadow(color: .black.opacity(0.12), radius: 6, x: 0, y: 3)
             .padding(.bottom, 4)
             .padding(.top, 2)
             // Dropping on a date-bucket header moves the sessions OUT of any
@@ -6374,7 +6374,7 @@ private struct SessionRow: View, Equatable {
         .padding(.vertical, 12)
         .background(Color(.systemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 3)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .contentShape(Rectangle())
@@ -6602,7 +6602,7 @@ private struct RemoteSessionRow: View {
         .padding(.vertical, 12)
         .background(Color(.systemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 3)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .contentShape(Rectangle())
