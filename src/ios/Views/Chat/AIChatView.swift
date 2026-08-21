@@ -2395,6 +2395,7 @@ struct AIChatView: View {
                     .font(.caption)
                     .foregroundStyle(ChatColors.secondaryText)
             }
+            .buttonStyle(.plain)
         }
         .contentShape(Rectangle())
         .onLongPressGesture {
@@ -3021,10 +3022,12 @@ struct AIChatView: View {
             } label: {
                 icon
             }
+            .buttonStyle(.plain)
         } else {
             Button { showAttachmentMenu = true } label: {
                 icon
             }
+            .buttonStyle(.plain)
             .confirmationDialog("Add Attachment", isPresented: $showAttachmentMenu) {
                 Button { showCamera = true } label: { Label("Take Photo", systemImage: "camera") }
                 Button { showPhotoPicker = true } label: { Label("Choose Photos & Videos", systemImage: "photo.on.rectangle") }
@@ -3121,6 +3124,7 @@ struct AIChatView: View {
                 .clipShape(Circle())
                 .overlay(Circle().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
     }
 
     /// "Exit Edit Mode" capsule shown while editing a past message.
@@ -3137,6 +3141,7 @@ struct AIChatView: View {
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
     }
 
     /// Speech language badge shown only while recording.
@@ -3152,6 +3157,7 @@ struct AIChatView: View {
                 .clipShape(Circle())
                 .overlay(Circle().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
     }
 
     /// Mic button plus the attached language-picker sheet.
@@ -3186,6 +3192,7 @@ struct AIChatView: View {
                     .font(.system(size: 34))
                     .foregroundStyle(ChatColors.sendButton)
             }
+            .buttonStyle(.plain)
             .keyboardShortcut(.return, modifiers: .command)
         } else if vm.isProcessing {
             Button { vm.cancel() } label: {
@@ -3193,12 +3200,14 @@ struct AIChatView: View {
                     .font(.system(size: 34))
                     .foregroundStyle(.red)
             }
+            .buttonStyle(.plain)
         } else {
             Button { performSend() } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 34))
                     .foregroundStyle(canSend ? ChatColors.sendButton : ChatColors.sendButtonDisabled)
             }
+            .buttonStyle(.plain)
             .disabled(!canSend)
             .keyboardShortcut(.return, modifiers: .command)
         }
@@ -3485,6 +3494,7 @@ struct AIChatView: View {
                             .background(.ultraThinMaterial)
                             .clipShape(Capsule())
                     }
+                    .buttonStyle(.plain)
                     .padding(.top, 6)
                     .padding(.trailing, 10)
                 }
