@@ -2593,11 +2593,11 @@ struct AIChatView: View {
             .foregroundStyle(.secondary)
             .frame(width: 36, height: 36)
             .background { ScrollToBottomBackground().clipShape(Circle()) }
-            // Border + shadow give the near-opaque disc its edge on a white
-            // page — at 0.25/0.12 the button had no readable outline over
-            // plain reply text. [T-ios-scrollbtn-invisible-lightmode]
+            // Border gives the near-opaque disc its edge on a white
+            // page. Shadow removed — two adjacent circular shadows
+            // overlapped into a visible square-ish block.
+            // [T-ios-scrollbtn-invisible-lightmode]
             .overlay(Circle().stroke(Color.gray.opacity(0.35), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
     }
 
     /// Background color for the scroll-to-bottom button.
