@@ -7470,7 +7470,7 @@ private struct SettingsSheet: View {
                                 .background(.indigo, in: Circle())
                         }
                     }
-                    Link(destination: URL(string: "https://openminis.github.io/privacy-policy.html")!) {
+                    Link(destination: URL(string: "https://vbox-ai.github.io/Lobster-APP/privacy.html")!) {
                         Label {
                             Text("Privacy Policy")
                         } icon: {
@@ -7500,7 +7500,7 @@ private struct SettingsSheet: View {
                             if let url = Self.makeBugReportURL() { UIApplication.shared.open(url) }
                         }
                         Button("Feedback (Telegram)") {
-                            if let url = URL(string: "https://t.me/+2NzhOJuzRyI1YmM1") { UIApplication.shared.open(url) }
+                            if let url = URL(string: "https://t.me/hfkj520") { UIApplication.shared.open(url) }
                         }
                         Button("Feedback (Email)") {
                             if let url = Self.makeFeedbackEmailURL() { UIApplication.shared.open(url) }
@@ -7739,7 +7739,7 @@ private struct SettingsSheet: View {
 
         """
 
-        var components = URLComponents(string: "https://github.com/OpenMinis/OpenMinis/issues/new")
+        var components = URLComponents(string: "https://github.com/vbox-Ai/Lobster-APP/issues/new")
         components?.queryItems = [
             URLQueryItem(name: "template", value: "bug_report.md"),
             URLQueryItem(name: "title", value: "[Bug] "),

@@ -294,7 +294,7 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_privacy_policy),
                     subtitle = null,
                     // iOS canonical URL — ContentView.swift / AddProviderView.swift
-                    onClick = { openExternalUrl(context, "https://openminis.github.io/privacy-policy.html") },
+                    onClick = { openExternalUrl(context, "https://vbox-ai.github.io/Lobster-APP/privacy.html") },
                 )
                 SettingsItem(
                     icon = Icons.Outlined.Feedback,
@@ -326,7 +326,7 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_feedback_telegram),
                     onClick = {
                         showFeedbackSheet = false
-                        openExternalUrl(context, "https://t.me/+2NzhOJuzRyI1YmM1")
+                        openExternalUrl(context, "https://t.me/hfkj520")
                     },
                 )
                 FeedbackSheetItem(
@@ -377,7 +377,7 @@ private fun FeedbackSheetItem(
  * triage instead of asking the user to fill in environment details.
  *
  * URL shape:
- *   https://github.com/OpenMinis/OpenMinis/issues/new
+ *   https://github.com/vbox-Ai/Lobster-APP/issues/new
  *     ?template=bug_report.md
  *     &title=[Bug]
  *     &body=<percent-encoded markdown>
@@ -440,7 +440,7 @@ private fun buildBugReportUrl(): String {
     // since URLEncoder turns spaces into '+' which GitHub also accepts but
     // the spec calls for the literal "[Bug] " form.
     val title = java.net.URLEncoder.encode("[Bug] ", "UTF-8")
-    return "https://github.com/OpenMinis/OpenMinis/issues/new" +
+    return "https://github.com/vbox-Ai/Lobster-APP/issues/new" +
         "?template=bug_report.md" +
         "&title=$title" +
         "&body=$encodedBody"
