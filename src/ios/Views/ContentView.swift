@@ -2768,7 +2768,8 @@ struct ContentView: View {
 
         }
         .listStyle(.plain)
-        .scrollContentBackground(listPageBackground)
+        .scrollContentBackground(.hidden)
+        .background(listPageBackground)
         #if DEBUG
         // TEMPORARY scroll-phase markers to bracket the jitter window in the
         // log. Pair with the [ROWH] probe: a [ROWH] line appearing during
