@@ -1,3 +1,3 @@
-1.0.10
-build=12
-android_code=34
+1.0.11
+build=13
+android_code=35
