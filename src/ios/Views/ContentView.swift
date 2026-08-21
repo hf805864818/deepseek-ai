@@ -2768,6 +2768,8 @@ struct ContentView: View {
 
         }
         .listStyle(.plain)
+        .listRowSpacing(8)
+        .environment(\.listSectionSpacing, 8)
         .scrollContentBackground(.hidden)
         .background(listPageBackground)
         #if DEBUG
@@ -4449,7 +4451,7 @@ struct ContentView: View {
             )
             .shadow(color: .black.opacity(0.12), radius: 6, x: 0, y: 3)
             .padding(.bottom, 4)
-            .padding(.top, 2)
+            .padding(.top, 0)
             // Dropping on a date-bucket header moves the sessions OUT of any
             // folder — the drag gesture works both directions, otherwise
             // moving out would still require a trip through the menu.

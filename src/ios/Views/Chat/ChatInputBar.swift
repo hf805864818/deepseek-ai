@@ -172,28 +172,30 @@ struct InputAttachmentGridView: View {
     @State private var draggingID: UUID?
 
     var body: some View {
-        FlowLayout(hSpacing: 8, vSpacing: 8) {
-            ForEach(attachments) { attachment in
-                AttachmentChip(attachment: attachment) {
-                    onRemove(attachment)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    AttachmentChip(attachment: attachment) {
+                        onRemove(attachment)
+                    }
+                    .opacity(draggingID == attachment.id ? 0.4 : 1)
+                    .onDrag {
+                        draggingID = attachment.id
+                        return NSItemProvider(object: attachment.id.uuidString as NSString)
+                    }
+                    .onDrop(of: [.text], delegate: AttachmentDropDelegate(
+                        targetID: attachment.id,
+                        draggingID: $draggingID,
+                        onMove: onMove
+                    ))
                 }
-                .opacity(draggingID == attachment.id ? 0.4 : 1)
-                .onDrag {
-                    draggingID = attachment.id
-                    return NSItemProvider(object: attachment.id.uuidString as NSString)
+                ForEach(0..<loadingVideoCount, id: \.self) { _ in
+                    VideoLoadingChip()
                 }
-                .onDrop(of: [.text], delegate: AttachmentDropDelegate(
-                    targetID: attachment.id,
-                    draggingID: $draggingID,
-                    onMove: onMove
-                ))
             }
-            ForEach(0..<loadingVideoCount, id: \.self) { _ in
-                VideoLoadingChip()
-            }
+            .padding(.top, 6)  // room for × button overhang (offset y: -4)
         }
         .padding(.horizontal, 16)
-        .padding(.top, 6)  // room for × button overhang (offset y: -4)
     }
 }
 
@@ -323,6 +325,7 @@ private struct AttachmentChip: View {
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.5), radius: 2)
             }
+            .buttonStyle(.plain)
             .offset(x: 4, y: -4)
         }
         .fixedSize()
@@ -361,6 +364,7 @@ private struct AttachmentChip: View {
                         .foregroundStyle(.white)
                         .shadow(color: .black.opacity(0.5), radius: 2)
                 }
+                .buttonStyle(.plain)
                 .offset(x: 4, y: -4)
             }
             .fixedSize()
