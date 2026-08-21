@@ -2719,7 +2719,7 @@ struct ContentView: View {
                                 if group.folderId != nil {
                                     FolderMemberRowBackground(isLast: sessionId == group.ids.last)
                                 } else {
-                                    Color(.systemBackground)
+                                    Color(.systemGroupedBackground)
                                 }
                             })
                             .contextMenu {
@@ -2912,7 +2912,7 @@ struct ContentView: View {
                                             RoundedRectangle(cornerRadius: 10, style: .continuous)
                                                 .fill(isSessionHighlighted(session.id)
                                                       ? Color(red: 183/255.0, green: 175/255.0, blue: 150/255.0).opacity(0.3)
-                                                      : Color.clear)
+                                                      : Color(.systemGroupedBackground))
                                                 .padding(.horizontal, 6)
                                                 .padding(.vertical, 2)
                                         }
@@ -3677,6 +3677,7 @@ struct ContentView: View {
                         }
                         .listRowInsets(EdgeInsets())
                         .listRowSeparator(.hidden)
+                        .listRowBackground(Color(.systemGroupedBackground))
                         .contextMenu {
                             Button {
                                 // [T-ios-state-publish-offmain-crash] @MainActor
@@ -6345,6 +6346,11 @@ private struct SessionRow: View, Equatable {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
         .contentShape(Rectangle())
         #if DEBUG
         // TEMPORARY height probe — confirms List self-sizing jitter source.
@@ -6568,6 +6574,11 @@ private struct RemoteSessionRow: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
         .contentShape(Rectangle())
     }
 
