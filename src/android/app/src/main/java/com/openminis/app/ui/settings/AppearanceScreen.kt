@@ -539,6 +539,16 @@ fun AppearanceScreen(
                     R.string.appearance_app_icon_dark,
                     R.mipmap.ic_launcher_classic_dark,
                 ),
+                IconOption(
+                    AppIconRepository.Variant.LegacyLight,
+                    R.string.appearance_app_icon_legacy_light,
+                    R.mipmap.ic_launcher_legacy_light,
+                ),
+                IconOption(
+                    AppIconRepository.Variant.LegacyDark,
+                    R.string.appearance_app_icon_legacy_dark,
+                    R.mipmap.ic_launcher_legacy_dark,
+                ),
             )
             Row(
                 modifier = Modifier

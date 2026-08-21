@@ -692,9 +692,11 @@
     <!-- T-android-dynamic-app-icon: launcher-icon picker section. -->
     <string name="appearance_section_app_icon">App Icon</string>
     <string name="appearance_app_icon_footer">Change the launcher icon. The home-screen icon may take a few seconds to refresh after a tap.</string>
-    <string name="appearance_app_icon_auto">Automatic</string>
-    <string name="appearance_app_icon_light">Light</string>
-    <string name="appearance_app_icon_dark">Dark</string>
+    <string name="appearance_app_icon_auto">Bright Blue</string>
+    <string name="appearance_app_icon_light">Mint Green</string>
+    <string name="appearance_app_icon_dark">Charcoal</string>
+    <string name="appearance_app_icon_legacy_light">Warm Orange</string>
+    <string name="appearance_app_icon_legacy_dark">Indigo</string>
     <string name="env_var_title">Environment Variables</string>
     <string name="env_var_add">Add</string>
     <string name="env_var_privacy_header">Privacy</string>

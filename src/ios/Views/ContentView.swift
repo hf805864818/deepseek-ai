@@ -6921,11 +6921,11 @@ private struct AppearanceSettingsView: View {
     @ObservedObject private var fontSettings = FontSettings.shared
 
     private let iconOptions: [AppIconOption] = [
-        AppIconOption(id: 0, title: "Automatic", subtitle: "Follows system", iconName: nil, imageName: "AlternateIcons/AppIcon-Light"),
-        AppIconOption(id: 1, title: "Light", subtitle: "Always light", iconName: "AppIcon-Light", imageName: "AlternateIcons/AppIcon-Light"),
-        AppIconOption(id: 2, title: "Dark", subtitle: "Always dark", iconName: "AppIcon-Dark", imageName: "AlternateIcons/AppIcon-Dark"),
-        AppIconOption(id: 3, title: "Light (Legacy)", subtitle: "Classic light icon", iconName: "AppIcon-LegacyLight", imageName: "AlternateIcons/AppIcon-LegacyLight"),
-        AppIconOption(id: 4, title: "Dark (Legacy)", subtitle: "Classic dark icon", iconName: "AppIcon-LegacyDark", imageName: "AlternateIcons/AppIcon-LegacyDark"),
+        AppIconOption(id: 0, title: "Bright Blue", subtitle: "Follows system", iconName: nil, imageName: "AlternateIcons/AppIcon-Auto"),
+        AppIconOption(id: 1, title: "Mint Green", subtitle: "Always on", iconName: "AppIcon-Light", imageName: "AlternateIcons/AppIcon-Light"),
+        AppIconOption(id: 2, title: "Charcoal", subtitle: "Always on", iconName: "AppIcon-Dark", imageName: "AlternateIcons/AppIcon-Dark"),
+        AppIconOption(id: 3, title: "Warm Orange", subtitle: "Always on", iconName: "AppIcon-LegacyLight", imageName: "AlternateIcons/AppIcon-LegacyLight"),
+        AppIconOption(id: 4, title: "Indigo", subtitle: "Always on", iconName: "AppIcon-LegacyDark", imageName: "AlternateIcons/AppIcon-LegacyDark"),
     ]
 
     var body: some View {

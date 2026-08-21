@@ -334,9 +334,11 @@
     <!-- T-android-dynamic-app-icon: 启动图标选择项。 -->
     <string name="appearance_section_app_icon">应用图标</string>
     <string name="appearance_app_icon_footer">更换桌面图标。切换后桌面图标可能需要几秒钟才会刷新。</string>
-    <string name="appearance_app_icon_auto">自动</string>
-    <string name="appearance_app_icon_light">浅色</string>
-    <string name="appearance_app_icon_dark">深色</string>
+    <string name="appearance_app_icon_auto">亮蓝</string>
+    <string name="appearance_app_icon_light">薄荷绿</string>
+    <string name="appearance_app_icon_dark">深黑</string>
+    <string name="appearance_app_icon_legacy_light">暖橙</string>
+    <string name="appearance_app_icon_legacy_dark">蓝紫</string>
     <string name="env_var_title">环境变量</string>
     <string name="env_var_add">添加</string>
     <string name="env_var_privacy_header">隐私</string>

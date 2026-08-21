@@ -35,6 +35,8 @@ object AppIconRepository {
         Auto("auto", "$PACKAGE_NAME.MainActivityIconAuto"),
         ClassicLight("classic_light", "$PACKAGE_NAME.MainActivityIconLight"),
         ClassicDark("classic_dark", "$PACKAGE_NAME.MainActivityIconDark"),
+        LegacyLight("legacy_light", "$PACKAGE_NAME.MainActivityIconLegacyLight"),
+        LegacyDark("legacy_dark", "$PACKAGE_NAME.MainActivityIconLegacyDark"),
         ;
 
         companion object {
