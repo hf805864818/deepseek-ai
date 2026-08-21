@@ -564,6 +564,7 @@ private struct BridgedAssistantFooterV3: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Color.orange).clipShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(10).frame(maxWidth: .infinity, alignment: .leading)

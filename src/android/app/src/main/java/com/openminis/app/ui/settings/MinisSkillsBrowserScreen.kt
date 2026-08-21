@@ -73,7 +73,7 @@ fun MinisSkillsBrowserScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    var currentUrl by remember { mutableStateOf("https://github.com/OpenMinis/MinisSkills") }
+    var currentUrl by remember { mutableStateOf("https://github.com/vbox-Ai/Lobsterskills") }
     var hudState by remember { mutableStateOf(HudState.HIDDEN) }
     var hudMessage by remember { mutableStateOf("") }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
@@ -179,7 +179,7 @@ fun MinisSkillsBrowserScreen(
 
                         webChromeClient = WebChromeClient()
 
-                        loadUrl("https://github.com/OpenMinis/MinisSkills")
+                        loadUrl("https://github.com/vbox-Ai/Lobsterskills")
                     }.also { webViewRef = it }
                 },
                 modifier = Modifier.fillMaxSize(),
@@ -323,9 +323,9 @@ private suspend fun importSkillFromCurrentUrl(
 
 /**
  * Check if the URL points to a specific skill directory (not repo root or non-skill pages).
- * e.g. github.com/OpenMinis/MinisSkills/tree/main/exa-search → true
- *      github.com/OpenMinis/MinisSkills → false
- *      github.com/OpenMinis/MinisSkills/issues → false
+ * e.g. github.com/vbox-Ai/Lobsterskills/tree/main/exa-search → true
+ *      github.com/vbox-Ai/Lobsterskills → false
+ *      github.com/vbox-Ai/Lobsterskills/issues → false
  */
 private fun isSkillDirectoryUrl(url: String): Boolean {
     if (!url.contains("github.com")) return true // Non-GitHub URL, let it try

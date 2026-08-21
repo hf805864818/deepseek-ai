@@ -1097,7 +1097,7 @@ private struct SkillBrowserWebView: UIViewRepresentable {
         webView.allowsBackForwardNavigationGestures = true
         // KVO to track URL changes (GitHub SPA uses pushState)
         context.coordinator.observe(webView)
-        if let url = URL(string: "https://github.com/OpenMinis/MinisSkills") {
+        if let url = URL(string: "https://github.com/vbox-Ai/Lobsterskills") {
             webView.load(URLRequest(url: url))
         }
         return webView
