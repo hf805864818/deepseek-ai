@@ -329,6 +329,18 @@ jobs:
       - name: Display artifacts
         run: ls -lh artifacts/
 
+      - name: Create GitHub Release on source repo
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: "龙虾Ai v${{ needs.prepare.outputs.version }}"
+          body: ${{ needs.prepare.outputs.changelog }}
+          files: |
+            artifacts/龙虾Ai-v${{ needs.prepare.outputs.version }}.ipa
+            artifacts/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
+          draft: false
+          prerelease: false
+
       - name: Create GitHub Release on Lobster-APP
         uses: softprops/action-gh-release@v2
         with:
