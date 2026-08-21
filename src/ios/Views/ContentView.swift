@@ -2769,7 +2769,7 @@ struct ContentView: View {
         }
         .listStyle(.plain)
         .listRowSpacing(8)
-        .environment(\.listSectionSpacing, 8)
+        .listSectionSpacing(8)
         .scrollContentBackground(.hidden)
         .background(listPageBackground)
         #if DEBUG
