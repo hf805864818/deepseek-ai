@@ -462,9 +462,11 @@
     <string name="appearance_language_footer">Переопределить язык отображения для этого приложения. \"Системный\" следует языку вашего устройства.</string>
     <string name="appearance_section_app_icon">Значок приложения</string>
     <string name="appearance_app_icon_footer">Изменение значка запуска. Значку на главном экране может потребоваться несколько секунд для обновления после нажатия.</string>
-    <string name="appearance_app_icon_auto">Автоматически</string>
-    <string name="appearance_app_icon_light">Светлый</string>
-    <string name="appearance_app_icon_dark">Тёмный</string>
+    <string name="appearance_app_icon_auto">Ярко-синий</string>
+    <string name="appearance_app_icon_light">Мятный зелёный</string>
+    <string name="appearance_app_icon_dark">Угольный</string>
+    <string name="appearance_app_icon_legacy_light">Тёплый оранжевый</string>
+    <string name="appearance_app_icon_legacy_dark">Индиго</string>
     <string name="env_var_title">Переменные окружения</string>
     <string name="env_var_add">Добавить</string>
     <string name="env_var_privacy_header">Конфиденциальность</string>

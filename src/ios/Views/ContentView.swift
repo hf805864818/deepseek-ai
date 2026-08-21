@@ -7076,7 +7076,7 @@ private struct AppearanceSettingsView: View {
                                 }
                                 VStack(alignment: .leading, spacing: 2) {
                                     // `option.title` / `option.subtitle` are fixed English
-                                    // keys ("Automatic", "Light", "Always light", etc.).
+                                    // keys ("Bright Blue", "Mint Green", "Always on", etc.).
                                     // Wrap in LocalizedStringKey so the catalog lookup kicks
                                     // in — Text(String) would render them verbatim.
                                     Text(LocalizedStringKey(option.title))
