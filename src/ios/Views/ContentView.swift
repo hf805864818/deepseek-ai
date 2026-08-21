@@ -4419,10 +4419,14 @@ struct ContentView: View {
                     .foregroundStyle(Color(UIColor.secondaryLabel))
             }
             .textCase(nil)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(dropTargetFolderId == "" ? Color.accentColor.opacity(0.18) : Color.clear)
+                Capsule()
+                    .fill(dropTargetFolderId == "" ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground))
             )
+            .padding(.bottom, 4)
+            .padding(.top, 2)
             // Dropping on a date-bucket header moves the sessions OUT of any
             // folder — the drag gesture works both directions, otherwise
             // moving out would still require a trip through the menu.
@@ -6350,7 +6354,7 @@ private struct SessionRow: View, Equatable {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
         .padding(.horizontal, 10)
-        .padding(.vertical, 3)
+        .padding(.vertical, 5)
         .contentShape(Rectangle())
         #if DEBUG
         // TEMPORARY height probe — confirms List self-sizing jitter source.
@@ -6578,7 +6582,7 @@ private struct RemoteSessionRow: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
         .padding(.horizontal, 10)
-        .padding(.vertical, 3)
+        .padding(.vertical, 5)
         .contentShape(Rectangle())
     }
 
