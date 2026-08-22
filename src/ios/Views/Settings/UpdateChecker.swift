@@ -96,9 +96,15 @@ final class UpdateChecker {
     }
 
     /// Last time a check was performed (used for throttling).
-    private var lastCheckDate: Date? {
+    var lastCheckDate: Date? {
         get { UserDefaults.standard.object(forKey: Key.lastCheckDate) as? Date }
         set { UserDefaults.standard.set(newValue, forKey: Key.lastCheckDate) }
+    }
+
+    /// Update the last-check timestamp (call after a manual check too so
+    /// the silent-check throttle resets).
+    func touchLastCheckDate() {
+        lastCheckDate = Date()
     }
 
     /// Version the user has explicitly dismissed (won't show badge).

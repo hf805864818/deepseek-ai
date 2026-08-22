@@ -20,11 +20,20 @@ struct UpdateCheckRow: View {
 
     @State private var isChecking = false
     @State private var statusMessage: String? = nil
+    @State private var statusKind: StatusKind? = nil
     @State private var showReleasesLink = false
     @State private var showUpdateDialog = false
     @State private var updateVersion: String? = nil
     @State private var updateIPAURL: URL? = nil
     @State private var updateChangelog: String = ""
+
+    /// Status kind drives text color — avoids fragile string-matching.
+    private enum StatusKind {
+        case success    // green: up-to-date
+        case info       // blue: new version found
+        case error      // red: failure / network issues
+        case neutral    // gray: info-only
+    }
 
     // MARK: - Current Version
 
@@ -70,7 +79,7 @@ struct UpdateCheckRow: View {
                 HStack {
                     Text(status)
                         .font(.subheadline)
-                        .foregroundStyle(statusColor(for: status))
+                        .foregroundStyle(statusColor(for: statusKind))
                     Spacer()
                 }
                 .padding(.leading, 40) // align with label text
@@ -124,6 +133,7 @@ struct UpdateCheckRow: View {
     private func performCheck() async {
         isChecking = true
         statusMessage = nil
+        statusKind = nil
         showReleasesLink = false
 
         let result = await UpdateChecker.shared.check()
@@ -134,6 +144,7 @@ struct UpdateCheckRow: View {
             updateIPAURL = ipaURL
             updateChangelog = changelog
             statusMessage = String(format: NSLocalizedString("New version available: %@", comment: "New version found status"), version)
+            statusKind = .info
             // Update persisted state.
             UpdateChecker.shared.hasPendingUpdate = true
             UpdateChecker.shared.pendingVersion = version
@@ -146,6 +157,7 @@ struct UpdateCheckRow: View {
 
         case .upToDate:
             statusMessage = NSLocalizedString("You're up to date", comment: "No update available")
+            statusKind = .success
             UpdateChecker.shared.hasPendingUpdate = false
             UpdateChecker.shared.pendingVersion = nil
             UpdateChecker.shared.pendingIPAURL = nil
@@ -153,42 +165,40 @@ struct UpdateCheckRow: View {
 
         case .noReleaseAvailable:
             statusMessage = NSLocalizedString("No releases found", comment: "No releases available")
+            statusKind = .neutral
 
         case .noIPAAsset(let version):
             statusMessage = String(format: NSLocalizedString("Version %@ has no IPA", comment: "New version but no IPA asset"), version)
+            statusKind = .error
 
         case .forbidden:
             statusMessage = NSLocalizedString("Unable to check (network restricted)", comment: "Geo-blocked / 403 error")
+            statusKind = .error
             showReleasesLink = true
 
         case .networkUnreachable:
             statusMessage = NSLocalizedString("Network unavailable", comment: "No internet connection")
+            statusKind = .error
 
         case .error(let message):
             statusMessage = String(format: NSLocalizedString("Check failed: %@", comment: "Generic check error"), message)
+            statusKind = .error
         }
 
+        // Update throttle timestamp for silent checks.
+        UpdateChecker.shared.touchLastCheckDate()
         isChecking = false
     }
 
     // MARK: - Helpers
 
-    private func statusColor(for message: String) -> Color {
-        if message.lowercased().contains("up to date") ||
-            message.contains("最新") || message.contains("up-to-date") {
-            return .green
+    private func statusColor(for kind: StatusKind?) -> Color {
+        switch kind {
+        case .success: return .green
+        case .info:    return .blue
+        case .error:   return .red
+        case .neutral, nil: return .secondary
         }
-        if message.lowercased().contains("new version") ||
-            message.contains("新版本") {
-            return .blue
-        }
-        if message.lowercased().contains("failed") ||
-            message.lowercased().contains("unable") ||
-            message.lowercased().contains("unavailable") ||
-            message.contains("失败") || message.contains("无法") {
-            return .red
-        }
-        return .secondary
     }
 }
 

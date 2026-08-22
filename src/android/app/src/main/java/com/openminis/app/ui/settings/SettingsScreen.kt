@@ -115,7 +115,7 @@ fun SettingsScreen(
     // Listen for update check result changes so the dot appears / disappears
     // without the user having to leave and re-open Settings.
     DisposableEffect(context) {
-        val prefs = context.getSharedPreferences("update_checker", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences(UpdateChecker.PREFS_NAME, Context.MODE_PRIVATE)
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
             hasUpdateDot = UpdateChecker.hasUnreadUpdate(context)
         }

@@ -9,7 +9,10 @@ import android.provider.Settings
 import androidx.core.content.FileProvider
 import com.openminis.app.BuildConfig
 import com.openminis.app.logging.AppLogger
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -53,7 +56,7 @@ object UpdateChecker {
      * `<files-path name="updates" path="updates/" />`.
      */
     private const val UPDATES_DIR = "updates"
-    private const val PREFS_NAME = "update_checker"
+    internal const val PREFS_NAME = "update_checker"
     private const val KEY_LAST_CHECK = "last_check_ms"
     private const val KEY_HAS_PENDING = "has_pending"
     private const val KEY_PENDING_VERSION = "pending_version"
@@ -122,8 +125,8 @@ object UpdateChecker {
             return // Throttled — skip.
         }
         val appContext = context.applicationContext
-        // Fire and forget on a background thread.
-        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+        // Fire and forget on the app-level IO scope.
+        appScope.launch {
             val result = check()
             val now = System.currentTimeMillis()
             val editor = p.edit()
@@ -189,6 +192,9 @@ object UpdateChecker {
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
+
+    /** App-wide scope for fire-and-forget background work (silent checks). */
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Hit `repos/{owner}/{repo}/releases` (the list endpoint, NOT
@@ -564,20 +570,25 @@ object UpdateChecker {
     }
 
     /**
-     * Numeric-aware version comparator. `1.0.10` beats `1.0.9`. Non-numeric
-     * components fall back to lexicographic compare so a `1.0.0-rc1` build is
-     * treated as "newer than 1.0.0" — acceptable noise for our use case.
+     * Numeric-aware version comparator. `1.0.10` beats `1.0.9`.
+     *
+     * Both sides are normalised first (strip leading `v` and any `-preview` /
+     * `-rc1` suffix), then compared component-by-component numerically. This
+     * matches the iOS UpdateChecker behaviour so silent-check / manual-check
+     * decisions are identical across platforms.
+     *
+     * Returns positive when `a > b`, negative when `a < b`, zero when equal.
      */
     private fun compareVersions(a: String, b: String): Int {
-        val ap = a.split('.', '-')
-        val bp = b.split('.', '-')
-        val n = maxOf(ap.size, bp.size)
+        val aClean = normalizeTag(a)
+        val bClean = normalizeTag(b)
+        val aParts = aClean.split('.').map { it.toIntOrNull() ?: 0 }
+        val bParts = bClean.split('.').map { it.toIntOrNull() ?: 0 }
+        val n = maxOf(aParts.size, bParts.size)
         for (i in 0 until n) {
-            val x = ap.getOrNull(i) ?: ""
-            val y = bp.getOrNull(i) ?: ""
-            val xi = x.toIntOrNull()
-            val yi = y.toIntOrNull()
-            val c = if (xi != null && yi != null) xi.compareTo(yi) else x.compareTo(y)
+            val x = aParts.getOrElse(i) { 0 }
+            val y = bParts.getOrElse(i) { 0 }
+            val c = x.compareTo(y)
             if (c != 0) return c
         }
         return 0
