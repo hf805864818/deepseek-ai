@@ -1987,11 +1987,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         s += DeepModeStore.loadRulesBody() + "\n"
         // [T-deep-mode-memory-proactive] Deterministic instruction so the
         // agent proactively persists long-term preferences instead of waiting
-        // for an explicit /memory request. Reuses the existing memory_write
-        // tool; it is self-limiting because memory_write is gated by the
-        // session's memoryEnabled toggle and returns a graceful refusal when
-        // memory is off.
-        s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, or project fact worth keeping, persist it via memory_write now (one short entry) and mention it in a single line, rather than waiting to be asked."
+        // for an explicit /memory request. Gated by the session's
+        // memoryEnabled toggle (same gate as the memory fragment injection
+        // below): when memory is off there is nothing to write to, and
+        // injecting the instruction anyway would make the model attempt a
+        // memory_write that every turn refuses with "Memory disabled".
+        if memoryEnabled {
+            s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, or project fact worth keeping, persist it via memory_write now (one short entry) and mention it in a single line, rather than waiting to be asked."
+        }
         return s
     }
 
