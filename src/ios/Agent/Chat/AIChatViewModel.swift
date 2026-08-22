@@ -1979,12 +1979,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// WITHOUT touching `baseSystemPrompt` (which sits on a type-check
     /// boundary and must not be edited).
     private var deepModeFragment: String {
-        return "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED. Adopt a deliberate, senior-engineer working style for this turn:\n"
-            + "1. PLAN FIRST — for non-trivial tasks, state a short numbered plan before acting, then execute it. Skip the plan for trivial single-command tasks.\n"
-            + "2. CONSULT SKILLS FIRST — check <available_skills> above and follow any matching skill's workflow before improvising a process.\n"
-            + "3. EXECUTE TRANSPARENTLY — prefer concrete tool calls over describing intentions; let the user follow each step.\n"
-            + "4. SELF-VERIFY — after finishing, re-read the result and fix any errors; do not declare success blindly.\n"
-            + "5. DELIVER & SUMMARIZE — end with a concise summary of what changed and anything the user should know."
+        var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED. Adopt a deliberate, senior-engineer working style for this turn:\n"
+        // [T-deep-mode-rules] Behavior rules are now user-maintainable via
+        // deep-rules.md (DeepModeStore). The file is the single source of
+        // truth; the old hard-coded five rules became its default seed, so a
+        // fresh install injects byte-identical behavior to before.
+        s += DeepModeStore.loadRulesBody() + "\n"
+        // [T-deep-mode-memory-proactive] Deterministic instruction so the
+        // agent proactively persists long-term preferences instead of waiting
+        // for an explicit /memory request. Reuses the existing memory_write
+        // tool; it is self-limiting because memory_write is gated by the
+        // session's memoryEnabled toggle and returns a graceful refusal when
+        // memory is off.
+        s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, or project fact worth keeping, persist it via memory_write now (one short entry) and mention it in a single line, rather than waiting to be asked."
+        return s
     }
 
     /// Session ID for persistence integration. Set by the view on appear.

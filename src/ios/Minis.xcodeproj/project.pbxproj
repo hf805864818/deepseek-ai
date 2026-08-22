@@ -341,6 +341,7 @@
 		E5SHV0002 /* SharedFolderVisibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SHV0101 /* SharedFolderVisibility.swift */; };
 		E5SHV0003 /* SharedFoldersSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SHV0103 /* SharedFoldersSettingsView.swift */; };
 		E5SHV0004 /* MountDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SHV0104 /* MountDetailView.swift */; };
+		E5DEEP001 /* DeepModeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP101 /* DeepModeStore.swift */; };
 		E5SOUL001 /* SoulStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SOUL101 /* SoulStore.swift */; };
 		E5SOUL002 /* SoulSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SOUL102 /* SoulSettingsView.swift */; };
 		E5SVP0021 /* ShadowVoiceProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SVP0031 /* ShadowVoiceProviderDetailView.swift */; };
@@ -977,6 +978,7 @@
 		E5SHV0101 /* SharedFolderVisibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedFolderVisibility.swift; sourceTree = "<group>"; };
 		E5SHV0103 /* SharedFoldersSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedFoldersSettingsView.swift; sourceTree = "<group>"; };
 		E5SHV0104 /* MountDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MountDetailView.swift; sourceTree = "<group>"; };
+		E5DEEP101 /* DeepModeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeStore.swift; sourceTree = "<group>"; };
 		E5SOUL101 /* SoulStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoulStore.swift; sourceTree = "<group>"; };
 		E5SOUL102 /* SoulSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoulSettingsView.swift; sourceTree = "<group>"; };
 		E5SVP0031 /* ShadowVoiceProviderDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowVoiceProviderDetailView.swift; sourceTree = "<group>"; };
@@ -1971,6 +1973,7 @@
 				E5N0000112F3B941A00049557 /* SkillStore.swift */,
 				F1MCPSTORE /* MCPStore.swift */,
 				F1MCPOAUTH /* MCPOAuthController.swift */,
+				E5DEEP101 /* DeepModeStore.swift */,
 				E5SOUL101 /* SoulStore.swift */,
 			);
 			path = Session;
@@ -2845,6 +2848,7 @@
 				F1VMCPB3 /* MCPJSONImportSheet.swift in Sources */,
 				F1VMCPB4 /* SessionMCPsView.swift in Sources */,
 				E5LOCK001 /* SessionLockStore.swift in Sources */,
+				E5DEEP001 /* DeepModeStore.swift in Sources */,
 				E5SOUL001 /* SoulStore.swift in Sources */,
 				E5SOUL002 /* SoulSettingsView.swift in Sources */,
 				E5LOCK002 /* FaceIDProtectionSettingsView.swift in Sources */,
