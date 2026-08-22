@@ -462,6 +462,7 @@ private struct AttachmentChip: View {
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.4), radius: 2)
             }
+            .buttonStyle(.plain)
             .offset(x: 4, y: -4)
         }
         .fixedSize()

@@ -426,9 +426,12 @@ extension AIChatViewModel {
 
         // Build <user-attached-files> XML block
         if !metas.isEmpty {
+            let dateFmt = ISO8601DateFormatter()
+            dateFmt.formatOptions = [.withInternetDateTime]
             var xml = "<user-attached-files>\n"
             for meta in metas {
-                xml += "  <file path=\"\(meta.path)\" url=\"\(meta.minisURL)\" size=\"\(meta.size)\" modified=\"\(nowStr)\" />\n"
+                let modifiedStr = dateFmt.string(from: meta.modified)
+                xml += "  <file path=\"\(meta.path)\" url=\"\(meta.minisURL)\" size=\"\(meta.size)\" modified=\"\(modifiedStr)\" />\n"
             }
             xml += "</user-attached-files>"
             parts.append(.text(xml))

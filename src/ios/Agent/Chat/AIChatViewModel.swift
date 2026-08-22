@@ -2559,7 +2559,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             if !attachmentMetas.isEmpty {
                 var xml = "<user-attached-files>\n"
                 for meta in attachmentMetas {
-                    xml += "  <file path=\"\(meta.path)\" url=\"\(meta.minisURL)\" size=\"\(meta.size)\" modified=\"\(nowStr)\" />\n"
+                    let modifiedStr = isoFormatter.string(from: meta.modified)
+                    xml += "  <file path=\"\(meta.path)\" url=\"\(meta.minisURL)\" size=\"\(meta.size)\" modified=\"\(modifiedStr)\" />\n"
                 }
                 xml += "</user-attached-files>"
                 userParts.append(.text(xml))
