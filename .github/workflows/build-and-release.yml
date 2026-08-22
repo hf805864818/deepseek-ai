@@ -278,10 +278,19 @@ jobs:
           bash scripts/prepare_android_sandbox.sh
         working-directory: ${{ github.workspace }}
 
+      - name: Decode release keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ${{ github.workspace }}/lobster-release.keystore
+          echo "Keystore decoded: $(ls -lh ${{ github.workspace }}/lobster-release.keystore)"
+
       - name: Build APK
         env:
           APP_VERSION: ${{ needs.prepare.outputs.version }}
           APP_ANDROID_CODE: ${{ needs.prepare.outputs.android_code }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/lobster-release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           cd src/android
 
@@ -291,11 +300,11 @@ jobs:
           echo "Android version set to $APP_VERSION (code: $APP_ANDROID_CODE)"
 
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon
+          ./gradlew :app:assembleRelease --no-daemon
 
           # Rename APK to include app name and version
-          APK_SRC="app/build/outputs/apk/debug/app-debug.apk"
-          APK_DST="app/build/outputs/apk/debug/龙虾Ai-v${APP_VERSION}.apk"
+          APK_SRC="app/build/outputs/apk/release/app-release-unsigned.apk"
+          APK_DST="app/build/outputs/apk/release/龙虾Ai-v${APP_VERSION}.apk"
           if [ -f "$APK_SRC" ]; then
             mv "$APK_SRC" "$APK_DST"
             echo "APK renamed to: $(ls -lh "$APK_DST")"
@@ -305,7 +314,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: 龙虾Ai-apk
-          path: src/android/app/build/outputs/apk/debug/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
+          path: src/android/app/build/outputs/apk/release/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
           retention-days: 30
 
   # === Step 4: Create GitHub Release ===
