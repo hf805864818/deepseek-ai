@@ -83,7 +83,7 @@ struct GoogleDriveFile: Codable {
 
     /// Parses a Google Drive date string, handling both with and without
     /// fractional seconds.
-    private static func parseDate(_ string: String) -> Date? {
+    fileprivate static func parseDate(_ string: String) -> Date? {
         if let d = dateFormatter.date(from: string) { return d }
         return dateFormatterNoFractional.date(from: string)
     }
