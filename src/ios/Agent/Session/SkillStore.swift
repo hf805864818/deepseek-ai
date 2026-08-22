@@ -389,6 +389,132 @@ Do not create extraneous files: README.md, INSTALLATION_GUIDE.md, CHANGELOG.md, 
         _ = try? importSkill(content: Self.skillCreatorContent, source: .bundled)
     }
 
+    // MARK: - Deep Mode Skills (深度龙虾Ai 技能包)
+
+    /// [T-deep-mode] The bundled deep-agent skill pack, installed lazily the
+    /// first time the user flips the 深度龙虾Ai toggle on. Each skill is a
+    /// procedural "how to do this class of task well" playbook, mirroring
+    /// TRAE's built-in skills. They are installed with `.bundled` source so
+    /// they rank first in `skillPromptFragment`'s overflow selection AND keep
+    /// the same upgrade path as `skill-creator`.
+    private static let deepSkillDefinitions: [(name: String, version: String, content: String)] = [
+        ("deep-planning", "1.0.0", """
+---
+name: deep-planning
+version: 1.0.0
+description: Break complex multi-step tasks into an explicit plan, execute it with tool calls, then self-verify the result. Use when the user's request is broad, ambiguous, or spans multiple steps (build a project, refactor, investigate, produce a multi-part deliverable).
+---
+
+# Deep Planning
+
+Turn a complex request into a plan → execute → verify loop.
+
+## When To Use
+- The task has 3+ distinct steps or spans multiple files/tools.
+- The user asked for something "end-to-end", "full", or open-ended.
+
+## Workflow
+1. State a short numbered plan (under 10 steps) before any tool call.
+2. Execute steps in order, calling tools rather than describing intent.
+3. After each milestone, sanity-check the intermediate result.
+4. On completion, re-read the final output and fix any errors.
+5. Conclude with a 2-3 sentence summary of what was done.
+
+## Notes
+- Skip the plan for trivial single-command tasks.
+- If a step blocks on missing info, ask or use available tools to obtain it rather than guessing.
+"""),
+        ("deep-research", "1.0.0", """
+---
+name: deep-research
+version: 1.0.0
+description: Conduct thorough evidence-based research and synthesis using web search and source retrieval. Use when the user asks to research, investigate, compare, fact-check, or verify information, especially when citations or sources are expected.
+---
+
+# Deep Research
+
+Produce a well-sourced, structured research answer instead of a shallow reply.
+
+## Workflow
+1. Clarify the question and identify the key dimensions to cover.
+2. Search with precise, distinct queries; avoid repeating near-identical searches.
+3. Prefer authoritative primary sources (official docs, vendor sites, RFCs) over secondary write-ups.
+4. Fetch full pages only when snippets are insufficient.
+5. Extract and record key facts before chaining more searches.
+6. Cite sources inline; never fabricate URLs or findings.
+7. Deliver a complete, table/header-organized summary.
+
+## Notes
+- Time-sensitive topics need a time anchor in the query.
+- If a source is unreachable, say so; do not invent its contents.
+"""),
+        ("deep-doc", "1.0.0", """
+---
+name: deep-doc
+version: 1.0.0
+description: Write structured documents and reports (PRDs, research reports, competitive analyses, technical proposals) with clear sections, tables, and citations. Use when the user asks for a document, report, spec, proposal, or any structured written deliverable.
+---
+
+# Deep Document Writing
+
+Write structured, professional written deliverables.
+
+## Workflow
+1. Confirm the genre (PRD, report, spec, analysis) and audience.
+2. Outline the section structure before drafting body text.
+3. Draft content section by section, keeping paragraphs tight (2-3 sentences with citations where applicable).
+4. Use Markdown tables for multi-dimension comparisons.
+5. Remove fluff: one idea per paragraph, no filler.
+6. Review for completeness against the original request.
+
+## Notes
+- Keep headers short (under 6 words) and unnumbered.
+- Cite sources inline where facts come from retrieval.
+"""),
+        ("deep-data", "1.0.0", """
+---
+name: deep-data
+version: 1.0.0
+description: Perform data analysis and produce charts or tables from datasets. Use when the user asks to analyze data, clean data, compute statistics, compare values, or visualize numbers.
+---
+
+# Deep Data Analysis
+
+Turn raw data into validated conclusions and visualizations.
+
+## Workflow
+1. Inspect the data first (file_read) — schema, size, sample rows.
+2. Choose the right tool for the job (a short Python script via file_write + shell_execute, or direct shell text-processing).
+3. Compute and validate numbers; cross-check totals and edge cases.
+4. Visualize with a chart or table where it aids understanding.
+5. State conclusions and any caveats (missing data, assumptions).
+
+## Notes
+- For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
+- Never fabricate values; if data is missing, say so.
+"""),
+    ]
+
+    /// [T-deep-mode] Install the deep-skill pack (if not already present) and
+    /// sync each skill's enabled state to the global 深度龙虾Ai toggle.
+    /// Idempotent: repeated calls only change enabled state when it differs,
+    /// so toggling does not spam iCloud dirty-marking. Uses "freeze" semantics
+    /// (方案 A): turning the toggle OFF disables the skills but keeps them
+    /// installed, so the app returns to its prior behavior with zero token cost
+    /// while remaining one tap away from re-enabling.
+    func syncDeepModeSkills() {
+        let enabled = UserDefaults.standard.bool(forKey: "deepMode.enabled")
+        for def in Self.deepSkillDefinitions {
+            let id = Self.slugify(def.name)
+            if !skills.contains(where: { $0.id == id }) {
+                try? importSkill(content: def.content, source: .bundled)
+            }
+            if skills.first(where: { $0.id == id })?.isEnabled != enabled {
+                setEnabled(id, enabled: enabled)
+            }
+        }
+    }
+
     // MARK: - One-time Migration: re-sync skills with bundled files
 
     /// On first launch after the bundle-sync update, mark all skills that have bundled files
@@ -1250,13 +1376,41 @@ Do not create extraneous files: README.md, INSTALLATION_GUIDE.md, CHANGELOG.md, 
     /// Maximum number of skill metadata entries to include in the prompt.
     private static let maxSkillMetadataCount = 20
 
+    /// [T-deep-mode] The single source of truth for whether the 深度龙虾Ai
+    /// behaviour is active. Deep-mode skills are a *global* capability gated
+    /// by this switch, so their *effective* enabled state must follow the
+    /// switch, NOT the per-skill `isEnabled` bit that iCloud sync replicates
+    /// across devices. Reading UserDefaults live (instead of caching) keeps
+    /// the toggle instantly effective for every subsequent prompt.
+    private var deepModeEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "deepMode.enabled")
+    }
+
+    /// [T-deep-mode] Deep-mode skills are governed by the global switch, so
+    /// exclude them from normal session-override semantics and instead pin
+    /// their effective state to `skill.isEnabled && deepModeEnabled`. This
+    /// guarantees a peer device's stale cloud push (with `isEnabled=true`)
+    /// can never resurrect a deep skill on a device whose switch is off.
+    private func isDeepSkill(_ id: String) -> Bool {
+        // Deep pack uses the same `.bundled` source as other shipped skills;
+        // the id prefix is the unambiguous discriminator.
+        guard id.hasPrefix("deep-") else { return false }
+        return skills.first(where: { $0.id == id })?.importSource == .bundled
+    }
+
     /// Build a discovery-only prompt fragment with priority-based disclosure:
     /// 1. Bundled skills (always included)
     /// 2. Recently modified/created skills within last 7 days (up to 10)
     /// 3. Frequently used skills by normalized use count (fill remaining slots)
     func skillPromptFragment(for sessionId: String) -> String? {
         let logger = AppLogger(category: "SkillDisclosure")
-        let enabled = skills.filter { isEnabledForSession($0.id, sessionId: sessionId) }
+        let enabled = skills.filter { skill in
+            if isDeepSkill(skill.id) {
+                // Switch is the source of truth; ignore cloud-replicated isEnabled.
+                return skill.isEnabled && deepModeEnabled
+            }
+            return isEnabledForSession(skill.id, sessionId: sessionId)
+        }
         guard !enabled.isEmpty else { return nil }
 
         let totalCount = enabled.count

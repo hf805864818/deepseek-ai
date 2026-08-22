@@ -866,6 +866,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     var skipCompactCheck = false
     /// When false, memory_write tool calls are skipped (returns "Memory disabled") in this session.
     @Published var memoryEnabled = true
+    /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
+    /// UserDefaults (the Settings toggle) so it applies across all sessions
+    /// without per-session state. When on, an extra deep-mode behavior
+    /// fragment is injected and the bundled deep skills are enabled.
+    var deepModeEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "deepMode.enabled")
+    }
 
     // MARK: - Session Stats
     /// Accumulated streaming duration (seconds) for output token speed calculation.
@@ -1963,6 +1970,21 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 + "- This toggle is per-session. Other sessions may still have memory enabled.\n"
                 + "- SOUL.md (your persona / identity) is unaffected and remains active above."
         }
+    }
+
+    /// [T-deep-mode] Extra "deep agent" behavior fragment injected just before
+    /// the memory footer when the global 深度龙虾Ai toggle is on. It upgrades
+    /// the agent from the default "act immediately" posture to a
+    /// plan → execute → verify loop modelled on TRAE's autonomous workflow,
+    /// WITHOUT touching `baseSystemPrompt` (which sits on a type-check
+    /// boundary and must not be edited).
+    private var deepModeFragment: String {
+        return "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED. Adopt a deliberate, senior-engineer working style for this turn:\n"
+            + "1. PLAN FIRST — for non-trivial tasks, state a short numbered plan before acting, then execute it. Skip the plan for trivial single-command tasks.\n"
+            + "2. CONSULT SKILLS FIRST — check <available_skills> above and follow any matching skill's workflow before improvising a process.\n"
+            + "3. EXECUTE TRANSPARENTLY — prefer concrete tool calls over describing intentions; let the user follow each step.\n"
+            + "4. SELF-VERIFY — after finishing, re-read the result and fix any errors; do not declare success blindly.\n"
+            + "5. DELIVER & SUMMARIZE — end with a concise summary of what changed and anything the user should know."
     }
 
     /// Session ID for persistence integration. Set by the view on appear.
@@ -4493,6 +4515,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // baseSystemPrompt mentions when memory is disabled).
         userSystemPrompt += memoryStatusFragment
 
+        // [T-deep-mode] Inject the deep-agent behavior fragment when the global
+        // 深度龙虾Ai toggle is on. Placed after the memory footer so deep mode's
+        // plan-first / self-verify posture is the LAST behavioral instruction
+        // the model sees before history.
+        if deepModeEnabled {
+            userSystemPrompt += deepModeFragment
+        }
+
         let promptBuildMs = (CFAbsoluteTimeGetCurrent() - loopSetupStart) * 1000
         logger.info("⏱️ [runAgentLoop] prompt build elapsed=\(String(format: "%.1f", promptBuildMs))ms history=\(self.agentHistory.count)")
         await Task.yield()
@@ -4895,6 +4925,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     }
                 }
                 userSystemPrompt += memoryStatusFragment
+                // [T-deep-mode] Mirror the deep-mode fragment on the fallback
+                // rebuild path so a provider switch doesn't silently drop the
+                // deep agent posture.
+                if deepModeEnabled {
+                    userSystemPrompt += deepModeFragment
+                }
                 fallbackTrigger += 1
                 if !fallbackReasons.isEmpty {
                     // Resync the assistant message index by its stable id before

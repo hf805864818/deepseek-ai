@@ -7272,6 +7272,11 @@ private struct SettingsSheet: View {
     @AppStorage("update_check_has_pending") private var hasPendingUpdate: Bool = false
     @AppStorage("update_check_dismissed_version") private var dismissedVersion: String?
     @AppStorage("update_check_pending_version") private var pendingVersion: String?
+    /// [T-deep-mode] Global 深度龙虾Ai switch. Read live by AIChatViewModel
+    /// (`deepModeEnabled`) and by SkillStore (`syncDeepModeSkills`) so it
+    /// applies across all sessions and can be turned off at any time to return
+    /// to the default agent behavior.
+    @AppStorage("deepMode.enabled") private var deepModeEnabled: Bool = false
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var navPath = NavigationPath()
@@ -7325,6 +7330,24 @@ private struct SettingsSheet: View {
                 }
 
                 Section("Agent Runtime") {
+                    // [T-deep-mode] 深度龙虾Ai 总开关：开后注入规划优先的
+                    // 深度行为片段 + 预置/启用深度技能包；关后冻结技能并
+                    // 恢复默认"立即执行"的 Agent 行为。
+                    Toggle(isOn: $deepModeEnabled) {
+                        Label {
+                            Text("深度龙虾Ai")
+                        } icon: {
+                            Image(systemName: "cpu.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.indigo, in: Circle())
+                        }
+                    }
+                    .onChange(of: deepModeEnabled) { enabled in
+                        SkillStore.shared.syncDeepModeSkills()
+                    }
+
                     NavigationLink {
                         SkillsManagementView()
                     } label: {
