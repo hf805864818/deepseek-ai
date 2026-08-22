@@ -98,6 +98,11 @@ final class SkillStore: ObservableObject {
         createTables()
         loadSkills()
         installBundledSkills()
+        // [T-deep-mode] Back-fill any missing deep skills at startup WITHOUT
+        // resetting per-skill toggles, so a user's individually-disabled deep
+        // skill stays disabled across relaunches. (The toggle-change path uses
+        // `syncDeepModeSkills()` to reset — see below.)
+        installDeepModeSkills()
         migrateMarkBundledSkillsDirty()
     }
 
@@ -493,15 +498,171 @@ Turn raw data into validated conclusions and visualizations.
 - For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
 - Never fabricate values; if data is missing, say so.
 """),
+        ("deep-code", "1.0.0", """
+---
+name: deep-code
+version: 1.0.0
+description: Generate, refactor, and debug code with a read-understand-change-verify discipline. Use when the user asks to write code, fix a bug, debug, refactor, or implement a feature in an existing codebase.
+---
+
+# Deep Code
+
+Produce working code by understanding context first and verifying after every change.
+
+## When To Use
+- Writing new code, or modifying/extending an existing codebase.
+- The user reports a bug, error, or unexpected behavior.
+
+## Workflow
+1. Read the relevant files first (file_read) to understand structure, dependencies, and conventions.
+2. State a short plan for the change before editing.
+3. Make small, focused edits (file_write / file_edit); avoid sweeping rewrites.
+4. After each change, verify it will compile and behaves as intended (re-read the edited region).
+5. Handle edge cases, errors, and input validation explicitly.
+
+## Notes
+- Follow the surrounding code style; do not silently change unrelated behavior.
+- If unsure about intent, ask or infer minimally rather than guessing wildly.
+"""),
+        ("deep-review", "1.0.0", """
+---
+name: deep-review
+version: 1.0.0
+description: Review code for correctness, bugs, security risks, performance, maintainability, and best practices, then give structured actionable feedback. Use when the user asks to review, audit, or critique code or a diff.
+---
+
+# Deep Code Review
+
+Give structured, actionable review feedback instead of vague comments.
+
+## Workflow
+1. Read the full file or diff (file_read) before judging.
+2. Assess across: correctness, security, performance, maintainability, and style.
+3. For each issue, report the specific location, the concrete problem, and a suggested fix.
+4. Separate blocking issues from suggestions/nitpicks.
+5. Summarize a prioritized action list at the end.
+
+## Notes
+- Never report an issue without pointing to the offending code.
+- Balance completeness with brevity; focus on the highest-impact findings.
+"""),
+        ("deep-browser", "1.0.0", """
+---
+name: deep-browser
+version: 1.0.0
+description: Drive a real web browser to navigate, fill forms, click, screenshot, and scrape content. Use when the user asks to open a website, test a web UI, extract web content, or perform multi-step browser actions.
+---
+
+# Deep Browser Automation
+
+Perform multi-step browser tasks with verification at each step.
+
+## Workflow
+1. Clarify the target page and the exact goal sequence.
+2. Navigate, then confirm the page loaded as expected (use read_image on screenshots).
+3. Fill forms, click, and interact step by step, checking results after each action.
+4. Extract or screenshot the final state.
+5. Report what happened and anything that could not be completed.
+
+## Notes
+- Hand control to the user for login, CAPTCHA, or actions requiring human judgment.
+- Prefer visible verification over assuming a click/type action succeeded.
+"""),
+        ("deep-shell", "1.0.0", """
+---
+name: deep-shell
+version: 1.0.0
+description: Plan and run shell commands for scripting, data processing, environment setup, and troubleshooting, with explicit safety checks. Use when the user asks to run commands, install tools, process files, or debug the environment.
+---
+
+# Deep Shell
+
+Run shell commands deliberately, with a plan and validation.
+
+## Workflow
+1. State the command and its intent before executing.
+2. Prefer non-destructive read/query commands to understand state first.
+3. Execute with shell_execute; inspect the output before the next command.
+4. Validate results and tidy up temporary files/processes when done.
+5. Summarize what changed and any warnings.
+
+## Notes
+- Confirm before destructive or irreversible commands (rm -rf, format, drop, overwrite).
+- Quote paths with spaces; avoid interactive commands unless unavoidable.
+"""),
+        ("deep-memory", "1.0.0", """
+---
+name: deep-memory
+version: 1.0.0
+description: Decide what user context is worth persisting and use memory tools to store and retrieve it across sessions. Use for long-term personalization: user preferences, ongoing projects, and recurring facts.
+---
+
+# Deep Memory Strategy
+
+Persist durable context so future sessions are smarter, without accumulating noise.
+
+## When To Store (memory_write)
+- Stable user preferences, recurring facts, or ongoing project context.
+- Only when the value clearly helps future requests.
+
+## When To Retrieve (memory_get)
+- Before acting on a request that depends on prior user context.
+- When the user refers to something discussed before ("as we discussed", "my project").
+
+## Rules
+- Prefer updating an existing memory over duplicating it.
+- Do not store transient or trivial details; noise degrades retrieval quality.
+- Store facts, not speculation.
+"""),
+        ("deep-slides", "1.0.0", """
+---
+name: deep-slides
+version: 1.0.0
+description: Produce presentation decks from a topic, outline, or document with clear page structure and one idea per slide. Use when the user asks for a presentation, slides, demo, or 汇报材料.
+---
+
+# Deep Slides
+
+Turn a topic into a clean, self-contained slide deck.
+
+## Workflow
+1. Confirm the topic, audience, and desired length.
+2. Outline pages: cover, agenda, content pages, and a summary.
+3. Write a self-contained HTML deck (file_write) with one core idea per slide.
+4. Keep visuals simple; use tables or diagrams where they clarify.
+5. Review that every page supports the main message and nothing is missing.
+
+## Notes
+- For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
+- Prefer HTML output (portable, visually rich); only use other formats when the user explicitly asks.
+"""),
     ]
 
-    /// [T-deep-mode] Install the deep-skill pack (if not already present) and
-    /// sync each skill's enabled state to the global 深度龙虾Ai toggle.
-    /// Idempotent: repeated calls only change enabled state when it differs,
-    /// so toggling does not spam iCloud dirty-marking. Uses "freeze" semantics
-    /// (方案 A): turning the toggle OFF disables the skills but keeps them
-    /// installed, so the app returns to its prior behavior with zero token cost
-    /// while remaining one tap away from re-enabling.
+    /// [T-deep-mode] Install any *missing* deep-skill definitions without
+    /// touching the enabled state of skills that already exist. Called at
+    /// startup so a newer pack is back-filled, while preserving the user's
+    /// per-skill toggles across relaunches. Newly installed skills are
+    /// initialized to the global 深度龙虾Ai toggle value (importSkill defaults
+    /// to `enabled=true`, so we correct it here when the toggle is off).
+    func installDeepModeSkills() {
+        let enabled = UserDefaults.standard.bool(forKey: "deepMode.enabled")
+        for def in Self.deepSkillDefinitions {
+            let id = Self.slugify(def.name)
+            guard !skills.contains(where: { $0.id == id }) else { continue }
+            try? importSkill(content: def.content, source: .bundled)
+            if skills.first(where: { $0.id == id })?.isEnabled != enabled {
+                setEnabled(id, enabled: enabled)
+            }
+        }
+    }
+
+    /// [T-deep-mode] Install missing deep skills AND force each skill's
+    /// enabled state to the global 深度龙虾Ai toggle. Called when the toggle
+    /// *changes*, so flipping it OFF→ON re-enables every deep skill (a
+    /// "reset"), and ON→OFF freezes them all (disable without uninstalling —
+    /// 方案 A). This is deliberately separate from `installDeepModeSkills()`,
+    /// which does NOT reset state and therefore lets per-skill toggles persist
+    /// across app relaunches.
     func syncDeepModeSkills() {
         let enabled = UserDefaults.standard.bool(forKey: "deepMode.enabled")
         for def in Self.deepSkillDefinitions {

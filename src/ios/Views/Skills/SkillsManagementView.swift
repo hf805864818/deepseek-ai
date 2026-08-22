@@ -54,6 +54,17 @@ struct SkillsManagementView: View {
         return sortAscending ? sorted : sorted.reversed()
     }
 
+    /// [T-deep-mode] 深度技能组：`.bundled` 来源且 id 以 `deep-` 开头，
+    /// 与 SkillStore 的 isDeepSkill 判定保持一致，用于在列表里置顶分组。
+    private var deepSkills: [Skill] {
+        filteredSkills.filter { $0.importSource == .bundled && $0.id.hasPrefix("deep-") }
+    }
+
+    /// [T-deep-mode] 非深度技能（用户自定义 / 导入的技能）。
+    private var userSkills: [Skill] {
+        filteredSkills.filter { !($0.importSource == .bundled && $0.id.hasPrefix("deep-")) }
+    }
+
     var body: some View {
         List {
             if store.skills.isEmpty {
@@ -70,35 +81,28 @@ struct SkillsManagementView: View {
                 }
             }
 
-            ForEach(filteredSkills) { skill in
-                NavigationLink {
-                    SkillDetailView(skillId: skill.id)
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                Text(skill.name).font(.body)
-                                importSourceBadge(skill.importSource)
-                            }
-                            if !skill.description.isEmpty {
-                                Text(skill.description)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                        }
-                        Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { skill.isEnabled },
-                            set: { store.setEnabled(skill.id, enabled: $0) }
-                        ))
-                        .labelsHidden()
+            if !deepSkills.isEmpty {
+                Section {
+                    ForEach(deepSkills) { skill in
+                        skillRow(skill)
                     }
+                } header: {
+                    Text("深度龙虾Ai")
                 }
             }
-            .onDelete { offsets in
-                let ids = offsets.map { filteredSkills[$0].id }
-                for id in ids { store.deleteSkill(id) }
+
+            if !userSkills.isEmpty {
+                Section {
+                    ForEach(userSkills) { skill in
+                        skillRow(skill)
+                    }
+                    .onDelete { offsets in
+                        let ids = offsets.map { userSkills[$0].id }
+                        for id in ids { store.deleteSkill(id) }
+                    }
+                } header: {
+                    Text("我的技能")
+                }
             }
         }
         .navigationTitle("Skills")
@@ -186,6 +190,35 @@ struct SkillsManagementView: View {
         SyncCore.shared.scheduleSend(delay: 0.5)
         forceSyncAllToast = String(localized: "Queued \(count) skills for sync")
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { forceSyncAllToast = nil }
+    }
+
+    /// [T-deep-mode] 复用的技能行视图，深度技能组与用户技能组共用，
+    /// 保证两组外观一致。
+    private func skillRow(_ skill: Skill) -> some View {
+        NavigationLink {
+            SkillDetailView(skillId: skill.id)
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(skill.name).font(.body)
+                        importSourceBadge(skill.importSource)
+                    }
+                    if !skill.description.isEmpty {
+                        Text(skill.description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { skill.isEnabled },
+                    set: { store.setEnabled(skill.id, enabled: $0) }
+                ))
+                .labelsHidden()
+            }
+        }
     }
 
     @ViewBuilder
