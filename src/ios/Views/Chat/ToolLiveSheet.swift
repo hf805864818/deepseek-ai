@@ -524,6 +524,7 @@ struct ToolLiveSheet: View {
                         .background(ChatColors.secondaryBg)
                         .clipShape(Circle())
                 }
+                .buttonStyle(.plain)
 
                 Spacer()
 
@@ -555,6 +556,7 @@ struct ToolLiveSheet: View {
                         .background(ChatColors.secondaryBg)
                         .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else if case .browserTool = block.kind, browserPool != nil {
                     Button { activeSheet = .takeoverBrowser } label: {
                         toolIcon
@@ -564,6 +566,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else if case .fileWriteTool = block.kind {
                     Button {
                         let text = block.streamingFileContent
@@ -580,6 +583,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else if case .fileReadTool = block.kind {
                     Button {
                         UIPasteboard.general.string = block.content
@@ -593,6 +597,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else if case .fileEditTool = block.kind {
                     Button {
                         let editStrings = extractEditStrings()
@@ -608,6 +613,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else if case .readImageTool = block.kind {
                     Button {
                         if let path = block.imageFilePath, let img = UIImage(contentsOfFile: path) {
@@ -623,6 +629,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else if case .memoryTool = block.kind {
                     Button {
                         let text = memoryWriteContentFromArgs() ?? block.content
@@ -637,6 +644,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 } else {
                     Button { showTerminal = true } label: {
                         toolIcon
@@ -646,6 +654,7 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
+                    .buttonStyle(.plain)
                 }
             }
 
@@ -1584,12 +1593,14 @@ struct ToolLiveSheet: View {
                     Label("Load more (\(nextBatch * Self.lazyRenderChunkLines) lines)", systemImage: "chevron.down")
                         .font(.system(size: 13, weight: .medium))
                 }
+                .buttonStyle(.plain)
                 Button {
                     revealedChunkCount = totalChunks
                 } label: {
                     Text("Load all")
                         .font(.system(size: 13, weight: .medium))
                 }
+                .buttonStyle(.plain)
             }
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity)
@@ -1913,6 +1924,7 @@ struct ToolLiveSheet: View {
                         .font(.system(size: 18))
                         .foregroundStyle(currentIdx > 0 ? ChatColors.primaryText : ChatColors.tertiaryText)
                 }
+                .buttonStyle(.plain)
                 .disabled(currentIdx <= 0)
 
                 Spacer()
@@ -1941,6 +1953,7 @@ struct ToolLiveSheet: View {
                         .font(.system(size: 18))
                         .foregroundStyle(currentIdx < toolBlocks.count - 1 ? ChatColors.primaryText : ChatColors.tertiaryText)
                 }
+                .buttonStyle(.plain)
                 .disabled(currentIdx >= toolBlocks.count - 1)
             }
             .padding(.horizontal, 24)
@@ -2448,6 +2461,7 @@ private struct ToolStatusBar: View {
                             .frame(width: 20, height: 20)
                             .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                     .disabled(displayedIdx <= 0)
 
                     Text("\(displayedIdx + 1)/\(toolBlocks.count)")
@@ -2464,6 +2478,7 @@ private struct ToolStatusBar: View {
                             .frame(width: 20, height: 20)
                             .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                     .disabled(displayedIdx >= toolBlocks.count - 1)
                 }
             }
