@@ -303,11 +303,22 @@ jobs:
           ./gradlew :app:assembleRelease --no-daemon
 
           # Rename APK to include app name and version
-          APK_SRC="app/build/outputs/apk/release/app-release-unsigned.apk"
+          # The output filename depends on signing config: signed builds produce
+          # app-release.apk, unsigned builds produce app-release-unsigned.apk
           APK_DST="app/build/outputs/apk/release/龙虾Ai-v${APP_VERSION}.apk"
-          if [ -f "$APK_SRC" ]; then
-            mv "$APK_SRC" "$APK_DST"
-            echo "APK renamed to: $(ls -lh "$APK_DST")"
+          for SRC in \
+            "app/build/outputs/apk/release/app-release.apk" \
+            "app/build/outputs/apk/release/app-release-unsigned.apk"; do
+            if [ -f "$SRC" ]; then
+              mv "$SRC" "$APK_DST"
+              echo "APK renamed to: $(ls -lh "$APK_DST")"
+              break
+            fi
+          done
+          if [ ! -f "$APK_DST" ]; then
+            echo "ERROR: No APK file found to rename"
+            ls -la app/build/outputs/apk/release/
+            exit 1
           fi
 
       - name: Upload APK artifact
