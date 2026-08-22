@@ -1,5 +1,6 @@
 package com.openminis.app.ui.settings
 
+import android.content.Context
 import android.content.SharedPreferences
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
