@@ -64,6 +64,8 @@ import com.openminis.app.ui.settings.MountedFoldersScreen
 import com.openminis.app.ui.settings.SharedFolderDetailScreen
 import com.openminis.app.ui.settings.SharedFoldersScreen
 import com.openminis.app.ui.settings.SkillsManagementScreen
+import com.openminis.app.ui.settings.GoogleDriveSyncScreen
+import com.openminis.app.ui.settings.OtherSyncScreen
 import com.openminis.app.data.repository.EnvVarRepository
 import com.openminis.app.data.repository.MemoryRepository
 import com.openminis.app.data.repository.SkillRepository
@@ -164,6 +166,8 @@ object Routes {
     const val APPEARANCE = "appearance"
     const val BACKGROUND = "background"
     const val ABOUT = "about"
+    const val OTHER_SYNC = "other_sync"
+    const val GOOGLE_DRIVE_SYNC = "google_drive_sync"
     const val ONBOARDING_MODELS = "onboarding_models"
     /** T219-2: Mount external folders settings + detail. */
     const val MOUNTED_FOLDERS = "mounted_folders"
@@ -587,6 +591,7 @@ fun AppNavigation(
                 onBackgroundClick = { navController.safeNavigate(Routes.BACKGROUND) },
                 onLogsClick = { navController.safeNavigate(Routes.LOGS) },
                 onAboutClick = { navController.safeNavigate(Routes.ABOUT) },
+                onOtherSyncClick = { navController.safeNavigate(Routes.OTHER_SYNC) },
                 onMountedFoldersClick = { navController.safeNavigate(Routes.MOUNTED_FOLDERS) },
                 onSharedFoldersClick = { navController.safeNavigate(Routes.SHARED_FOLDERS) },
             )
@@ -1193,6 +1198,19 @@ fun AppNavigation(
 
         composable(Routes.ABOUT) {
             AboutScreen(onBack = { navController.safePopBackStack() })
+        }
+
+        composable(Routes.OTHER_SYNC) {
+            OtherSyncScreen(
+                onBack = { navController.safePopBackStack() },
+                onGoogleDriveClick = { navController.safeNavigate(Routes.GOOGLE_DRIVE_SYNC) },
+            )
+        }
+
+        composable(Routes.GOOGLE_DRIVE_SYNC) {
+            GoogleDriveSyncScreen(
+                onBack = { navController.safePopBackStack() },
+            )
         }
 
         composable(Routes.LOGS) {

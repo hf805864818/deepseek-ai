@@ -453,6 +453,11 @@
 		EAB000051 /* SyncMigrationDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAB000050 /* SyncMigrationDetailView.swift */; };
 		EAB000071 /* UploadPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAB000070 /* UploadPolicy.swift */; };
 		EAB000081 /* CloudSyncSettingsV2View.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAB000080 /* CloudSyncSettingsV2View.swift */; };
+		GD0000000A /* GoogleDriveOAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000001 /* GoogleDriveOAuthManager.swift */; };
+		GD0000000B /* GoogleDriveAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000002 /* GoogleDriveAPI.swift */; };
+		GD0000000C /* GoogleDriveSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000003 /* GoogleDriveSyncManager.swift */; };
+		GD0000000D /* GoogleDriveSyncView.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000004 /* GoogleDriveSyncView.swift */; };
+		GD0000000E /* OtherSyncSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000005 /* OtherSyncSettingsView.swift */; };
 		EXA000001 /* xAIModelsAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = EXA000011 /* xAIModelsAPI.swift */; };
 		EXA000002 /* XAITokenStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = EXA000012 /* XAITokenStorage.swift */; };
 		EXA000003 /* XAIOAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = EXA000013 /* XAIOAuthManager.swift */; };
@@ -1075,6 +1080,11 @@
 		EAB000050 /* SyncMigrationDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncMigrationDetailView.swift; sourceTree = "<group>"; };
 		EAB000070 /* UploadPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UploadPolicy.swift; sourceTree = "<group>"; };
 		EAB000080 /* CloudSyncSettingsV2View.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSettingsV2View.swift; sourceTree = "<group>"; };
+		GD00000001 /* GoogleDriveOAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveOAuthManager.swift; sourceTree = "<group>"; };
+		GD00000002 /* GoogleDriveAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveAPI.swift; sourceTree = "<group>"; };
+		GD00000003 /* GoogleDriveSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveSyncManager.swift; sourceTree = "<group>"; };
+		GD00000004 /* GoogleDriveSyncView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveSyncView.swift; sourceTree = "<group>"; };
+		GD00000005 /* OtherSyncSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OtherSyncSettingsView.swift; sourceTree = "<group>"; };
 		EXA000011 /* xAIModelsAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = xAIModelsAPI.swift; sourceTree = "<group>"; };
 		EXA000012 /* XAITokenStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XAITokenStorage.swift; sourceTree = "<group>"; };
 		EXA000013 /* XAIOAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XAIOAuthManager.swift; sourceTree = "<group>"; };
@@ -1382,6 +1392,7 @@
 				E5C000030 /* OpenAI */,
 				E7A000030 /* OpenRouter */,
 				EXA000030 /* xAI */,
+				GD00000010 /* GoogleDrive */,
 				42A3821DABA8773E8A5BA57E /* Voice */,
 			);
 			path = Providers;
@@ -1510,6 +1521,24 @@
 			isa = PBXGroup;
 			children = (
 				E58000013 /* GeminiOAuthManager.swift */,
+			);
+			path = OAuth;
+			sourceTree = "<group>";
+		};
+		GD00000010 /* GoogleDrive */ = {
+			isa = PBXGroup;
+			children = (
+				GD00000002 /* GoogleDriveAPI.swift */,
+				GD00000003 /* GoogleDriveSyncManager.swift */,
+				GD00000011 /* OAuth */,
+			);
+			path = GoogleDrive;
+			sourceTree = "<group>";
+		};
+		GD00000011 /* OAuth */ = {
+			isa = PBXGroup;
+			children = (
+				GD00000001 /* GoogleDriveOAuthManager.swift */,
 			);
 			path = OAuth;
 			sourceTree = "<group>";
@@ -1835,6 +1864,8 @@
 			children = (
 				EAB000050 /* SyncMigrationDetailView.swift */,
 				EAB000080 /* CloudSyncSettingsV2View.swift */,
+				GD00000004 /* GoogleDriveSyncView.swift */,
+				GD00000005 /* OtherSyncSettingsView.swift */,
 			);
 			path = Sync;
 			sourceTree = "<group>";
@@ -2627,6 +2658,11 @@
 				EAB000051 /* SyncMigrationDetailView.swift in Sources */,
 				EAB000071 /* UploadPolicy.swift in Sources */,
 				EAB000081 /* CloudSyncSettingsV2View.swift in Sources */,
+				GD0000000A /* GoogleDriveOAuthManager.swift in Sources */,
+				GD0000000B /* GoogleDriveAPI.swift in Sources */,
+				GD0000000C /* GoogleDriveSyncManager.swift in Sources */,
+				GD0000000D /* GoogleDriveSyncView.swift in Sources */,
+				GD0000000E /* OtherSyncSettingsView.swift in Sources */,
 				E5W000032 /* WebAppPathResolver.swift in Sources */,
 				E5W000033 /* WebAppWebViewController.swift in Sources */,
 				E5W000035 /* WebAppHtmlMetadata.swift in Sources */,

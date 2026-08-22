@@ -7448,6 +7448,19 @@ private struct SettingsSheet: View {
                                     .background(.cyan, in: Circle())
                             }
                         }
+                        NavigationLink {
+                            OtherSyncSettingsView()
+                        } label: {
+                            Label {
+                                Text("Other Sync")
+                            } icon: {
+                                Image(systemName: "arrow.triangle.swap")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 21, height: 21)
+                                    .background(.indigo, in: Circle())
+                            }
+                        }
                     }
                 }
 

@@ -43,6 +43,7 @@ import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -108,6 +109,7 @@ fun SettingsScreen(
     // About row below still has a TODO onClick in HEAD; future settings-bucket
     // work will wire this through.
     onAboutClick: () -> Unit = {},
+    onOtherSyncClick: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var showFeedbackSheet by remember { mutableStateOf(false) }
@@ -252,6 +254,18 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_mount_external_folders),
                     subtitle = stringResource(R.string.settings_mount_external_folders_subtitle),
                     onClick = onMountedFoldersClick,
+                    showDivider = false,
+                )
+            }
+
+            // -- Other Sync --
+            SettingsSection(title = "Other Sync") {
+                SettingsItem(
+                    icon = Icons.Outlined.Sync,
+                    iconColor = Color(0xFF5856D6),
+                    title = "Other Sync",
+                    subtitle = "Google Drive and more",
+                    onClick = onOtherSyncClick,
                     showDivider = false,
                 )
             }
