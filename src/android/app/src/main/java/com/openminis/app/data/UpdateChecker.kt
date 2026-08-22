@@ -2,6 +2,7 @@ package com.openminis.app.data
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -52,6 +53,107 @@ object UpdateChecker {
      * `<files-path name="updates" path="updates/" />`.
      */
     private const val UPDATES_DIR = "updates"
+    private const val PREFS_NAME = "update_checker"
+    private const val KEY_LAST_CHECK = "last_check_ms"
+    private const val KEY_HAS_PENDING = "has_pending"
+    private const val KEY_PENDING_VERSION = "pending_version"
+    private const val KEY_PENDING_APK_URL = "pending_apk_url"
+    private const val KEY_PENDING_SIZE = "pending_size"
+    private const val KEY_PENDING_CHANGELOG = "pending_changelog"
+    private const val KEY_PENDING_TAG = "pending_tag"
+    private const val KEY_PENDING_RELEASE_NAME = "pending_release_name"
+    private const val KEY_DISMISSED_VERSION = "dismissed_version"
+    private const val AUTO_CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L // 24 hours
+
+    private var prefs: SharedPreferences? = null
+
+    private fun requirePrefs(context: Context): SharedPreferences {
+        prefs?.let { return it }
+        val p = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs = p
+        return p
+    }
+
+    /**
+     * Whether there is a pending update that the user has not dismissed.
+     * Drives the red dot badge on the Settings → About row.
+     */
+    fun hasUnreadUpdate(context: Context): Boolean {
+        val p = requirePrefs(context)
+        if (!p.getBoolean(KEY_HAS_PENDING, false)) return false
+        val pending = p.getString(KEY_PENDING_VERSION, null) ?: return false
+        val dismissed = p.getString(KEY_DISMISSED_VERSION, null)
+        return pending != dismissed
+    }
+
+    /** Returns the pending update info, or null. */
+    fun getPendingUpdate(context: Context): CheckResult.UpdateAvailable? {
+        val p = requirePrefs(context)
+        if (!p.getBoolean(KEY_HAS_PENDING, false)) return null
+        val tag = p.getString(KEY_PENDING_TAG, null) ?: return null
+        val version = p.getString(KEY_PENDING_VERSION, null) ?: return null
+        val apkUrl = p.getString(KEY_PENDING_APK_URL, null) ?: return null
+        return CheckResult.UpdateAvailable(
+            tagName = tag,
+            versionName = version,
+            releaseName = p.getString(KEY_PENDING_RELEASE_NAME, "") ?: "",
+            changelog = p.getString(KEY_PENDING_CHANGELOG, "") ?: "",
+            apkUrl = apkUrl,
+            apkSizeBytes = p.getLong(KEY_PENDING_SIZE, 0L),
+        )
+    }
+
+    /** Marks a version as dismissed so the red dot goes away. */
+    fun dismissUpdate(context: Context, versionName: String) {
+        requirePrefs(context).edit()
+            .putString(KEY_DISMISSED_VERSION, versionName)
+            .apply()
+    }
+
+    /**
+     * Performs a silent background check if enough time has passed.
+     * Updates persisted state only — does not show any UI.
+     * Safe to call from onCreate / onStart.
+     */
+    fun checkSilentlyIfNeeded(context: Context) {
+        val p = requirePrefs(context)
+        val lastCheck = p.getLong(KEY_LAST_CHECK, 0L)
+        if (lastCheck > 0 && System.currentTimeMillis() - lastCheck < AUTO_CHECK_INTERVAL_MS) {
+            return // Throttled — skip.
+        }
+        val appContext = context.applicationContext
+        // Fire and forget on a background thread.
+        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+            val result = check()
+            val now = System.currentTimeMillis()
+            val editor = p.edit()
+            editor.putLong(KEY_LAST_CHECK, now)
+            when (result) {
+                is CheckResult.UpdateAvailable -> {
+                    editor.putBoolean(KEY_HAS_PENDING, true)
+                    editor.putString(KEY_PENDING_TAG, result.tagName)
+                    editor.putString(KEY_PENDING_VERSION, result.versionName)
+                    editor.putString(KEY_PENDING_APK_URL, result.apkUrl)
+                    editor.putLong(KEY_PENDING_SIZE, result.apkSizeBytes)
+                    editor.putString(KEY_PENDING_CHANGELOG, result.changelog)
+                    editor.putString(KEY_PENDING_RELEASE_NAME, result.releaseName)
+                }
+                CheckResult.UpToDate -> {
+                    editor.putBoolean(KEY_HAS_PENDING, false)
+                    editor.remove(KEY_PENDING_TAG)
+                    editor.remove(KEY_PENDING_VERSION)
+                    editor.remove(KEY_PENDING_APK_URL)
+                    editor.remove(KEY_PENDING_SIZE)
+                    editor.remove(KEY_PENDING_CHANGELOG)
+                    editor.remove(KEY_PENDING_RELEASE_NAME)
+                }
+                else -> {
+                    // Don't clear pending state on transient errors.
+                }
+            }
+            editor.apply()
+        }
+    }
 
     sealed class CheckResult {
         data class UpdateAvailable(

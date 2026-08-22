@@ -1312,6 +1312,8 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 flushPendingBackgroundNavigation()
             }
+            // Silent update check (throttled to once per day).
+            UpdateChecker.shared.checkSilentlyIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: .sessionDidCreate)) { note in
             guard isWideLayout, let newId = note.object as? String else { return }
@@ -7267,6 +7269,9 @@ private enum SettingsDestination: Hashable {
 private struct SettingsSheet: View {
     @Binding var showTerminal: Bool
     @AppStorage("appearanceMode") private var appearanceMode: Int = 0
+    @AppStorage("update_check_has_pending") private var hasPendingUpdate: Bool = false
+    @AppStorage("update_check_dismissed_version") private var dismissedVersion: String?
+    @AppStorage("update_check_pending_version") private var pendingVersion: String?
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var navPath = NavigationPath()
@@ -7499,14 +7504,22 @@ private struct SettingsSheet: View {
                     NavigationLink {
                         AboutView()
                     } label: {
-                        Label {
-                            Text("About Minis", comment: "Settings about section title")
-                        } icon: {
-                            Image(systemName: "info")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.white)
-                                .frame(width: 21, height: 21)
-                                .background(.indigo, in: Circle())
+                        HStack {
+                            Label {
+                                Text("About Minis", comment: "Settings about section title")
+                            } icon: {
+                                Image(systemName: "info")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 21, height: 21)
+                                    .background(.indigo, in: Circle())
+                            }
+                            Spacer()
+                            if hasPendingUpdate && dismissedVersion != pendingVersion {
+                                Circle()
+                                    .fill(.red)
+                                    .frame(width: 8, height: 8)
+                            }
                         }
                     }
                     Link(destination: URL(string: "https://vbox-ai.github.io/Lobster-APP/privacy.html")!) {

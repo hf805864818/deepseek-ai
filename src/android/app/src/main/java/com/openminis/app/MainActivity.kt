@@ -19,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import android.app.AlertDialog
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -37,6 +38,7 @@ import com.openminis.app.deeplink.DeepLinkCoordinator
 import com.openminis.app.deeplink.DeepLinkHandler
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.service.SessionActivityTracker
+import com.openminis.app.data.UpdateChecker
 import com.openminis.app.ui.navigation.AppNavigation
 import com.openminis.app.ui.navigation.Routes
 import com.openminis.app.ui.navigation.safeNavigate
@@ -539,6 +541,11 @@ class MainActivity : ComponentActivity() {
 
             MinisTheme(darkTheme = darkTheme, fontScale = fontScale) {
                 val navController = rememberNavController().also { this.navController = it }
+
+                // Silent update check on launch (throttled to once per day).
+                LaunchedEffect(Unit) {
+                    UpdateChecker.checkSilentlyIfNeeded(this@MainActivity)
+                }
 
                 // T166: drive `SessionActivityTracker.setPresent` /
                 // `setAbsent` from the nav back-stack so the foreground

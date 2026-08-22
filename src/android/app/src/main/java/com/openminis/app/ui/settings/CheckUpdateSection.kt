@@ -231,6 +231,7 @@ fun CheckUpdateSection() {
             onOpenSettings = { UpdateChecker.openInstallPermissionSettings(context) },
             onDismiss = {
                 if (downloadProgress == null) {
+                    update?.let { UpdateChecker.dismissUpdate(context, it.versionName) }
                     update = null
                     downloadError = null
                     awaitingInstallPerm = false

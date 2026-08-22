@@ -13,6 +13,10 @@
 		<string>de</string>
 		<string>ru</string>
 	</array>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>apple-magnifier</string>
+	</array>
 	<key>CFBundleDisplayName</key>
 	<string>龙虾Ai</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

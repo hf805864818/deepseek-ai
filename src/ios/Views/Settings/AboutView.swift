@@ -68,6 +68,9 @@ struct AboutView: View {
                     }
                 }
             }
+
+            // MARK: - Update
+            UpdateCheckRow()
         }
         .navigationTitle("About")
         .navigationBarTitleDisplayMode(.inline)

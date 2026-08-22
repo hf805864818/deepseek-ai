@@ -1,5 +1,6 @@
 package com.openminis.app.ui.settings
 
+import android.content.SharedPreferences
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,6 +52,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -66,6 +68,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.res.stringResource
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
+import com.openminis.app.data.UpdateChecker
 import com.openminis.app.ui.components.openExternalUrl
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -107,6 +110,18 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     var showFeedbackSheet by remember { mutableStateOf(false) }
+    var hasUpdateDot by remember { mutableStateOf(UpdateChecker.hasUnreadUpdate(context)) }
+
+    // Listen for update check result changes so the dot appears / disappears
+    // without the user having to leave and re-open Settings.
+    DisposableEffect(context) {
+        val prefs = context.getSharedPreferences("update_checker", Context.MODE_PRIVATE)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            hasUpdateDot = UpdateChecker.hasUnreadUpdate(context)
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -287,6 +302,7 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_about_minis),
                     subtitle = stringResource(R.string.settings_about_subtitle),
                     onClick = onAboutClick,
+                    showDot = hasUpdateDot,
                 )
                 SettingsItem(
                     icon = Icons.Outlined.FrontHand,
@@ -528,6 +544,7 @@ private fun SettingsItem(
     subtitle: String?,
     onClick: () -> Unit,
     showDivider: Boolean = true,
+    showDot: Boolean = false,
 ) {
     Column {
         Row(
@@ -576,7 +593,15 @@ private fun SettingsItem(
                 }
             }
 
-            // Chevron
+            // Chevron (and optional red dot)
+            if (showDot) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(Color.Red, shape = CircleShape),
+                )
+                Spacer(Modifier.width(6.dp))
+            }
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                 contentDescription = null,
