@@ -75,6 +75,7 @@
 		E52000006 /* OAuthHTTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E52000015 /* OAuthHTTPClient.swift */; };
 		E52000007 /* ClaudeOAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E52000016 /* ClaudeOAuthManager.swift */; };
 		E52000009 /* AnthropicModelsAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = E52000018 /* AnthropicModelsAPI.swift */; };
+		E5DEEP002 /* PlanGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP102 /* PlanGate.swift */; };
 		E53000001 /* AIChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = E53000011 /* AIChatViewModel.swift */; };
 		E53000002 /* AIChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E53000012 /* AIChatView.swift */; };
 		E53000004 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E53000014 /* ChatStore.swift */; };
@@ -680,6 +681,7 @@
 		E52000015 /* OAuthHTTPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthHTTPClient.swift; sourceTree = "<group>"; };
 		E52000016 /* ClaudeOAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeOAuthManager.swift; sourceTree = "<group>"; };
 		E52000018 /* AnthropicModelsAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicModelsAPI.swift; sourceTree = "<group>"; };
+		E5DEEP102 /* PlanGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanGate.swift; sourceTree = "<group>"; };
 		E53000011 /* AIChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIChatViewModel.swift; sourceTree = "<group>"; };
 		E53000012 /* AIChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIChatView.swift; sourceTree = "<group>"; };
 		E53000014 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
@@ -1893,6 +1895,7 @@
 		F1A00010 /* Chat */ = {
 			isa = PBXGroup;
 			children = (
+				E5DEEP102 /* PlanGate.swift */,
 				E53000011 /* AIChatViewModel.swift */,
 				E5VMA0011 /* AIChatViewModel+Attachments.swift */,
 				E5VMA0012 /* AIChatViewModel+SlashCommands.swift */,
@@ -2600,6 +2603,7 @@
 				E5KIMI0C1 /* KimiOAuthManager.swift in Sources */,
 				E5KIMI0D1 /* KimiModelsAPI.swift in Sources */,
 				E52000009 /* AnthropicModelsAPI.swift in Sources */,
+				E5DEEP002 /* PlanGate.swift in Sources */,
 				E53000001 /* AIChatViewModel.swift in Sources */,
 				E5VMA0001 /* AIChatViewModel+Attachments.swift in Sources */,
 				E5VMA0002 /* AIChatViewModel+SlashCommands.swift in Sources */,

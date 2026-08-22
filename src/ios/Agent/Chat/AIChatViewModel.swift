@@ -874,6 +874,35 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         UserDefaults.standard.bool(forKey: "deepMode.enabled")
     }
 
+    /// [T-deep-mode-plan-gate] Gate state for Layer B: `.awaitingApproval`
+    /// when the agent's last turn was a plan-only reply awaiting the user's
+    /// confirm/edit. Only ever set while deep mode is on.
+    @Published var planGateState: PlanGate.State = .idle
+
+    /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
+    /// execution prompt through the normal `send()` path so it inherits every
+    /// existing guard (context check, persistence, session tracking, run loop).
+    func confirmPlan() {
+        guard case .awaitingApproval = planGateState else { return }
+        planGateState = .idle
+        inputText = String(localized: "计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
+        send()
+    }
+
+    /// [T-deep-mode-plan-gate] User wants to adjust the plan: park the plan
+    /// text in the composer and close the gate. The user edits and sends it as
+    /// a normal message.
+    func editPlan() {
+        guard case .awaitingApproval(let planText) = planGateState else { return }
+        planGateState = .idle
+        inputText = planText
+    }
+
+    /// [T-deep-mode-plan-gate] Dismiss the pending plan without acting.
+    func cancelPlan() {
+        planGateState = .idle
+    }
+
     // MARK: - Session Stats
     /// Accumulated streaming duration (seconds) for output token speed calculation.
     var sessionStreamDuration: TimeInterval = 0
@@ -1985,6 +2014,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // truth; the old hard-coded five rules became its default seed, so a
         // fresh install injects byte-identical behavior to before.
         s += DeepModeStore.loadRulesBody() + "\n"
+        // [T-deep-mode-plan-gate] Layer B: deterministic plan-gate instruction.
+        // For multi-step tasks the model must first emit ONLY a plan inside a
+        // fenced ```plan``` code block and issue no tool calls; the client then
+        // raises a confirm/edit bar and pauses execution until the user acts.
+        // Trivial single-command tasks skip the plan and act immediately.
+        s += "PLAN GATE — if a request needs more than one step, your FIRST reply must be ONLY a plan: a fenced ```plan``` code block listing numbered steps, with no tool calls. Stop there and wait for the user to confirm before executing anything. For a trivial single-command task, skip the plan and act immediately.\n"
         // [T-deep-mode-memory-proactive] Deterministic instruction so the
         // agent proactively persists long-term preferences instead of waiting
         // for an explicit /memory request. Gated by the session's
@@ -2300,6 +2335,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         committedBlockCount = 0
         prevCommittedBlockCount = 0
         userDidCancel = false
+        // [T-deep-mode-plan-gate] Any fresh user send supersedes a pending plan.
+        planGateState = .idle
 
         inputText = ""
 
@@ -5778,6 +5815,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 block.toolStatus = .cancelled
             default:
                 break
+            }
+        }
+
+        // [T-deep-mode-plan-gate] After a clean end-turn, if deep mode is on and
+        // this turn was a plan-only reply (no tool calls + fenced plan marker),
+        // raise the confirm/edit gate. Guarded by "no error, not resumable" so
+        // truncated/interrupted turns never trigger the gate. The gate is the
+        // ONLY behavior here — execution resumes only via confirmPlan().
+        if deepModeEnabled, messages[msgIdx].error == nil, !canResume {
+            if let plan = PlanGate.detectPlan(in: messages[msgIdx]) {
+                planGateState = .awaitingApproval(planText: plan)
+                logger.info("[PlanGate] awaiting approval — plan=\(plan.count)ch msg=\(msgIdx)")
+            } else {
+                planGateState = .idle
             }
         }
 

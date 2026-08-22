@@ -509,6 +509,12 @@ struct AIChatView: View {
                                 }
                             }
                     }
+                    // [T-deep-mode-plan-gate] Confirm/edit bar for a pending
+                    // deep-mode plan. Only the gate's presence is driven here;
+                    // approval/edit flows through vm.confirmPlan()/editPlan().
+                    if case .awaitingApproval = vm.planGateState {
+                        planGateBanner
+                    }
                 }
                 .overlay(alignment: .bottom) {
                     // Tool preview + input bar stacked at the bottom.
@@ -2406,6 +2412,55 @@ struct AIChatView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.red.opacity(0.12))
+    }
+
+    /// [T-deep-mode-plan-gate] Confirm/edit bar rendered above the messages
+    /// while a deep-mode plan is awaiting approval. Approval re-enters the
+    /// normal send path; edit parks the plan text in the composer.
+    private var planGateBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.caption)
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("深度龙虾Ai · 已拟定执行计划")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(ChatColors.primaryText)
+                Text("确认后开始执行，或修改计划细节")
+                    .font(.caption2)
+                    .foregroundColor(ChatColors.secondaryText)
+            }
+            Spacer(minLength: 8)
+            Button { vm.editPlan() } label: {
+                Text("修改")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            Button { vm.confirmPlan() } label: {
+                Text("确认执行")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(Color.accentColor)
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            Button { vm.cancelPlan() } label: {
+                Image(systemName: "xmark")
+                    .font(.caption)
+                    .foregroundColor(ChatColors.secondaryText)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ChatColors.secondaryBg)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(ChatColors.toolBorder).frame(height: 0.5)
+        }
     }
 
     #if DEBUG

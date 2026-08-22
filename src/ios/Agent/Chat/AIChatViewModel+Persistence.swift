@@ -188,6 +188,10 @@ extension AIChatViewModel {
 
         // Loop detector state is per-runtime; reload of a session clears it.
         toolLoopDetector.reset()
+        // [T-deep-mode-plan-gate] The gate is a per-runtime interaction, not
+        // persisted: re-entering a session (including via a cached VM) clears any
+        // stale pending plan so a banner from a previous visit can't linger.
+        planGateState = .idle
 
         // Load persisted memory-write toggle
         memoryEnabled = await ChatStore.shared.getMemoryEnabled(sessionId: sessionId)
