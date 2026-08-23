@@ -925,6 +925,28 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// re-parsing `block.content` (which no longer carries the marker).
     var pendingGoalSentinel: GoalRunner.ParseResult? = nil
 
+    // MARK: - Phase 2: VerifyGate
+
+    /// [T-deep-mode-verify-gate] Remaining self-verification rounds for Phase 2.
+    /// Decremented each time we re-enter `.executing` from a failed verify,
+    /// reset on fresh user send / session load / workflow reset. Not @Published:
+    /// nothing renders it directly; it is only consulted at verify-turn end.
+    var verifyRoundsLeft: Int = VerifyGate.maxVerifyRounds
+
+    /// [T-deep-mode-verify-gate] Verify sentinel resolved at text-capture time,
+    /// same pattern as `pendingGoalSentinel`. The `<<VERIFY_STATE>>` line is
+    /// stripped from the visible text; the parsed result is stashed here for
+    /// the verify-result handler at turn end.
+    var pendingVerifySentinel: VerifyGate.ParseResult? = nil
+
+    // MARK: - Phase 2: ClarifyGate
+
+    /// [T-deep-mode-clarify-gate] Clarification gate state for Phase 2.
+    /// `.awaitingClarification` when the gate detected ambiguity in the user's
+    /// request and raised a question before planning begins. Always gated on
+    /// `deepModeEnabled`; memory-only, never persisted.
+    @Published var clarifyState: ClarifyGate.State = .idle
+
     /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
     /// execution prompt through the normal `send()` path so it inherits every
     /// existing guard (context check, persistence, session tracking, run loop).
@@ -962,6 +984,34 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         resetWorkflow()
     }
 
+    // MARK: - Phase 2: ClarifyGate actions
+
+    /// [T-deep-mode-clarify-gate] Skip the clarification step and proceed
+    /// directly with the original request. Used when the user clicks "直接执行"
+    /// on the clarification banner — they don't need to clarify, they just want
+    /// the agent to make a reasonable guess and get on with it.
+    func skipClarification() {
+        guard case .awaitingClarification(_, let original) = clarifyState else { return }
+        clarifyState = .idle
+        inputText = original
+        // Set a flag so send() knows to skip the ambiguity check this time.
+        skipClarifyCheck = true
+        send()
+    }
+
+    /// [T-deep-mode-clarify-gate] Cancel the pending clarification — close the
+    /// banner, restore the original text to the composer, and do NOT send.
+    func cancelClarification() {
+        guard case .awaitingClarification(_, let original) = clarifyState else { return }
+        clarifyState = .idle
+        inputText = original
+    }
+
+    /// [T-deep-mode-clarify-gate] When true, send() skips the ambiguity check
+    /// for the current message. Set by `skipClarification()` so the user can
+    /// bypass the gate on demand. Reset to false after each send.
+    private var skipClarifyCheck = false
+
     /// [T-deep-mode-workflow] Reset the Phase 1 workflow state machine to its
     /// "off" shape: idle phase, no steps. Idempotent and safe to call even when
     /// deep mode is off — it is the single place that guarantees the toggle-off
@@ -969,6 +1019,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     func resetWorkflow() {
         workflowPhase = .idle
         workflowSteps = []
+        // [T-deep-mode-verify-gate] Phase 2: verify budget and sentinel are
+        // also per-workflow; resets alongside the workflow state machine.
+        verifyRoundsLeft = VerifyGate.maxVerifyRounds
+        pendingVerifySentinel = nil
     }
 
     /// [T-deep-mode-workflow] Enter the executing phase and light up the first
@@ -1021,10 +1075,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     }
 
     /// [T-deep-mode-workflow] Task fully done (`done` sentinel): flip every step
-    /// to `.done`, enter the brief `.verifying` phase so the user sees an
-    /// all-green completion for a moment, then fade the tracker out. Gated so it
-    /// is a no-op clean-up unless a workflow is actually executing.
-    private func completeWorkflow() {
+    /// to `.done` and enter the `.verifying` phase. In Phase 1 this was a brief
+    /// fade-out; in Phase 2 it is a real self-check phase — the client injects
+    /// a mandatory verify prompt and the model must confirm with
+    /// `<<VERIFY_STATE>> passed` before the workflow actually finishes.
+    private func completeWorkflow() async {
         guard workflowPhase == .executing else {
             resetWorkflow()
             return
@@ -1033,7 +1088,124 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         for i in steps.indices { steps[i].status = .done }
         workflowSteps = steps
         workflowPhase = .verifying
-        scheduleWorkflowFinish()
+        // [T-deep-mode-verify-gate] Phase 2: kick off the self-verification
+        // round. If verify budget is already exhausted, fall back to the
+        // Phase 1 behavior (instant finish) — zero blockage, zero risk.
+        guard verifyRoundsLeft > 0 else {
+            logger.info("[VerifyGate] verify budget exhausted — finishing without verification")
+            scheduleWorkflowFinish()
+            return
+        }
+        await beginVerification()
+    }
+
+    /// [T-deep-mode-verify-gate] Phase 2: inject a self-verification prompt
+    /// and recurse into `runAgentLoop()`. The model is asked to re-read its
+    /// results, run/preview/compare, and report `passed` or `failed`.
+    /// Gated on `deepModeEnabled` at the call-site; this method assumes the
+    /// caller already checked.
+    private func beginVerification() async {
+        guard deepModeEnabled else { return }
+        guard workflowPhase == .verifying else { return }
+        verifyRoundsLeft -= 1
+        let used = VerifyGate.maxVerifyRounds - verifyRoundsLeft
+        logger.info("[VerifyGate] beginning self-verification \(used)/\(VerifyGate.maxVerifyRounds)")
+
+        let cont = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>深度模式自检阶段：执行已完成，请现在严格复查你的工作。请重新阅读所有改动的文件、运行或预览结果、对照原始需求检查是否完全正确。如果一切正常，回复 <<VERIFY_STATE>> passed；如果发现问题，说明问题在哪里、为什么错、以及如何修复，并回复 <<VERIFY_STATE>> failed: <问题简述>。不要输出新的计划块，直接开始复查。</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(cont)
+        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+
+        do {
+            try await runAgentLoop()
+        } catch is CancellationError {
+            logger.info("[VerifyGate] verification cancelled")
+            handleUserCancelledCleanup()
+        } catch {
+            logger.error("[VerifyGate] verification error: \(String(describing: error))")
+        }
+    }
+
+    /// [T-deep-mode-verify-gate] Phase 2: process the result of a verification
+    /// turn. Called at turn end when `workflowPhase == .verifying`.
+    ///   • `passed` → schedule the finish fade-out (workflow truly done).
+    ///   • `failed` → re-enter `.executing` so the model can fix the issues.
+    ///   • no sentinel / unknown → treat as passed (fail-safe: don't block).
+    private func maybeProcessVerifyResult(afterMsgIdx msgIdx: Int) async {
+        guard deepModeEnabled else { return }
+        guard workflowPhase == .verifying else { return }
+        guard messages.indices.contains(msgIdx) else { return }
+        guard messages[msgIdx].error == nil else {
+            logger.info("[VerifyGate] skipped — turn has error")
+            scheduleWorkflowFinish()
+            return
+        }
+        guard !canResume else {
+            logger.info("[VerifyGate] skipped — turn resumable")
+            scheduleWorkflowFinish()
+            return
+        }
+
+        guard let result = pendingVerifySentinel else {
+            // [T-deep-mode-verify-gate] Fail-safe: no sentinel or unrecognized
+            // token → treat as passed and finish. This degrades gracefully to
+            // Phase 1 behavior instead of blocking the user.
+            logger.info("[VerifyGate] no verify sentinel — treating as passed (fail-safe)")
+            scheduleWorkflowFinish()
+            return
+        }
+
+        switch result {
+        case .passed:
+            logger.info("[VerifyGate] verification passed — finishing workflow")
+            scheduleWorkflowFinish()
+        case .failed(let reason):
+            if verifyRoundsLeft > 0 {
+                logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft))")
+                // Flip the last step back to active so the progress tracker
+                // shows "still working" instead of "all done".
+                workflowPhase = .executing
+                var steps = workflowSteps
+                if let lastDoneIdx = steps.lastIndex(where: { $0.status == .done }) {
+                    steps[lastDoneIdx].status = .active
+                }
+                workflowSteps = steps
+                // [T-deep-mode-verify-gate] Top up the GoalRunner budget by 1
+                // if it's exhausted, so the fix round has at least one continue
+                // available. Without this, a task that used all 3 goal rounds
+                // before "falsely reporting done" would be stuck after verify
+                // failure — the model would output pending but couldn't continue.
+                if goalRunnerRoundsLeft <= 0 {
+                    goalRunnerRoundsLeft = 1
+                    logger.info("[VerifyGate] topped up goalRunner budget to 1 for fix round")
+                }
+                // Inject a "fix it" continue prompt and recurse.
+                let fixReason = reason ?? "发现问题需要修复"
+                let cont = AgentMessage(role: .user, parts: [
+                    .text("<system-reminder>深度模式自检发现问题：\(fixReason)。请回到执行阶段，修复上述问题，修复完成后重新以 <<GOAL_STATE>> done 结束本回合。</system-reminder>")
+                ])
+                let ci = agentHistory.count
+                agentHistory.append(cont)
+                if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+                    agentHistory[ci].dbMessageId = pid
+                }
+                do {
+                    try await runAgentLoop()
+                } catch is CancellationError {
+                    logger.info("[VerifyGate] fix-round cancelled")
+                    handleUserCancelledCleanup()
+                } catch {
+                    logger.error("[VerifyGate] fix-round error: \(String(describing: error))")
+                }
+            } else {
+                logger.info("[VerifyGate] verification failed but out of rounds — finishing anyway")
+                scheduleWorkflowFinish()
+            }
+        }
     }
 
     /// [T-deep-mode-workflow] Schedule the fade-out of a completed tracker after
@@ -1061,6 +1233,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         resetWorkflow()
         goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
         pendingGoalSentinel = nil
+        // [T-deep-mode-clarify-gate] Phase 2: clarification gate also resets
+        // immediately when the master switch goes off — no residual banner.
+        clarifyState = .idle
+        skipClarifyCheck = false
     }
 
     /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
@@ -1086,6 +1262,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // A pending plan is awaiting user confirmation — don't auto-continue.
         guard case .idle = planGateState else {
             logger.info("[GoalRunner] skipped — plan gate not idle (\(planGateState))")
+            return
+        }
+        // [T-deep-mode-verify-gate] Phase 2: don't auto-continue during the
+        // verification phase — that phase is driven by VerifyGate's own sentinel,
+        // not GoalRunner's. A verify turn may incidentally mention goal state
+        // (e.g. "still pending because I need to fix X") and we don't want that
+        // to trigger a GoalRunner continue inside a verify round.
+        guard workflowPhase != .verifying else {
+            logger.info("[GoalRunner] skipped — in verifying phase (VerifyGate owns this turn)")
             return
         }
         guard messages.indices.contains(msgIdx) else {
@@ -1117,7 +1302,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             logger.info("[GoalRunner] skipped — no sentinel parsed")
             // [T-deep-mode-workflow] No continuation signal: the execution turn
             // ended on its own. Clear the tracker so it can't linger as "执行中".
-            finishWorkflow()
+            // [T-deep-mode-verify-gate] Phase 2: but don't clear during verifying —
+            // that phase has its own lifecycle and shouldn't be wiped by the
+            // absence of a goal sentinel (verify turns use the VERIFY sentinel).
+            if workflowPhase != .verifying {
+                finishWorkflow()
+            }
             return
         }
 
@@ -1127,7 +1317,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
             // [T-deep-mode-workflow] Task complete: show an all-green completion
             // for a beat, then fade the tracker out (no lingering residue).
-            completeWorkflow()
+            await completeWorkflow()
         case .pending(let reason):
             guard goalRunnerRoundsLeft > 0 else {
                 logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
@@ -2294,6 +2484,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // status line; the client auto-continues on `pending` until `done` or
         // the cap. Emitting nothing is always safe (no auto-continuation).
         s += "GOAL AUTO-CONTINUE — at the very END of a turn where you used tools, append exactly one line (and do NOT put other text after it):\n  • <<GOAL_STATE>> done   (the task is fully complete)\n  • <<GOAL_STATE>> pending: <one-line next step>   (still incomplete; the client will auto-continue)\n"
+        // [T-deep-mode-verify-gate] Phase 2: deterministic self-verification.
+        // When in the verification phase (client injected a verify prompt), the
+        // model MUST re-read its own results, run / preview / compare them, and
+        // append exactly one VERIFY_STATE line at the very end. The client uses
+        // this to decide whether to finish the workflow or loop back to fix.
+        s += "SELF-VERIFY — when the client asks you to verify your work, re-read all changed files, run/preview/test the results, and check against the original goal. At the very END of your reply append exactly one line:\n  • <<VERIFY_STATE>> passed   (everything works correctly, matches the requirements)\n  • <<VERIFY_STATE>> failed: <one-line summary of what's wrong + how to fix>   (issues found; the client will let you fix them)\n"
         // [T-deep-mode-memory-proactive] Deterministic instruction so the
         // agent proactively persists long-term preferences instead of waiting
         // for an explicit /memory request. Gated by the session's
@@ -2522,6 +2718,35 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             return
         }
 
+        // [T-deep-mode-clarify-gate] Phase 2: handle the clarification gate.
+        // Two paths:
+        //   (a) We were awaiting clarification and the user just replied: merge
+        //       the original request with the answer and proceed normally.
+        //   (b) Fresh request, deep mode on, text-only: check for ambiguity.
+        //       If found, raise the gate and pause — don't send yet.
+        var clarifiedText: String?
+        if case .awaitingClarification(let question, let original) = clarifyState {
+            // User replied to our clarification question — combine the original
+            // request with their answer into a single clarified request, then
+            // clear the gate and continue the normal send path.
+            clarifiedText = "\(original)\n\n（澄清答复：\(text)）"
+            clarifyState = .idle
+            // Fall through to normal send flow with the clarified text.
+            logger.info("[ClarifyGate] user replied to clarification — proceeding with clarified request")
+        } else if deepModeEnabled, !text.isEmpty, pendingAttachments.isEmpty, !skipClarifyCheck {
+            // Fresh request: check for ambiguity before we commit to sending.
+            // Only for text-only requests (attachments usually mean a concrete
+            // task with context, less likely to be ambiguous).
+            // Skipped when `skipClarifyCheck` is true (user clicked "直接执行").
+            if let question = ClarifyGate.detectAmbiguity(in: text) {
+                clarifyState = .awaitingClarification(question: question, originalRequest: text)
+                logger.info("[ClarifyGate] ambiguity detected — pausing for clarification")
+                return // Don't send; wait for the user to reply / skip / cancel.
+            }
+        }
+        // If we have a clarified text, use it as the actual send text.
+        let sendText = clarifiedText ?? text
+
         // Don't stop TTS here — let the previous reply finish playing. The stream
         // handler will clear the queue on the FIRST textDelta of the new reply, so
         // the old audio plays until actual new content starts arriving.
@@ -2569,14 +2794,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     // opt-in [T-chat-auto-compact-opt-in] rides the same
                     // no-prompt path — compact and send without asking.
                     logger.info("[Context] Near capacity — auto-compacting (\(sessionSource == "shortcut" ? "shortcut session" : "autoCompactEnabled"))")
-                    pendingSendText = text
+                    pendingSendText = sendText
                     pendingSendAttachments = pendingAttachments
                     inputText = ""
                     attachments = []
                     compactAndSend()
                     return
                 }
-                pendingSendText = text
+                pendingSendText = sendText
                 pendingSendAttachments = pendingAttachments
                 inputText = ""
                 attachments = []
@@ -2592,7 +2817,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     messages.append(errMsg)
                     return
                 }
-                pendingSendText = text
+                pendingSendText = sendText
                 pendingSendAttachments = pendingAttachments
                 inputText = ""
                 attachments = []
@@ -2621,6 +2846,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
         // [T-deep-mode-strip-sentinel] A fresh send owns a fresh sentinel decision.
         pendingGoalSentinel = nil
+        // [T-deep-mode-clarify-gate] Phase 2: a fresh user send also clears the
+        // clarification gate. If the user typed something new while the gate
+        // was open, treat it as a fresh start rather than a clarification reply.
+        clarifyState = .idle
+        // [T-deep-mode-clarify-gate] Also reset the one-shot skip flag so it
+        // only applies to the send that set it.
+        skipClarifyCheck = false
 
         inputText = ""
 
@@ -2689,7 +2921,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
 
         // Note: toolSnapshots are NOT cleared here so the floating toolbar shows the full session history
-        let displayText = text.isEmpty && pendingAttachments.isEmpty ? "" : text
+        let displayText = sendText.isEmpty && pendingAttachments.isEmpty ? "" : sendText
         let userMsg = ChatMessage(role: .user, content: displayText)
         // [T-ios-user-attach-two-phase-birth] Attach the user's OWN selection before
         // the row is inserted, so the cell is born with its final height.
@@ -5524,6 +5756,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 if let clean = GoalRunner.textWithoutSentinel(assistantText) {
                     assistantText = clean
                 }
+                // [T-deep-mode-verify-gate] Phase 2: also resolve + strip the
+                // verify sentinel at text-capture time, same two-phase pattern.
+                pendingVerifySentinel = VerifyGate.parse(assistantText)
+                if let clean = VerifyGate.textWithoutSentinel(assistantText) {
+                    assistantText = clean
+                }
             }
             let toolEntries = streamResult.toolEntries
             let stopReason = streamResult.stopReason
@@ -6122,20 +6360,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // ONLY behavior here — execution resumes only via confirmPlan().
         if deepModeEnabled, messages[msgIdx].error == nil, !canResume {
             if let plan = PlanGate.detectPlan(in: messages[msgIdx]) {
-                if workflowPhase == .executing {
-                    // [T-deep-mode-workflow] Mid-execution plan-only turn: do NOT
-                    // raise the top-level confirm gate (that would yank the
-                    // deterministic state machine back to `.planning` and swap
-                    // the live step tracker for a confirm bar). Treat it as an
-                    // ordinary turn and let GoalRunner's sentinel decide whether
-                    // to continue. This closes the "子计划点取消清空进度" edge.
-                    planGateState = .idle
-                } else {
+                if workflowPhase == .idle || workflowPhase == .planning {
                     // [T-deep-mode-plan-gate] Layer B: a plan-only turn from an
-                    // idle/planning workflow still raises the confirm/edit bar.
+                    // idle/planning workflow raises the confirm/edit bar.
                     planGateState = .awaitingApproval(planText: plan)
                     workflowPhase = .planning
                     workflowSteps = WorkflowPlanParser.parseSteps(from: plan)
+                } else {
+                    // [T-deep-mode-workflow] Mid-execution or mid-verification
+                    // plan-only turn: do NOT raise the top-level confirm gate
+                    // (that would yank the deterministic state machine back to
+                    // `.planning` and swap the live step tracker for a confirm
+                    // bar). Treat it as an ordinary turn and let the phase's
+                    // own sentinel (goal / verify) decide what to do next.
+                    planGateState = .idle
                 }
                 logger.info("[PlanGate] awaiting approval — plan=\(plan.count)ch steps=\(workflowSteps.count) msg=\(msgIdx)")
             } else {
@@ -6165,6 +6403,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // and auto-continue if the model reported `pending` — bounded by
         // goalRunnerRoundsLeft and gated by `deepModeEnabled` inside.
         await maybeAutoContinueGoal(afterMsgIdx: msgIdx)
+
+        // [T-deep-mode-verify-gate] Phase 2: if we are in the verifying phase,
+        // process the verify sentinel and either finish the workflow or loop
+        // back to execution for a fix round. No-op in any other phase.
+        await maybeProcessVerifyResult(afterMsgIdx: msgIdx)
 
     }
 

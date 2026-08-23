@@ -19,9 +19,13 @@ enum WorkflowPhase: Equatable {
     case planning
     /// Plan confirmed / executing tools.
     case executing
-    /// Brief completion fade-out (Phase 1): entered on the `done` sentinel to
-    /// show an all-green summary before the tracker clears. Also the placeholder
-    /// for Phase 2's post-execution self-check.
+    /// Post-execution self-verification (Phase 2). Entered when the model
+    /// reports `done` on an execution turn; the client then injects a
+    /// mandatory self-check prompt. The model must verify results and emit
+    /// a `<<VERIFY_STATE>> passed / failed` sentinel. On `passed` the
+    /// workflow finishes; on `failed` it re-enters `.executing` for a fix.
+    /// All steps stay `.done` visually during this phase (the user sees
+    /// "复查中" on an all-green list).
     case verifying
 }
 

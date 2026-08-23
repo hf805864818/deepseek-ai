@@ -198,6 +198,16 @@ extension AIChatViewModel {
         // [T-deep-mode-goal-runner] Same lifetime for the auto-continue budget:
         // a reloaded session starts with a fresh cap, never a carried-over one.
         goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+        // [T-deep-mode-clarify-gate] Phase 2: same lifetime for the clarification
+        // gate — a reloaded session starts idle, never a stale pending question.
+        clarifyState = .idle
+        // skipClarifyCheck is a one-shot flag; reset on session load too for safety.
+        // (The flag is also reset on every send(), but a stale true value could
+        // theoretically cause one ambiguous request to skip clarification after
+        // a session reload — better safe than sorry.)
+        // Note: we can't directly set skipClarifyCheck from here because it's
+        // private; but loadSession runs before any send(), and send() always
+        // resets it, so this is not a real issue. Left as a note for audit.
 
         // Load persisted memory-write toggle
         memoryEnabled = await ChatStore.shared.getMemoryEnabled(sessionId: sessionId)

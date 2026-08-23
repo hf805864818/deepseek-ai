@@ -13,7 +13,7 @@ extension WorkflowPhase {
         case .idle: return "空闲"
         case .planning: return "规划中"
         case .executing: return "执行中"
-        case .verifying: return "执行完成"
+        case .verifying: return "复查中"
         }
     }
 

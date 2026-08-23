@@ -518,7 +518,12 @@ struct AIChatView: View {
                     // workflow UI with zero residue. Approval/edit still flows
                     // through vm.confirmPlan()/editPlan()/cancelPlan().
                     if vm.deepModeEnabled {
-                        if case .awaitingApproval = vm.planGateState {
+                        // [T-deep-mode-clarify-gate] Phase 2: clarification banner.
+                        // Shown before planning — if the gate detected ambiguity
+                        // in the user's request, ask a clarifying question first.
+                        if case .awaitingClarification = vm.clarifyState {
+                            clarifyBanner
+                        } else if case .awaitingApproval = vm.planGateState {
                             // Planning: parsed steps preview + confirm/edit bar.
                             VStack(alignment: .leading, spacing: 0) {
                                 if !vm.workflowSteps.isEmpty {
@@ -536,7 +541,7 @@ struct AIChatView: View {
                                 planGateBanner
                             }
                         } else if vm.workflowPhase == .executing || vm.workflowPhase == .verifying {
-                            // Executing / completed fade-out: live step progress.
+                            // Executing / verifying: live step progress.
                             WorkflowProgressView(phase: vm.workflowPhase,
                                                  steps: vm.workflowSteps)
                         }
@@ -2438,6 +2443,56 @@ struct AIChatView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.red.opacity(0.12))
+    }
+
+    /// [T-deep-mode-clarify-gate] Phase 2: clarification banner shown above the
+    /// message list when the gate detected ambiguity in the user's request.
+    /// The user can reply in the composer (their answer gets merged with the
+    /// original request), skip straight to execution, or cancel.
+    private var clarifyBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "questionmark.circle")
+                    .font(.caption)
+                    .foregroundColor(.accentColor)
+                Text("深度龙虾Ai · 需要澄清")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(ChatColors.primaryText)
+                Spacer(minLength: 8)
+                Button { vm.cancelClarification() } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption)
+                        .foregroundColor(ChatColors.secondaryText)
+                }
+                .buttonStyle(.plain)
+            }
+            if case .awaitingClarification(let question, _) = vm.clarifyState {
+                Text(question)
+                    .font(.caption2)
+                    .foregroundColor(ChatColors.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 10) {
+                Spacer(minLength: 8)
+                Button { vm.skipClarification() } label: {
+                    Text("直接执行")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 8).padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+                Text("或在下方输入答复后发送")
+                    .font(.caption2)
+                    .foregroundColor(ChatColors.secondaryText)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ChatColors.secondaryBg)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(ChatColors.toolBorder).frame(height: 0.5)
+        }
     }
 
     /// [T-deep-mode-plan-gate] Confirm/edit bar rendered above the messages
