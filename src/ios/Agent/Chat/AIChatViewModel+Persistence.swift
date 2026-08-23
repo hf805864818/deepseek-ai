@@ -201,13 +201,10 @@ extension AIChatViewModel {
         // [T-deep-mode-clarify-gate] Phase 2: same lifetime for the clarification
         // gate — a reloaded session starts idle, never a stale pending question.
         clarifyState = .idle
-        // skipClarifyCheck is a one-shot flag; reset on session load too for safety.
-        // (The flag is also reset on every send(), but a stale true value could
-        // theoretically cause one ambiguous request to skip clarification after
-        // a session reload — better safe than sorry.)
-        // Note: we can't directly set skipClarifyCheck from here because it's
-        // private; but loadSession runs before any send(), and send() always
-        // resets it, so this is not a real issue. Left as a note for audit.
+        // Also reset the one-shot skip flag for safety. (Reset on every send() too,
+        // but a stale true value could theoretically cause one ambiguous request
+        // to skip clarification after a session reload — better safe than sorry.)
+        skipClarifyCheck = false
 
         // Load persisted memory-write toggle
         memoryEnabled = await ChatStore.shared.getMemoryEnabled(sessionId: sessionId)

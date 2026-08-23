@@ -1010,13 +1010,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-deep-mode-clarify-gate] When true, send() skips the ambiguity check
     /// for the current message. Set by `skipClarification()` so the user can
     /// bypass the gate on demand. Reset to false after each send.
-    private var skipClarifyCheck = false
+    /// Internal access (same as goalRunnerRoundsLeft / pendingGoalSentinel) so
+    /// cross-file extensions (Persistence) can reset it on session load.
+    var skipClarifyCheck = false
 
     /// [T-deep-mode-workflow] Reset the Phase 1 workflow state machine to its
     /// "off" shape: idle phase, no steps. Idempotent and safe to call even when
     /// deep mode is off — it is the single place that guarantees the toggle-off
     /// contract leaves zero residue.
     func resetWorkflow() {
+        // [T-deep-mode-workflow] Cancel any pending fade-out so a delayed reset
+        // from a previously completed workflow can't wipe a new run's state.
+        // (Was previously only done in beginExecution(); resetWorkflow is the
+        // canonical "return to idle" entry point so it should own this cleanup.)
+        workflowFinishTask?.cancel()
         workflowPhase = .idle
         workflowSteps = []
         // [T-deep-mode-verify-gate] Phase 2: verify budget and sentinel are
