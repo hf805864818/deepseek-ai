@@ -1143,6 +1143,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     ///   • `failed` → re-enter `.executing` so the model can fix the issues.
     ///   • no sentinel / unknown → treat as passed (fail-safe: don't block).
     private func maybeProcessVerifyResult(afterMsgIdx msgIdx: Int) async {
+        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? pendingVerifySentinel!.description : "nil")")
         guard deepModeEnabled else { return }
         guard workflowPhase == .verifying else { return }
         guard messages.indices.contains(msgIdx) else { return }
@@ -3532,6 +3533,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         guard !isProcessing, canResume else { return }
         guard let lastMsg = messages.last, lastMsg.role == .assistant else { return }
 
+        // [T-deep-mode-resume-log] Log resume trigger with workflow state
+        logger.info("[WorkflowLog] resume() called - workflowPhase=\(workflowPhase) canResume=\(canResume) stepsCount=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
+
         canResume = false
         userDidCancel = false
 
@@ -5580,6 +5584,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 // the gate from the first injection site — fallback to a
                 // new provider must respect the per-session memoryEnabled
                 // toggle the same way the initial system prompt did.
+                        logger.info("[WorkflowLog] runAgentLoop() - loading categorizedMemoryFragment (fallback path)")
                 if memoryEnabled {
                     // [T-deep-mode-memory-phase3] Phase 3: categorized memory
                     // when deep mode is on, flat GLOBAL.md when off.
