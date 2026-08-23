@@ -2738,7 +2738,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // Only for text-only requests (attachments usually mean a concrete
             // task with context, less likely to be ambiguous).
             // Skipped when `skipClarifyCheck` is true (user clicked "直接执行").
-            if let question = ClarifyGate.detectAmbiguity(in: text) {
+            // Also skipped for shortcut sessions — they can't display the
+            // clarification UI, so we'd rather let the model guess than hang.
+            if sessionSource != "shortcut", let question = ClarifyGate.detectAmbiguity(in: text) {
                 clarifyState = .awaitingClarification(question: question, originalRequest: text)
                 logger.info("[ClarifyGate] ambiguity detected — pausing for clarification")
                 return // Don't send; wait for the user to reply / skip / cancel.

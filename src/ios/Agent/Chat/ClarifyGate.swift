@@ -90,7 +90,7 @@ enum ClarifyGate {
             let afterKeywords = findTechKeywords(in: after)
 
             if !beforeKeywords.isEmpty && !afterKeywords.isEmpty {
-                return "你提到了 \(beforeKeywords.joined("/")) 还是 \(afterKeywords.joined("/"))，请问你希望使用哪个技术栈？"
+                return "你提到了 \(beforeKeywords.joined(separator: "/")) 还是 \(afterKeywords.joined(separator: "/"))，请问你希望使用哪个技术栈？"
             }
         }
         return nil
