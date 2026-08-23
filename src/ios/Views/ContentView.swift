@@ -7277,6 +7277,9 @@ private struct SettingsSheet: View {
     /// applies across all sessions and can be turned off at any time to return
     /// to the default agent behavior.
     @AppStorage("deepMode.enabled") private var deepModeEnabled: Bool = false
+    /// [T-deep-mode-selftest] Debug switch to deterministically exercise the
+    /// Layer C auto-continue branch (see AIChatViewModel.goalRunnerForcePendingSelfTest).
+    @AppStorage("deepMode.selfTestForcePending") private var goalRunnerForcePending: Bool = false
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var navPath = NavigationPath()
@@ -7347,6 +7350,23 @@ private struct SettingsSheet: View {
                     .onChange(of: deepModeEnabled) { enabled in
                         SkillStore.shared.syncDeepModeSkills()
                     }
+
+                    // [T-deep-mode-selftest] Layer C 自检开关：开启后，深度模式下
+                    // 每一回合结束时客户端都强制判定为 `pending`，走真实续跑链路
+                    // （自动续跑 → 预算递减 → 最多 3 轮 → cap 停止），日志会打出
+                    // `[GoalRunner] pending sentinel — auto-continue x/3`。测完关闭即可。
+                    Toggle(isOn: $goalRunnerForcePending) {
+                        Label {
+                            Text("层C自检（强制 pending）")
+                        } icon: {
+                            Image(systemName: "hammer.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.orange, in: Circle())
+                        }
+                    }
+                    .disabled(!deepModeEnabled)
 
                     NavigationLink {
                         SkillsManagementView()
