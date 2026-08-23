@@ -886,6 +886,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// only consulted at the turn's end and logged for diagnostics.
     var goalRunnerRoundsLeft: Int = GoalRunner.maxAutoRounds
 
+    /// [T-deep-mode-strip-sentinel] Sentinel resolved at text-capture time (in
+    /// the agent loop, right before the final assistant text is flushed/persisted).
+    /// The visible text is stripped of the `<<GOAL_STATE>>` line at that same
+    /// point, so the auto-continue step at turn end reads this stash instead of
+    /// re-parsing `block.content` (which no longer carries the marker).
+    var pendingGoalSentinel: GoalRunner.ParseResult? = nil
+
     /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
     /// execution prompt through the normal `send()` path so it inherits every
     /// existing guard (context check, persistence, session tracking, run loop).
@@ -956,16 +963,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             return
         }
 
-        let text = messages[msgIdx].blocks.compactMap { block -> String? in
-            if case .text = block.kind { return block.content }
-            return nil
-        }.joined(separator: "\n")
-
-        guard let result = GoalRunner.parse(text) else {
-            // [T-deep-mode-diagnose] The most informative skip: the block text
-            // is present but holds no recognizable sentinel (or the sentinel
-            // landed outside a .text block — e.g. inside a tool result).
-            logger.info("[GoalRunner] skipped — no sentinel parsed (textLen=\(text.count))")
+        // [T-deep-mode-strip-sentinel] Read the result resolved at text-capture
+        // time. The visible text was already stripped of the `<<GOAL_STATE>>`
+        // line before flush/persist, so re-parsing `block.content` here would
+        // always miss it.
+        guard let result = pendingGoalSentinel else {
+            logger.info("[GoalRunner] skipped — no sentinel parsed")
             return
         }
 
@@ -2454,6 +2457,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // auto-continuation budget — each new prompt may chain up to
         // GoalRunner.maxAutoRounds rounds again.
         goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+        // [T-deep-mode-strip-sentinel] A fresh send owns a fresh sentinel decision.
+        pendingGoalSentinel = nil
 
         inputText = ""
 
@@ -5344,7 +5349,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
 
             let streamEnd = Date()
-            let assistantText = streamResult.assistantText
+            // [T-deep-mode-strip-sentinel] Resolve + strip the goal sentinel from
+            // the final assistant text BEFORE it is flushed to the UI, folded into
+            // assistantParts, and persisted — so the technical `<<GOAL_STATE>>` line
+            // never reaches the visible UI, the markdown caches, or the DB (which
+            // would otherwise resurrect it on every reload). The parsed result is
+            // stashed in `pendingGoalSentinel` for the auto-continue step at turn
+            // end, which must run AFTER the text is stripped (two-phase split).
+            var assistantText = streamResult.assistantText
+            if deepModeEnabled {
+                pendingGoalSentinel = GoalRunner.parse(assistantText)
+                if let clean = GoalRunner.textWithoutSentinel(assistantText) {
+                    assistantText = clean
+                }
+            }
             let toolEntries = streamResult.toolEntries
             let stopReason = streamResult.stopReason
             turnUsage = streamResult.turnUsage

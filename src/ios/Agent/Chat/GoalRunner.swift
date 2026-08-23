@@ -52,4 +52,26 @@ struct GoalRunner {
         }
         return nil
     }
+
+    /// Return `text` with the trailing sentinel line removed, or nil when there
+    /// is no recognizable sentinel (the caller leaves `text` untouched). Uses
+    /// the same LAST-occurrence rule as `parse` so a quoted marker up-stream
+    /// never strips the wrong line, and removes only the single line that owns
+    /// the marker (plus its trailing newline) so surrounding content survives
+    /// verbatim. Pair with `parse` at text-capture time so the auto-continue
+    /// decision is taken BEFORE the technical line is stripped from the shown /
+    /// persisted text.
+    static func textWithoutSentinel(_ text: String) -> String? {
+        guard parse(text) != nil else { return nil }
+        guard let markerRange = text.range(of: marker, options: [.caseInsensitive, .backwards]) else {
+            return nil
+        }
+        let prefix = text[..<markerRange.lowerBound]
+        let lineStart = prefix.lastIndex(of: "\n").map { text.index(after: $0) } ?? text.startIndex
+        let suffix = text[markerRange.upperBound...]
+        let lineEnd = suffix.firstIndex(of: "\n").map { text.index(after: $0) } ?? text.endIndex
+        var cleaned = text
+        cleaned.removeSubrange(lineStart..<lineEnd)
+        return cleaned
+    }
 }
