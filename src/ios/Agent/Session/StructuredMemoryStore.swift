@@ -153,30 +153,59 @@ enum StructuredMemoryStore {
         set { UserDefaults.standard.set(newValue, forKey: migrationDoneKey) }
     }
 
-    // MARK: - Load / save
+    // MARK: - Cache
 
-    /// Load all structured memory entries. Performs one-time migration from
-    /// GLOBAL.md if the structured store doesn't exist yet.
+    /// Thread-safe cached entries with file modification time check.
+    /// Invalidates cache when the file is modified on disk.
+    private static var cachedEntries: ([MemoryEntry], Date)?
+    private static var cachedEntriesModTime: Date?
+
+    /// Load all structured memory entries with caching.
+    ///
+    /// Phase 3.4 fix: avoids repeated disk reads by caching entries in memory
+    /// and only re-reading when the file's modification time changes.
     static func loadEntries() -> [MemoryEntry] {
         let fm = FileManager.default
+        let url = fileURL
+
+        // Check cache first
+        if let cached = cachedEntries,
+           let modTime = cachedEntriesModTime,
+           fm.fileExists(atPath: url.path) {
+            if let currentModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date,
+               currentModTime == modTime {
+                return cached
+            }
+            // File changed — invalidate cache
+            cachedEntries = nil
+            cachedEntriesModTime = nil
+        }
 
         // If the structured file doesn't exist, try migration first
-        if !fm.fileExists(atPath: fileURL.path), !migrationDone {
+        if !fm.fileExists(atPath: url.path), !migrationDone {
             let migrated = migrateFromLegacyGlobal()
             migrationDone = true
             if !migrated.isEmpty {
                 // Save the migrated entries immediately
                 try? saveEntries(migrated)
+                cachedEntries = migrated
+                cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date
                 return migrated
             }
         }
 
-        guard let data = try? Data(contentsOf: fileURL),
+        guard let data = try? Data(contentsOf: url),
               let entries = try? JSONDecoder().decode([MemoryEntry].self, from: data) else {
             return []
         }
+
+        // Cache the result
+        cachedEntries = entries
+        cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date
         return entries
     }
+
+    // MARK: - Load / save
 
     /// Persist entries to disk atomically.
     static func saveEntries(_ entries: [MemoryEntry]) throws {
@@ -189,6 +218,10 @@ enum StructuredMemoryStore {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(entries)
         try data.write(to: url, options: .atomic)
+
+        // Invalidate cache after write
+        cachedEntries = nil
+        cachedEntriesModTime = nil
     }
 
     // MARK: - CRUD operations

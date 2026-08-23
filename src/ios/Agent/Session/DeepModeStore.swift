@@ -119,24 +119,52 @@ enum DeepModeStore {
         try? defaultRulesBody.data(using: .utf8)?.write(to: url, options: .atomic)
     }
 
-    // MARK: - Read (scoped rules — Phase 3)
+    // MARK: - Cache
 
-    /// Load and parse all rules from `deep-rules.md`.
+    /// Thread-safe cached rules with file modification time check.
+    /// Invalidates cache when the file is modified on disk.
+    private static var cachedRules: [DeepModeRule]?
+    private static var cachedRulesModTime: Date?
+
+    /// Load and parse all rules from `deep-rules.md` with caching.
     ///
-    /// Returns parsed `DeepModeRule` array. Falls back to default rules when
-    /// the file is missing, unreadable, or empty. Synchronous so it can run
-    /// inside prompt build without threading hops.
+    /// Phase 3.4 fix: avoids repeated disk reads and YAML parsing by caching
+    /// the parsed rules in memory and only re-reading when the file changes.
     static func loadRules() -> [DeepModeRule] {
         ensureExists()
+
+        // Check cache first
+        if let cached = cachedRules {
+            if let currentModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date,
+               let cachedModTime = cachedRulesModTime,
+               currentModTime == cachedModTime {
+                return cached
+            }
+            // File changed — invalidate cache
+            cachedRules = nil
+            cachedRulesModTime = nil
+        }
+
         guard let data = try? Data(contentsOf: fileURL),
               let str = String(data: data, encoding: .utf8) else {
-            return DeepModeRuleParser.parse(defaultRulesBody)
+            let defaultParsed = DeepModeRuleParser.parse(defaultRulesBody)
+            cachedRules = defaultParsed
+            cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date
+            return defaultParsed
         }
+
         let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return DeepModeRuleParser.parse(defaultRulesBody)
+            let defaultParsed = DeepModeRuleParser.parse(defaultRulesBody)
+            cachedRules = defaultParsed
+            cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date
+            return defaultParsed
         }
-        return DeepModeRuleParser.parse(trimmed)
+
+        let parsed = DeepModeRuleParser.parse(trimmed)
+        cachedRules = parsed
+        cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date
+        return parsed
     }
 
     /// Load rules filtered to the given scope context.
@@ -194,5 +222,9 @@ enum DeepModeStore {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         try body.data(using: .utf8)?.write(to: url, options: .atomic)
+
+        // Invalidate cache after write
+        cachedRules = nil
+        cachedRulesModTime = nil
     }
 }
