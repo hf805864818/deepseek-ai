@@ -83,6 +83,10 @@ enum ChatColors {
     static let accent = Color(UIColor.label)
     static let sendButton = Color(UIColor.label)
     static let sendButtonDisabled = Color(UIColor.quaternaryLabel)
+    /// Semantic "success / completed" color. Used for done state glyphs (e.g.
+    /// workflow step tracker) so a change of success-color is one centralized
+    /// edit instead of scattered hard-coded `.green` literals.
+    static let success = Color(UIColor.systemGreen)
 }
 
 // MARK: - System Resource Monitor
@@ -509,11 +513,33 @@ struct AIChatView: View {
                                 }
                             }
                     }
-                    // [T-deep-mode-plan-gate] Confirm/edit bar for a pending
-                    // deep-mode plan. Only the gate's presence is driven here;
-                    // approval/edit flows through vm.confirmPlan()/editPlan().
-                    if case .awaitingApproval = vm.planGateState {
-                        planGateBanner
+                    // [T-deep-mode-workflow] Phase 1 visualization feedback, hard-gated
+                    // on the master switch so turning deep mode off removes ALL
+                    // workflow UI with zero residue. Approval/edit still flows
+                    // through vm.confirmPlan()/editPlan()/cancelPlan().
+                    if vm.deepModeEnabled {
+                        if case .awaitingApproval = vm.planGateState {
+                            // Planning: parsed steps preview + confirm/edit bar.
+                            VStack(alignment: .leading, spacing: 0) {
+                                if !vm.workflowSteps.isEmpty {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text("计划步骤")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(ChatColors.secondaryText)
+                                        WorkflowStepsList(steps: vm.workflowSteps)
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(ChatColors.secondaryBg)
+                                }
+                                planGateBanner
+                            }
+                        } else if vm.workflowPhase == .executing || vm.workflowPhase == .verifying {
+                            // Executing / completed fade-out: live step progress.
+                            WorkflowProgressView(phase: vm.workflowPhase,
+                                                 steps: vm.workflowSteps)
+                        }
                     }
                 }
                 .overlay(alignment: .bottom) {

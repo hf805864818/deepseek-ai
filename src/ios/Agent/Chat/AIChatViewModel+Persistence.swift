@@ -192,6 +192,9 @@ extension AIChatViewModel {
         // persisted: re-entering a session (including via a cached VM) clears any
         // stale pending plan so a banner from a previous visit can't linger.
         planGateState = .idle
+        // [T-deep-mode-workflow] Same lifetime for the Phase 1 state machine:
+        // a reloaded session starts idle with no steps, never a carried-over one.
+        resetWorkflow()
         // [T-deep-mode-goal-runner] Same lifetime for the auto-continue budget:
         // a reloaded session starts with a fresh cap, never a carried-over one.
         goalRunnerRoundsLeft = GoalRunner.maxAutoRounds

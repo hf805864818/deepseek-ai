@@ -172,6 +172,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     private var bgHintForegroundObserver: Any?
     private var snapshotForegroundObserver: Any?
     private var detachedLoopEndObserver: Any?
+    /// [T-deep-mode-workflow] Observer that hard-resets Phase 1 workflow state
+    /// the moment the 深度龙虾Ai master switch is toggled off.
+    private var deepModeObserver: Any?
     /// Timestamp of the most recent background-entry, used to detect that a
     /// long-running browser task actually spanned a background period.
     private var bgHintBackgroundEntryDate: Date?
@@ -311,6 +314,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             Task { @MainActor in
                 await self.reloadMessagesFromDB(reason: "cloudSyncDidFetchChanges")
             }
+        }
+
+        // [T-deep-mode-workflow] Master-switch contract: when the 深度龙虾Ai
+        // toggle is turned off, tear down every Phase 1 / deep-mode UI state so
+        // no banner, phase, or step list survives the off switch.
+        deepModeObserver = NotificationCenter.default.addObserver(
+            forName: .deepModeDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in self.deepModeDidDisableCleanup() }
         }
 
         activityTrackingCancellable = $isProcessing
@@ -479,6 +492,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = detachedLoopEndObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = deepModeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
     }
@@ -879,6 +895,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// confirm/edit. Only ever set while deep mode is on.
     @Published var planGateState: PlanGate.State = .idle
 
+    /// [T-deep-mode-workflow] Phase 1 explicit workflow state machine. The
+    /// client owns the phase — `.planning` (plan raised), `.executing` (user
+    /// confirmed) — instead of relying on the model's fuzzy plan output. Always
+    /// gated on `deepModeEnabled` and reset to `.idle` whenever the toggle is
+    /// off, so disabling deep mode leaves no residue.
+    @Published var workflowPhase: WorkflowPhase = .idle
+
+    /// [T-deep-mode-workflow] Parsed plan steps for the current workflow, shown
+    /// as a live progress list. Empty unless a plan is active. In-memory only.
+    @Published var workflowSteps: [WorkflowStep] = []
+
+    /// [T-deep-mode-workflow] Pending one-shot task that fades the completed
+    /// tracker out after a short all-green "完成过渡". Cancelled on master-switch
+    /// teardown so a disabled deep mode never lets a stray delay mutate state.
+    private var workflowFinishTask: Task<Void, Never>?
+
     /// [T-deep-mode-goal-runner] Remaining auto-continuation budget for Layer C.
     /// Decremented once per auto-round, reset to `GoalRunner.maxAutoRounds` on a
     /// fresh user send, on a `done` sentinel, on reaching the cap, and on
@@ -896,25 +928,139 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
     /// execution prompt through the normal `send()` path so it inherits every
     /// existing guard (context check, persistence, session tracking, run loop).
+    /// After `send()` (which resets the workflow as part of its fresh-send
+    /// path) re-enters the executing phase with the captured steps, so the
+    /// progress tracker survives the confirm round-trip.
     func confirmPlan() {
         guard case .awaitingApproval = planGateState else { return }
+        let capturedSteps = workflowSteps
         planGateState = .idle
         inputText = String(localized: "计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
         send()
+        // [T-deep-mode-workflow] `send()` can early-return before committing
+        // (context near/exhausted shows a dialog, read-only mode, still
+        // processing). Only enter `.executing` when the message actually went
+        // through — otherwise an "执行中" bar would linger with no real run.
+        guard !showCompactBeforeSendPrompt && !showContextExhaustedPrompt else { return }
+        beginExecution(restoring: capturedSteps)
     }
 
     /// [T-deep-mode-plan-gate] User wants to adjust the plan: park the plan
     /// text in the composer and close the gate. The user edits and sends it as
-    /// a normal message.
+    /// a normal message. The workflow is reset — editing a plan is a return to
+    /// the idle pre-task state, not an execution instruction.
     func editPlan() {
         guard case .awaitingApproval(let planText) = planGateState else { return }
         planGateState = .idle
+        resetWorkflow()
         inputText = planText
     }
 
     /// [T-deep-mode-plan-gate] Dismiss the pending plan without acting.
     func cancelPlan() {
         planGateState = .idle
+        resetWorkflow()
+    }
+
+    /// [T-deep-mode-workflow] Reset the Phase 1 workflow state machine to its
+    /// "off" shape: idle phase, no steps. Idempotent and safe to call even when
+    /// deep mode is off — it is the single place that guarantees the toggle-off
+    /// contract leaves zero residue.
+    func resetWorkflow() {
+        workflowPhase = .idle
+        workflowSteps = []
+    }
+
+    /// [T-deep-mode-workflow] Enter the executing phase and light up the first
+    /// pending step. Gated on the master switch: if deep mode is somehow off,
+    /// fall back to a hard reset so the state machine can never run unbounded.
+    /// Also falls back when the plan parsed zero recognizable steps — there is
+    /// nothing to track, so we stay idle rather than render an empty "0/0" bar.
+    private func beginExecution(restoring steps: [WorkflowStep]) {
+        guard deepModeEnabled, !steps.isEmpty else {
+            resetWorkflow()
+            return
+        }
+        // [T-deep-mode-workflow] A fresh execution invalidates any pending fade
+        // from a previous completed task, so a stale delayed reset can never
+        // wipe the new run's tracker.
+        workflowFinishTask?.cancel()
+        workflowPhase = .executing
+        var s = steps
+        if let i = s.firstIndex(where: { $0.status == .pending }) {
+            s[i].status = .active
+        }
+        workflowSteps = s
+    }
+
+    /// [T-deep-mode-workflow] Advance the step tracker by one: mark the current
+    /// active step done and promote the next pending step to active. Coarse but
+    /// deterministic heuristic — each goal-runner auto-continue round is treated
+    /// as roughly one plan step. Never advances outside the executing phase and
+    /// never beyond the parsed step list.
+    private func advanceWorkflowStep() {
+        guard workflowPhase == .executing, !workflowSteps.isEmpty else { return }
+        var steps = workflowSteps
+        if let activeIdx = steps.firstIndex(where: { $0.status == .active }) {
+            steps[activeIdx].status = .done
+        }
+        if let nextIdx = steps.firstIndex(where: { $0.status == .pending }) {
+            steps[nextIdx].status = .active
+        }
+        workflowSteps = steps
+    }
+
+    /// [T-deep-mode-workflow] Clear the tracker when an execution turn stops on
+    /// its own (no continuation signal, or the auto-continue cap is reached).
+    /// No-op unless a workflow is actually executing, so it can't disturb the
+    /// planning gate or a trivial `.idle` turn.
+    private func finishWorkflow() {
+        guard workflowPhase == .executing else { return }
+        workflowFinishTask?.cancel()
+        resetWorkflow()
+    }
+
+    /// [T-deep-mode-workflow] Task fully done (`done` sentinel): flip every step
+    /// to `.done`, enter the brief `.verifying` phase so the user sees an
+    /// all-green completion for a moment, then fade the tracker out. Gated so it
+    /// is a no-op clean-up unless a workflow is actually executing.
+    private func completeWorkflow() {
+        guard workflowPhase == .executing else {
+            resetWorkflow()
+            return
+        }
+        var steps = workflowSteps
+        for i in steps.indices { steps[i].status = .done }
+        workflowSteps = steps
+        workflowPhase = .verifying
+        scheduleWorkflowFinish()
+    }
+
+    /// [T-deep-mode-workflow] Schedule the fade-out of a completed tracker after
+    /// a short delay. Cancels any prior pending fade first so repeated completion
+    /// can't schedule duplicate mutations. The `deepModeEnabled` re-check at fire
+    /// time guarantees the toggle-off contract isn't violated by a stray delay.
+    private func scheduleWorkflowFinish() {
+        workflowFinishTask?.cancel()
+        workflowFinishTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self, self.deepModeEnabled else { return }
+            self.resetWorkflow()
+        }
+    }
+
+    /// [T-deep-mode-workflow] Invoked on a master-switch change. When deep mode
+    /// is now OFF, tear down every Phase 1 / deep-mode UI state so the UI and
+    /// behavior return byte-for-byte to the pre-deep-mode shape. Non-destructive
+    /// no-op when deep mode is ON.
+    func deepModeDidDisableCleanup() {
+        guard !deepModeEnabled else { return }
+        workflowFinishTask?.cancel()
+        planGateState = .idle
+        resetWorkflow()
+        goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+        pendingGoalSentinel = nil
     }
 
     /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
@@ -969,6 +1115,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // always miss it.
         guard let result = pendingGoalSentinel else {
             logger.info("[GoalRunner] skipped — no sentinel parsed")
+            // [T-deep-mode-workflow] No continuation signal: the execution turn
+            // ended on its own. Clear the tracker so it can't linger as "执行中".
+            finishWorkflow()
             return
         }
 
@@ -976,13 +1125,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         case .done:
             logger.info("[GoalRunner] done sentinel — resetting auto-continue budget")
             goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            // [T-deep-mode-workflow] Task complete: show an all-green completion
+            // for a beat, then fade the tracker out (no lingering residue).
+            completeWorkflow()
         case .pending(let reason):
             guard goalRunnerRoundsLeft > 0 else {
                 logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
                 goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+                // [T-deep-mode-workflow] Stopping without a `done` sentinel:
+                // clear the tracker so it can't linger as "执行中".
+                finishWorkflow()
                 return
             }
             goalRunnerRoundsLeft -= 1
+            // [T-deep-mode-workflow] Each auto-continue round advances the step
+            // tracker one position so the user sees live progress.
+            advanceWorkflowStep()
             let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
             logger.info("[GoalRunner] pending sentinel — auto-continue \(used)/\(GoalRunner.maxAutoRounds)")
 
@@ -2453,6 +2611,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         userDidCancel = false
         // [T-deep-mode-plan-gate] Any fresh user send supersedes a pending plan.
         planGateState = .idle
+        // [T-deep-mode-workflow] A fresh user send also ends any in-flight
+        // workflow; confirmPlan() re-enters `.executing` right after send()
+        // returns, so the confirm path is unaffected.
+        resetWorkflow()
         // [T-deep-mode-goal-runner] A fresh user send also restarts the
         // auto-continuation budget — each new prompt may chain up to
         // GoalRunner.maxAutoRounds rounds again.
@@ -5960,11 +6122,33 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // ONLY behavior here — execution resumes only via confirmPlan().
         if deepModeEnabled, messages[msgIdx].error == nil, !canResume {
             if let plan = PlanGate.detectPlan(in: messages[msgIdx]) {
-                planGateState = .awaitingApproval(planText: plan)
-                logger.info("[PlanGate] awaiting approval — plan=\(plan.count)ch msg=\(msgIdx)")
+                if workflowPhase == .executing {
+                    // [T-deep-mode-workflow] Mid-execution plan-only turn: do NOT
+                    // raise the top-level confirm gate (that would yank the
+                    // deterministic state machine back to `.planning` and swap
+                    // the live step tracker for a confirm bar). Treat it as an
+                    // ordinary turn and let GoalRunner's sentinel decide whether
+                    // to continue. This closes the "子计划点取消清空进度" edge.
+                    planGateState = .idle
+                } else {
+                    // [T-deep-mode-plan-gate] Layer B: a plan-only turn from an
+                    // idle/planning workflow still raises the confirm/edit bar.
+                    planGateState = .awaitingApproval(planText: plan)
+                    workflowPhase = .planning
+                    workflowSteps = WorkflowPlanParser.parseSteps(from: plan)
+                }
+                logger.info("[PlanGate] awaiting approval — plan=\(plan.count)ch steps=\(workflowSteps.count) msg=\(msgIdx)")
             } else {
                 planGateState = .idle
+                // [T-deep-mode-workflow] A non-plan turn: leave the workflow
+                // phase untouched. A trivial task stays `.idle`; an execution
+                // turn stays `.executing` until the goal sentinel resolves it.
             }
+        } else if deepModeEnabled, messages[msgIdx].error != nil {
+            // [T-deep-mode-workflow] A failed turn will not auto-continue, so
+            // clear the tracker to avoid a stale "执行中" bar after an error.
+            planGateState = .idle
+            resetWorkflow()
         }
 
         // Cache parsed MarkdownContent and NSAttributedString on completed text blocks

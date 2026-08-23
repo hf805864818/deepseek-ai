@@ -7346,6 +7346,9 @@ private struct SettingsSheet: View {
                     }
                     .onChange(of: deepModeEnabled) { enabled in
                         SkillStore.shared.syncDeepModeSkills()
+                        // [T-deep-mode-workflow] Broadcast the master-switch flip so
+                        // live VMs tear down Phase 1 state the instant it turns off.
+                        NotificationCenter.default.post(name: .deepModeDidChange, object: nil)
                     }
 
                     NavigationLink {
