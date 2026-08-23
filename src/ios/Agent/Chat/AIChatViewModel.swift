@@ -902,6 +902,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// off, so disabling deep mode leaves no residue.
     @Published var workflowPhase: WorkflowPhase = .idle
 
+
+    /// [T-deep-mode-resume-opt] Saved state for fast resume after pause.
+    /// When user pauses during workflow, we save the current state here.
+    /// On resume, we skip re-evaluation and directly restore the saved state.
+    private var savedWorkflowState: (phase: WorkflowPhase, steps: [WorkflowStep], verifyRoundsLeft: Int)? = nil
     /// [T-deep-mode-workflow] Parsed plan steps for the current workflow, shown
     /// as a live progress list. Empty unless a plan is active. In-memory only.
     @Published var workflowSteps: [WorkflowStep] = []
@@ -1024,6 +1029,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // (Was previously only done in beginExecution(); resetWorkflow is the
         // canonical "return to idle" entry point so it should own this cleanup.)
         workflowFinishTask?.cancel()
+        // [T-deep-mode-resume-opt] Clear saved state on reset
+        savedWorkflowState = nil
         workflowPhase = .idle
         workflowSteps = []
         // [T-deep-mode-verify-gate] Phase 2: verify budget and sentinel are
@@ -3535,6 +3542,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         // [T-deep-mode-resume-log] Log resume trigger with workflow state
         logger.info("[WorkflowLog] resume() called - workflowPhase=\(workflowPhase) canResume=\(canResume) stepsCount=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
+        
+        // [T-deep-mode-resume-opt] Check if we have saved state from pause
+        if let saved = savedWorkflowState {
+            logger.info("[WorkflowLog] resume() - using saved state, skipping re-evaluation")
+            workflowPhase = saved.phase
+            workflowSteps = saved.steps
+            verifyRoundsLeft = saved.verifyRoundsLeft
+            savedWorkflowState = nil
+        }
 
         canResume = false
         userDidCancel = false
@@ -4291,6 +4307,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         let lastRole = messages.last.map { $0.role == .assistant ? "assistant" : "user" } ?? "nil"
         logger.info("⏹️ cancel() START session=\(self.sessionId ?? "nil") isProcessing=\(self.isProcessing) lastRole=\(lastRole) lastBlocks=\(lastBlocks) currentTask=\(self.currentTask != nil)")
         dumpCandidateState("cancel-START")
+        // [T-deep-mode-resume-opt] Save workflow state before cancel for fast resume
+        if deepModeEnabled && workflowPhase != .idle {
+            savedWorkflowState = (workflowPhase, workflowSteps, verifyRoundsLeft)
+            logger.info("[WorkflowLog] cancel() - saved workflow state phase=\(workflowPhase) steps=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
+        }
         // [T-ios-queued-candidate-not-onscreen] Snapshot the queue + on-screen
         // messages at Stop time, and again 500ms later, so we can see whether a
         // queued candidate that drains after Stop actually lands on screen.
