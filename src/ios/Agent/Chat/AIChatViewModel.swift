@@ -5124,6 +5124,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         defer { logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop END session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(self.estimateContextTokens()) tokens") }
 
         let loopSetupStart = CFAbsoluteTimeGetCurrent()
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // [T-deep-mode-perf] Track individual step timing
+        var perfTimings: [String: Double] = [:]
 
         // [T-ios-empty-after-toolresult-reminder] Fresh turn → allow one reminder retry.
         didInjectEmptyToolReminderThisRun = false
@@ -5229,11 +5233,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // plan-first / self-verify posture is the LAST behavioral instruction
         // the model sees before history.
         if deepModeEnabled {
+            let t_deep = CFAbsoluteTimeGetCurrent()
             userSystemPrompt += deepModeFragment
+            perfTimings["deepModeFragment"] = (t_deep - t0) * 1000
         }
 
         let promptBuildMs = (CFAbsoluteTimeGetCurrent() - loopSetupStart) * 1000
-        logger.info("⏱️ [runAgentLoop] prompt build elapsed=\(String(format: "%.1f", promptBuildMs))ms history=\(self.agentHistory.count)")
+        let perfSummary = perfTimings.map { "\($0.key)=\(String(format: "%.1f", $0.value))ms" }.joined(separator: ", ")
+        logger.info("⏱️ [runAgentLoop] prompt build elapsed=\(String(format: "%.1f", promptBuildMs))ms history=\(self.agentHistory.count) [perf: \(perfSummary)]")
         await Task.yield()
 
         // When resuming after error, reuse the existing assistant message; otherwise create new
