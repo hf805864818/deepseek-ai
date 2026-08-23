@@ -879,6 +879,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// confirm/edit. Only ever set while deep mode is on.
     @Published var planGateState: PlanGate.State = .idle
 
+    /// [T-deep-mode-goal-runner] Remaining auto-continuation budget for Layer C.
+    /// Decremented once per auto-round, reset to `GoalRunner.maxAutoRounds` on a
+    /// fresh user send, on a `done` sentinel, on reaching the cap, and on
+    /// session load. Not @Published: nothing renders it directly today; it is
+    /// only consulted at the turn's end and logged for diagnostics.
+    var goalRunnerRoundsLeft: Int = GoalRunner.maxAutoRounds
+
     /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
     /// execution prompt through the normal `send()` path so it inherits every
     /// existing guard (context check, persistence, session tracking, run loop).
@@ -901,6 +908,78 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-deep-mode-plan-gate] Dismiss the pending plan without acting.
     func cancelPlan() {
         planGateState = .idle
+    }
+
+    /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
+    /// runAgentLoop turn (right after the per-block markdown cache). Reads the
+    /// goal sentinel from the just-finished turn and, when deep mode is on and
+    /// the sentinel says `pending`, injects a synthetic continue message and
+    /// recurses into a fresh `runAgentLoop()` — bounded by `goalRunnerRoundsLeft`.
+    ///
+    /// Fail-safe and non-blocking by construction:
+    ///   • no sentinel / unrecognized token → no-op (parse returns nil).
+    ///   • plan gate still waiting → no-op (a plan is not an execution turn).
+    ///   • errored or resumable turn → no-op (never auto-continue a broken turn).
+    ///   • cap reached → reset budget and stop.
+    private func maybeAutoContinueGoal(afterMsgIdx msgIdx: Int) async {
+        guard deepModeEnabled else {
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            return
+        }
+        // A pending plan is awaiting user confirmation — don't auto-continue.
+        guard case .idle = planGateState else { return }
+        guard messages.indices.contains(msgIdx),
+              messages[msgIdx].error == nil,
+              !canResume,
+              !userDidCancel,
+              !Task.isCancelled else { return }
+
+        let text = messages[msgIdx].blocks.compactMap { block -> String? in
+            if case .text = block.kind { return block.content }
+            return nil
+        }.joined(separator: "\n")
+        guard let result = GoalRunner.parse(text) else { return }
+
+        switch result {
+        case .done:
+            logger.info("[GoalRunner] done sentinel — resetting auto-continue budget")
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+        case .pending(let reason):
+            guard goalRunnerRoundsLeft > 0 else {
+                logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
+                goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+                return
+            }
+            goalRunnerRoundsLeft -= 1
+            let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
+            logger.info("[GoalRunner] pending sentinel — auto-continue \(used)/\(GoalRunner.maxAutoRounds)")
+
+            // Synthetic continue turn: lives only in agentHistory, produces no
+            // user bubble (the `<system-reminder>` prefix makes isUserBubbleEntry
+            // treat it as non-visible). Mirrors resume()'s stop-continue message.
+            let next = reason ?? "继续完成剩余步骤"
+            let cont = AgentMessage(role: .user, parts: [
+                .text("<system-reminder>深度模式自动续跑：目标尚未完成。\(next)。请继续执行剩余步骤，不要重复已完成的工作；全部完成后以 <<GOAL_STATE>> done 结束本回合。</system-reminder>")
+            ])
+            let ci = agentHistory.count
+            agentHistory.append(cont)
+            if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+                agentHistory[ci].dbMessageId = pid
+            }
+
+            // Recurse: the next runAgentLoop() reuses every existing backstop —
+            // maxAgentTurns per round, ToolLoopDetector, in-loop compaction.
+            // Bounded by goalRunnerRoundsLeft, so this cannot loop forever.
+            do {
+                try await runAgentLoop()
+            } catch is CancellationError {
+                logger.info("[GoalRunner] auto-continue cancelled")
+                handleUserCancelledCleanup()
+            } catch {
+                logger.error("[GoalRunner] auto-continue error: \(String(describing: error))")
+                // Never wedge the turn: swallow and stop continuing.
+            }
+        }
     }
 
     // MARK: - Session Stats
@@ -2020,6 +2099,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // raises a confirm/edit bar and pauses execution until the user acts.
         // Trivial single-command tasks skip the plan and act immediately.
         s += "PLAN GATE — if a request needs more than one step, your FIRST reply must be ONLY a plan: a fenced ```plan``` code block listing numbered steps, with no tool calls. Stop there and wait for the user to confirm before executing anything. For a trivial single-command task, skip the plan and act immediately.\n"
+        // [T-deep-mode-goal-runner] Layer C: deterministic goal sentinel. After
+        // executing (a turn that used tools), the model appends exactly one
+        // status line; the client auto-continues on `pending` until `done` or
+        // the cap. Emitting nothing is always safe (no auto-continuation).
+        s += "GOAL AUTO-CONTINUE — at the very END of a turn where you used tools, append exactly one line (and do NOT put other text after it):\n  • <<GOAL_STATE>> done   (the task is fully complete)\n  • <<GOAL_STATE>> pending: <one-line next step>   (still incomplete; the client will auto-continue)\n"
         // [T-deep-mode-memory-proactive] Deterministic instruction so the
         // agent proactively persists long-term preferences instead of waiting
         // for an explicit /memory request. Gated by the session's
@@ -2337,6 +2421,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         userDidCancel = false
         // [T-deep-mode-plan-gate] Any fresh user send supersedes a pending plan.
         planGateState = .idle
+        // [T-deep-mode-goal-runner] A fresh user send also restarts the
+        // auto-continuation budget — each new prompt may chain up to
+        // GoalRunner.maxAutoRounds rounds again.
+        goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
 
         inputText = ""
 
@@ -5840,6 +5928,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 cacheAttributedString(for: messages[msgIdx].blocks[i])
             }
         }
+
+        // [T-deep-mode-goal-runner] Layer C: the turn is fully closed out
+        // (markdown cached, tool statuses settled). Consult the goal sentinel
+        // and auto-continue if the model reported `pending` — bounded by
+        // goalRunnerRoundsLeft and gated by `deepModeEnabled` inside.
+        await maybeAutoContinueGoal(afterMsgIdx: msgIdx)
 
     }
 
