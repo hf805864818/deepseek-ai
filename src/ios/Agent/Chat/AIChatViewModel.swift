@@ -874,18 +874,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         UserDefaults.standard.bool(forKey: "deepMode.enabled")
     }
 
-    /// [T-deep-mode-selftest] Deterministic Layer C self-test switch (debug only,
-    /// default off). When on, the END of every completed deep-mode turn is
-    /// treated as if the model had emitted `<<GOAL_STATE>> pending`, forcing the
-    /// real auto-continue path to run: budget decrement → synthetic
-    /// `<system-reminder>` injection → recursive `runAgentLoop()`. This lets a
-    /// tester prove the WHOLE pending branch (and its 3-round cap + cap-stop
-    /// logging) deterministically, with any command — no reliance on the model
-    /// choosing to emit `pending`. Zero impact when off.
-    var goalRunnerForcePendingSelfTest: Bool {
-        UserDefaults.standard.bool(forKey: "deepMode.selfTestForcePending")
-    }
-
     /// [T-deep-mode-plan-gate] Gate state for Layer B: `.awaitingApproval`
     /// when the agent's last turn was a plan-only reply awaiting the user's
     /// confirm/edit. Only ever set while deep mode is on.
@@ -973,17 +961,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             return nil
         }.joined(separator: "\n")
 
-        // [T-deep-mode-selftest] Deterministic override: force a `pending`
-        // decision regardless of what the model wrote, so the full auto-continue
-        // branch (recursion, budget, cap) can be exercised on demand.
-        let parsed: GoalRunner.ParseResult?
-        if goalRunnerForcePendingSelfTest {
-            logger.info("[GoalRunner][SELFTEST] force-pending override ON — treating turn as pending")
-            parsed = .pending(reason: "自检：强制触发一次自动续跑")
-        } else {
-            parsed = GoalRunner.parse(text)
-        }
-        guard let result = parsed else {
+        guard let result = GoalRunner.parse(text) else {
             // [T-deep-mode-diagnose] The most informative skip: the block text
             // is present but holds no recognizable sentinel (or the sentinel
             // landed outside a .text block — e.g. inside a tool result).
