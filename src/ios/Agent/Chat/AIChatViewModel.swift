@@ -924,21 +924,49 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     private func maybeAutoContinueGoal(afterMsgIdx msgIdx: Int) async {
         guard deepModeEnabled else {
             goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            // [T-deep-mode-diagnose] Deep mode off is the #1 silent-skip cause.
+            // One info line per turn makes it impossible to confuse "toggle off"
+            // with a code deficiency again.
+            logger.info("[GoalRunner] skipped — deep mode off")
             return
         }
         // A pending plan is awaiting user confirmation — don't auto-continue.
-        guard case .idle = planGateState else { return }
-        guard messages.indices.contains(msgIdx),
-              messages[msgIdx].error == nil,
-              !canResume,
-              !userDidCancel,
-              !Task.isCancelled else { return }
+        guard case .idle = planGateState else {
+            logger.info("[GoalRunner] skipped — plan gate not idle (\(planGateState))")
+            return
+        }
+        guard messages.indices.contains(msgIdx) else {
+            logger.warning("[GoalRunner] skipped — msgIdx \(msgIdx) out of range")
+            return
+        }
+        if messages[msgIdx].error != nil {
+            logger.info("[GoalRunner] skipped — turn has error")
+            return
+        }
+        if canResume {
+            logger.info("[GoalRunner] skipped — turn resumable (truncated at tool limit)")
+            return
+        }
+        if userDidCancel {
+            logger.info("[GoalRunner] skipped — user cancelled")
+            return
+        }
+        if Task.isCancelled {
+            logger.info("[GoalRunner] skipped — task cancelled")
+            return
+        }
 
         let text = messages[msgIdx].blocks.compactMap { block -> String? in
             if case .text = block.kind { return block.content }
             return nil
         }.joined(separator: "\n")
-        guard let result = GoalRunner.parse(text) else { return }
+        guard let result = GoalRunner.parse(text) else {
+            // [T-deep-mode-diagnose] The most informative skip: the block text
+            // is present but holds no recognizable sentinel (or the sentinel
+            // landed outside a .text block — e.g. inside a tool result).
+            logger.info("[GoalRunner] skipped — no sentinel parsed (textLen=\(text.count))")
+            return
+        }
 
         switch result {
         case .done:
