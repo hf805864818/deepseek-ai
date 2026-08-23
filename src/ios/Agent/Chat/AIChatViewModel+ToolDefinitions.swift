@@ -124,24 +124,27 @@ extension AIChatViewModel {
         if includeMemoryTools {
             tools.append(AgentToolDefinition(
                 name: "memory_write",
-                description: "Write a memory entry to today's daily log (YYYY-MM-DD.md). Memories persist across all sessions. Each entry is prepended with a timestamp. Save: user preferences, recurring patterns, key facts, project conventions, reusable knowledge. Avoid saving passwords, API keys, tokens, or secrets unless the user explicitly confirms after being warned. Keep entries concise and general-purpose. GLOBAL.md is read-only (user-maintained via Settings).",
+                description: "Write a memory entry to today's daily log (YYYY-MM-DD.md) and to structured long-term memory. Memories persist across all sessions. Each entry is prepended with a timestamp. Save: user preferences, recurring patterns, key facts, project conventions, reusable knowledge. Avoid saving passwords, API keys, tokens, or secrets unless the user explicitly confirms after being warned. Keep entries concise and general-purpose. GLOBAL.md is read-only (user-maintained via Settings).",
                 parameters: [
                     "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Save user preference for Python', 'Note today's project context'). Use the same language as the user."),
                     "content": AgentToolParam(type: .string, description: "The memory content to write. Use concise Markdown with a short heading (## Topic) and context about what was done/learned."),
+                    "category": AgentToolParam(type: .string, description: "Optional. Category for structured memory: 'preference' (user preference), 'convention' (agreed convention/standard), 'fact' (established fact), 'taboo' (things to avoid), 'project' (project-specific), 'other' (default).", enumValues: ["preference", "convention", "fact", "taboo", "project", "other"]),
+                    "tags": AgentToolParam(type: .string, description: "Optional. Comma-separated tags for finer-grained search (e.g. 'python, backend, api')."),
                 ],
                 required: ["tool_title", "content"],
-                propertyOrdering: ["tool_title", "content"]
+                propertyOrdering: ["tool_title", "content", "category", "tags"]
             ))
             tools.append(AgentToolDefinition(
                 name: "memory_get",
-                description: "Retrieve memories from persistent storage. Supports keyword-based fuzzy search across memory files. Returns matching lines with surrounding context. Use this to recall previous knowledge, user preferences, or past notes.",
+                description: "Retrieve memories from persistent storage. Supports keyword-based fuzzy search across memory files and structured memory entries. Returns matching entries with confidence scores. Use this to recall previous knowledge, user preferences, or past notes.",
                 parameters: [
                     "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Recall user preferences', 'Search past notes'). Use the same language as the user."),
-                    "scope": AgentToolParam(type: .string, description: "Memory scope to search: 'daily' for daily logs only, 'all' for daily logs + GLOBAL.md.", enumValues: ["daily", "all"]),
+                    "scope": AgentToolParam(type: .string, description: "Memory scope to search: 'daily' for daily logs only, 'all' for daily logs + GLOBAL.md + structured memory.", enumValues: ["daily", "all"]),
+                    "category": AgentToolParam(type: .string, description: "Optional. Filter structured memory by category: 'preference', 'convention', 'fact', 'taboo', 'project', 'other'. Only applies when scope includes structured memory.", enumValues: ["preference", "convention", "fact", "taboo", "project", "other"]),
                     "keywords": AgentToolParam(type: .string, description: "Space-separated keywords for fuzzy matching (e.g. 'python preference' or 'API key setup'). All keywords must appear in a line or its surrounding context for a match. Leave empty to return full memory files."),
                 ],
                 required: ["tool_title"],
-                propertyOrdering: ["tool_title", "scope", "keywords"]
+                propertyOrdering: ["tool_title", "scope", "category", "keywords"]
             ))
         }
 

@@ -2467,19 +2467,107 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
     }
 
+    // MARK: - Deep mode scope context (Phase 3)
+
+    /// Build the scope context for rule matching from recent messages.
+    ///
+    /// Phase 3: extracts file paths mentioned in recent conversation and
+    /// keywords from the latest user message so DeepModeStore can select
+    /// only the rules that are relevant to the current turn.
+    private func buildDeepModeScopeContext() -> DeepModeScopeContext {
+        // Find the latest user message text
+        let lastUserMessage = messages
+            .last(where: { $0.role == .user })?.content ?? ""
+
+        // Extract file paths from recent messages (last 10 messages)
+        let recentMessages = messages.suffix(10)
+        var mentionedPaths: Set<String> = []
+        for msg in recentMessages {
+            let paths = Self.extractFilePaths(from: msg.content)
+            mentionedPaths.formUnion(paths)
+            // Also extract from assistant blocks (tool_use descriptions, etc.)
+            for block in msg.blocks {
+                let blockPaths = Self.extractFilePaths(from: block.content)
+                mentionedPaths.formUnion(blockPaths)
+            }
+        }
+
+        return DeepModeScopeContext(
+            mentionedFilePaths: Array(mentionedPaths),
+            userInputLowercased: lastUserMessage.lowercased()
+        )
+    }
+
+    /// Extract potential file paths / filenames from text using heuristics.
+    /// Matches:
+    ///   - Paths containing slashes: /foo/bar.swift, src/main.py
+    ///   - Bare filenames with known extensions: file.swift, script.py
+    private static func extractFilePaths(from text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+
+        var paths: Set<String> = []
+
+        // Pattern 1: paths with slashes (e.g. /a/b/c.swift, src/foo/bar.py)
+        // Match sequences of non-whitespace that contain at least one /
+        // and end with a known extension or a filename-like component.
+        let slashPattern = #"[^\s]*/[^\s]*"#
+        if let regex = try? NSRegularExpression(pattern: slashPattern, options: []) {
+            let nsRange = NSRange(text.startIndex..., in: text)
+            regex.enumerateMatches(in: text, options: [], range: nsRange) { match, _, _ in
+                guard let match = match,
+                      let range = Range(match.range, in: text) else { return }
+                var path = String(text[range])
+                // Trim trailing punctuation that's unlikely to be part of a path
+                while path.last?.isPunctuation == true && path.last != "/" && path.last != "." {
+                    path.removeLast()
+                }
+                if !path.isEmpty {
+                    paths.insert(path)
+                }
+            }
+        }
+
+        // Pattern 2: bare filenames with common code extensions
+        let knownExtensions = [
+            "swift", "py", "js", "ts", "jsx", "tsx", "java", "kt", "c", "cpp", "h",
+            "hpp", "m", "mm", "rb", "go", "rs", "php", "sh", "bash", "zsh",
+            "html", "css", "scss", "json", "yaml", "yml", "xml", "md", "markdown",
+            "sql", "plist", "xib", "storyboard", "swiftpm", "podspec",
+            "txt", "cfg", "ini", "toml", "env"
+        ]
+        for ext in knownExtensions {
+            let pattern = #"[\w\-.]+\.\#(ext)\b"#
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                let nsRange = NSRange(text.startIndex..., in: text)
+                regex.enumerateMatches(in: text, options: [], range: nsRange) { match, _, _ in
+                    guard let match = match,
+                          let range = Range(match.range, in: text) else { return }
+                    let filename = String(text[range])
+                    paths.insert(filename)
+                }
+            }
+        }
+
+        return Array(paths)
+    }
+
     /// [T-deep-mode] Extra "deep agent" behavior fragment injected just before
     /// the memory footer when the global 深度龙虾Ai toggle is on. It upgrades
     /// the agent from the default "act immediately" posture to a
     /// plan → execute → verify loop modelled on TRAE's autonomous workflow,
     /// WITHOUT touching `baseSystemPrompt` (which sits on a type-check
     /// boundary and must not be edited).
+    ///
+    /// Phase 3 evolution: rules are scoped to the current conversation context
+    /// (file paths mentioned + user input keywords) rather than always injecting
+    /// the full rule set. This reduces token waste and keeps the prompt focused.
     private var deepModeFragment: String {
+        let scopeCtx = buildDeepModeScopeContext()
         var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED. Adopt a deliberate, senior-engineer working style for this turn:\n"
-        // [T-deep-mode-rules] Behavior rules are now user-maintainable via
-        // deep-rules.md (DeepModeStore). The file is the single source of
-        // truth; the old hard-coded five rules became its default seed, so a
-        // fresh install injects byte-identical behavior to before.
-        s += DeepModeStore.loadRulesBody() + "\n"
+        // [T-deep-mode-rules-phase3] Behavior rules are scoped to current context.
+        // Phase 3: only rules matching the current scope (file globs + keywords
+        // + alwaysApply) are injected, replacing the old flat full-list injection.
+        s += DeepModeStore.rulesFragment(for: scopeCtx) + "\n"
         // [T-deep-mode-plan-gate] Layer B: deterministic plan-gate instruction.
         // For multi-step tasks the model must first emit ONLY a plan inside a
         // fenced ```plan``` code block and issue no tool calls; the client then
@@ -2497,15 +2585,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // append exactly one VERIFY_STATE line at the very end. The client uses
         // this to decide whether to finish the workflow or loop back to fix.
         s += "SELF-VERIFY — when the client asks you to verify your work, re-read all changed files, run/preview/test the results, and check against the original goal. At the very END of your reply append exactly one line:\n  • <<VERIFY_STATE>> passed   (everything works correctly, matches the requirements)\n  • <<VERIFY_STATE>> failed: <one-line summary of what's wrong + how to fix>   (issues found; the client will let you fix them)\n"
-        // [T-deep-mode-memory-proactive] Deterministic instruction so the
-        // agent proactively persists long-term preferences instead of waiting
-        // for an explicit /memory request. Gated by the session's
-        // memoryEnabled toggle (same gate as the memory fragment injection
-        // below): when memory is off there is nothing to write to, and
-        // injecting the instruction anyway would make the model attempt a
-        // memory_write that every turn refuses with "Memory disabled".
+        // [T-deep-mode-memory-proactive-phase3] Phase 3: proactive memory with
+        // categories. The agent should classify memories by type (preference /
+        // convention / fact / taboo / project) when writing them.
         if memoryEnabled {
-            s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, or project fact worth keeping, persist it via memory_write now (one short entry) and mention it in a single line, rather than waiting to be asked."
+            s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, project fact, or taboo worth keeping, persist it via memory_write with an appropriate category (preference/convention/fact/taboo/project) and mention it in a single line, rather than waiting to be asked."
         }
         return s
     }
@@ -5077,7 +5161,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // global default.
         AppLogger(category: "MemDiag").info("[MemDiag] inject-decision sid=\(self.sessionId?.prefix(8) ?? "nil") vm.memoryEnabled=\(self.memoryEnabled)")
         if memoryEnabled {
-            if let memoryFragment = Self.loadGlobalMemoryFragment() {
+            // [T-deep-mode-memory-phase3] Phase 3: when deep mode is on, inject
+            // categorized structured memory instead of flat GLOBAL.md. When deep
+            // mode is off, fall back to the legacy flat injection (total switch
+            // contract: 100% behavior parity when switch is off).
+            if deepModeEnabled,
+               let structuredFragment = StructuredMemoryStore.categorizedMemoryFragment() {
+                userSystemPrompt += "\n\n" + structuredFragment
+            } else if let memoryFragment = Self.loadGlobalMemoryFragment() {
                 userSystemPrompt += "\n\n" + memoryFragment
             }
             if let dailyFragment = Self.loadRecentDailyMemoryFragment() {
@@ -5490,7 +5581,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 // new provider must respect the per-session memoryEnabled
                 // toggle the same way the initial system prompt did.
                 if memoryEnabled {
-                    if let memoryFragment = Self.loadGlobalMemoryFragment() {
+                    // [T-deep-mode-memory-phase3] Phase 3: categorized memory
+                    // when deep mode is on, flat GLOBAL.md when off.
+                    if deepModeEnabled,
+                       let structuredFragment = StructuredMemoryStore.categorizedMemoryFragment() {
+                        userSystemPrompt += "\n\n" + structuredFragment
+                    } else if let memoryFragment = Self.loadGlobalMemoryFragment() {
                         userSystemPrompt += "\n\n" + memoryFragment
                     }
                     if let dailyFragment = Self.loadRecentDailyMemoryFragment() {

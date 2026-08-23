@@ -60,7 +60,12 @@ extension AIChatViewModel {
         return result
     }
 
-    /// Execute a memory_write tool call: prepend a timestamped entry to today's daily log.
+    /// Execute a memory_write tool call: prepend a timestamped entry to today's daily log
+    /// and also save to structured memory (Phase 3).
+    ///
+    /// Phase 3 enhancement: accepts optional `category` and `tags` parameters for
+    /// structured memory classification. The daily log write always happens
+    /// (backward compatible); structured memory is an additional write.
     func executeMemoryWrite(from json: String) -> FileToolResult {
         guard memoryEnabled else {
             return FileToolResult(output: "Memory saving is disabled for this session. Use /memory to re-enable.", success: false)
@@ -70,6 +75,15 @@ extension AIChatViewModel {
               let content = dict["content"] as? String else {
             return FileToolResult(output: "Error: Missing required 'content' parameter", success: false)
         }
+
+        // Parse optional Phase 3 fields
+        let categoryStr = (dict["category"] as? String) ?? "other"
+        let category = MemoryCategory(rawValue: categoryStr) ?? .other
+        let tagsStr = (dict["tags"] as? String) ?? ""
+        let tags = tagsStr
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
 
         let fm = FileManager.default
         let persistDir = Self.minisMemoryPersistentDir
@@ -116,7 +130,22 @@ extension AIChatViewModel {
         }
         NotificationCenter.default.post(name: .memoryFilesDidChange, object: nil)
 
-        return FileToolResult(output: "Memory saved to \(fileName) (\(content.count) chars)", success: true)
+        // Phase 3: also save to structured memory store
+        var structuredInfo = ""
+        do {
+            let source = deepModeEnabled ? "deep-mode" : "memory_write"
+            let entry = try StructuredMemoryStore.add(
+                content: content,
+                category: category,
+                tags: tags,
+                source: source
+            )
+            structuredInfo = "; structured: category=\(entry.category.rawValue), id=\(entry.id.prefix(8))"
+        } catch {
+            structuredInfo = "; structured write failed: \(error.localizedDescription)"
+        }
+
+        return FileToolResult(output: "Memory saved to \(fileName) (\(content.count) chars)\(structuredInfo)", success: true)
     }
 
     /// Execute a memory_get tool call: read and optionally search memory files.
@@ -361,7 +390,35 @@ extension AIChatViewModel {
         }
 
         let summary = "Found \(sortedScored.count) matching entries (scanned \(totalEntryCount) total), sorted by combined score (50% confidence + 50% recency):"
-        return FileToolResult(output: globalNote + summary + "\n\n" + output + truncatedNote, success: true)
+        var outputStr = globalNote + summary + "\n\n" + output + truncatedNote
+
+        // Phase 3: also search structured memory when scope == "all"
+        if scope == "all" {
+            let categoryFilter = (dict["category"] as? String).flatMap { MemoryCategory(rawValue: $0) }
+            let structuredResults = StructuredMemoryStore.filter(
+                category: categoryFilter,
+                keywords: keywords
+            )
+            if !structuredResults.isEmpty {
+                let maxStructured = 20
+                let shown = structuredResults.prefix(maxStructured)
+                var structuredSection = "\n\n---\n\n## Structured Memory (\(structuredResults.count) matches"
+                if let cat = categoryFilter {
+                    structuredSection += ", category: \(cat.rawValue)"
+                }
+                structuredSection += "):\n"
+                for entry in shown {
+                    let tagsStr = entry.tags.isEmpty ? "" : " [\(entry.tags.joined(separator: ", "))]"
+                    structuredSection += "\n### [\(entry.category.rawValue)\(tagsStr)] \(entry.content.prefix(200))\n"
+                }
+                if structuredResults.count > maxStructured {
+                    structuredSection += "\n... (showing \(maxStructured) of \(structuredResults.count) structured entries)"
+                }
+                outputStr += structuredSection
+            }
+        }
+
+        return FileToolResult(output: outputStr, success: true)
     }
 
     /// Escape single quotes for shell arguments.
