@@ -1106,6 +1106,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // round. If verify budget is already exhausted, fall back to the
         // Phase 1 behavior (instant finish) — zero blockage, zero risk.
         guard verifyRoundsLeft > 0 else {
+            // [T-deep-mode-s2-1] Log warning when verification budget is exhausted
+            logger.warning("[VerifyGate] verify budget exhausted — finishing without verification (S2-1)")
             logger.info("[VerifyGate] verify budget exhausted — finishing without verification")
             scheduleWorkflowFinish()
             return
@@ -1169,6 +1171,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // [T-deep-mode-verify-gate] Fail-safe: no sentinel or unrecognized
             // token → treat as passed and finish. This degrades gracefully to
             // Phase 1 behavior instead of blocking the user.
+            // [T-deep-mode-s1-2] Log warning when sentinel is missing
+            logger.warning("[VerifyGate] no verify sentinel — treating as passed (fail-safe) — possible missed verification round")
             logger.info("[VerifyGate] no verify sentinel — treating as passed (fail-safe)")
             scheduleWorkflowFinish()
             return
@@ -1180,6 +1184,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             scheduleWorkflowFinish()
         case .failed(let reason):
             if verifyRoundsLeft > 0 {
+                // [T-deep-mode-s2-2] Log coupling state between VerifyGate and GoalRunner
+                logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft), goalRoundsLeft: \(goalRunnerRoundsLeft))")
                 logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft))")
                 // Flip the last step back to active so the progress tracker
                 // shows "still working" instead of "all done".
@@ -2505,6 +2511,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             userInputLowercased: lastUserMessage.lowercased()
         )
     }
+
+    // [T-deep-mode-s1-1] Precompiled regexes for filename extensions — compiled once, reused every call
+    private static let pathFilenameRegexes: [NSRegularExpression] = {
+        let extensions = [
+            "swift", "py", "js", "ts", "jsx", "tsx", "java", "kt", "c", "cpp", "h",
+            "hpp", "m", "mm", "rb", "go", "rs", "php", "sh", "bash", "zsh",
+            "html", "css", "scss", "json", "yaml", "yml", "xml", "md", "markdown",
+            "sql", "plist", "xib", "storyboard", "swiftpm", "podspec",
+            "txt", "cfg", "ini", "toml", "env"
+        ]
+        return extensions.compactMap { ext -> NSRegularExpression? in
+            try? NSRegularExpression(pattern: "[\w\-.]+\.\(ext)\b", options: [.caseInsensitive])
+        }
+    }()
 
     /// Extract potential file paths / filenames from text using heuristics.
     /// Matches:
