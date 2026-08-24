@@ -30,6 +30,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.ui.res.stringResource
+import com.openminis.app.R
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -83,7 +85,7 @@ fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Other Sync") },
+                title = { Text(stringResource(R.string.other_sync)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(

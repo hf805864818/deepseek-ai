@@ -1535,4 +1535,7 @@
     </plurals>
     <string name="model_picker_quick_test">快速测试</string>
     <string name="provider_no_key_required">无需密钥</string>
+
+    <!-- Other Sync -->
+    <string name="other_sync">其他同步</string>
 </resources>

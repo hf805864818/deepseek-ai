@@ -7478,7 +7478,7 @@ private struct SettingsSheet: View {
                             OtherSyncSettingsView()
                         } label: {
                             Label {
-                                Text("Other Sync")
+                                Text(String(localized: "Other Sync", comment: "Settings row for third-party cloud sync platforms"))
                             } icon: {
                                 Image(systemName: "arrow.triangle.swap")
                                     .font(.system(size: 9))

@@ -1680,4 +1680,7 @@
     <string name="browser_downloads_failed">Failed</string>
     <string name="browser_downloads_open">Open</string>
     <string name="provider_no_key_required">No key required</string>
+
+    <!-- Other Sync -->
+    <string name="other_sync">Other Sync</string>
 </resources>

@@ -42,7 +42,7 @@ struct OtherSyncSettingsView: View {
                 status: .comingSoon
             )
         }
-        .navigationTitle("Other Sync")
+        .navigationTitle(String(localized: "Other Sync", comment: "Navigation title for third-party cloud sync settings"))
         .navigationBarTitleDisplayMode(.inline)
     }
 

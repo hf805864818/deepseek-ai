@@ -259,11 +259,11 @@ fun SettingsScreen(
             }
 
             // -- Other Sync --
-            SettingsSection(title = "Other Sync") {
+            SettingsSection(title = stringResource(R.string.other_sync)) {
                 SettingsItem(
                     icon = Icons.Outlined.Sync,
                     iconColor = Color(0xFF5856D6),
-                    title = "Other Sync",
+                    title = stringResource(R.string.other_sync),
                     subtitle = "Google Drive and more",
                     onClick = onOtherSyncClick,
                     showDivider = false,
