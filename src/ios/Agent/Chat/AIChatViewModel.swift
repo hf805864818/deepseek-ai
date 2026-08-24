@@ -766,6 +766,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// error instead of injecting again — so it can never loop. Reset at the
     /// start of each agent loop (a fresh user turn).
     var didInjectEmptyToolReminderThisRun = false
+    /// [T-deep-mode-cognitive-p1] C8: Uncertainty detection flag — ensures the
+    /// uncertainty check is injected at most once per runAgentLoop invocation.
+    /// When the model's output contains uncertainty markers ("不确定", "可能",
+    /// "大概", "I'm not sure", "maybe", "probably"), a one-shot verification
+    /// prompt is appended to the tool result message (or injected as a new user
+    /// message if the turn had no tool calls). Capped at 1 per run to prevent
+    /// loops. Reset at the start of each agent loop. Guarded by deepModeEnabled.
+    var didInjectUncertaintyCheckThisRun = false
     /// Incremented when a model fallback occurs so the UI can animate the model name change.
     @Published var fallbackTrigger: Int = 0
     /// Signal to trigger scroll-to-bottom in views (not @Published to avoid full view diff).
@@ -1078,6 +1086,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // from a previous completed task, so a stale delayed reset can never
         // wipe the new run's tracker.
         workflowFinishTask?.cancel()
+        // [T-deep-mode-cognitive-p1] C7: Reset the retrospective flag for the
+        // new workflow — each workflow gets one retrospective at completion.
+        retrospectiveHasRun = false
         workflowPhase = .executing
         var s = steps
         if let i = s.firstIndex(where: { $0.status == .pending }) {
@@ -1265,6 +1276,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             guard !Task.isCancelled else { return }
             guard let self, self.deepModeEnabled else { return }
             self.resetWorkflow()
+            // [T-deep-mode-cognitive-p1] C7: Post-task retrospective — after the
+            // workflow is reset to idle, run the retrospective hook. This injects
+            // a review prompt, runs one agent loop turn, and saves the model's
+            // self-reflection to StructuredMemoryStore. Guarded by the outer
+            // `deepModeEnabled` check and the `retrospectiveHasRun` flag inside.
+            // The 900ms delay above ensures the completion UI had time to show
+            // before the retrospective turn begins.
+            await self.maybeRunRetrospective()
         }
     }
 
@@ -1283,6 +1302,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // immediately when the master switch goes off — no residual banner.
         clarifyState = .idle
         skipClarifyCheck = false
+        // [T-deep-mode-cognitive-p1] C7: Clear the retrospective flag so it
+        // doesn't carry over to a future deep-mode re-enable. Also clears the
+        // C8 uncertainty flag for the same reason. Total-switch safe: both are
+        // in-memory only and never persisted.
+        retrospectiveHasRun = false
+        didInjectUncertaintyCheckThisRun = false
     }
 
     /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
@@ -2700,6 +2725,93 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // C5: Fail-three-times-switch-method
         s += "5. FAIL-SWITCH — If the same approach fails 3 consecutive times (same error pattern or same dead-end), STOP and switch to a fundamentally different strategy. Do not attempt a 4th iteration of the same method. State: \"Approach X failed 3 times — switching to Y because Z.\" The auto-continue budget (3 rounds) exists for this: if you've used all 3 rounds without success, the next step must be a different approach, not a retry.\n"
         return s
+    }
+
+    // MARK: - P1 Cognitive Abilities (C6/C7/C8)
+
+    /// [T-deep-mode-cognitive-p1] C7: Guard flag ensuring the retrospective runs
+    /// at most once per workflow completion. Set when the retrospective begins,
+    /// cleared when a new workflow starts (beginExecution). Total-switch safe:
+    /// the retrospective only runs inside `if deepModeEnabled`, and this flag is
+    /// in-memory only — never persisted.
+    private var retrospectiveHasRun = false
+
+    /// [T-deep-mode-cognitive-p1] C8: Detect uncertainty markers in the model's
+    /// output text. Returns true if any uncertainty marker is found. Pure
+    /// function — no side effects, no state. Called only inside `if deepModeEnabled`.
+    /// Markers cover both Chinese and English common uncertainty expressions.
+    private static func detectUncertainty(in text: String) -> Bool {
+        // Chinese uncertainty markers
+        let zhMarkers = ["不确定", "不太确定", "无法确定", "可能", "大概", "也许",
+                         "似乎", "好像", "不太清楚", "不敢确定", "应该是"]
+        // English uncertainty markers (case-insensitive)
+        let enMarkers = ["i'm not sure", "i am not sure", "not sure",
+                         "maybe", "perhaps", "probably", "i think",
+                         "might be", "could be", "uncertain", "unclear",
+                         "i believe", "i guess", "as far as i know"]
+        let lower = text.lowercased()
+        for m in zhMarkers { if text.contains(m) { return true } }
+        for m in enMarkers { if lower.contains(m) { return true } }
+        return false
+    }
+
+    /// [T-deep-mode-cognitive-p1] C7: Post-task retrospective hook. Called after
+    /// a meaningful workflow completes (workflow phase transitions back to idle).
+    /// Injects a structured review prompt, runs one agent loop turn to get the
+    /// model's self-reflection, and persists the result to StructuredMemoryStore
+    /// as a project-category memory entry.
+    ///
+    /// Total-switch safe: guarded by `deepModeEnabled` at entry. The injected
+    /// message is a normal AgentMessage (persisted as conversation history), and
+    /// the memory entry is only written when deep mode is on. When the master
+    /// switch is off, this method returns immediately — zero behavioral residue.
+    /// The `retrospectiveHasRun` flag prevents double-injection across multiple
+    /// scheduleWorkflowFinish calls.
+    private func maybeRunRetrospective() async {
+        guard deepModeEnabled else { return }
+        guard !retrospectiveHasRun else {
+            logger.info("[Retrospective] C7 skipped — already ran for this workflow")
+            return
+        }
+        retrospectiveHasRun = true
+        logger.info("[Retrospective] C7 beginning post-task retrospective")
+
+        let reviewPrompt = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>深度模式任务后复盘（C7）：本次任务已完成，请快速复盘以下四个维度：\n1. 意图理解准确吗？（用户要什么 vs 你做了什么）\n2. 难度评估准吗？（预估难度 vs 实际难度）\n3. 工具选择最优吗？（有无更优工具/路径）\n4. 边界声明到位吗？（做了什么 / 没做什么 / 为什么）\n请简洁回答，提炼一条可复用的经验教训。如果你的复盘包含值得长期记住的经验，请使用 memory_write 工具保存。</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(reviewPrompt)
+        if let pid = await persistAgentMessage(reviewPrompt), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+
+        do {
+            try await runAgentLoop()
+            // After the review turn, check if the model's response is worth
+            // saving. We look at the last assistant message in agentHistory.
+            if let lastAssistant = agentHistory.last(where: { $0.role == .assistant }) {
+                let reviewText = lastAssistant.parts.compactMap { part -> String? in
+                    if case .text(let t) = part { return t }
+                    return nil
+                }.joined(separator: "\n")
+                if !reviewText.isEmpty {
+                    // Save the review to structured memory as a project note.
+                    // Source tag "auto:deep-mode-c7" distinguishes it from
+                    // user-written entries and makes it easy to filter/delete.
+                    try? StructuredMemoryStore.add(
+                        content: "任务复盘: \(reviewText.prefix(500))",
+                        category: .project,
+                        tags: ["retrospective", "auto", "deep-mode"],
+                        source: "auto:deep-mode-c7"
+                    )
+                    logger.info("[Retrospective] C7 review saved to StructuredMemoryStore (\(reviewText.count) chars)")
+                }
+            }
+        } catch is CancellationError {
+            logger.info("[Retrospective] C7 cancelled")
+        } catch {
+            logger.error("[Retrospective] C7 error: \(String(describing: error))")
+        }
     }
 
     /// Session ID for persistence integration. Set by the view on appear.
@@ -5237,6 +5349,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         // [T-ios-empty-after-toolresult-reminder] Fresh turn → allow one reminder retry.
         didInjectEmptyToolReminderThisRun = false
+        // [T-deep-mode-cognitive-p1] C8: Reset uncertainty check flag for this run.
+        didInjectUncertaintyCheckThisRun = false
 
         // Resolve provider from ProviderConfigStore
         guard let entry = resolveCurrentEntry() else {
@@ -5510,6 +5624,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // that keeps hitting the threshold can't compact forever; when the cap
         // is reached and we're still near capacity, the loop stops as exhausted.
         var compactionsThisLoop = 0
+        // [T-deep-mode-cognitive-p1] C6: Heartbeat self-check counter.
+        // Counts tool-bearing iterations within this runAgentLoop invocation.
+        // Every 5th tool-bearing iteration triggers a self-check injection
+        // that reminds the model to verify goal alignment. Per-loop (not
+        // persisted), so turning off deepMode mid-loop is safe — the counter
+        // simply ceases to be checked. Total-switch safe: the injection only
+        // fires inside `if deepModeEnabled`.
+        var heartbeatToolCallCount = 0
         loopLabel: while turnCount < Self.maxAgentTurns {
             defer { turnCount += 1 }
             // [LoopHeartbeat] (#181) One line per loop iteration. If the loop
@@ -6032,6 +6154,25 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             turnUsage = streamResult.turnUsage
             logger.info("📐 Context after API: latestContextTokens=\(turnUsage.latestContextTokens) (in:\(turnUsage.inputTokens) cache_read:\(turnUsage.cacheReadTokens) cache_create:\(turnUsage.cacheCreationTokens))")
 
+            // [T-deep-mode-cognitive-p1] C8: Uncertainty detection — scan the
+            // model's output for uncertainty markers ("不确定", "可能", "大概",
+            // "I'm not sure", "maybe", "probably", etc.). When detected and deep
+            // mode is on, a one-shot verification prompt is injected: appended
+            // to toolResultParts (if this turn has tool calls) or injected as a
+            // separate user message before the break (if no tool calls). Capped
+            // at 1 injection per runAgentLoop via didInjectUncertaintyCheckThisRun.
+            // Total-switch safe: the detection and injection are both inside
+            // `if deepModeEnabled` — when the master switch is off, no scan, no
+            // injection, no flag mutation, zero behavioral residue.
+            var shouldInjectUncertaintyCheck = false
+            if deepModeEnabled && !didInjectUncertaintyCheckThisRun && !assistantText.isEmpty {
+                if Self.detectUncertainty(in: assistantText) {
+                    shouldInjectUncertaintyCheck = true
+                    didInjectUncertaintyCheckThisRun = true
+                    logger.info("[UncertaintyCheck] C8 uncertainty markers detected — will inject verification prompt")
+                }
+            }
+
             // Track session-level token stats
             let iterationStreamDuration = streamEnd.timeIntervalSince(iterationStreamStart)
             let iterUsage = streamResult.turnUsage
@@ -6298,6 +6439,27 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     turnUsage = TokenUsage()
                     continue
                 }
+                // [T-deep-mode-cognitive-p1] C8: Uncertainty check for no-tool-call
+                // turns — if the model's output contained uncertainty markers and
+                // this turn had no tool calls (model finished but uncertain), inject
+                // a verification prompt and continue the loop so the model gets a
+                // chance to use web search. Capped at 1 per runAgentLoop via
+                // didInjectUncertaintyCheckThisRun (set above). Total-switch safe:
+                // the flag is only set inside `if deepModeEnabled`.
+                if shouldInjectUncertaintyCheck {
+                    logger.info("[UncertaintyCheck] C8 injecting verification prompt for no-tool-call turn")
+                    let verifyMsg = AgentMessage(role: .user, parts: [
+                        .text("<system-reminder>深度模式联网查证（C8）：检测到你在上一条回复中使用了不确定表述（如\"不确定\"、\"可能\"、\"大概\"等）。请使用联网工具（如 web_search 或 browser）查证相关不确定信息，确认后再给出确定结论。如果经查证后确认无法确定，请说明原因。</system-reminder>")
+                    ])
+                    let ci = agentHistory.count
+                    agentHistory.append(verifyMsg)
+                    if let pid = await persistAgentMessage(verifyMsg), ci < agentHistory.count {
+                        agentHistory[ci].dbMessageId = pid
+                    }
+                    canResume = false
+                    turnUsage = TokenUsage()
+                    continue
+                }
                 break
             }
 
@@ -6447,6 +6609,35 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
 
             // Add tool results as a user message
+            // [T-deep-mode-cognitive-p1] C6: Heartbeat self-check — every 5th
+            // tool-bearing iteration, append a self-check reminder to the tool
+            // result message so the model pauses to verify goal alignment. The
+            // injection is a text part appended to toolResultParts, so it rides
+            // alongside the tool results and the model sees it on its next turn.
+            // Guarded by deepModeEnabled: when the master switch is off, the
+            // counter is never incremented and no injection occurs — zero
+            // behavioral residue. The counter is per-loop (local variable), so
+            // it is never persisted and resets on every new runAgentLoop call.
+            if deepModeEnabled {
+                heartbeatToolCallCount += 1
+                if heartbeatToolCallCount % 5 == 0 {
+                    toolResultParts.append(.text(
+                        "<system-reminder>深度模式心跳自检（C6）：已完成 \(heartbeatToolCallCount) 次工具调用。请自检：原始目标是什么？当前第几步？当前动作是否服务于原始目标？有没有承诺要做但忘了的事？如有偏离，请调整方向。</system-reminder>"
+                    ))
+                    logger.info("[Heartbeat] C6 self-check injected at toolCallCount=\(heartbeatToolCallCount)")
+                }
+            }
+            // [T-deep-mode-cognitive-p1] C8: Uncertainty check — if the model's
+            // output contained uncertainty markers this turn, append a verification
+            // prompt to the tool result message so the model sees it on its next
+            // turn and uses web search to verify. The flag was set above after
+            // assistantText was resolved. Only fires once per runAgentLoop.
+            if shouldInjectUncertaintyCheck {
+                toolResultParts.append(.text(
+                    "<system-reminder>深度模式联网查证（C8）：检测到你在上一条回复中使用了不确定表述（如\"不确定\"、\"可能\"、\"大概\"等）。请使用联网工具（如 web_search 或 browser）查证相关不确定信息，确认后再给出确定结论。如果经查证后确认无法确定，请说明原因。</system-reminder>"
+                ))
+                logger.info("[UncertaintyCheck] C8 verification prompt appended to tool results")
+            }
             let toolResultMessage = AgentMessage(role: .user, parts: toolResultParts)
             logger.info("Appending tool result message with \(toolResultParts.count) part(s) to agentHistory (now \(self.agentHistory.count + 1) messages)")
             let toolResultAgentIdx = agentHistory.count
