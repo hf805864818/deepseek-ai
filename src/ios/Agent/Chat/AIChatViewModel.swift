@@ -1324,6 +1324,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         retrospectiveHasRun = false
         isRetrospectiveRunning = false
         didInjectUncertaintyCheckThisRun = false
+        // [T-phase5] Cancel and clear all active subagent sessions.
+        // Ensures no subagent processes are left running when the master
+        // switch is turned off. Total-switch safe: all UI is guarded by
+        // deepModeEnabled, so the cleared array won't render.
+        for subagent in activeSubagents {
+            subagent.cancel()
+        }
+        activeSubagents.removeAll()
     }
 
     /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
@@ -2382,7 +2390,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         return _cachedTimeString
     }
 
-    private var baseSystemPrompt: String {
+    // [T-phase5] Changed from private to internal so the task_dispatch
+    // tool execution (in AIChatViewModel+ConcurrentTools.swift) can
+    // access it when initializing subagent sessions.
+    var baseSystemPrompt: String {
         // [T-soul-md] Layer 1 is rendered by SystemPromptBuilder, which
         // owns the "You are <name>, a capable AI assistant running on an
         // iOS device ..." identity sentence (parametric on SOUL.md's
@@ -2771,6 +2782,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// safe: only set inside maybeRunRetrospective(), which is guarded by
     /// `guard deepModeEnabled`.
     private var isRetrospectiveRunning = false
+
+    // [T-phase5] Subagent orchestration: active subagent sessions.
+    // `task_dispatch` creates a SubagentSession and appends it here.
+    // When the subagent finishes, it's removed. Total-switch safe:
+    //   - task_dispatch tool is only registered when deepModeEnabled
+    //   - deepModeDidDisableCleanup() cancels and clears all sessions
+    //   - UI rendering is guarded by `if deepModeEnabled`
+    @Published var activeSubagents: [SubagentSession] = []
 
     /// [T-deep-mode-cognitive-p1] C8: Detect uncertainty markers in the model's
     /// output text. Returns true if any uncertainty marker is found. Pure

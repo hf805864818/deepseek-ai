@@ -613,6 +613,16 @@ struct AIChatView: View {
                                 }
                         }
                         VStack(spacing: 0) {
+                            // [T-phase5] Subagent status cards — only shown
+                            // when deep mode is on and there are active
+                            // subagent sessions. Total-switch safe: when
+                            // the master switch is off, activeSubagents is
+                            // cleared, so this view is EmptyView.
+                            if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
+                                SubagentCardStack(subagents: vm.activeSubagents)
+                                    .padding(.vertical, 4)
+                                    .transition(.opacity)
+                            }
                             floatingToolPreview
                                 .shadow(color: Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0, alpha: 0.25) : UIColor(white: 0, alpha: 0) }), radius: 6, x: 0, y: 4)
                             #if DEBUG

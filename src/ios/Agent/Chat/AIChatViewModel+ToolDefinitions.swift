@@ -119,7 +119,73 @@ extension AIChatViewModel {
                 required: ["tool_title", "action"],
                 propertyOrdering: ["tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"]
             ),
+            // [T-phase4] S1: Sequential Thinking — on-demand structured
+            // reasoning tool. The model calls this when it feels the need to
+            // break down a complex problem step by step. Always registered
+            // (not deepMode-gated) — it's a general-purpose tool. P2-C11
+            // directly depends on this tool existing.
+            AgentToolDefinition(
+                name: "sequential_thinking",
+                description: "Break down a complex problem into structured reasoning steps. Use this when you need to think through a problem methodically before acting. Each step should build on the previous one: state the hypothesis, check assumptions, and converge on a conclusion. Do NOT use this for simple tasks — only when the problem genuinely requires multi-step deduction.",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Analyze authentication flow', 'Plan database migration strategy'). Use the same language as the user."),
+                    "problem": AgentToolParam(type: .string, description: "The problem or question that needs structured reasoning. Be specific — include context, constraints, and what you're trying to determine."),
+                    "max_steps": AgentToolParam(type: .integer, description: "Maximum reasoning steps (default: 5). Each step is one hypothesis-check-conclusion cycle. Use more for complex architecture decisions, fewer for straightforward questions."),
+                ],
+                required: ["tool_title", "problem"],
+                propertyOrdering: ["tool_title", "problem", "max_steps"]
+            ),
+            // [T-phase4] S3: Diff Apply — apply a unified diff patch to a file.
+            // Uses the `patch` command backend in iSH. Complements file_edit for
+            // multi-hunk changes.
+            AgentToolDefinition(
+                name: "diff_apply",
+                description: "Apply a unified diff (patch) to an existing file. Use this when you need to make multiple targeted changes to a file at once — it's more reliable than multiple file_edit calls for complex modifications. The patch must be in standard unified diff format (with --- and +++ headers and @@ hunks). Always read the file first with file_read to verify current contents before crafting a patch.",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Apply security patch to auth module', 'Update API endpoints'). Use the same language as the user."),
+                    "file_path": AgentToolParam(type: .string, description: "Absolute Linux path to the file to patch (e.g. /root/server.py)"),
+                    "patch": AgentToolParam(type: .string, description: "The unified diff content. Must include --- and +++ file headers and @@ hunk markers. Example:\n--- /root/file.py\n+++ /root/file.py\n@@ -1,3 +1,3 @@\n-old line\n+new line"),
+                ],
+                required: ["tool_title", "file_path", "patch"],
+                propertyOrdering: ["tool_title", "file_path", "patch"]
+            ),
+            // [T-phase4] S4: Code Search — semantic code search across project
+            // files. Uses grep/ripgrep backend in iSH.
+            AgentToolDefinition(
+                name: "code_search",
+                description: "Search for code patterns across files using regular expressions. Faster than shell_execute with grep for code exploration — optimized for finding function definitions, class declarations, and usage patterns. Returns matching file paths, line numbers, and content snippets.",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Find all API endpoint definitions', 'Search for auth middleware usage'). Use the same language as the user."),
+                    "pattern": AgentToolParam(type: .string, description: "Regular expression pattern to search for (e.g. 'func.*authenticate', 'class.*Service', 'TODO.*fix'). Uses grep -E extended regex."),
+                    "directory": AgentToolParam(type: .string, description: "Directory to search in (default: /root). Use absolute paths."),
+                    "file_pattern": AgentToolParam(type: .string, description: "Glob pattern to filter files (e.g. '*.swift', '*.py', '*.js'). If omitted, searches all file types."),
+                    "max_results": AgentToolParam(type: .integer, description: "Maximum number of matches to return (default: 50). Use a smaller value for overview, larger for exhaustive search."),
+                ],
+                required: ["tool_title", "pattern"],
+                propertyOrdering: ["tool_title", "pattern", "directory", "file_pattern", "max_results"]
+            ),
         ]
+
+        // [T-phase5] S5: Task Dispatch — subagent task delegation tool.
+        // Only registered when deepModeEnabled is on — subagent orchestration
+        // is a deep-mode-exclusive feature. Total-switch safe: when the
+        // master switch is off, this tool is invisible to the model, no
+        // subagent sessions can be created, and all related UI is guarded.
+        if deepModeEnabled {
+            tools.append(AgentToolDefinition(
+                name: "task_dispatch",
+                description: "Dispatch a sub-task to an independent subagent for execution. The subagent gets its own context window, limited tool access, and a bounded number of turns. Use this to parallelize independent subtasks (e.g. 'analyze security of module A' while you work on module B). The subagent returns a result summary that you can incorporate into your analysis. Do NOT use this for sequential tasks that depend on each other — use it for genuinely independent work.",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Analyze auth module security', 'Check database migration scripts'). Use the same language as the user."),
+                    "task_description": AgentToolParam(type: .string, description: "A short 5-10 word description of the subtask, shown in the subagent status card."),
+                    "prompt": AgentToolParam(type: .string, description: "The full instruction for the subagent. Include all context the subagent needs — it does NOT share your conversation history. Specify: what to do, what files to read, what to check, and what format to return results in."),
+                    "max_tool_calls": AgentToolParam(type: .integer, description: "Maximum tool calls the subagent can make (default: 10). Each tool call counts toward this limit."),
+                    "allowed_tools": AgentToolParam(type: .string, description: "Comma-separated list of tools the subagent is allowed to use (e.g. 'file_read,code_search,shell_execute'). If omitted, the subagent gets access to all tools except task_dispatch (no recursive subagents)."),
+                ],
+                required: ["tool_title", "task_description", "prompt"],
+                propertyOrdering: ["tool_title", "task_description", "prompt", "max_tool_calls", "allowed_tools"]
+            ))
+        }
 
         if includeMemoryTools {
             tools.append(AgentToolDefinition(

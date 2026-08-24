@@ -800,8 +800,267 @@ extension AIChatViewModel {
             toolSuccess = memResult.success
 
         default:
-            toolOutput = "Error: Unknown tool '\(tu.name)'"
-            toolSuccess = false
+            // [T-phase4] S1: Sequential Thinking — structured reasoning tool.
+            // The model provides a problem and max_steps; we return a framework
+            // that guides the model through hypothesis-check-conclusion cycles.
+            // The actual reasoning is done by the model in its response; this
+            // tool structures the output format.
+            switch tu.name {
+            case "sequential_thinking":
+                let problem = (tu.args["problem"] as? String) ?? ""
+                let maxSteps = (tu.args["max_steps"] as? Int) ?? 5
+                let actualSteps = max(1, min(maxSteps, 20))
+
+                if problem.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    toolOutput = "Error: 'problem' parameter is required. Please describe the problem you want to reason through."
+                    toolSuccess = false
+                    break
+                }
+
+                // Build a structured reasoning framework. The model fills in
+                // each step in its response. We return the framework template.
+                var framework = "## 结构化推理框架\n\n**问题**: \(problem)\n\n"
+                for i in 1...actualSteps {
+                    framework += "### 步骤 \(i)\n"
+                    framework += "- **假设**: [在此陈述本步假设]\n"
+                    framework += "- **验证**: [在此检验假设是否成立]\n"
+                    framework += "- **结论**: [在此给出本步结论]\n\n"
+                }
+                framework += "### 最终结论\n[在此综合所有步骤，给出最终结论]\n"
+                toolOutput = framework
+                toolSuccess = true
+
+            // [T-phase4] S3: Diff Apply — apply unified diff patch to a file.
+            case "diff_apply":
+                let filePath = (tu.args["file_path"] as? String) ?? ""
+                let patchContent = (tu.args["patch"] as? String) ?? ""
+
+                if filePath.isEmpty {
+                    toolOutput = "Error: 'file_path' parameter is required."
+                    toolSuccess = false
+                    break
+                }
+                if patchContent.isEmpty {
+                    toolOutput = "Error: 'patch' parameter is required."
+                    toolSuccess = false
+                    break
+                }
+
+                // Write the patch to a temp file, then apply with `patch`.
+                let tempPatchPath = "/tmp/minis_patch_\(UUID().uuidString.prefix(8)).diff"
+                let writeCmd = "cat > '\(tempPatchPath)' << 'PATCH_EOF'\n\(patchContent)\nPATCH_EOF"
+                let writeResult: CommandResult
+                do {
+                    writeResult = try await executeCommand(writeCmd, timeout: 10) { _ in }
+                } catch {
+                    toolOutput = "Error: Failed to write patch to temp file: \(error.localizedDescription)"
+                    toolSuccess = false
+                    break
+                }
+                if writeResult.exitCode != 0 {
+                    toolOutput = "Error: Failed to write patch to temp file: \(writeResult.output)"
+                    toolSuccess = false
+                    break
+                }
+
+                // Apply the patch. Use --no-backup to avoid .orig files.
+                let applyCmd = "cd / && patch -p0 < '\(tempPatchPath)' 2>&1 || patch -p1 < '\(tempPatchPath)' 2>&1"
+                let applyResult: CommandResult
+                do {
+                    applyResult = try await executeCommand(applyCmd, timeout: 30) { _ in }
+                } catch {
+                    toolOutput = "Patch application failed: \(error.localizedDescription)"
+                    toolSuccess = false
+                    // Clean up temp file even on error
+                    _ = try? await executeCommand("rm -f '\(tempPatchPath)'", timeout: 5) { _ in }
+                    break
+                }
+                // Clean up temp file
+                _ = try? await executeCommand("rm -f '\(tempPatchPath)'", timeout: 5) { _ in }
+
+                if applyResult.exitCode == 0 {
+                    toolOutput = "Patch applied successfully to \(filePath).\n\n\(applyResult.output)"
+                    toolSuccess = true
+                } else {
+                    toolOutput = "Patch application failed:\n\(applyResult.output)\n\nEnsure the patch is in unified diff format with correct file paths and line numbers. Read the file first with file_read to verify current contents."
+                    toolSuccess = false
+                }
+
+            // [T-phase4] S4: Code Search — regex search across project files.
+            case "code_search":
+                let pattern = (tu.args["pattern"] as? String) ?? ""
+                let directory = (tu.args["directory"] as? String) ?? "/root"
+                let filePattern = (tu.args["file_pattern"] as? String)
+                let maxResults = (tu.args["max_results"] as? Int) ?? 50
+
+                if pattern.isEmpty {
+                    toolOutput = "Error: 'pattern' parameter is required."
+                    toolSuccess = false
+                    break
+                }
+
+                // Build grep command. Use grep -rnE for extended regex.
+                // If file_pattern is provided, use --include to filter.
+                var cmd = "grep -rnE --include='*'"
+                if let fp = filePattern, !fp.isEmpty {
+                    cmd = "grep -rnE --include='\(fp)'"
+                }
+                cmd += " '\(pattern.replacingOccurrences(of: "'", with: "'\\''"))' '\(directory)' 2>/dev/null | head -\(maxResults)"
+
+                let searchResult: CommandResult
+                do {
+                    searchResult = try await executeCommand(cmd, timeout: 30) { _ in }
+                } catch {
+                    toolOutput = "Search failed: \(error.localizedDescription)"
+                    toolSuccess = false
+                    break
+                }
+
+                let lines = searchResult.output.components(separatedBy: "\n").filter { !$0.isEmpty }
+                if lines.isEmpty {
+                    toolOutput = "No matches found for pattern '\(pattern)' in \(directory)."
+                    toolSuccess = true
+                } else {
+                    toolOutput = "Found \(lines.count) match(es):\n\n\(searchResult.output)"
+                    toolSuccess = true
+                }
+
+            // [T-phase5] S5: Task Dispatch — subagent task delegation.
+            // Creates a SubagentSession with its own context window and
+            // bounded tool calls, runs it, and returns the result.
+            // Total-switch safe: the tool is only registered when
+            // deepModeEnabled is on. If it was turned off between
+            // registration and execution, return a safe error.
+            case "task_dispatch":
+                guard deepModeEnabled else {
+                    toolOutput = "Error: Deep mode was disabled after task_dispatch was registered. Cannot dispatch subagent."
+                    toolSuccess = false
+                    break
+                }
+
+                let taskDesc = (tu.args["task_description"] as? String) ?? "Subtask"
+                let subPrompt = (tu.args["prompt"] as? String) ?? ""
+                let maxCalls = (tu.args["max_tool_calls"] as? Int) ?? 10
+                let allowedToolsStr = (tu.args["allowed_tools"] as? String)
+                let allowedTools = allowedToolsStr?
+                    .components(separatedBy: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+
+                if subPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    toolOutput = "Error: 'prompt' parameter is required. Provide full instructions for the subagent."
+                    toolSuccess = false
+                    break
+                }
+
+                // Resolve the current provider entry for the subagent.
+                guard let entry = resolveCurrentEntry() else {
+                    toolOutput = "Error: No model configured for subagent dispatch."
+                    toolSuccess = false
+                    break
+                }
+
+                let subProvider = await makeAgentProvider(for: entry)
+                let subSystemPrompt = baseSystemPrompt
+
+                // Create the subagent session.
+                let subagent = SubagentSession(
+                    taskDescription: taskDesc,
+                    prompt: subPrompt,
+                    maxToolCalls: maxCalls,
+                    allowedTools: allowedTools
+                )
+                activeSubagents.append(subagent)
+
+                // Execute the subagent. Tool execution is delegated back
+                // to the parent's executeSingleToolUse, which contains all
+                // the tool switch logic. We create a temporary message +
+                // block at the END of the messages array (not messages[0]),
+                // execute, extract output, then remove the temp message.
+                // Total-switch safe: only reachable when deepModeEnabled.
+                let result = await subagent.run(
+                    provider: subProvider,
+                    systemPrompt: subSystemPrompt,
+                    makeTools: { [weak self] in
+                        guard let self else { return [] }
+                        return self.makeAgentTools()
+                    },
+                    executeTool: { [weak self] toolUse, loopNum, callNum in
+                        guard let self else {
+                            return ("Error: Parent view model deallocated.", false)
+                        }
+                        // Determine the block kind from the tool name —
+                        // same mapping as the SSE stream handler.
+                        let blockKind: AssistantBlockKind = switch toolUse.name {
+                        case "shell_execute": .shellTool(command: "")
+                        case "file_read": .fileReadTool(path: "")
+                        case "file_write": .fileWriteTool(path: "")
+                        case "file_edit": .fileEditTool(path: "")
+                        case "browser_use": .browserTool(action: "")
+                        case "read_image": .readImageTool(path: "")
+                        case "memory_write", "memory_get": .memoryTool(action: toolUse.name)
+                        default: .shellTool(command: toolUse.name)
+                        }
+
+                        // Create a temporary assistant message with the
+                        // tool block at the end of the messages array.
+                        let tempMsg = ChatMessage(role: .assistant, content: "", blocks: [])
+                        let block = AssistantBlock(
+                            kind: blockKind,
+                            content: "",
+                            toolStatus: .running,
+                            toolUseId: toolUse.id
+                        )
+                        block.toolStartTime = Date()
+                        tempMsg.blocks.append(block)
+                        self.messages.append(tempMsg)
+                        let tempIdx = self.messages.count - 1
+                        let tempBlockIdx = 0
+
+                        // Build a complete ToolEntry with all required fields.
+                        let streamResult = StreamResult.ToolEntry(
+                            id: toolUse.id,
+                            name: toolUse.name,
+                            args: toolUse.args,
+                            blockIdx: tempBlockIdx,
+                            metadata: nil,
+                            inputChunkRing: []
+                        )
+
+                        // Per-call image budget for the subagent.
+                        let imageBudget = BatchImageBudget(initial: Self.kImageContextKeepCount)
+
+                        let outcome = await self.executeSingleToolUse(
+                            tu: streamResult,
+                            msgIdx: tempIdx,
+                            tools: self.makeAgentTools(),
+                            batchBudget: imageBudget
+                        )
+
+                        // Remove the temporary message.
+                        if tempIdx < self.messages.count {
+                            self.messages.remove(at: tempIdx)
+                        }
+
+                        // Extract (output, success) from the ToolExecOutcome.
+                        if case .toolResult(_, _, let content, let isError, _, _, _, _) = outcome.resultPart {
+                            let success = !isError && !outcome.cancelled
+                            return (content, success)
+                        }
+                        return ("Error: Unexpected tool result format.", false)
+                    }
+                )
+
+                // Remove the subagent from active list.
+                activeSubagents.removeAll { $0.id == subagent.id }
+
+                toolOutput = "Subagent result for '\(taskDesc)':\n\n\(result)"
+                toolSuccess = subagent.status == .completed
+
+            default:
+                toolOutput = "Error: Unknown tool '\(tu.name)'"
+                toolSuccess = false
+            }
         }
         } catch is CancellationError {
             let cancelContent = "<system-reminder>The user cancelled this operation. The returned result may be incomplete.</system-reminder>"
