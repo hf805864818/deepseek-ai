@@ -1152,7 +1152,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     ///   • `failed` → re-enter `.executing` so the model can fix the issues.
     ///   • no sentinel / unknown → treat as passed (fail-safe: don't block).
     private func maybeProcessVerifyResult(afterMsgIdx msgIdx: Int) async {
-        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? pendingVerifySentinel!.description : "nil")")
+        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? String(describing: pendingVerifySentinel!) : "nil")")
         guard deepModeEnabled else { return }
         guard workflowPhase == .verifying else { return }
         guard messages.indices.contains(msgIdx) else { return }
@@ -2522,7 +2522,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             "txt", "cfg", "ini", "toml", "env"
         ]
         return extensions.compactMap { ext -> NSRegularExpression? in
-            try? NSRegularExpression(pattern: "[\w\-.]+\.\(ext)\b", options: [.caseInsensitive])
+            try? NSRegularExpression(pattern: "[\\w\\-.]+\\.\(ext)\\b", options: [.caseInsensitive])
         }
     }()
 
