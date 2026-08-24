@@ -214,34 +214,81 @@ object UpdateChecker {
         val url = "https://api.github.com/repos/$OWNER/$REPO/releases?per_page=30"
         AppLogger.info(TAG, "GET $url (local=${BuildConfig.VERSION_NAME})")
         try {
+            // 先直连官方 API；若网络不通（403/超时/连接失败）再自动切镜像重试。
+            // 镜像 URL 已由 GitHubMirrorManager 解析为完整代理地址。
+            when (val direct = executeReleases(url)) {
+                ReleaseResponse.Success(body) -> return@withContext processReleaseResponse(body)
+                ReleaseResponse.Error(code, _) -> {
+                    // 404=无 release；403/451=被墙或限流，此时尝试镜像再判断
+                    if (code == 404) return@withContext CheckResult.NoReleaseAvailable
+                    if (code == 403 || code == 451) {
+                        val mirrored = GitHubMirrorManager.mirrorUrl(url)
+                        when (val m = executeReleases(mirrored)) {
+                            is ReleaseResponse.Success -> return@withContext processReleaseResponse(m.body)
+                            else -> return@withContext CheckResult.Forbidden
+                        }
+                    }
+                    AppLogger.info(TAG, "直接访问失败(code=$code)，切换镜像重试")
+                    val mirrored = GitHubMirrorManager.mirrorUrl(url)
+                    when (val m = executeReleases(mirrored)) {
+                        is ReleaseResponse.Success -> return@withContext processReleaseResponse(m.body)
+                        ReleaseResponse.Error(404, _) -> return@withContext CheckResult.NoReleaseAvailable
+                        else -> return@withContext CheckResult.NetworkUnreachable
+                    }
+                }
+                ReleaseResponse.NetworkError -> {
+                    AppLogger.info(TAG, "直连网络错误，切换镜像重试")
+                    val mirrored = GitHubMirrorManager.mirrorUrl(url)
+                    when (val m = executeReleases(mirrored)) {
+                        is ReleaseResponse.Success -> return@withContext processReleaseResponse(m.body)
+                        ReleaseResponse.Error(404, _) -> return@withContext CheckResult.NoReleaseAvailable
+                        ReleaseResponse.Error(code, _) -> CheckResult.Error("GitHub API $code")
+                        else -> return@withContext CheckResult.NetworkUnreachable
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.warning(TAG, "check() 异常", e)
+            return@withContext CheckResult.NetworkUnreachable
+        }
+    }
+
+    private sealed class ReleaseResponse {
+        data class Success(val body: String) : ReleaseResponse()
+        data class Error(val code: Int, val message: String) : ReleaseResponse()
+        object NetworkError : ReleaseResponse()
+    }
+
+    /** 执行一次 releases 请求并分类结果。 */
+    private fun executeReleases(targetUrl: String): ReleaseResponse {
+        return try {
             val req = Request.Builder()
-                .url(url)
+                .url(targetUrl)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "MinisApp/1.0")
                 .build()
             client.newCall(req).execute().use { resp ->
-                AppLogger.info(TAG, "HTTP ${resp.code}")
-                if (resp.code == 404) {
-                    return@withContext CheckResult.NoReleaseAvailable
+                if (resp.isSuccessful) {
+                    ReleaseResponse.Success(resp.body?.string() ?: "")
+                } else {
+                    ReleaseResponse.Error(resp.code, "HTTP ${resp.code}")
                 }
-                // 403 = rate-limit or geo-blocked. 451 = legal block. Both
-                // map to the same "open Releases in browser" hint — there's
-                // nothing the app can do client-side.
-                if (resp.code == 403 || resp.code == 451) {
-                    AppLogger.warning(TAG, "GitHub API ${resp.code} — geo-block or rate-limit")
-                    return@withContext CheckResult.Forbidden
-                }
-                if (!resp.isSuccessful) {
-                    val msg = "GitHub API ${resp.code}"
-                    AppLogger.warning(TAG, msg)
-                    return@withContext CheckResult.Error(msg)
-                }
-                val body = resp.body?.string() ?: return@withContext CheckResult.Error("empty body")
-                val arr = runCatching { JSONArray(body) }.getOrNull()
-                if (arr == null || arr.length() == 0) {
-                    AppLogger.info(TAG, "releases list empty")
-                    return@withContext CheckResult.NoReleaseAvailable
-                }
+            }
+        } catch (e: Exception) {
+            AppLogger.warning(TAG, "releases 请求失败: $targetUrl → ${e.message}")
+            ReleaseResponse.NetworkError
+        }
+    }
+
+    /** 解析已成功取得的 releases JSON body；若不是数组或为空则视为无 release。 */
+    private suspend fun processReleaseResponse(body: String): CheckResult = withContext(Dispatchers.IO) {
+        try {
+            val arr = runCatching { JSONArray(body) }.getOrNull()
+            if (arr == null || arr.length() == 0) {
+                AppLogger.info(TAG, "releases list empty")
+                return@withContext CheckResult.NoReleaseAvailable
+            }
 
                 // Build a list of non-draft releases. GitHub already returns
                 // them sorted by created_at desc, but we re-sort by parsed
@@ -343,27 +390,25 @@ object UpdateChecker {
 
                 AppLogger.info(TAG, "Up to date: local=$localVer highest=${highest.versionName}")
                 CheckResult.UpToDate
+            } catch (e: UnknownHostException) {
+                AppLogger.error(TAG, "check failed: UnknownHostException: ${e.message}")
+                CheckResult.NetworkUnreachable
+            } catch (e: ConnectException) {
+                AppLogger.error(TAG, "check failed: ConnectException: ${e.message}")
+                CheckResult.NetworkUnreachable
+            } catch (e: SocketTimeoutException) {
+                AppLogger.error(TAG, "check failed: SocketTimeoutException: ${e.message}")
+                CheckResult.NetworkUnreachable
+            } catch (e: IOException) {
+                // Catch-all for okhttp connection plumbing (e.g.
+                // "failed to connect", SSL handshake errors).
+                AppLogger.error(TAG, "check failed: ${e.javaClass.simpleName}: ${e.message}")
+                CheckResult.NetworkUnreachable
+            } catch (e: Exception) {
+                AppLogger.error(TAG, "check failed: ${e.javaClass.simpleName}: ${e.message}")
+                CheckResult.Error(e.message ?: e.javaClass.simpleName)
             }
-        } catch (e: UnknownHostException) {
-            AppLogger.error(TAG, "check failed: UnknownHostException: ${e.message}")
-            CheckResult.NetworkUnreachable
-        } catch (e: ConnectException) {
-            AppLogger.error(TAG, "check failed: ConnectException: ${e.message}")
-            CheckResult.NetworkUnreachable
-        } catch (e: SocketTimeoutException) {
-            AppLogger.error(TAG, "check failed: SocketTimeoutException: ${e.message}")
-            CheckResult.NetworkUnreachable
-        } catch (e: IOException) {
-            // Catch-all for okhttp connection plumbing (e.g.
-            // "failed to connect", SSL handshake errors). Most of these in
-            // the CN-no-VPN scenario are effectively "can't reach github".
-            AppLogger.error(TAG, "check failed: ${e.javaClass.simpleName}: ${e.message}")
-            CheckResult.NetworkUnreachable
-        } catch (e: Exception) {
-            AppLogger.error(TAG, "check failed: ${e.javaClass.simpleName}: ${e.message}")
-            CheckResult.Error(e.message ?: e.javaClass.simpleName)
         }
-    }
 
     /** Public so UI can deep-link users to manual download when GitHub is blocked. */
     const val RELEASES_URL: String = "https://github.com/vbox-Ai/Lobster-APP/releases"
@@ -429,11 +474,64 @@ object UpdateChecker {
             if (outFile.exists()) outFile.delete()
 
             val req = Request.Builder().url(url).build()
-            client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    return@withContext DownloadResult.Error("HTTP ${resp.code}")
+            val firstOk = downloadToFile(req, outFile, onProgress)
+            if (!firstOk) {
+                // 直连下载失败（被墙/超时），改用镜像重试一次。
+                val mirrored = GitHubMirrorManager.mirrorUrl(url)
+                if (mirrored != url) {
+                    AppLogger.info(TAG, "直连下载失败，切换镜像: $mirrored")
+                    val req2 = Request.Builder().url(mirrored)
+                        .header("User-Agent", "MinisApp/1.0").build()
+                    if (downloadToFile(req2, outFile, onProgress)) {
+                        return@withContext afterDownload(context, outFile, versionName)
+                    }
                 }
-                val body = resp.body ?: return@withContext DownloadResult.Error("empty body")
+                return@withContext DownloadResult.Error("download failed (direct & mirror)")
+            }
+            return@withContext afterDownload(context, outFile, versionName)
+        } catch (e: Exception) {
+            AppLogger.error(TAG, "download failed: ${e.javaClass.simpleName}: ${e.message}")
+            DownloadResult.Error(e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    /** 下载文件成功后的收尾：计算 sha256 并写入 pending 记录，返回成功结果。 */
+    private fun afterDownload(
+        context: Context,
+        outFile: File,
+        versionName: String?,
+    ): DownloadResult {
+        AppLogger.info(TAG, "Downloaded ${outFile.length()} bytes to ${outFile.absolutePath}")
+        // Persist so a subsequent Activity recreate can resume the install
+        // without re-downloading. sha256 best-effort.
+        val sha = runCatching { PendingUpdateStore.sha256(outFile) }
+            .onFailure { AppLogger.warning(TAG, "sha256 compute failed: ${it.message}") }
+            .getOrNull()
+        if (versionName != null) {
+            PendingUpdateStore.setPending(
+                context,
+                PendingUpdateStore.PendingUpdate(
+                    targetVersionName = versionName,
+                    apkPath = outFile.absolutePath,
+                    apkSize = outFile.length(),
+                    sha256 = sha,
+                    downloadedAtMs = System.currentTimeMillis(),
+                ),
+            )
+        }
+        return DownloadResult.Success(outFile)
+    }
+
+    /** 将 [req] 的响应体流式写入 [outFile]，同步进度；成功返回 true。 */
+    private fun downloadToFile(
+        req: Request,
+        outFile: File,
+        onProgress: (Float) -> Unit,
+    ): Boolean {
+        return try {
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@downloadToFile false
+                val body = resp.body ?: return@downloadToFile false
                 val total = body.contentLength().takeIf { it > 0 } ?: -1L
                 body.byteStream().use { input ->
                     outFile.outputStream().use { output ->
@@ -455,30 +553,10 @@ object UpdateChecker {
                     }
                 }
             }
-            AppLogger.info(TAG, "Downloaded ${outFile.length()} bytes to ${outFile.absolutePath}")
-            // Persist so a subsequent Activity recreate (e.g. after the user
-            // returns from "install unknown apps" settings) can resume the
-            // install without re-downloading. sha256 computed best-effort;
-            // verify() falls back to size-only when null.
-            val sha = runCatching { PendingUpdateStore.sha256(outFile) }
-                .onFailure { AppLogger.warning(TAG, "sha256 compute failed: ${it.message}") }
-                .getOrNull()
-            if (versionName != null) {
-                PendingUpdateStore.setPending(
-                    context,
-                    PendingUpdateStore.PendingUpdate(
-                        targetVersionName = versionName,
-                        apkPath = outFile.absolutePath,
-                        apkSize = outFile.length(),
-                        sha256 = sha,
-                        downloadedAtMs = System.currentTimeMillis(),
-                    ),
-                )
-            }
-            DownloadResult.Success(outFile)
+            true
         } catch (e: Exception) {
-            AppLogger.error(TAG, "download failed: ${e.javaClass.simpleName}: ${e.message}")
-            DownloadResult.Error(e.message ?: e.javaClass.simpleName)
+            AppLogger.error(TAG, "downloadToFile failed: ${e.message}")
+            false
         }
     }
 

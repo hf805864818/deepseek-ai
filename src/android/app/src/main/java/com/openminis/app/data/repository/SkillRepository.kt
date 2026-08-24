@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
 import android.util.Log
+import com.openminis.app.data.GitHubMirrorManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -979,6 +980,27 @@ class SkillRepository(private val context: Context) {
      * reason is recorded into [outcome] so the UI can surface it.
      */
     private suspend fun fetchContentsWithRetry(apiURL: String, outcome: AggregateOutcome): String? {
+        // 依次尝试直连、镜像（各最多 2 次重试）。镜像对 api.github.com 有效，可绕过被墙/限流。
+        val candidates = buildList {
+            add(apiURL)
+            GitHubMirrorManager.mirrorUrl(apiURL).takeIf { it != apiURL }?.let { add(it) }
+        }
+        var lastReason: String? = null
+        for (candidate in candidates) {
+            val body = fetchContentsSingle(candidate, outcome) { lastReason = it }
+            if (body != null) return body
+        }
+        Log.w(TAG, "[siblings] all attempts failed: $lastReason")
+        outcome.recordReason(lastReason ?: "GitHub contents API unavailable")
+        return null
+    }
+
+    /** 单个目标 URL 的目录列举请求，带 1 次短时故障重试。返回 body 或 null。 */
+    private suspend fun fetchContentsSingle(
+        apiURL: String,
+        outcome: AggregateOutcome,
+        onReason: (String) -> Unit,
+    ): String? {
         var lastReason: String? = null
         repeat(2) { attempt ->
             try {
@@ -992,34 +1014,46 @@ class SkillRepository(private val context: Context) {
                         val body = resp.body?.string()
                         if (body != null) return body
                         lastReason = "GitHub contents API returned empty body"
+                        onReason(lastReason!!)
                     } else {
                         val isTransient = resp.code == 403 || resp.code == 429 || resp.code in 500..599
-                        // 403 from api.github.com is almost always rate-limit;
-                        // call it out specifically so users know waiting helps.
                         val hint = if (resp.code == 403) " (likely anonymous rate limit — wait an hour or sign in)" else ""
                         lastReason = "GitHub contents API HTTP ${resp.code}$hint for $apiURL"
+                        onReason(lastReason!!)
+                        // 非瞬时错误（如 404 目录不存在）直接放弃，不再重试当前候选
                         if (!isTransient) {
-                            Log.w(TAG, "[siblings] non-retryable ${lastReason}")
-                            outcome.recordReason(lastReason!!)
+                            Log.w(TAG, "[siblings] non-retryable $lastReason")
                             return null
                         }
                     }
                 }
             } catch (e: Exception) {
                 lastReason = "GitHub contents API ${e.javaClass.simpleName}: ${e.message ?: "unknown"} for $apiURL"
+                onReason(lastReason!!)
             }
             if (attempt == 0) {
                 Log.w(TAG, "[siblings] retrying after transient failure: $lastReason")
                 try { delay(1500) } catch (_: Exception) {}
             }
         }
-        Log.w(TAG, "[siblings] both attempts failed: $lastReason")
-        outcome.recordReason(lastReason ?: "GitHub contents API unavailable")
         return null
     }
 
-    /** Same retry policy as [fetchContentsWithRetry], for raw file blobs. */
+    /** Same retry policy as [fetchContentsWithRetry], for raw file blobs (直连失败走镜像)。 */
     private suspend fun fetchBytesWithRetry(url: String): ByteArray? {
+        val candidates = buildList {
+            add(url)
+            GitHubMirrorManager.mirrorUrl(url).takeIf { it != url }?.let { add(it) }
+        }
+        for (target in candidates) {
+            val bytes = fetchBytesSingle(target)
+            if (bytes != null) return bytes
+        }
+        return null
+    }
+
+    /** 单个目标 URL 的 raw 文件下载，带 1 次短时故障重试。 */
+    private suspend fun fetchBytesSingle(url: String): ByteArray? {
         repeat(2) { attempt ->
             try {
                 val req = Request.Builder().url(url).get().build()
