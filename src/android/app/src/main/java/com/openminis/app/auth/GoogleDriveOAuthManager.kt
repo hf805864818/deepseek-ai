@@ -33,11 +33,11 @@ class GoogleDriveOAuthManager(context: Context, instanceId: String) : OAuthManag
     override val authURL = "https://accounts.google.com/o/oauth2/v2/auth"
     override val tokenURL = "https://oauth2.googleapis.com/token"
     override val clientId = "483538693797-hs0c9jrjg9b4s0pcj5hphrv20mrvf3d7.apps.googleusercontent.com"
-    // Desktop app client type — PKCE only, no client_secret.
+    // Desktop app client type — requires client_secret for token exchange.
     // Changed from Android type to Desktop app type to support localhost redirect.
-    // The base OAuthManager.buildTokenParams already skips client_secret
-    // when it is null, so the token exchange request omits it correctly.
-    override val clientSecret: String? = null
+    // The base OAuthManager.buildTokenParams includes client_secret
+    // when it is non-null, which is required for Desktop app clients.
+    override val clientSecret: String? = "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"
     override val callbackPort = 8087
     override val redirectPath = "/oauth2callback"
     override val scopes = "https://www.googleapis.com/auth/drive.file"

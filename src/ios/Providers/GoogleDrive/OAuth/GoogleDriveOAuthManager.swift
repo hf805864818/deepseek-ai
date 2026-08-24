@@ -22,8 +22,8 @@ struct GoogleDriveTokenStorage: Codable {
 
 // MARK: - OAuth Manager
 
-/// Google Drive OAuth manager for iOS (type) OAuth client.
-/// Uses PKCE only — no client secret required.
+/// Google Drive OAuth manager (Desktop app client type).
+/// Uses PKCE + client_secret — required for Desktop app OAuth clients.
 /// Follows the same pattern as GeminiOAuthManager but simplified
 /// for a single-account (singleton) use case.
 @MainActor
@@ -31,14 +31,16 @@ final class GoogleDriveOAuthManager: NSObject, ObservableObject {
 
     static let shared = GoogleDriveOAuthManager()
 
-    // MARK: - OAuth Config (Desktop app client — PKCE only, no client secret)
+    // MARK: - OAuth Config (Desktop app client — requires client_secret)
     // Changed from iOS type to Desktop app type to support localhost redirect.
-    // Desktop app clients allow http://localhost callback URIs natively.
+    // Desktop app clients allow http://localhost callback URIs natively,
+    // but require client_secret for both token exchange and refresh.
 
     private let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
     private let tokenURL = "https://oauth2.googleapis.com/token"
     private let userInfoURL = "https://www.googleapis.com/oauth2/v1/userinfo"
     private let clientID = "483538693797-hs0c9jrjg9b4s0pcj5hphrv20mrvf3d7.apps.googleusercontent.com"
+    private let clientSecret = "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"
     private let callbackPort: UInt16 = 8086
     private var redirectURI: String { "http://localhost:\(callbackPort)/oauth2callback" }
     private let scopes = "https://www.googleapis.com/auth/drive.file"
@@ -128,8 +130,8 @@ final class GoogleDriveOAuthManager: NSObject, ObservableObject {
             throw LLMError.providerError(message: "OAuth state mismatch")
         }
 
-        // 6. Exchange code for token (with PKCE verifier — NO client_secret
-        //    for iOS type OAuth client)
+        // 6. Exchange code for token (with PKCE verifier + client_secret
+        //    for Desktop app type OAuth client)
         let token = try await exchangeCode(result.code, codeVerifier: pkce.verifier)
         saveToken(token)
 
@@ -215,12 +217,13 @@ final class GoogleDriveOAuthManager: NSObject, ObservableObject {
         return (verifier, challenge)
     }
 
-    // MARK: - Token Exchange (NO client_secret — iOS type OAuth client)
+    // MARK: - Token Exchange (Desktop app client — requires client_secret)
 
     private func exchangeCode(_ code: String, codeVerifier: String) async throws -> GoogleDriveTokenStorage {
         let body: [String: String] = [
             "grant_type": "authorization_code",
             "client_id": clientID,
+            "client_secret": clientSecret,
             "code": code,
             "redirect_uri": redirectURI,
             "code_verifier": codeVerifier,
@@ -233,6 +236,7 @@ final class GoogleDriveOAuthManager: NSObject, ObservableObject {
         let body: [String: String] = [
             "grant_type": "refresh_token",
             "client_id": clientID,
+            "client_secret": clientSecret,
             "refresh_token": refreshToken,
         ]
 
