@@ -2829,6 +2829,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Phase 3 evolution: rules are scoped to the current conversation context
     /// (file paths mentioned + user input keywords) rather than always injecting
     /// the full rule set. This reduces token waste and keeps the prompt focused.
+    ///
+    /// [T-ios-orphan-scan-perf] Incremental orphan scan cursor. Tracks how far
+    /// into agentHistory we have already verified tool-use/result pairing.
+    /// On each runAgentLoop entry we only scan from this cursor forward,
+    /// reducing O(n*m) to O(d*m) where d is the number of new messages
+    /// since the last scan. Reset to 0 on resume (partial re-scan needed).
+    var orphanScanCursor = 0
+
     private var deepModeFragment: String {
         // [T-deep-mode-perf-fragment-cache] Cache hit fast-path. The fragment
         // is a pure function of: deep-mode level, memory flag, the scope context
@@ -3459,6 +3467,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
             if remainingUserCount == 0 {
                 agentHistory.removeAll()
+                orphanScanCursor = 0
             } else if keepUpTo + 1 < agentHistory.count {
                 agentHistory.removeSubrange((keepUpTo + 1)...)
             }
@@ -5602,6 +5611,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         let loopSetupStart = CFAbsoluteTimeGetCurrent()
         let t0 = CFAbsoluteTimeGetCurrent()
+        let isResume = existingMsgIdx != nil
 
         // [T-deep-mode-perf] Track individual step timing
         var perfTimings: [String: Double] = [:]
@@ -5794,12 +5804,31 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         dumpHistoryPairing("runAgentLoop-entry (pre-orphan-scan)")
         await Task.yield()
 
-        // Now scan ALL messages for orphaned tool_uses and orphaned tool_results.
-        // Build sets of all tool_use IDs and tool_result IDs.
+        // [T-ios-orphan-scan-perf] Incremental orphan scan: only scan newly
+        // added messages since the last scan, not the entire agentHistory.
+        // The invariant is: once a message pair (tool_use / tool_result) is
+        // verified clean, it stays clean until a FUTURE operation appends
+        // more messages. Scanning the full history is O(n*m) where n is
+        // total messages and m is average parts — unacceptable once the
+        // conversation has 100+ turns.
+        //
+        // We track `orphanScanCursor`: the index in agentHistory up to which
+        // we have already verified pairing. On each runAgentLoop entry we
+        // only scan agentHistory[orphanScanCursor...], then advance the
+        // cursor to agentHistory.count. On resume (partial re-scan), we
+        // reset the cursor to 0 because an interrupted turn may have left
+        // earlier messages in an unknown state.
+        let scanFrom = isResume ? 0 : max(0, orphanScanCursor)
         var allToolUseIds = Set<String>()
         var allToolResultIds = Set<String>()
-        for msg in agentHistory {
-            for part in msg.parts {
+
+        // Phase 1: scan only the dirty suffix for IDs, and the full history
+        // for orphaned results that may have been stranded by a prior cancel.
+        // For tool_results we must scan the full history because a prior
+        // incomplete turn may have left a result whose tool_use is earlier.
+        for msg in scanFrom..<agentHistory.count {
+            let partList = agentHistory[msg].parts
+            for part in partList {
                 if case .toolUse(let id, _, _) = part {
                     allToolUseIds.insert(id)
                 }
@@ -5808,11 +5837,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 }
             }
         }
+        // Also scan the clean prefix to catch any tool_results whose
+        // matching tool_use was added in the same batch (rare edge case).
+        if scanFrom > 0 {
+            for i in 0..<scanFrom {
+                for part in agentHistory[i].parts {
+                    if case .toolResult(let id, _, _, _, _, _, _, _) = part {
+                        allToolResultIds.insert(id)
+                    }
+                }
+            }
+        }
 
         // 1. Remove orphaned tool_results (tool_result without matching tool_use).
         //    These cause API 400: "unexpected tool_use_id found in tool_result blocks".
         var removedOrphanedResults = 0
-        for i in (0..<agentHistory.count).reversed() {
+        // Only scan from scanFrom forward — earlier messages are already clean.
+        for i in (scanFrom..<agentHistory.count).reversed() {
             let msg = agentHistory[i]
             guard msg.role == .user else { continue }
             let beforeCount = msg.parts.count
@@ -5840,10 +5881,19 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
 
         // 2. Inject placeholder tool_results for orphaned tool_uses (tool_use without matching tool_result).
-        // Rebuild allToolResultIds after removals above.
+        // Rebuild allToolResultIds after removals above — only in the scanned range.
         allToolResultIds.removeAll()
-        for msg in agentHistory {
+        for i in scanFrom..<agentHistory.count {
+            let msg = agentHistory[i]
             for part in msg.parts {
+                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
+                    allToolResultIds.insert(id)
+                }
+            }
+        }
+        // Include results from the clean prefix too.
+        for i in 0..<scanFrom {
+            for part in agentHistory[i].parts {
                 if case .toolResult(let id, _, _, _, _, _, _, _) = part {
                     allToolResultIds.insert(id)
                 }
@@ -5851,7 +5901,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
 
         var insertions: [(index: Int, message: AgentMessage)] = []
-        for (i, msg) in agentHistory.enumerated() {
+        for i in scanFrom..<agentHistory.count {
+            let msg = agentHistory[i]
             guard msg.role == .assistant else { continue }
             let orphanedToolUses = msg.parts.compactMap { part -> (String, String)? in
                 if case .toolUse(let id, let name, _) = part, !allToolResultIds.contains(id) {
@@ -5881,7 +5932,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
 
         let orphanScanMs = (CFAbsoluteTimeGetCurrent() - loopSetupStart) * 1000
-        logger.info("⏱️ [runAgentLoop] setup complete elapsed=\(String(format: "%.1f", orphanScanMs))ms (prompt+orphanScan)")
+        // Advance the orphan scan cursor past all messages we've now verified.
+        // On resume we scan from 0 (dirty suffix), then advance to count so
+        // the next normal runAgentLoop starts from here.
+        orphanScanCursor = agentHistory.count
+        logger.info("⏱️ [runAgentLoop] setup complete elapsed=\(String(format: "%.1f", orphanScanMs))ms (prompt+orphanScan) scanFrom=\(scanFrom) cursor=\(orphanScanCursor)")
         await Task.yield()
 
         // Counted instead of `while true` so we have a hard backstop against

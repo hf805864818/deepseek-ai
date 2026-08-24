@@ -68,6 +68,12 @@ private struct SidebarSessionKey: Equatable {
 /// freshly-built set, which misses the memo — same "next ambient refresh"
 /// timing the unmemoized per-member query had). `dayStamp` invalidates the
 /// date buckets when the calendar day flips.
+///
+/// [T-ios-sidebar-memo-perf] Separate lightweight memo for Set-based
+/// invalidation to avoid O(N) Set.== on every high-frequency re-eval:
+/// badge/activity store fires every 5 s, but the SET CONTENT often stays
+/// identical across those ticks. Store the set hashes once computed so the
+/// memo key only carries compact Int values instead of full Set instances.
 private struct SidebarGroupsMemoKey: Equatable {
     let sessions: [SidebarSessionKey]
     let folders: [ChatFolder]
@@ -75,18 +81,15 @@ private struct SidebarGroupsMemoKey: Equatable {
     let pendingDraftId: String?
     let pendingDraftFolderId: String?
     let isSearching: Bool
-    let unreadIds: Set<String>
-    let freshCornerIds: Set<String>
-    let activeIds: Set<String>
+    let unreadIdsHash: Int          // hash of unreadSessionIds
+    let freshCornerIdsHash: Int     // hash of freshCornerBadgeSessionIds
+    let activeIdsHash: Int          // hash of resolvedActiveSessionIds
     let dayStamp: Date
 }
 
-/// Reference-type memo box held in @State: mutating its contents during a
-/// body evaluation is legal (no observed value changes, so no re-entrant
-/// invalidation), and identity survives ContentView struct re-inits. A memo
-/// hit returns the SAME [SidebarGroup] array instance, so the downstream
-/// ForEach diff takes the identical-storage fast path instead of comparing
-/// element-wise.
+/// [T-ios-sidebar-memo-perf] Separate memo for Set-hash validity. When the
+/// three set hashes are all equal we short-circuit and return the cached
+/// groups without even comparing sessions/folders/collapsed.
 private final class SidebarGroupsMemo {
     var key: SidebarGroupsMemoKey?
     var groups: [SidebarGroup] = []
@@ -2169,6 +2172,11 @@ struct ContentView: View {
         // that changed nothing the sidebar shows) — the whole partition +
         // aggregation below is skipped and the previous array instance is
         // returned.
+        //
+        // [T-ios-sidebar-memo-perf] Hash the sets once, carry Ints in the key.
+        // Set.== is O(set.count); hashing the same set twice is also O(count)
+        // but we only pay it when the memo misses, and the hot path is now
+        // three Int comparisons plus the session-array compare (unchanged).
         let unreadIds = sidebarBadgeStore.unreadSessionIds
         let freshCornerIds = sidebarBadgeStore.freshCornerBadgeSessionIds(within: 24 * 3600)
         let activeIds = sidebarActivityTracker.resolvedActiveSessionIds
@@ -2184,9 +2192,9 @@ struct ContentView: View {
             pendingDraftId: pendingFolderDraft?.draftId,
             pendingDraftFolderId: pendingFolderDraft?.folderId,
             isSearching: isSearching,
-            unreadIds: unreadIds,
-            freshCornerIds: freshCornerIds,
-            activeIds: activeIds,
+            unreadIdsHash: unreadIds.hashValue,
+            freshCornerIdsHash: freshCornerIds.hashValue,
+            activeIdsHash: activeIds.hashValue,
             dayStamp: Calendar.current.startOfDay(for: Date()))
         if sidebarGroupsMemo.key == key {
             return sidebarGroupsMemo.groups

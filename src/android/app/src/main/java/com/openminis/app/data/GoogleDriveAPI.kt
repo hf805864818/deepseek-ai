@@ -101,7 +101,12 @@ object GoogleDriveAPI {
         val response = httpClient.newCall(request).execute()
         val body = response.body?.string() ?: ""
         response.close()
-        if (response.code !in 200..299) {
+        if (response.code == 403) {
+            // 403 on search may mean the folder exists but we can't search for it.
+            // Fall back to creating it directly (create also returns existing folder ID
+            // if one with the same name already exists in the same location).
+            Log.w(TAG, "findOrCreateFolder search returned 403, falling back to create")
+        } else if (response.code !in 200..299) {
             throw IOException("findOrCreateFolder search failed: ${response.code} $body")
         }
         val files = JSONObject(body).optJSONArray("files")
