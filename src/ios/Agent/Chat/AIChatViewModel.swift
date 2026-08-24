@@ -890,8 +890,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     // entry, agentHistory doesn't change, so the cache hits and skips the
     // expensive recomputation. Also used by defer-block logging (which used
     // to call estimateContextTokens() twice more at round end).
-    private var _cachedEstimateTokens: Int? = nil
-    private var _cachedEstimateHistoryCount: Int = -1
+    // [fix] Changed from `private` to `internal` so the estimate cache
+    // is accessible from AIChatViewModel+Offloading.swift (same module,
+    // different file — `private` only permits same-file access in Swift).
+    var _cachedEstimateTokens: Int? = nil
+    var _cachedEstimateHistoryCount: Int = -1
 
     /// Invalidate the estimate cache. Called at send()/resume() entry points
     /// and whenever agentHistory is mutated by compaction/offload.
