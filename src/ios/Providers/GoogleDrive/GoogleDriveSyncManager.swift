@@ -10,7 +10,11 @@ private let logger = AppLogger(category: "GoogleDriveSync")
 /// Creates ZIP archives of the app's documents directory and uploads
 /// them to a dedicated "Minis" folder in the user's Google Drive.
 /// Supports manual backup/restore and automatic periodic sync.
-@MainActor
+///
+/// Note: This class is NOT @MainActor. Heavy I/O work (file collection,
+/// ZIP building, extraction) runs on the calling cooperative thread.
+/// Only @Published properties are isolated to the main actor via
+/// MainActor.run {} at the call sites.
 final class GoogleDriveSyncManager: ObservableObject {
 
     static let shared = GoogleDriveSyncManager()
@@ -32,12 +36,12 @@ final class GoogleDriveSyncManager: ObservableObject {
         return f
     }()
 
-    // MARK: - Published State
+    // MARK: - Published State (must be accessed on main actor)
 
-    @Published private(set) var isSyncing = false
-    @Published private(set) var syncError: String?
-    @Published private(set) var backupCount = 0
-    @Published private(set) var totalBackupSize: Int64 = 0
+    @MainActor @Published private(set) var isSyncing = false
+    @MainActor @Published private(set) var syncError: String?
+    @MainActor @Published private(set) var backupCount = 0
+    @MainActor @Published private(set) var totalBackupSize: Int64 = 0
 
     // MARK: - AppStorage (persistent settings)
 
@@ -69,19 +73,30 @@ final class GoogleDriveSyncManager: ObservableObject {
 
     /// Creates a ZIP archive of the app's documents directory and uploads
     /// it to Google Drive. Updates sync state on completion.
+    ///
+    /// Heavy work (file collection, ZIP building) runs on the calling
+    /// cooperative thread; only UI state updates hop to the main actor.
     func backup() async throws {
-        guard !isSyncing else {
+        // Check syncing flag on main actor
+        let alreadySyncing = await MainActor.run { isSyncing }
+        guard !alreadySyncing else {
             logger.warning("Backup already in progress — skipping")
             return
         }
 
-        isSyncing = true
-        syncError = nil
-        defer { isSyncing = false }
+        await MainActor.run {
+            isSyncing = true
+            syncError = nil
+        }
+        defer {
+            Task { @MainActor in
+                isSyncing = false
+            }
+        }
 
         logger.info("=== Google Drive backup started ===")
 
-        // 1. Collect all files from documents directory
+        // 1. Collect all files from documents directory (I/O — runs on background)
         let docsDir = documentsDirectory
         let files = collectFiles(in: docsDir)
         logger.info("Collected \(files.count) files from documents directory")
@@ -90,7 +105,7 @@ final class GoogleDriveSyncManager: ObservableObject {
             throw LLMError.providerError(message: "No files found to back up")
         }
 
-        // 2. Create ZIP archive
+        // 2. Create ZIP archive (CPU + memory heavy — runs on background)
         let zipData = SkillStore.buildZipArchive(files: files)
         let fileSize = zipData.count
         logger.info("ZIP archive built: \(fileSize) bytes")
@@ -129,7 +144,7 @@ final class GoogleDriveSyncManager: ObservableObject {
 
         // 5. Update sync state
         lastSyncTimestamp = Date().timeIntervalSince1970
-        syncError = nil
+        await MainActor.run { syncError = nil }
         logger.info("=== Google Drive backup complete: \(fileId) ===")
 
         // 6. Refresh backup list
@@ -141,14 +156,21 @@ final class GoogleDriveSyncManager: ObservableObject {
     /// Downloads the latest backup from Google Drive and restores it
     /// to the app's documents directory.
     func restore() async throws {
-        guard !isSyncing else {
+        let alreadySyncing = await MainActor.run { isSyncing }
+        guard !alreadySyncing else {
             logger.warning("Restore already in progress — skipping")
             return
         }
 
-        isSyncing = true
-        syncError = nil
-        defer { isSyncing = false }
+        await MainActor.run {
+            isSyncing = true
+            syncError = nil
+        }
+        defer {
+            Task { @MainActor in
+                isSyncing = false
+            }
+        }
 
         logger.info("=== Google Drive restore started ===")
 
@@ -163,7 +185,7 @@ final class GoogleDriveSyncManager: ObservableObject {
         let zipData = try await GoogleDriveAPI.downloadFile(fileId: latest.id)
         logger.info("Backup downloaded: \(zipData.count) bytes")
 
-        // 3. Extract and restore
+        // 3. Extract and restore (I/O heavy — runs on background)
         try extractBackup(zipData)
 
         logger.info("=== Google Drive restore complete ===")
@@ -171,14 +193,21 @@ final class GoogleDriveSyncManager: ObservableObject {
 
     /// Restores from a specific backup file by its ID.
     func restoreFrom(fileId: String) async throws {
-        guard !isSyncing else {
+        let alreadySyncing = await MainActor.run { isSyncing }
+        guard !alreadySyncing else {
             logger.warning("Restore already in progress — skipping")
             return
         }
 
-        isSyncing = true
-        syncError = nil
-        defer { isSyncing = false }
+        await MainActor.run {
+            isSyncing = true
+            syncError = nil
+        }
+        defer {
+            Task { @MainActor in
+                isSyncing = false
+            }
+        }
 
         logger.info("=== Google Drive restore from \(fileId) started ===")
 
@@ -186,7 +215,7 @@ final class GoogleDriveSyncManager: ObservableObject {
         let zipData = try await GoogleDriveAPI.downloadFile(fileId: fileId)
         logger.info("Backup downloaded: \(zipData.count) bytes")
 
-        // 2. Extract and restore
+        // 2. Extract and restore (I/O heavy — runs on background)
         try extractBackup(zipData)
 
         logger.info("=== Google Drive restore complete ===")
@@ -207,11 +236,16 @@ final class GoogleDriveSyncManager: ObservableObject {
                 (a.modifiedTime ?? .distantPast) > (b.modifiedTime ?? .distantPast)
             }
 
-        // Update published stats
-        backupCount = backups.count
-        totalBackupSize = backups.reduce(0) { $0 + ($1.size ?? 0) }
+        let count = backups.count
+        let totalSize = backups.reduce(0) { $0 + ($1.size ?? 0) }
 
-        logger.info("Found \(backups.count) backups totaling \(totalBackupSize) bytes")
+        // Update published stats (on main actor)
+        await MainActor.run {
+            backupCount = count
+            totalBackupSize = totalSize
+        }
+
+        logger.info("Found \(count) backups totaling \(totalSize) bytes")
         return backups
     }
 
@@ -360,7 +394,11 @@ final class GoogleDriveSyncManager: ObservableObject {
     private func refreshBackupStats(folderId: String) async throws {
         let allFiles = try await GoogleDriveAPI.listFiles(parentId: folderId)
         let backups = allFiles.filter { $0.name.hasPrefix(backupPrefix) && $0.name.hasSuffix(".zip") }
-        backupCount = backups.count
-        totalBackupSize = backups.reduce(0) { $0 + ($1.size ?? 0) }
+        let count = backups.count
+        let totalSize = backups.reduce(0) { $0 + ($1.size ?? 0) }
+        await MainActor.run {
+            backupCount = count
+            totalBackupSize = totalSize
+        }
     }
 }

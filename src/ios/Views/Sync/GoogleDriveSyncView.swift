@@ -32,28 +32,32 @@ struct GoogleDriveSyncView: View {
                 backupsSection
             }
         }
-        .navigationTitle("Google Drive")
+        .navigationTitle(String(localized: "Google Drive", comment: "Navigation title for Google Drive sync settings"))
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if oauthManager.isAuthenticated {
                 loadBackups()
             }
         }
-        .alert("Error", isPresented: $showError) {
-            Button("OK", role: .cancel) {}
+        .alert(String(localized: "Error", comment: "Error alert title"), isPresented: $showError) {
+            Button(String(localized: "OK", comment: "Error alert confirm button"), role: .cancel) {}
         } message: {
-            Text(errorMessage ?? "An unknown error occurred.")
+            Text(errorMessage ?? String(localized: "An unknown error occurred.", comment: "Generic error message"))
         }
-        .alert("Restore Backup?", isPresented: $showRestoreConfirm) {
-            Button("Cancel", role: .cancel) {}
-            Button("Restore") {
+        .alert(String(localized: "Restore Backup?", comment: "Restore confirmation alert title"), isPresented: $showRestoreConfirm) {
+            Button(String(localized: "Cancel", comment: "Restore confirmation cancel button"), role: .cancel) {}
+            Button(String(localized: "Restore", comment: "Restore confirmation confirm button")) {
                 if let fileId = restoreFileId {
                     performRestore(from: fileId)
                 }
             }
         } message: {
             if let name = restoreFileName {
-                Text("This will overwrite files in the app's documents directory with the contents of \"\(name)\". This cannot be undone.")
+                Text(String.localizedStringWithFormat(
+                    String(localized: "This will overwrite files in the app's documents directory with the contents of \"%@\". This cannot be undone.",
+                           comment: "Restore confirmation message with file name"),
+                    name
+                ))
             }
         }
         .onChange(of: syncManager.syncError) { _, error in
@@ -72,7 +76,7 @@ struct GoogleDriveSyncView: View {
                 HStack {
                     settingsIcon("person.crop.circle.fill", color: .blue)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Signed In")
+                        Text(String(localized: "Signed In", comment: "Google Drive signed in status"))
                             .font(.subheadline)
                         if let email = oauthManager.userEmail {
                             Text(email)
@@ -85,7 +89,7 @@ struct GoogleDriveSyncView: View {
                         oauthManager.logout()
                         backups = []
                     } label: {
-                        Text("Sign Out")
+                        Text(String(localized: "Sign Out", comment: "Google Drive sign out button"))
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.red)
@@ -97,12 +101,12 @@ struct GoogleDriveSyncView: View {
                     HStack {
                         settingsIcon("person.badge.plus", color: .blue)
                         if oauthManager.isAuthenticating {
-                            Text("Signing In...")
+                            Text(String(localized: "Signing In...", comment: "Google Drive signing in status"))
                             Spacer()
                             ProgressView()
                                 .controlSize(.small)
                         } else {
-                            Text("Sign in with Google")
+                            Text(String(localized: "Sign in with Google", comment: "Google Drive sign in button"))
                                 .foregroundStyle(Color.primary)
                             Spacer()
                             Image(systemName: "chevron.right")
@@ -115,7 +119,7 @@ struct GoogleDriveSyncView: View {
                 .disabled(oauthManager.isAuthenticating)
             }
         } header: {
-            Text("Account")
+            Text(String(localized: "Account", comment: "Google Drive account section header"))
         }
     }
 
@@ -125,20 +129,20 @@ struct GoogleDriveSyncView: View {
         Section {
             if let date = syncManager.lastSyncDate {
                 HStack {
-                    Text("Last Synced")
+                    Text(String(localized: "Last Synced", comment: "Last sync time label"))
                     Spacer()
                     Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
                         .foregroundStyle(.secondary)
                 }
             }
             HStack {
-                Text("Backups")
+                Text(String(localized: "Backups", comment: "Backup count label"))
                 Spacer()
                 Text("\(syncManager.backupCount)")
                     .foregroundStyle(.secondary)
             }
             HStack {
-                Text("Total Size")
+                Text(String(localized: "Total Size", comment: "Total backup size label"))
                 Spacer()
                 Text(formatSize(syncManager.totalBackupSize))
                     .foregroundStyle(.secondary)
@@ -149,12 +153,12 @@ struct GoogleDriveSyncView: View {
                 HStack {
                     settingsIcon("arrow.up.circle.fill", color: .blue)
                     if syncManager.isSyncing {
-                        Text("Backing Up...")
+                        Text(String(localized: "Backing Up...", comment: "Backup in progress status"))
                         Spacer()
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Text("Backup Now")
+                        Text(String(localized: "Backup Now", comment: "Backup now button"))
                             .foregroundStyle(Color.primary)
                     }
                 }
@@ -168,12 +172,12 @@ struct GoogleDriveSyncView: View {
                 HStack {
                     settingsIcon("arrow.down.circle.fill", color: .green)
                     if syncManager.isSyncing {
-                        Text("Restoring...")
+                        Text(String(localized: "Restoring...", comment: "Restore in progress status"))
                         Spacer()
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Text("Restore from Latest")
+                        Text(String(localized: "Restore from Latest", comment: "Restore from latest backup button"))
                             .foregroundStyle(Color.primary)
                     }
                 }
@@ -181,7 +185,7 @@ struct GoogleDriveSyncView: View {
             .buttonStyle(.plain)
             .disabled(syncManager.isSyncing)
         } header: {
-            Text("Sync")
+            Text(String(localized: "Sync", comment: "Google Drive sync section header"))
         }
     }
 
@@ -202,13 +206,14 @@ struct GoogleDriveSyncView: View {
             )) {
                 HStack {
                     settingsIcon("arrow.triangle.2.circlepath", color: .orange)
-                    Text("Auto Sync")
+                    Text(String(localized: "Auto Sync", comment: "Auto sync toggle label"))
                 }
             }
         } header: {
-            Text("Auto Sync")
+            Text(String(localized: "Auto Sync", comment: "Auto sync section header"))
         } footer: {
-            Text("Automatically backs up your data to Google Drive every 4 hours when the app is running.")
+            Text(String(localized: "Automatically backs up your data to Google Drive every 4 hours when the app is running.",
+                         comment: "Auto sync description footer"))
         }
     }
 
@@ -221,13 +226,14 @@ struct GoogleDriveSyncView: View {
                     Spacer()
                     ProgressView()
                         .controlSize(.small)
-                    Text("Loading backups...")
+                    Text(String(localized: "Loading backups...", comment: "Loading backups status"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
                 }
             } else if backups.isEmpty {
-                Text("No backups yet. Tap \"Backup Now\" to create one.")
+                Text(String(localized: "No backups yet. Tap \"Backup Now\" to create one.",
+                             comment: "Empty backups state message"))
                     .foregroundStyle(.secondary)
                     .font(.callout)
             } else {
@@ -268,13 +274,13 @@ struct GoogleDriveSyncView: View {
                         Button(role: .destructive) {
                             performDelete(fileId: backup.id)
                         } label: {
-                            Label("Delete", systemImage: "trash")
+                            Label(String(localized: "Delete", comment: "Delete backup swipe action"), systemImage: "trash")
                         }
                     }
                 }
             }
         } header: {
-            Text("Backups")
+            Text(String(localized: "Backups", comment: "Backups list section header"))
         }
     }
 
@@ -364,13 +370,25 @@ struct GoogleDriveSyncView: View {
 
     private func formatSize(_ bytes: Int64) -> String {
         if bytes >= 1_073_741_824 {
-            return String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+            return String.localizedStringWithFormat(
+                String(localized: "%.1f GB", comment: "Gigabytes size format"),
+                Double(bytes) / 1_073_741_824
+            )
         } else if bytes >= 1_048_576 {
-            return String(format: "%.1f MB", Double(bytes) / 1_048_576)
+            return String.localizedStringWithFormat(
+                String(localized: "%.1f MB", comment: "Megabytes size format"),
+                Double(bytes) / 1_048_576
+            )
         } else if bytes >= 1024 {
-            return String(format: "%.1f KB", Double(bytes) / 1024)
+            return String.localizedStringWithFormat(
+                String(localized: "%.1f KB", comment: "Kilobytes size format"),
+                Double(bytes) / 1024
+            )
         } else {
-            return "\(bytes) B"
+            return String.localizedStringWithFormat(
+                String(localized: "%lld B", comment: "Bytes size format"),
+                bytes
+            )
         }
     }
 }

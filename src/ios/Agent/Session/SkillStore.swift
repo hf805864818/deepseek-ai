@@ -2623,7 +2623,7 @@ extension SkillStore {
 
     /// Build a ZIP archive in memory from a list of (relativePath, data) pairs.
     /// Uses Store method (no compression) for simplicity and speed.
-    static func buildZipArchive(files: [(relativePath: String, data: Data)]) -> Data {
+    nonisolated static func buildZipArchive(files: [(relativePath: String, data: Data)]) -> Data {
         var archive = Data()
         var centralDirectory = Data()
         var offset: UInt32 = 0
@@ -2697,7 +2697,7 @@ extension SkillStore {
     }
 
     /// CRC-32 (ISO 3309 / ITU-T V.42)
-    private static func crc32(_ data: Data) -> UInt32 {
+    nonisolated private static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFFFFFF
         for byte in data {
             crc ^= UInt32(byte)
@@ -2729,7 +2729,7 @@ extension SkillStore {
         let data: Data
     }
 
-    static func readZipEntries(data: Data) throws -> [ZipEntry] {
+    nonisolated static func readZipEntries(data: Data) throws -> [ZipEntry] {
         guard data.count >= 22 else { throw SkillError.invalidArchive }
 
         var eocdOffset = -1
