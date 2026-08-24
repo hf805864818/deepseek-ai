@@ -350,6 +350,8 @@
 		E5DEEP001 /* DeepModeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP101 /* DeepModeStore.swift */; };
 		E5RULE001 /* DeepModeRule.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5RULE101 /* DeepModeRule.swift */; };
 		E5SMEM001 /* StructuredMemoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SMEM101 /* StructuredMemoryStore.swift */; };
+		E5SUB001 /* SubagentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SUB101 /* SubagentSession.swift */; };
+		E5SUB002 /* SubagentCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SUB102 /* SubagentCard.swift */; };
 		E5SOUL001 /* SoulStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SOUL101 /* SoulStore.swift */; };
 		E5SOUL002 /* SoulSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SOUL102 /* SoulSettingsView.swift */; };
 		E5SVP0021 /* ShadowVoiceProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SVP0031 /* ShadowVoiceProviderDetailView.swift */; };
@@ -995,6 +997,8 @@
 		E5DEEP101 /* DeepModeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeStore.swift; sourceTree = "<group>"; };
 		E5RULE101 /* DeepModeRule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeRule.swift; sourceTree = "<group>"; };
 		E5SMEM101 /* StructuredMemoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StructuredMemoryStore.swift; sourceTree = "<group>"; };
+		E5SUB101 /* SubagentSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentSession.swift; sourceTree = "<group>"; };
+		E5SUB102 /* SubagentCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentCard.swift; sourceTree = "<group>"; };
 		E5SOUL101 /* SoulStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoulStore.swift; sourceTree = "<group>"; };
 		E5SOUL102 /* SoulSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoulSettingsView.swift; sourceTree = "<group>"; };
 		E5SVP0031 /* ShadowVoiceProviderDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowVoiceProviderDetailView.swift; sourceTree = "<group>"; };
@@ -1997,6 +2001,7 @@
 				E5DEEP101 /* DeepModeStore.swift */,
 				E5RULE101 /* DeepModeRule.swift */,
 				E5SMEM101 /* StructuredMemoryStore.swift */,
+				E5SUB101 /* SubagentSession.swift */,
 				E5SOUL101 /* SoulStore.swift */,
 			);
 			path = Session;
@@ -2084,6 +2089,7 @@
 			children = (
 				E53000012 /* AIChatView.swift */,
 				E5DEEP105 /* WorkflowProgressView.swift */,
+				E5SUB102 /* SubagentCard.swift */,
 				E5F200011 /* MarkdownPrepRegex.swift */,
 				E5F200012 /* MinisMediaViews.swift */,
 				E5F200013 /* AssistantBlockView.swift */,
@@ -2881,6 +2887,8 @@
 				E5DEEP001 /* DeepModeStore.swift in Sources */,
 				E5RULE001 /* DeepModeRule.swift in Sources */,
 				E5SMEM001 /* StructuredMemoryStore.swift in Sources */,
+				E5SUB001 /* SubagentSession.swift in Sources */,
+				E5SUB002 /* SubagentCard.swift in Sources */,
 				E5SOUL001 /* SoulStore.swift in Sources */,
 				E5SOUL002 /* SoulSettingsView.swift in Sources */,
 				E5LOCK002 /* FaceIDProtectionSettingsView.swift in Sources */,
