@@ -1955,6 +1955,10 @@
 				E53000014 /* ChatStore.swift */,
 				BB1000110F700000000000AA /* ContextPolicy.swift */,
 				E5FMI0011 /* FileMentionIndex.swift */,
+				E5MPATH101 /* MultiPathPlanner.swift */,
+				E5COG9101 /* CognitiveLoadMonitor.swift */,
+				E5SEQ9101 /* SequentialThinkingTool.swift */,
+				E5ROOT101 /* ErrorRootCauseAnalyzer.swift */,
 			);
 			path = Chat;
 			sourceTree = "<group>";
@@ -2101,10 +2105,6 @@
 				E53000012 /* AIChatView.swift */,
 				E5DEEP105 /* WorkflowProgressView.swift */,
 				E5SUB102 /* SubagentCard.swift */,
-				E5MPATH101 /* MultiPathPlanner.swift */,
-				E5COG9101 /* CognitiveLoadMonitor.swift */,
-				E5SEQ9101 /* SequentialThinkingTool.swift */,
-				E5ROOT101 /* ErrorRootCauseAnalyzer.swift */,
 				E5F200011 /* MarkdownPrepRegex.swift */,
 				E5F200012 /* MinisMediaViews.swift */,
 				E5F200013 /* AssistantBlockView.swift */,
