@@ -151,7 +151,7 @@ enum SequentialThinkingTool {
 
         // Check for divergence
         framework += "\n---\n"
-        framework += "**自检**: 如果有超过一半的步骤标记为"发散中"，请考虑：是否问题本身需要重新定义？是否需要更多上下文信息（可用 <<GOAL_STATE>> need_more_context: <说明> 退出自主模式请求用户输入）？"
+        framework += "**自检**: 如果有超过一半的步骤标记为「发散中」，请考虑：是否问题本身需要重新定义？是否需要更多上下文信息（可用 <<GOAL_STATE>> need_more_context: <说明> 退出自主模式请求用户输入）？"
 
         return SequentialThinkingResult(
             problem: problem,
