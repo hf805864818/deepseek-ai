@@ -119,6 +119,11 @@ enum ClarifyGate {
     }
 
     private static func findTechKeywords(in text: String) -> [String] {
+        // Fast path: if no tech-stack keyword appears at all, skip the 33-entry
+        // linear `contains` scan entirely (the common case). The combined regex
+        // is only a presence pre-check — it never decides WHICH keyword, so the
+        // subsequent scan (which runs in techChoicePatterns order) is unchanged.
+        guard anyTechKeywordPresent(in: text) else { return [] }
         var found: [String] = []
         for keyword in techChoicePatterns {
             if text.contains(keyword) {
@@ -127,5 +132,25 @@ enum ClarifyGate {
             }
         }
         return found
+    }
+
+    /// Lazily-built single regex alternation over all tech-choice keywords.
+    /// Static so it compiles once per process, not per call.
+    private static let techKeywordRegex: NSRegularExpression? = {
+        // Escape regex metacharacters (e.g. "node.js" contains a literal dot).
+        let escaped = techChoicePatterns.map { NSRegularExpression.escapedPattern(for: $0) }
+        let pattern = escaped.joined(separator: "|")
+        return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
+
+    /// Presence pre-check: does ANY tech keyword appear as a substring?
+    /// Returns false immediately when none do (avoids the full scan).
+    private static func anyTechKeywordPresent(in text: String) -> Bool {
+        guard let regex = techKeywordRegex, !text.isEmpty else {
+            // Regex build failed (shouldn't happen) — fall back to a plain scan
+            // so behavior is never degraded vs. the original.
+            return techChoicePatterns.contains { text.contains($0) }
+        }
+        return regex.firstMatch(in: text, options: [], range: NSRange(location: 0, length: (text as NSString).length)) != nil
     }
 }

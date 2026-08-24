@@ -1397,6 +1397,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         retrospectiveHasRun = false
         isRetrospectiveRunning = false
         didInjectUncertaintyCheckThisRun = false
+        // [T-deep-mode-perf-fragment-cache] Clear the cached deep-mode fragment
+        // so nothing survives a toggle-off (cache re-keyed anyway, but explicit
+        // for the total-switch contract).
+        _cachedDeepModeFragment = nil
+        _cachedDeepModeFragmentKey = nil
         // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load state to
         // empty so no warning banner survives the off switch.
         cognitiveLoadState = .empty
@@ -2698,6 +2703,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     private var _cachedScopeContext: DeepModeScopeContext?
     private var _cachedScopeLastUserMessage: String = ""
 
+    /// [T-deep-mode-perf-fragment-cache] Cache for the computed
+    /// `deepModeFragment` string (the large multi-KB deep-agent behavior
+    /// fragment). It is recomputed on every send/resume/fallback/auto-continue
+    /// turn today (AIChatViewModel.swift deepModeFragment), hitting expensive
+    /// paths (scope-context regex traversal + rule glob NSPredicate builds +
+    /// multi-KB string concat) each time. Caching it keyed on its true inputs
+    /// (level + memory flag + scope signature + rules file mod-time) makes all
+    /// the within-turn recomputations O(1) cache hits.
+    ///
+    /// Total-switch safe: this cache is only ever READ inside `deepModeFragment`,
+    /// which is only invoked under `if deepModeEnabled`. When the switch is off
+    /// the fragment is never read and the cache is never touched; we additionally
+    /// clear it in `deepModeDidDisableCleanup()` so no state survives a toggle-off.
+    private var _cachedDeepModeFragment: String?
+    private var _cachedDeepModeFragmentKey: String?
+
     private func buildDeepModeScopeContext() -> DeepModeScopeContext {
         // [T-perf-scope-cache] Return cached result when the last user message
         // hasn't changed (same send flow → same scope context → no recomputation).
@@ -2809,8 +2830,18 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// (file paths mentioned + user input keywords) rather than always injecting
     /// the full rule set. This reduces token waste and keeps the prompt focused.
     private var deepModeFragment: String {
+        // [T-deep-mode-perf-fragment-cache] Cache hit fast-path. The fragment
+        // is a pure function of: deep-mode level, memory flag, the scope context
+        // (itself cached/derived from the last user message), and the rules
+        // file mod-time. When none of those changed since the last build, reuse
+        // the cached string instead of re-running the scope regex traversal +
+        // rule glob NSPredicate builds + multi-KB concat.
         let scopeCtx = buildDeepModeScopeContext()
         let level = deepModeLevel
+        let cacheKey = "\(level.rawValue)|\(memoryEnabled)|\(scopeCtx.userInputLowercased)|\(scopeCtx.mentionedFilePaths.joined())|\(DeepModeStore.rulesFileModTime() ?? -1)"
+        if let cached = _cachedDeepModeFragment, _cachedDeepModeFragmentKey == cacheKey {
+            return cached
+        }
         var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED (intensity: \(level.rawValue)). Adopt a deliberate, senior-engineer working style for this turn:\n"
         // [T-deep-mode-rules-phase3] Behavior rules are scoped to current context.
         // Phase 3: only rules matching the current scope (file globs + keywords
@@ -2885,6 +2916,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
             s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
         }
+        _cachedDeepModeFragment = s
+        _cachedDeepModeFragmentKey = cacheKey
         return s
     }
 

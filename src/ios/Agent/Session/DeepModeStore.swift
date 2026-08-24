@@ -198,6 +198,14 @@ enum DeepModeStore {
         DeepModeRuleParser.matchingRules(loadRules(), in: context)
     }
 
+    /// Last-known modification time of the rules file (drives cache keying
+    /// so a rules-file edit invalidates any higher-level cached fragment).
+    /// Returns nil if the file isn't accessible yet (ensureExists will create
+    /// the default on next loadRules()).
+    static func rulesFileModTime() -> TimeInterval? {
+        cachedRulesModTime?.timeIntervalSinceReferenceDate
+    }
+
     /// Build the rules fragment string for injection into the system prompt.
     ///
     /// Phase 3 behavior (deep mode on): only matching rules are injected,

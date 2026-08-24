@@ -210,45 +210,57 @@ object UpdateChecker {
      * All network work happens on [Dispatchers.IO]; safe to call from any
      * coroutine scope.
      */
-    suspend fun check(): CheckResult = withContext(Dispatchers.IO) {
+    suspend fun check(): CheckResult = withContext<CheckResult>(Dispatchers.IO) {
         val url = "https://api.github.com/repos/$OWNER/$REPO/releases?per_page=30"
         AppLogger.info(TAG, "GET $url (local=${BuildConfig.VERSION_NAME})")
         try {
             // 先直连官方 API；若网络不通（403/超时/连接失败）再自动切镜像重试。
-            // 镜像 URL 已由 GitHubMirrorManager 解析为完整代理地址。
-            when (val direct = executeReleases(url)) {
-                ReleaseResponse.Success(body) -> return@withContext processReleaseResponse(body)
-                ReleaseResponse.Error(code, _) -> {
+            val direct = executeReleases(url)
+            when (direct) {
+                is ReleaseResponse.Success -> {
+                    return@withContext processReleaseResponse(direct.body)
+                }
+                is ReleaseResponse.Error -> {
                     // 404=无 release；403/451=被墙或限流，此时尝试镜像再判断
-                    if (code == 404) return@withContext CheckResult.NoReleaseAvailable
-                    if (code == 403 || code == 451) {
+                    if (direct.code == 404) return@withContext CheckResult.NoReleaseAvailable
+                    if (direct.code == 403 || direct.code == 451) {
                         val mirrored = GitHubMirrorManager.mirrorUrl(url)
-                        when (val m = executeReleases(mirrored)) {
+                        val m = executeReleases(mirrored)
+                        when (m) {
                             is ReleaseResponse.Success -> return@withContext processReleaseResponse(m.body)
                             else -> return@withContext CheckResult.Forbidden
                         }
                     }
-                    AppLogger.info(TAG, "直接访问失败(code=$code)，切换镜像重试")
+                    AppLogger.info(TAG, "直接访问失败(code=${direct.code})，切换镜像重试")
                     val mirrored = GitHubMirrorManager.mirrorUrl(url)
-                    when (val m = executeReleases(mirrored)) {
+                    val m = executeReleases(mirrored)
+                    when (m) {
                         is ReleaseResponse.Success -> return@withContext processReleaseResponse(m.body)
-                        ReleaseResponse.Error(404, _) -> return@withContext CheckResult.NoReleaseAvailable
+                        is ReleaseResponse.Error ->
+                            if (m.code == 404) return@withContext CheckResult.NoReleaseAvailable
+                            else return@withContext CheckResult.NetworkUnreachable
                         else -> return@withContext CheckResult.NetworkUnreachable
                     }
                 }
                 ReleaseResponse.NetworkError -> {
                     AppLogger.info(TAG, "直连网络错误，切换镜像重试")
                     val mirrored = GitHubMirrorManager.mirrorUrl(url)
-                    when (val m = executeReleases(mirrored)) {
+                    val m = executeReleases(mirrored)
+                    when (m) {
                         is ReleaseResponse.Success -> return@withContext processReleaseResponse(m.body)
-                        ReleaseResponse.Error(404, _) -> return@withContext CheckResult.NoReleaseAvailable
-                        ReleaseResponse.Error(code, _) -> CheckResult.Error("GitHub API $code")
+                        is ReleaseResponse.Error ->
+                            if (m.code == 404) return@withContext CheckResult.NoReleaseAvailable
+                            else return@withContext CheckResult.NetworkUnreachable
                         else -> return@withContext CheckResult.NetworkUnreachable
                     }
                 }
             }
+            // Unreachable, but required to give the try block a CheckResult-
+            // typed tail expression so withContext infers CheckResult (not Unit).
+            @Suppress("UNREACHABLE_CODE")
+            return@withContext CheckResult.NetworkUnreachable
         } catch (e: Exception) {
-            AppLogger.warning(TAG, "check() 异常", e)
+            AppLogger.warning(TAG, "check() 异常: ${e.message}")
             return@withContext CheckResult.NetworkUnreachable
         }
     }

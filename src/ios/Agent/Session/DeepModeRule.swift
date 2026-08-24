@@ -244,12 +244,22 @@ extension DeepModeRuleParser {
 
     // MARK: - Glob matching
 
+    /// Cache: compiled NSPredicate per glob string. NSPredicate construction
+    /// is expensive (parses the regex string); globs are a small fixed set that
+    /// repeat across every deep-mode turn, so caching them removes the dominant
+    /// cost of per-turn rule matching. Purely a performance cache — the results
+    /// are byte-identical to building the predicate fresh, so behavior is
+    /// unchanged whether deep mode is on or off (this code is only reachable
+    /// from deep-mode rule matching anyway).
+    private static let globPredicateCacheLock = NSLock()
+    private static var globPredicateCache: [String: NSPredicate] = [:]
+
     /// Test if any glob pattern matches any of the given paths.
     /// Uses `fnmatch`-style globbing via `NSPredicate` with MATCHES operator.
     static func matchesAnyGlob(_ globs: [String], paths: [String]) -> Bool {
         guard !globs.isEmpty, !paths.isEmpty else { return false }
         for glob in globs {
-            let predicate = NSPredicate(format: "SELF MATCHES %@", fnmatchRegex(from: glob))
+            let predicate = predicate(forGlob: glob)
             for path in paths {
                 if predicate.evaluate(with: path) {
                     return true
@@ -262,6 +272,24 @@ extension DeepModeRuleParser {
             }
         }
         return false
+    }
+
+    /// Return a compiled NSPredicate for a glob, reusing a cached one when
+    /// available. Thread-safe; result is deterministic (pure function of glob).
+    private static func predicate(forGlob glob: String) -> NSPredicate {
+        globPredicateCacheLock.lock()
+        defer { globPredicateCacheLock.unlock() }
+        if let cached = globPredicateCache[glob] {
+            return cached
+        }
+        let predicate = NSPredicate(format: "SELF MATCHES %@", fnmatchRegex(from: glob))
+        // Bound the cache so a pathological unbounded glob set can't grow it
+        // forever; rule globs are small/fixed in practice.
+        if globPredicateCache.count >= 256 {
+            globPredicateCache.removeAll()
+        }
+        globPredicateCache[glob] = predicate
+        return predicate
     }
 
     /// Convert a shell-style glob pattern to a regex string for NSPredicate MATCHES.
