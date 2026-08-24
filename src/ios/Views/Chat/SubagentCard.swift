@@ -30,6 +30,10 @@ struct SubagentStatusBadge: View {
     }
 
     private var symbolName: String {
+        Self.symbolName(for: status)
+    }
+
+    static func symbolName(for status: SubagentStatus) -> String {
         switch status {
         case .pending: return "circle.dashed"
         case .running: return "gearshape.2"
@@ -88,80 +92,77 @@ private struct BounceSymbolModifier: ViewModifier {
     }
 }
 
-// MARK: - SubagentCard
+// MARK: - SubagentCard (Capsule Style)
 
-/// A compact card showing a single subagent's status.
-/// Shown in a VStack when one or more subagents are active.
+/// A capsule-shaped subagent status pill, matching the ToolCapsuleView
+/// aesthetic. Shown in a floating stack at the top of the chat area.
 struct SubagentCard: View {
     @ObservedObject var subagent: SubagentSession
 
+    private var iconColor: Color {
+        switch subagent.status {
+        case .pending:    return ChatColors.tertiaryText
+        case .running:    return Color.accentColor
+        case .completed:  return ChatColors.success
+        case .failed:     return Color(UIColor.systemRed)
+        case .cancelled:  return ChatColors.tertiaryText
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            // Header: task description + status badge
-            HStack(alignment: .center, spacing: 8) {
-                Image(systemName: "person.crop.square")
-                    .font(.system(size: 12))
-                    .foregroundColor(ChatColors.secondaryText)
-
-                Text(subagent.taskDescription)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(ChatColors.primaryText)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                Spacer(minLength: 0)
-
-                SubagentStatusBadge(status: subagent.status)
-            }
-
-            // Progress: tool call count / max
-            if subagent.status == .running {
-                HStack(spacing: 4) {
-                    Image(systemName: "hammer")
-                        .font(.system(size: 10))
-                        .foregroundColor(ChatColors.tertiaryText)
-                    Text("\(subagent.toolCallCount)/\(subagent.maxToolCalls) tool calls")
-                        .font(.system(size: 11))
-                        .foregroundColor(ChatColors.tertiaryText)
-                    if !subagent.lastActivity.isEmpty {
-                        Text("· \(subagent.lastActivity)")
-                            .font(.system(size: 11))
-                            .foregroundColor(ChatColors.tertiaryText)
-                            .lineLimit(1)
-                    }
+        HStack(spacing: 6) {
+            // Status icon
+            Group {
+                if subagent.status == .running {
+                    Image(systemName: "gearshape.2")
+                        .modifier(BounceSymbolModifier(value: subagent.status))
+                } else {
+                    Image(systemName: SubagentStatusBadge.symbolName(for: subagent.status))
                 }
-                .padding(.leading, 20)
             }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(iconColor)
 
-            // Result summary (when finished)
-            if subagent.isFinished && !subagent.resultSummary.isEmpty {
+            // Task description
+            Text(subagent.taskDescription)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(ChatColors.primaryText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            // Progress or result
+            if subagent.status == .running {
+                Text("\(subagent.toolCallCount)/\(subagent.maxToolCalls)")
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundColor(ChatColors.tertiaryText)
+            } else if subagent.isFinished && !subagent.resultSummary.isEmpty {
                 Text(subagent.resultSummary)
                     .font(.system(size: 11))
-                    .foregroundColor(ChatColors.secondaryText)
-                    .lineLimit(3)
-                    .padding(.leading, 20)
-                    .padding(.top, 2)
+                    .foregroundColor(ChatColors.tertiaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(ChatColors.toolBg)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(ChatColors.toolBorder, lineWidth: 0.5)
-                )
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .background(Color(UIColor.systemGray6))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .stroke(ChatColors.toolBorder, lineWidth: 0.5)
         )
+        .contentShape(Capsule())
     }
 }
 
 // MARK: - SubagentCardStack
 
-/// A vertical stack of SubagentCards for all active subagents.
-/// Rendered by AIChatView when `deepModeEnabled` and there are active subagents.
-/// Total-switch safe: only shown when deep mode is on and activeSubagents is
-/// non-empty. When the master switch is off, activeSubagents is cleared in
-/// deepModeDidDisableCleanup, so this view simply never appears.
+/// A floating vertical stack of SubagentCards for all active subagents.
+/// Rendered by AIChatView as a top overlay when `deepModeEnabled` and there
+/// are active subagent sessions. Total-switch safe: only shown when deep mode
+/// is on and activeSubagents is non-empty. When the master switch is off,
+/// activeSubagents is cleared in deepModeDidDisableCleanup, so this view
+/// simply never appears.
 struct SubagentCardStack: View {
     let subagents: [SubagentSession]
 
@@ -169,12 +170,11 @@ struct SubagentCardStack: View {
         if subagents.isEmpty {
             EmptyView()
         } else {
-            VStack(spacing: 6) {
+            VStack(spacing: 4) {
                 ForEach(subagents) { subagent in
                     SubagentCard(subagent: subagent)
                 }
             }
-            .padding(.horizontal, 12)
             .frame(maxWidth: .infinity)
         }
     }

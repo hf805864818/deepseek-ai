@@ -546,6 +546,18 @@ struct AIChatView: View {
                                                  steps: vm.workflowSteps)
                         }
                     }
+                    // [T-phase5] Subagent status capsules — shown at the top
+                    // of the chat area when deep mode is on and there are
+                    // active subagent sessions. Uses the same capsule style
+                    // as ToolCapsuleView for visual consistency. Total-switch
+                    // safe: when the master switch is off, activeSubagents is
+                    // cleared, so this view is EmptyView.
+                    if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
+                        SubagentCardStack(subagents: vm.activeSubagents)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 4)
+                            .transition(.opacity)
+                    }
                 }
                 .overlay(alignment: .bottom) {
                     // Tool preview + input bar stacked at the bottom.
@@ -613,16 +625,8 @@ struct AIChatView: View {
                                 }
                         }
                         VStack(spacing: 0) {
-                            // [T-phase5] Subagent status cards — only shown
-                            // when deep mode is on and there are active
-                            // subagent sessions. Total-switch safe: when
-                            // the master switch is off, activeSubagents is
-                            // cleared, so this view is EmptyView.
-                            if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
-                                SubagentCardStack(subagents: vm.activeSubagents)
-                                    .padding(.vertical, 4)
-                                    .transition(.opacity)
-                            }
+                            // [T-phase5] Subagent status cards moved to top
+                            // safeAreaInset — see messagesArea's .safeAreaInset(edge: .top).
                             floatingToolPreview
                                 .shadow(color: Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0, alpha: 0.25) : UIColor(white: 0, alpha: 0) }), radius: 6, x: 0, y: 4)
                             #if DEBUG
