@@ -120,7 +120,8 @@ enum MultiPathPlanner {
                     .lowercased()
                 // Try to extract a number.
                 let digits = afterMarker.compactMap { $0.isNumber ? $0 : nil }
-                if let numStr = String(digits), let num = Int(numStr), num >= 1 && num <= pathLines.count {
+                let numStr = String(digits)
+                if let num = Int(numStr), num >= 1 && num <= pathLines.count {
                     recommendedIndex = num
                 }
             } else {

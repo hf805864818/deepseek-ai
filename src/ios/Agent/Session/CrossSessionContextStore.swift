@@ -42,7 +42,7 @@ struct CrossSessionEntry: Codable, Identifiable, Equatable {
     let type: EntryType
     let content: String
     let createdAt: Date
-    let updatedAt: Date
+    var updatedAt: Date
     /// Optional session ID this entry originated from.
     var sourceSessionId: String?
 

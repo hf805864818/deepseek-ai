@@ -838,7 +838,7 @@ extension AIChatViewModel {
                 case .executing: phaseStr = "executing"
                 case .verifying: phaseStr = "verifying"
                 }
-                let currentStep = workflowSteps.firstIndex(where: { $0.status == .active }).map { $0.id } ?? 0
+                let currentStep = workflowSteps.first(where: { $0.status == .active })?.id ?? 0
                 let isMultiPath = pendingGoalSentinel != nil
 
                 let result = SequentialThinkingTool.generateFramework(

@@ -1000,7 +1000,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// `<<GOAL_STATE>> need_more_context: <reason>`, the auto-continuation
     /// loop stops and this state is set. The UI renders a "needs input" prompt.
     /// Reset to nil in `deepModeDidDisableCleanup()` and on fresh send.
-    @Published var needMoreContextState: (reason: String?)? = nil
+    @Published var needMoreContextState: String? = nil
 
     /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
     /// execution prompt through the normal `send()` path so it inherits every
@@ -1496,7 +1496,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         case .needMoreContext(let reason):
             logger.info("[GoalRunner] need_more_context sentinel — stopping auto-continue, surfacing to user")
             goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-            needMoreContextState = (reason: reason)
+            needMoreContextState = reason
             // The model's visible text already explains what it needs.
             // We just stop the loop — the user sees the message and can reply.
             finishWorkflow()
