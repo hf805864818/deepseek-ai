@@ -31,12 +31,14 @@ final class GoogleDriveOAuthManager: NSObject, ObservableObject {
 
     static let shared = GoogleDriveOAuthManager()
 
-    // MARK: - OAuth Config (iOS type client — PKCE only, no client secret)
+    // MARK: - OAuth Config (Desktop app client — PKCE only, no client secret)
+    // Changed from iOS type to Desktop app type to support localhost redirect.
+    // Desktop app clients allow http://localhost callback URIs natively.
 
     private let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
     private let tokenURL = "https://oauth2.googleapis.com/token"
     private let userInfoURL = "https://www.googleapis.com/oauth2/v1/userinfo"
-    private let clientID = "483538693797-ej4bihr3mio71oj3a17cfdj4gan2j0kg.apps.googleusercontent.com"
+    private let clientID = "483538693797-hs0c9jrjg9b4s0pcj5hphrv20mrvf3d7.apps.googleusercontent.com"
     private let callbackPort: UInt16 = 8086
     private var redirectURI: String { "http://localhost:\(callbackPort)/oauth2callback" }
     private let scopes = "https://www.googleapis.com/auth/drive.file"
