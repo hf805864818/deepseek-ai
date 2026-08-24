@@ -1057,6 +1057,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // also per-workflow; resets alongside the workflow state machine.
         verifyRoundsLeft = VerifyGate.maxVerifyRounds
         pendingVerifySentinel = nil
+        // [fix] Also clear the goal sentinel for consistency. While callers
+        // already re-check deepModeEnabled / message errors before reading it,
+        // leaving a stale sentinel across a reset is a latent hazard if a
+        // future caller forgets the guard.
+        pendingGoalSentinel = nil
     }
 
     /// [T-deep-mode-workflow] Enter the executing phase and light up the first
@@ -3647,12 +3652,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // [T-deep-mode-resume-log] Log resume trigger with workflow state
         logger.info("[WorkflowLog] resume() called - workflowPhase=\(workflowPhase) canResume=\(canResume) stepsCount=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
         
-        // [T-deep-mode-resume-opt] Check if we have saved state from pause
-        if let saved = savedWorkflowState {
+        // [T-deep-mode-resume-opt] Check if we have saved state from pause.
+        // [fix] Guard on deepModeEnabled: if the master switch was turned
+        // off while paused, deepModeDidDisableCleanup already cleared
+        // savedWorkflowState, so this branch is unreachable in normal flow.
+        // The guard is defensive — if a race somehow left savedWorkflowState
+        // non-nil after the switch-off, we must NOT restore workflow UI state
+        // (phase / steps / verifyRoundsLeft) that contradicts a disabled
+        // deep mode. That would violate the total-switch contract.
+        if let saved = savedWorkflowState, deepModeEnabled {
             logger.info("[WorkflowLog] resume() - using saved state, skipping re-evaluation")
             workflowPhase = saved.phase
             workflowSteps = saved.steps
             verifyRoundsLeft = saved.verifyRoundsLeft
+            savedWorkflowState = nil
+        } else if savedWorkflowState != nil {
+            // Deep mode was turned off while we had saved state — discard it.
+            logger.info("[WorkflowLog] resume() - discarding saved workflow state (deep mode off)")
             savedWorkflowState = nil
         }
 
