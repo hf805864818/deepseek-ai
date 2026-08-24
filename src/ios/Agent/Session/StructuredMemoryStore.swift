@@ -176,7 +176,7 @@ enum StructuredMemoryStore {
         if let cached = cachedEntries,
            let modTime = cachedEntriesModTime,
            fm.fileExists(atPath: url.path) {
-            if let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date,
+            if let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationDate] as? Date,
                currentModTime == modTime {
                 return cached
             }
@@ -193,7 +193,7 @@ enum StructuredMemoryStore {
                 // Save the migrated entries immediately
                 try? saveEntries(migrated)
                 cachedEntries = migrated
-                cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date
+                cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationDate] as? Date
                 return migrated
             }
         }
@@ -205,7 +205,7 @@ enum StructuredMemoryStore {
 
         // Cache the result
         cachedEntries = entries
-        cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date
+        cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationDate] as? Date
         return entries
     }
 
@@ -380,7 +380,7 @@ enum StructuredMemoryStore {
         // [T-deep-mode-perf] Use cached fragment if file hasn't changed
         let fm = FileManager.default
         let url = fileURL
-        let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date
+        let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationDate] as? Date
         
         if let cached = cachedFragment,
            let modTime = currentModTime,
