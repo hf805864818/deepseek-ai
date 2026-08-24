@@ -157,7 +157,7 @@ enum StructuredMemoryStore {
 
     /// Thread-safe cached entries with file modification time check.
     /// Invalidates cache when the file is modified on disk.
-    private static var cachedEntries: ([MemoryEntry], Date)?
+    private static var cachedEntries: [MemoryEntry]?
     private static var cachedEntriesModTime: Date?
     
     /// [T-deep-mode-perf] Cached categorized fragment to avoid repeated string building.
@@ -176,7 +176,7 @@ enum StructuredMemoryStore {
         if let cached = cachedEntries,
            let modTime = cachedEntriesModTime,
            fm.fileExists(atPath: url.path) {
-            if let currentModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date,
+            if let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date,
                currentModTime == modTime {
                 return cached
             }
@@ -193,7 +193,7 @@ enum StructuredMemoryStore {
                 // Save the migrated entries immediately
                 try? saveEntries(migrated)
                 cachedEntries = migrated
-                cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date
+                cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date
                 return migrated
             }
         }
@@ -205,7 +205,7 @@ enum StructuredMemoryStore {
 
         // Cache the result
         cachedEntries = entries
-        cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date
+        cachedEntriesModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date
         return entries
     }
 
@@ -380,7 +380,7 @@ enum StructuredMemoryStore {
         // [T-deep-mode-perf] Use cached fragment if file hasn't changed
         let fm = FileManager.default
         let url = fileURL
-        let currentModTime = try? fm.attributesOfItem(atPath: url.path)[.modificationTime] as? Date
+        let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationTime] as? Date
         
         if let cached = cachedFragment,
            let modTime = currentModTime,

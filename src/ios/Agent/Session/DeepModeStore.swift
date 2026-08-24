@@ -135,7 +135,7 @@ enum DeepModeStore {
 
         // Check cache first
         if let cached = cachedRules {
-            if let currentModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date,
+            if let currentModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationTime] as? Date,
                let cachedModTime = cachedRulesModTime,
                currentModTime == cachedModTime {
                 return cached
@@ -149,7 +149,7 @@ enum DeepModeStore {
               let str = String(data: data, encoding: .utf8) else {
             let defaultParsed = DeepModeRuleParser.parse(defaultRulesBody)
             cachedRules = defaultParsed
-            cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date
+            cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationTime] as? Date
             return defaultParsed
         }
 
@@ -157,13 +157,13 @@ enum DeepModeStore {
         guard !trimmed.isEmpty else {
             let defaultParsed = DeepModeRuleParser.parse(defaultRulesBody)
             cachedRules = defaultParsed
-            cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date
+            cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationTime] as? Date
             return defaultParsed
         }
 
         let parsed = DeepModeRuleParser.parse(trimmed)
         cachedRules = parsed
-        cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationTime] as? Date
+        cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationTime] as? Date
         return parsed
     }
 
