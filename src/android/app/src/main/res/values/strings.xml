@@ -1683,4 +1683,38 @@
 
     <!-- Other Sync -->
     <string name="other_sync">Other Sync</string>
+
+
+    <!-- Google Drive / Other Sync -->
+    <string name="gdrive_title">Google Drive</string>
+    <string name="gdrive_account">Account</string>
+    <string name="gdrive_signed_in">Signed in</string>
+    <string name="gdrive_tap_to_sign_out">Tap to sign out</string>
+    <string name="gdrive_not_signed_in">Not signed in</string>
+    <string name="gdrive_sign_in_to_sync">Sign in with Google to sync</string>
+    <string name="gdrive_sign_in_with_google">Sign in with Google</string>
+    <string name="gdrive_backup_now">Backup Now</string>
+    <string name="gdrive_restore_latest">Restore Latest</string>
+    <string name="gdrive_auto_sync">Auto Sync</string>
+    <string name="gdrive_auto_sync_desc">Automatically back up every 4 hours</string>
+    <string name="gdrive_last_sync">Last sync</string>
+    <string name="gdrive_backups">Backups</string>
+    <string name="gdrive_backups_subtitle">%1$d backups (%2$s)</string>
+    <string name="gdrive_more_options">More options</string>
+    <string name="gdrive_no_backups">No backups yet. Tap \"Backup Now\" to create one.</string>
+    <string name="gdrive_unknown_size">Unknown size</string>
+    <string name="gdrive_restore">Restore</string>
+    <string name="gdrive_restore_backup">Restore Backup</string>
+    <string name="gdrive_restore_confirm">Restore from %1$s? This will overwrite current app data.</string>
+    <string name="gdrive_delete_backup">Delete Backup</string>
+    <string name="gdrive_delete_confirm">Delete %1$s? This cannot be undone.</string>
+    <string name="gdrive_sync">Sync</string>
+    <string name="cloud_sync">Cloud Sync</string>
+    <string name="sync_connected">Connected</string>
+    <string name="sync_not_connected">Not Connected</string>
+    <string name="sync_onedrive">OneDrive</string>
+    <string name="sync_webdav">WebDAV</string>
+    <string name="sync_other">Other</string>
+    <string name="coming_soon">Coming Soon</string>
+    <string name="other_sync_subtitle">Google Drive and more</string>
 </resources>

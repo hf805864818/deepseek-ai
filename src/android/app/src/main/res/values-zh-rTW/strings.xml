@@ -825,4 +825,46 @@
     </plurals>
     <string name="model_picker_quick_test">快速測試</string>
     <string name="provider_no_key_required">無需金鑰</string>
+
+
+    <!-- Google Drive / Other Sync -->
+    <string name="gdrive_title">Google Drive</string>
+    <string name="gdrive_account">帳戶</string>
+    <string name="gdrive_signed_in">已登入</string>
+    <string name="gdrive_tap_to_sign_out">點擊登出</string>
+    <string name="gdrive_not_signed_in">未登入</string>
+    <string name="gdrive_sign_in_to_sync">用 Google 登入以同步</string>
+    <string name="gdrive_sign_in_with_google">使用 Google 登入</string>
+    <string name="gdrive_backup_now">立即備份</string>
+    <string name="gdrive_restore_latest">還原最新</string>
+    <string name="gdrive_auto_sync">自動同步</string>
+    <string name="gdrive_auto_sync_desc">每 4 小時自動備份</string>
+    <string name="gdrive_last_sync">上次同步</string>
+    <string name="gdrive_backups">備份</string>
+    <string name="gdrive_backups_subtitle">%1$d 個備份（%2$s）</string>
+    <string name="gdrive_more_options">更多選項</string>
+    <string name="gdrive_no_backups">尚無備份。點擊「立即備份」建立。</string>
+    <string name="gdrive_unknown_size">未知大小</string>
+    <string name="gdrive_restore">還原</string>
+    <string name="gdrive_restore_backup">還原備份</string>
+    <string name="gdrive_restore_confirm">從 %1$s 還原？這將覆蓋目前應用程式資料。</string>
+    <string name="gdrive_delete_backup">刪除備份</string>
+    <string name="gdrive_delete_confirm">刪除 %1$s？此操作無法復原。</string>
+    <string name="gdrive_sync">同步</string>
+    <string name="cloud_sync">雲端同步</string>
+    <string name="sync_connected">已連線</string>
+    <string name="sync_not_connected">未連線</string>
+    <string name="sync_onedrive">OneDrive</string>
+    <string name="sync_webdav">WebDAV</string>
+    <string name="sync_other">其他</string>
+    <string name="coming_soon">即將推出</string>
+
+    <!-- Inherited UI actions -->
+    <string name="back">返回</string>
+    <string name="cancel">取消</string>
+    <string name="delete">刪除</string>
+
+    <!-- Other Sync -->
+    <string name="other_sync">其他同步</string>
+    <string name="other_sync_subtitle">Google Drive 等</string>
 </resources>

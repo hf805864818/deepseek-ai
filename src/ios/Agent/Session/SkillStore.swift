@@ -2794,18 +2794,18 @@ extension SkillStore {
         return entries
     }
 
-    private static func readU16(_ data: Data, at offset: Int) -> UInt16 {
+    nonisolated private static func readU16(_ data: Data, at offset: Int) -> UInt16 {
         UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
     }
 
-    private static func readU32(_ data: Data, at offset: Int) -> UInt32 {
+    nonisolated private static func readU32(_ data: Data, at offset: Int) -> UInt32 {
         UInt32(data[offset]) |
         (UInt32(data[offset + 1]) << 8) |
         (UInt32(data[offset + 2]) << 16) |
         (UInt32(data[offset + 3]) << 24)
     }
 
-    private static func decompress(_ data: Data, expectedSize: Int) -> Data? {
+    nonisolated private static func decompress(_ data: Data, expectedSize: Int) -> Data? {
         guard expectedSize > 0 else { return Data() }
         var decompressed = Data(count: expectedSize)
         let result = decompressed.withUnsafeMutableBytes { destPtr -> Int in

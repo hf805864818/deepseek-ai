@@ -264,7 +264,7 @@ fun SettingsScreen(
                     icon = Icons.Outlined.Sync,
                     iconColor = Color(0xFF5856D6),
                     title = stringResource(R.string.other_sync),
-                    subtitle = "Google Drive and more",
+                    subtitle = stringResource(R.string.other_sync_subtitle),
                     onClick = onOtherSyncClick,
                     showDivider = false,
                 )

@@ -90,7 +90,7 @@ fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit) {
                     IconButton(onClick = onBack) {
                         Icon(
                             Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.back),
                         )
                     }
                 },
@@ -104,31 +104,31 @@ fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit) {
                 .verticalScroll(rememberScrollState()),
         ) {
             // ── Cloud Sync platforms ──
-            OtherSyncSection(title = "Cloud Sync") {
+            OtherSyncSection(title = stringResource(R.string.cloud_sync)) {
                 OtherSyncItem(
                     icon = Icons.Outlined.Cloud,
                     iconColor = Color(0xFF4285F4),
-                    title = "Google Drive",
-                    subtitle = if (googleDriveConnected) "Connected" else "Not Connected",
+                    title = stringResource(R.string.gdrive_title),
+                    subtitle = if (googleDriveConnected) stringResource(R.string.sync_connected) else stringResource(R.string.sync_not_connected),
                     onClick = onGoogleDriveClick,
                 )
                 OtherSyncItem(
                     icon = Icons.Outlined.CloudOff,
                     iconColor = Color(0xFF8E8E93),
-                    title = "OneDrive",
-                    subtitle = "Coming Soon",
+                    title = stringResource(R.string.sync_onedrive),
+                    subtitle = stringResource(R.string.coming_soon),
                     onClick = {},
                     showDivider = false,
                 )
             }
 
             // ── Other protocols ──
-            OtherSyncSection(title = "Other") {
+            OtherSyncSection(title = stringResource(R.string.sync_other)) {
                 OtherSyncItem(
                     icon = Icons.Outlined.Sync,
                     iconColor = Color(0xFF8E8E93),
-                    title = "WebDAV",
-                    subtitle = "Coming Soon",
+                    title = stringResource(R.string.sync_webdav),
+                    subtitle = stringResource(R.string.coming_soon),
                     onClick = {},
                     showDivider = false,
                 )

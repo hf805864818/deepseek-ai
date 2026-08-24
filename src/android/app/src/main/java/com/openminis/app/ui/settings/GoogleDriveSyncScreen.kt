@@ -61,9 +61,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.openminis.app.R
 import com.openminis.app.auth.GoogleDriveOAuthManager
 import com.openminis.app.data.GoogleDriveFile
 import com.openminis.app.data.GoogleDriveSyncManager
@@ -125,12 +127,12 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Google Drive") },
+                title = { Text(stringResource(R.string.gdrive_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
                             Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.back),
                         )
                     }
                 },
@@ -145,14 +147,14 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState()),
         ) {
             // ── Account section ──
-            SyncSection(title = "Account") {
+            SyncSection(title = stringResource(R.string.gdrive_account)) {
                 if (isLoggedIn) {
                     // Logged in — show email + sign out
                     SyncRow(
                         icon = Icons.Outlined.AccountCircle,
                         iconColor = Color(0xFF34C759),
-                        title = email ?: "Signed in",
-                        subtitle = "Tap to sign out",
+                        title = email ?: stringResource(R.string.gdrive_signed_in),
+                        subtitle = stringResource(R.string.gdrive_tap_to_sign_out),
                         onClick = {
                             oauthManager.logout()
                             isLoggedIn = false
@@ -167,8 +169,8 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                     SyncRow(
                         icon = Icons.Outlined.AccountCircle,
                         iconColor = Color(0xFF007AFF),
-                        title = "Not signed in",
-                        subtitle = "Sign in with Google to sync",
+                        title = stringResource(R.string.gdrive_not_signed_in),
+                        subtitle = stringResource(R.string.gdrive_sign_in_to_sync),
                         onClick = {},
                         showDivider = false,
                     )
@@ -190,26 +192,26 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                     ) {
                         Icon(Icons.Outlined.Cloud, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("Sign in with Google")
+                        Text(stringResource(R.string.gdrive_sign_in_with_google))
                     }
                 }
             }
 
             if (isLoggedIn) {
                 // ── Sync section ──
-                SyncSection(title = "Sync") {
+                SyncSection(title = stringResource(R.string.gdrive_sync)) {
                     SyncRow(
                         icon = Icons.Outlined.Schedule,
                         iconColor = Color(0xFF007AFF),
-                        title = "Last sync",
+                        title = stringResource(R.string.gdrive_last_sync),
                         subtitle = GoogleDriveSyncManager.formatDate(lastSyncTime),
                         onClick = {},
                     )
                     SyncRow(
                         icon = Icons.Outlined.CloudSync,
                         iconColor = Color(0xFF5856D6),
-                        title = "Backups",
-                        subtitle = "$backupCount backups (${GoogleDriveSyncManager.formatSize(totalBackupSize)})",
+                        title = stringResource(R.string.gdrive_backups),
+                        subtitle = stringResource(R.string.gdrive_backups_subtitle, backupCount, GoogleDriveSyncManager.formatSize(totalBackupSize)),
                         onClick = {},
                     )
                     Spacer(Modifier.height(12.dp))
@@ -235,7 +237,7 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                                 Icon(Icons.Outlined.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
                             }
                             Spacer(Modifier.width(8.dp))
-                            Text("Backup Now")
+                            Text(stringResource(R.string.gdrive_backup_now))
                         }
                         OutlinedButton(
                             onClick = {
@@ -246,14 +248,14 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                         ) {
                             Icon(Icons.Outlined.Restore, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(8.dp))
-                            Text("Restore Latest")
+                            Text(stringResource(R.string.gdrive_restore_latest))
                         }
                     }
                     Spacer(Modifier.height(12.dp))
                 }
 
                 // ── Auto Sync section ──
-                SyncSection(title = "Auto Sync") {
+                SyncSection(title = stringResource(R.string.gdrive_auto_sync)) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -273,12 +275,12 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                         Spacer(Modifier.width(14.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Auto Sync",
+                                text = stringResource(R.string.gdrive_auto_sync),
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = MaterialTheme.colorScheme.onSurface,
                             )
                             Text(
-                                text = "Automatically back up every 4 hours",
+                                text = stringResource(R.string.gdrive_auto_sync_desc),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -299,10 +301,10 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                 }
 
                 // ── Backups section ──
-                SyncSection(title = "Backups") {
+                SyncSection(title = stringResource(R.string.gdrive_backups)) {
                     if (backups.isEmpty()) {
                         Text(
-                            text = "No backups yet. Tap \"Backup Now\" to create one.",
+                            text = stringResource(R.string.gdrive_no_backups),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
@@ -328,7 +330,7 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                                         style = MaterialTheme.typography.bodyLarge,
                                         color = MaterialTheme.colorScheme.onSurface,
                                     )
-                                    val sizeText = backup.size?.let { GoogleDriveSyncManager.formatSize(it) } ?: "Unknown size"
+                                    val sizeText = backup.size?.let { GoogleDriveSyncManager.formatSize(it) } ?: stringResource(R.string.gdrive_unknown_size)
                                     val dateText = backup.modifiedTime?.take(10) ?: ""
                                     Text(
                                         text = if (dateText.isNotEmpty()) "$dateText - $sizeText" else sizeText,
@@ -338,7 +340,7 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                                 }
                                 Icon(
                                     Icons.Outlined.MoreVert,
-                                    contentDescription = "More options",
+                                    contentDescription = stringResource(R.string.gdrive_more_options),
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                     modifier = Modifier
                                         .size(20.dp)
@@ -360,7 +362,7 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
         onDismissRequest = { menuForBackup = null },
     ) {
         DropdownMenuItem(
-            text = { Text("Restore") },
+            text = { Text(stringResource(R.string.gdrive_restore)) },
             onClick = {
                 val backup = menuForBackup
                 menuForBackup = null
@@ -371,7 +373,7 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
             leadingIcon = { Icon(Icons.Outlined.Restore, contentDescription = null, modifier = Modifier.size(20.dp)) },
         )
         DropdownMenuItem(
-            text = { Text("Delete") },
+            text = { Text(stringResource(R.string.delete)) },
             onClick = {
                 val backup = menuForBackup
                 menuForBackup = null
@@ -387,8 +389,8 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
     confirmRestore?.let { backup ->
         AlertDialog(
             onDismissRequest = { confirmRestore = null },
-            title = { Text("Restore Backup") },
-            text = { Text("Restore from ${backup.name}? This will overwrite current app data.") },
+            title = { Text(stringResource(R.string.gdrive_restore_backup)) },
+            text = { Text(stringResource(R.string.gdrive_restore_confirm, backup.name)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -398,10 +400,10 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                             GoogleDriveSyncManager.restoreFrom(oauthManager, fileId)
                         }
                     },
-                ) { Text("Restore") }
+                ) { Text(stringResource(R.string.gdrive_restore)) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmRestore = null }) { Text("Cancel") }
+                TextButton(onClick = { confirmRestore = null }) { Text(stringResource(R.string.cancel)) }
             },
         )
     }
@@ -410,8 +412,8 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
     confirmDelete?.let { backup ->
         AlertDialog(
             onDismissRequest = { confirmDelete = null },
-            title = { Text("Delete Backup") },
-            text = { Text("Delete ${backup.name}? This cannot be undone.") },
+            title = { Text(stringResource(R.string.gdrive_delete_backup)) },
+            text = { Text(stringResource(R.string.gdrive_delete_confirm, backup.name)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -422,10 +424,10 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                             backups = GoogleDriveSyncManager.listBackups(oauthManager)
                         }
                     },
-                ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                ) { Text(stringResource(R.string.delete), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmDelete = null }) { Text("Cancel") }
+                TextButton(onClick = { confirmDelete = null }) { Text(stringResource(R.string.cancel)) }
             },
         )
     }

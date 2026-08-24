@@ -1538,4 +1538,41 @@
 
     <!-- Other Sync -->
     <string name="other_sync">其他同步</string>
+
+
+    <!-- Google Drive / Other Sync -->
+    <string name="gdrive_title">Google Drive</string>
+    <string name="gdrive_account">账户</string>
+    <string name="gdrive_signed_in">已登录</string>
+    <string name="gdrive_tap_to_sign_out">点击退出登录</string>
+    <string name="gdrive_not_signed_in">未登录</string>
+    <string name="gdrive_sign_in_to_sync">用 Google 登录以同步</string>
+    <string name="gdrive_sign_in_with_google">使用 Google 登录</string>
+    <string name="gdrive_backup_now">立即备份</string>
+    <string name="gdrive_restore_latest">恢复最新</string>
+    <string name="gdrive_auto_sync">自动同步</string>
+    <string name="gdrive_auto_sync_desc">每 4 小时自动备份</string>
+    <string name="gdrive_last_sync">上次同步</string>
+    <string name="gdrive_backups">备份</string>
+    <string name="gdrive_backups_subtitle">%1$d 个备份（%2$s）</string>
+    <string name="gdrive_more_options">更多选项</string>
+    <string name="gdrive_no_backups">尚无备份。点击“立即备份”创建。</string>
+    <string name="gdrive_unknown_size">未知大小</string>
+    <string name="gdrive_restore">恢复</string>
+    <string name="gdrive_restore_backup">恢复备份</string>
+    <string name="gdrive_restore_confirm">从 %1$s 恢复？这将覆盖当前应用数据。</string>
+    <string name="gdrive_delete_backup">删除备份</string>
+    <string name="gdrive_delete_confirm">删除 %1$s？此操作无法撤销。</string>
+    <string name="gdrive_sync">同步</string>
+    <string name="cloud_sync">云同步</string>
+    <string name="sync_connected">已连接</string>
+    <string name="sync_not_connected">未连接</string>
+    <string name="sync_onedrive">OneDrive</string>
+    <string name="sync_webdav">WebDAV</string>
+    <string name="sync_other">其他</string>
+    <string name="coming_soon">即将推出</string>
+
+    <!-- Inherited UI actions -->
+    <string name="back">返回</string>
+    <string name="other_sync_subtitle">Google Drive 等</string>
 </resources>

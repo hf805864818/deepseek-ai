@@ -105,7 +105,11 @@ object GoogleDriveSyncManager {
             GoogleDriveAPI.configure(oauthManager)
             val folderId = GoogleDriveAPI.findOrCreateFolder(APP_FOLDER)
             val filesDir = appContext.filesDir
-            val zipData = createZipFromDirectory(filesDir)
+            // ZIP building is CPU-heavy; run it off the main thread so the UI
+            // doesn't freeze/fail during backup.
+            val zipData = withContext(Dispatchers.IO) {
+                createZipFromDirectory(filesDir)
+            }
             val timestamp = SimpleDateFormat("yyyy-MM-dd-HHmmss", Locale.US).format(Date())
             val backupName = "$BACKUP_PREFIX$timestamp.zip"
             GoogleDriveAPI.uploadFile(backupName, zipData, folderId, "application/zip")
@@ -157,7 +161,11 @@ object GoogleDriveSyncManager {
         try {
             GoogleDriveAPI.configure(oauthManager)
             val zipData = GoogleDriveAPI.downloadFile(fileId)
-            extractZipToDirectory(zipData, appContext.filesDir)
+            // Extraction is CPU-heavy; run it off the main thread so the UI
+            // doesn't freeze/fail during restore.
+            withContext(Dispatchers.IO) {
+                extractZipToDirectory(zipData, appContext.filesDir)
+            }
             Log.i(TAG, "Restore completed from file: $fileId (${zipData.size} bytes)")
         } catch (e: Exception) {
             Log.e(TAG, "Restore failed", e)

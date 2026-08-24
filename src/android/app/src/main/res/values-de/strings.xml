@@ -1093,4 +1093,44 @@
     <string name="shizuku_grant_footer_sui">Sui läuft. Tippe auf „LobsterAI autorisieren“, um Zugriff zu gewähren — Sui zeigt den Bestätigungsdialog selbst an. Es gibt keine separate Manager-App zum Öffnen.</string>
     <string name="shizuku_install_footer">Installiere eines von Shizuku (RikkaApps), AXManager (Axeron) oder Sui (RikkaApps) — alle drei nutzen dasselbe Protokoll und sind austauschbar. Shizuku und AXManager sind normale Apps, die per drahtlosem ADB aktiviert werden. Sui ist für bereits gerootete Geräte: Es wird als Magisk/KernelSU-Modul installiert, braucht keine App und bleibt über Neustarts aktiv. Unter KernelSU oder APatch benötigt Sui zusätzlich eine Zygisk-Implementierung (Zygisk Next / ReZygisk / NeoZygisk) — ohne sie wird Sui nicht geladen. Installiere eines und kehre dann hierher zurück.</string>
     <string name="shizuku_state_not_installed_subtitle">Installiere Shizuku, AXManager oder Sui — eines davon genügt.</string>
+
+
+    <!-- Google Drive / Other Sync -->
+    <string name="gdrive_title">Google Drive</string>
+    <string name="gdrive_account">Konto</string>
+    <string name="gdrive_signed_in">Angemeldet</string>
+    <string name="gdrive_tap_to_sign_out">Zum Abmelden tippen</string>
+    <string name="gdrive_not_signed_in">Nicht angemeldet</string>
+    <string name="gdrive_sign_in_to_sync">Mit Google anmelden zum Synchronisieren</string>
+    <string name="gdrive_sign_in_with_google">Mit Google anmelden</string>
+    <string name="gdrive_backup_now">Jetzt sichern</string>
+    <string name="gdrive_restore_latest">Neueste wiederherstellen</string>
+    <string name="gdrive_auto_sync">Auto-Sync</string>
+    <string name="gdrive_auto_sync_desc">Automatisch alle 4 Stunden sichern</string>
+    <string name="gdrive_last_sync">Letzte Synchronisierung</string>
+    <string name="gdrive_backups">Sicherungen</string>
+    <string name="gdrive_backups_subtitle">%1$d Sicherungen (%2$s)</string>
+    <string name="gdrive_more_options">Weitere Optionen</string>
+    <string name="gdrive_no_backups">Noch keine Sicherungen. Tippe auf „Jetzt sichern“, um eine zu erstellen.</string>
+    <string name="gdrive_unknown_size">Unbekannte Größe</string>
+    <string name="gdrive_restore">Wiederherstellen</string>
+    <string name="gdrive_restore_backup">Sicherung wiederherstellen</string>
+    <string name="gdrive_restore_confirm">Von %1$s wiederherstellen? Aktuelle App-Daten werden überschrieben.</string>
+    <string name="gdrive_delete_backup">Sicherung löschen</string>
+    <string name="gdrive_delete_confirm">%1$s löschen? Dies kann nicht rückgängig gemacht werden.</string>
+    <string name="gdrive_sync">Synchronisieren</string>
+    <string name="cloud_sync">Cloud-Sync</string>
+    <string name="sync_connected">Verbunden</string>
+    <string name="sync_not_connected">Nicht verbunden</string>
+    <string name="sync_onedrive">OneDrive</string>
+    <string name="sync_webdav">WebDAV</string>
+    <string name="sync_other">Andere</string>
+    <string name="coming_soon">Demnächst</string>
+
+    <!-- Inherited UI actions -->
+    <string name="back">Zurück</string>
+
+    <!-- Other Sync -->
+    <string name="other_sync">Weitere Synchronisierung</string>
+    <string name="other_sync_subtitle">Google Drive und mehr</string>
 </resources>
