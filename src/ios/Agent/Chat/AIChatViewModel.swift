@@ -918,6 +918,24 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         UserDefaults.standard.bool(forKey: "deepMode.enabled")
     }
 
+    /// [T-deep-mode-level] Three-tier intensity for deep mode, controlling
+    /// which cognitive abilities are active and which sentinels are forced.
+    /// Stored in UserDefaults so it persists across sessions and is readable
+    /// from both ContentView (settings) and AIChatView (slash menu picker).
+    /// - low: base workflow + C1-C5 (prompt only) + C9 background monitoring
+    /// - medium: low + C10/C12/C14 forced sentinels + C9 sentinel
+    /// - high: medium + C11 tool registration + C13 root cause
+    var deepModeLevel: DeepModeLevel {
+        DeepModeLevel(rawValue: UserDefaults.standard.string(forKey: "deepMode.level") ?? "medium") ?? .medium
+    }
+
+    /// Setter for deep mode level — persists to UserDefaults and broadcasts
+    /// so live VMs re-read the level on the next turn.
+    func setDeepModeLevel(_ level: DeepModeLevel) {
+        UserDefaults.standard.set(level.rawValue, forKey: "deepMode.level")
+        NotificationCenter.default.post(name: .deepModeLevelDidChange, object: nil)
+    }
+
     /// [T-deep-mode-plan-gate] Gate state for Layer B: `.awaitingApproval`
     /// when the agent's last turn was a plan-only reply awaiting the user's
     /// confirm/edit. Only ever set while deep mode is on.
@@ -2792,7 +2810,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// the full rule set. This reduces token waste and keeps the prompt focused.
     private var deepModeFragment: String {
         let scopeCtx = buildDeepModeScopeContext()
-        var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED. Adopt a deliberate, senior-engineer working style for this turn:\n"
+        let level = deepModeLevel
+        var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED (intensity: \(level.rawValue)). Adopt a deliberate, senior-engineer working style for this turn:\n"
         // [T-deep-mode-rules-phase3] Behavior rules are scoped to current context.
         // Phase 3: only rules matching the current scope (file globs + keywords
         // + alwaysApply) are injected, replacing the old flat full-list injection.
@@ -2826,6 +2845,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // master switch controls them implicitly — when deepModeEnabled is off,
         // deepModeFragment is never appended to the system prompt, and none of
         // these directives appear. Zero runtime state, zero UI, zero persistence.
+        // These C1-C5 directives are included at ALL levels (low/medium/high).
         s += "\n"
         s += "COGNITIVE ABILITIES (think like a senior engineer, not just execute):\n"
         // C1: Three-layer intent decoding
@@ -2838,36 +2858,33 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         s += "4. PROACTIVE RISK FORESIGHT — Before the user asks, identify risks they haven't mentioned. If your plan has potential side effects, breaking changes, performance implications, or security concerns, surface them proactively in one line. Don't wait to be asked \"what could go wrong\" — tell the user first.\n"
         // C5: Fail-three-times-switch-method
         s += "5. FAIL-SWITCH — If the same approach fails 3 consecutive times (same error pattern or same dead-end), STOP and switch to a fundamentally different strategy. Do not attempt a 4th iteration of the same method. State: \"Approach X failed 3 times — switching to Y because Z.\" The auto-continue budget (3 rounds) exists for this: if you've used all 3 rounds without success, the next step must be a different approach, not a retry.\n"
-        // [T-deep-mode-cognitive-p2-c12] C12: Multi-path parallel thinking.
-        // When planning, the model should generate at least 3 candidate
-        // paths, assess risk for each, recommend the best, and let the
-        // user pick. Only triggered for non-trivial multi-step tasks;
-        // trivial tasks skip the plan gate entirely (per PLAN GATE rule).
-        s += "6. MULTI-PATH THINKING — When you produce a plan (fenced ```plan``` block), if the task is complex (more than 3 steps, or involves architecture/design decisions), generate AT LEAST 3 candidate paths. Format each path as:\n  ## PATH 1: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 2: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 3: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  RECOMMENDED: PATH <N>\n  Briefly explain why you recommend this path over the others (1-2 sentences). For trivial tasks (≤3 steps, no design decisions), use a standard single-path plan as before.\n"
-        // [T-deep-mode-cognitive-p2-c13] C13: Error → root cause → strategy
-        // update closed loop. When the self-verify fails and the client
-        // injects a root-cause analysis prompt, the model must analyze the
-        // fundamental reason, fix it, and emit a reusable avoidance rule.
-        s += "7. ROOT CAUSE LEARNING — When verification fails and you receive a root-cause analysis prompt, do NOT just fix the surface symptom. Analyze the FUNDAMENTAL reason it went wrong (wrong assumption? missing step? platform constraint?), fix it, then produce a single reusable rule that would prevent this class of error. Wrap the rule in <<ROOT_CAUSE_RULE>> ... <<ROOT_CAUSE_RULE>> tags. The rule will be auto-saved to your behavior rules for future sessions.\n"
-        // [T-deep-mode-cognitive-p2-c9] C9: Cognitive load real-time monitoring.
-        // The model self-assesses its cognitive load and emits a sentinel.
-        // The client merges this with objective metrics (context saturation,
-        // tool count) and shows a UI warning when load is high.
-        s += "8. COGNITIVE LOAD MONITORING — At the END of each turn where you used tools, assess your cognitive load and append exactly one line:\n  • <<COGNITIVE_LOAD>> low    (on track, confident, context is clear)\n  • <<COGNITIVE_LOAD>> medium  (some complexity, but manageable)\n  • <<COGNITIVE_LOAD>> high: <one-line note>   (losing track, context getting long, multiple failures)\n  • <<COGNITIVE_LOAD>> critical: <one-line note>   (context near limit, severe confusion, need to step back)\n  Be honest — under-reporting load leads to degraded output quality. If the client also detects high load from its own metrics, it will warn the user.\n"
-        // [T-deep-mode-cognitive-p2-c10] C10: Dynamic autonomy exit.
-        // When the model hits a gap it can't fill, it should emit
-        // need_more_context instead of guessing or hallucinating.
-        s += "9. DYNAMIC AUTONOMY EXIT — If you are in an auto-continue loop and discover you need information you don't have (ambiguous requirements, missing file access, need a design decision only the user can make), do NOT guess. Instead emit:\n  • <<GOAL_STATE>> need_more_context: <one-line description of what you need>\n  The client will STOP the auto-continuation loop and surface your question to the user. This is preferable to 3 rounds of increasingly-wrong assumptions.\n"
-        // [T-deep-mode-cognitive-p2-c14] C14: Unified cross-mode context.
-        // The model should proactively update cross-session context when
-        // meaningful state changes occur.
-        s += "10. CROSS-SESSION CONTEXT — When you complete a meaningful workflow (not a trivial single-step task), append a one-line summary of what was accomplished. The client will persist this as cross-session context so future sessions can pick up where you left off. Also, when you start a new workflow, briefly state the current project context so the client can persist it as the active project.\n"
-        // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
-        // The model has a `sequential_thinking` tool it can call mid-task
-        // when it needs to structure its reasoning. This is the "柔性版
-        // planning" — not forced like PlanGate, but called when the model
-        // itself decides it needs to think step by step.
-        s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
+        // [T-deep-mode-level] Medium/High only: C12 multi-path, C9 sentinel,
+        // C10 need_more_context, C14 cross-session. Low level skips these
+        // for a more natural, less sentinel-heavy conversation experience.
+        if level.forcesMultiPath {
+            // [T-deep-mode-cognitive-p2-c12] C12: Multi-path parallel thinking.
+            s += "6. MULTI-PATH THINKING — When you produce a plan (fenced ```plan``` block), if the task is complex (more than 3 steps, or involves architecture/design decisions), generate AT LEAST 3 candidate paths. Format each path as:\n  ## PATH 1: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 2: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 3: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  RECOMMENDED: PATH <N>\n  Briefly explain why you recommend this path over the others (1-2 sentences). For trivial tasks (≤3 steps, no design decisions), use a standard single-path plan as before.\n"
+        }
+        if level.enablesRootCause {
+            // [T-deep-mode-cognitive-p2-c13] C13: Error → root cause → strategy
+            s += "7. ROOT CAUSE LEARNING — When verification fails and you receive a root-cause analysis prompt, do NOT just fix the surface symptom. Analyze the FUNDAMENTAL reason it went wrong (wrong assumption? missing step? platform constraint?), fix it, then produce a single reusable rule that would prevent this class of error. Wrap the rule in <<ROOT_CAUSE_RULE>> ... <<ROOT_CAUSE_RULE>> tags. The rule will be auto-saved to your behavior rules for future sessions.\n"
+        }
+        if level.forcesCognitiveLoadSentinel {
+            // [T-deep-mode-cognitive-p2-c9] C9: Cognitive load real-time monitoring.
+            s += "8. COGNITIVE LOAD MONITORING — At the END of each turn where you used tools, assess your cognitive load and append exactly one line:\n  • <<COGNITIVE_LOAD>> low    (on track, confident, context is clear)\n  • <<COGNITIVE_LOAD>> medium  (some complexity, but manageable)\n  • <<COGNITIVE_LOAD>> high: <one-line note>   (losing track, context getting long, multiple failures)\n  • <<COGNITIVE_LOAD>> critical: <one-line note>   (context near limit, severe confusion, need to step back)\n  Be honest — under-reporting load leads to degraded output quality. If the client also detects high load from its own metrics, it will warn the user.\n"
+        }
+        if level.enablesNeedMoreContext {
+            // [T-deep-mode-cognitive-p2-c10] C10: Dynamic autonomy exit.
+            s += "9. DYNAMIC AUTONOMY EXIT — If you are in an auto-continue loop and discover you need information you don't have (ambiguous requirements, missing file access, need a design decision only the user can make), do NOT guess. Instead emit:\n  • <<GOAL_STATE>> need_more_context: <one-line description of what you need>\n  The client will STOP the auto-continuation loop and surface your question to the user. This is preferable to 3 rounds of increasingly-wrong assumptions.\n"
+        }
+        if level.enablesCrossSession {
+            // [T-deep-mode-cognitive-p2-c14] C14: Unified cross-mode context.
+            s += "10. CROSS-SESSION CONTEXT — When you complete a meaningful workflow (not a trivial single-step task), append a one-line summary of what was accomplished. The client will persist this as cross-session context so future sessions can pick up where you left off. Also, when you start a new workflow, briefly state the current project context so the client can persist it as the active project.\n"
+        }
+        if level.registersSequentialThinking {
+            // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
+            s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
+        }
         return s
     }
 

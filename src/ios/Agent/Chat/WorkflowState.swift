@@ -114,4 +114,75 @@ extension Notification.Name {
     /// instant deep mode is disabled, so turning the toggle off leaves zero
     /// residual banner, phase, or step list.
     static let deepModeDidChange = Notification.Name("deepModeDidChange")
+
+    /// [T-deep-mode-level] Posted when the deep mode intensity level changes
+    /// (low / medium / high). Live VMs re-read `deepModeLevel` on the next
+    /// turn so the prompt fragment and tool registration adapt immediately.
+    static let deepModeLevelDidChange = Notification.Name("deepModeLevelDidChange")
+}
+
+// MARK: - DeepModeLevel
+
+/// [T-deep-mode-level] Three-tier intensity for the 深度龙虾Ai deep mode.
+/// Controls which cognitive abilities are active and which sentinels are
+/// forced, so users can trade cognitive overhead against naturalness.
+///
+/// - low: Base workflow (plan gate, goal auto-continue, self-verify) +
+///   C1-C5 prompt-only abilities + C9 background monitoring (no forced
+///   sentinel). Natural conversation; cognitive safety net runs silently.
+/// - medium: Low + C10 need_more_context sentinel + C12 multi-path plan +
+///   C14 cross-session context + C9 forced sentinel. Structured but
+///   not tool-heavy.
+/// - high: Medium + C11 sequential_thinking tool registration + C13 root
+///   cause analysis. Full 14-capability cognitive arsenal.
+///
+/// The level is read live from UserDefaults ("deepMode.level") so it
+/// applies across all sessions. When the master switch (deepModeEnabled)
+/// is off, the level has no effect — all capabilities are inactive
+/// regardless of the level setting.
+enum DeepModeLevel: String, CaseIterable, Equatable {
+    case low = "low"
+    case medium = "medium"
+    case high = "high"
+
+    /// Human-readable label for the slash-menu picker.
+    var displayName: String {
+        switch self {
+        case .low:    return "低"
+        case .medium: return "中"
+        case .high:   return "高"
+        }
+    }
+
+    /// One-line description shown in the slash command subtitle.
+    var subtitle: String {
+        switch self {
+        case .low:    return "基础认知 + 后台监控"
+        case .medium: return "多路径 + 跨会话 + 退出口"
+        case .high:   return "全功能深度分析"
+        }
+    }
+
+    // MARK: - Capability gating
+
+    /// Whether C9 cognitive load sentinel should be FORCED (model must emit).
+    /// Low: monitoring runs in background but sentinel is not forced.
+    /// Medium/High: sentinel is forced.
+    var forcesCognitiveLoadSentinel: Bool { self != .low }
+
+    /// Whether C10 need_more_context sentinel is active.
+    var enablesNeedMoreContext: Bool { self != .low }
+
+    /// Whether C11 sequential_thinking tool is registered.
+    /// Only High: the tool is available for the model to call.
+    var registersSequentialThinking: Bool { self == .high }
+
+    /// Whether C12 multi-path plan format is forced.
+    var forcesMultiPath: Bool { self != .low }
+
+    /// Whether C13 root cause analysis is active on verify failure.
+    var enablesRootCause: Bool { self == .high }
+
+    /// Whether C14 cross-session context is injected and persisted.
+    var enablesCrossSession: Bool { self != .low }
 }

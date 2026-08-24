@@ -171,6 +171,19 @@ extension AIChatViewModel {
             }
             return cmd
         }
+        // [T-deep-mode-level] Insert the deep-mode level row at the top of
+        // the list when deep mode is enabled. When the master switch is off,
+        // this row is absent from the slash menu — zero residue.
+        if deepModeEnabled {
+            let level = deepModeLevel
+            let deepCmd = SlashCommand(
+                id: "deepmode",
+                icon: "cpu.fill",
+                title: "DeepMode",
+                subtitle: "深度模式强度 · \(level.displayName) — \(level.subtitle)"
+            )
+            commands.insert(deepCmd, at: 0)
+        }
         // Append enabled skills as slash entries.
         // - id is namespaced ("skill:<uuid>") so it never collides with a
         //   built-in id.
