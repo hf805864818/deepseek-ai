@@ -636,6 +636,40 @@ Turn a topic into a clean, self-contained slide deck.
 - For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
 - Prefer HTML output (portable, visually rich); only use other formats when the user explicitly asks.
 """),
+        ("deep-security", "1.0.0", """
+---
+name: deep-security
+version: 1.0.0
+description: Audit code for security vulnerabilities — injection, XSS, hardcoded secrets, unsafe storage, permission bypass, insecure network, dependency CVEs. Use when the user asks for a security review, vulnerability scan, or penetration test of source code.
+---
+
+# Deep Security Audit
+
+Scan code for security vulnerabilities, not just bugs.
+
+## When To Use
+- The user asks to "check security", "audit for vulnerabilities", or "is this safe".
+- Code handles user input, authentication, secrets, or network communication.
+
+## Workflow
+1. Read the full source (file_read) before judging — do not audit blindly.
+2. Scan across these vulnerability classes:
+   - Injection (SQL/Command/Path): concatenated queries, shell strings, file paths from user input.
+   - XSS: unescaped user input rendered in HTML/UI.
+   - Hardcoded secrets: API keys, tokens, passwords committed in source.
+   - Unsafe storage: plaintext passwords in UserDefaults/files, unencrypted sensitive data.
+   - Permission bypass: missing auth checks on privileged endpoints or functions.
+   - Insecure network: HTTP (not HTTPS), disabled TLS verification, unvalidated certificates.
+   - Dependency CVEs: known-vulnerable third-party libraries.
+3. For each finding, report: location (file:line), severity (Critical/High/Medium/Low), the attack scenario, and the fix.
+4. Separate critical issues (exploitable now) from informational findings.
+5. Provide a prioritized remediation list at the end.
+
+## Notes
+- Never report a vulnerability without showing the exact code location.
+- Distinguish "could be exploited" from "defensive depth" — prioritize real attack vectors.
+- Check both the code AND configuration (Info.plist, build settings, environment variables).
+"""),
     ]
 
     /// [T-deep-mode] Install any *missing* deep-skill definitions without
