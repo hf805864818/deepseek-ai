@@ -1276,13 +1276,25 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             guard !Task.isCancelled else { return }
             guard let self, self.deepModeEnabled else { return }
             self.resetWorkflow()
-            // [T-deep-mode-cognitive-p1] C7: Post-task retrospective — after the
-            // workflow is reset to idle, run the retrospective hook. This injects
-            // a review prompt, runs one agent loop turn, and saves the model's
-            // self-reflection to StructuredMemoryStore. Guarded by the outer
-            // `deepModeEnabled` check and the `retrospectiveHasRun` flag inside.
-            // The 900ms delay above ensures the completion UI had time to show
-            // before the retrospective turn begins.
+            // [T-deep-mode-cognitive-p1] C7 fix: Wait for the main agent loop
+            // to fully finish before running the retrospective. The 900ms delay
+            // above usually suffices, but if the loop is still cleaning up
+            // (error handling, DB writes, queued prompts), isProcessing would
+            // still be true — calling runAgentLoop() again would cause
+            // reentrancy. Wait up to 5 seconds for the loop to release, then
+            // proceed. If it doesn't release (stuck), skip the retrospective
+            // for this workflow — the retrospectiveHasRun flag ensures we
+            // don't double-run on the next finish.
+            var waitCount = 0
+            while self.isProcessing && waitCount < 50 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled else { return }
+                waitCount += 1
+            }
+            if self.isProcessing {
+                logger.warning("[Retrospective] C7 skipped — isProcessing still true after 5s wait")
+                return
+            }
             await self.maybeRunRetrospective()
         }
     }
@@ -2742,13 +2754,19 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Markers cover both Chinese and English common uncertainty expressions.
     private static func detectUncertainty(in text: String) -> Bool {
         // Chinese uncertainty markers
+        // Note: "应该" alone is too broad (used in confident statements like
+        // "应该使用X"), but "我应该是" / "应该是吧" carry uncertainty tone.
         let zhMarkers = ["不确定", "不太确定", "无法确定", "可能", "大概", "也许",
-                         "似乎", "好像", "不太清楚", "不敢确定", "应该是"]
+                         "似乎", "好像", "不太清楚", "不敢确定",
+                         "我应该是", "应该是吧", "大概吧", "可能吧"]
         // English uncertainty markers (case-insensitive)
+        // Note: "i think" alone is too broad ("I think this is correct" is
+        // confident), so only match "i think maybe/perhaps/so" variants.
         let enMarkers = ["i'm not sure", "i am not sure", "not sure",
-                         "maybe", "perhaps", "probably", "i think",
+                         "maybe", "perhaps", "probably",
                          "might be", "could be", "uncertain", "unclear",
-                         "i believe", "i guess", "as far as i know"]
+                         "i believe", "i guess", "as far as i know",
+                         "i think maybe", "i think so", "i think perhaps"]
         let lower = text.lowercased()
         for m in zhMarkers { if text.contains(m) { return true } }
         for m in enMarkers { if lower.contains(m) { return true } }
@@ -2785,6 +2803,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             agentHistory[ci].dbMessageId = pid
         }
 
+        // [T-deep-mode-cognitive-p1] C7 fix: Set isProcessing and background
+        // processing BEFORE calling runAgentLoop(), matching send()'s pattern.
+        // Without this, the UI wouldn't show the processing state, and the
+        // user could send another message during the retrospective — causing
+        // a race condition. Reset in the defer/finally block after the loop
+        // returns. Total-switch safe: this entire method is guarded by
+        // `guard deepModeEnabled` at entry.
+        isProcessing = true
+        beginBackgroundProcessing()
+
         do {
             try await runAgentLoop()
             // After the review turn, check if the model's response is worth
@@ -2812,6 +2840,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         } catch {
             logger.error("[Retrospective] C7 error: \(String(describing: error))")
         }
+
+        // [T-deep-mode-cognitive-p1] C7 fix: Always restore isProcessing and
+        // background processing state after the retrospective, regardless of
+        // success/failure/cancellation. This matches send()'s epilogue pattern.
+        isProcessing = false
+        endBackgroundProcessing()
     }
 
     /// Session ID for persistence integration. Set by the view on appear.
