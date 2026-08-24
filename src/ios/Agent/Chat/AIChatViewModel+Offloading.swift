@@ -570,6 +570,13 @@ extension AIChatViewModel {
         }
 
         if offloadedCount > 0 {
+            // [fix] Invalidate the estimate cache: offload replaced real
+            // toolResult/toolUse/text parts with stubs, so the cached token
+            // count (keyed only on agentHistory.count) is now stale. Without
+            // this, the next estimateContextTokens() returns the pre-offload
+            // (too-high) value within the same agentHistory.count.
+            invalidateEstimateCache()
+
             let afterPct = Int(Double(currentTokens) / Double(contextWindow) * 100)
             logger.info("━━━ Context Offload Complete ━━━")
             logger.info("  Parts offloaded: \(offloadedCount)")

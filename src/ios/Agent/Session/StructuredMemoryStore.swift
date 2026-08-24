@@ -231,6 +231,10 @@ enum StructuredMemoryStore {
         // Invalidate cache after write
         cachedEntries = nil
         cachedEntriesModTime = nil
+        // [fix] Also invalidate the fragment cache so the TTL fast-path
+        // doesn't return a stale fragment after a write within the 5s window.
+        cachedFragment = nil
+        _fragmentCacheTimestamp = .distantPast
     }
 
     // MARK: - CRUD operations

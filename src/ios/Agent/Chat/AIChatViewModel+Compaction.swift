@@ -880,6 +880,13 @@ extension AIChatViewModel {
         }
         offloadContextIfNeeded(model: activeModel, lastContextTokens: 0, force: true)
 
+        // [fix] Invalidate the estimate cache unconditionally: even if
+        // offload didn't find anything to remove (offloadedCount == 0),
+        // the compact-v2 marker overlay changes what effectiveAgentHistory()
+        // returns, so the cached estimate (keyed on raw agentHistory.count,
+        // which Phase B does NOT change) is now stale.
+        invalidateEstimateCache()
+
         // Scroll to bottom so the user sees the compact divider and retained messages.
         forceScrollToBottom.send()
 

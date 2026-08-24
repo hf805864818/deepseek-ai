@@ -248,5 +248,6 @@ enum DeepModeStore {
         // Invalidate cache after write
         cachedRules = nil
         cachedRulesModTime = nil
+        _rulesCacheTimestamp = .distantPast
     }
 }
