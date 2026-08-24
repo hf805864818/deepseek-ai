@@ -1152,7 +1152,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     ///   • `failed` → re-enter `.executing` so the model can fix the issues.
     ///   • no sentinel / unknown → treat as passed (fail-safe: don't block).
     private func maybeProcessVerifyResult(afterMsgIdx msgIdx: Int) async {
-        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? String(describing: pendingVerifySentinel!) : "nil")")
+        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? String(describing: pendingVerifySentinel!) : \"nil\")")
         guard deepModeEnabled else { return }
         guard workflowPhase == .verifying else { return }
         guard messages.indices.contains(msgIdx) else { return }
