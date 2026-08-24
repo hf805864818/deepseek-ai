@@ -22,7 +22,7 @@ import Foundation
 // is ever created, and `activeSubagents` stays empty.
 
 /// Status of a subagent session.
-enum SubagentStatus: String, Codable {
+enum SubagentStatus: String, Codable, Equatable {
     case pending
     case running
     case completed

@@ -54,7 +54,7 @@ struct SubagentStatusBadge: View {
             if status == .running {
                 Image(systemName: symbolName)
                     .font(.system(size: 10, weight: .medium))
-                    .symbolEffect(.bounce, value: status)
+                    .modifier(BounceSymbolModifier(value: status))
             } else {
                 Image(systemName: symbolName)
                     .font(.system(size: 10, weight: .medium))
@@ -69,6 +69,22 @@ struct SubagentStatusBadge: View {
             Capsule()
                 .fill(color.opacity(0.12))
         )
+    }
+}
+
+// MARK: - BounceSymbolModifier
+
+/// Wrapper for `.symbolEffect(.bounce:)` with iOS 17+ availability guard.
+/// On iOS 16 and below, this is a no-op — the icon just doesn't bounce.
+private struct BounceSymbolModifier: ViewModifier {
+    let value: SubagentStatus
+
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content.symbolEffect(.bounce, value: value)
+        } else {
+            content
+        }
     }
 }
 

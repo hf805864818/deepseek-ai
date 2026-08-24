@@ -119,22 +119,6 @@ extension AIChatViewModel {
                 required: ["tool_title", "action"],
                 propertyOrdering: ["tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"]
             ),
-            // [T-phase4] S1: Sequential Thinking — on-demand structured
-            // reasoning tool. The model calls this when it feels the need to
-            // break down a complex problem step by step. Always registered
-            // (not deepMode-gated) — it's a general-purpose tool. P2-C11
-            // directly depends on this tool existing.
-            AgentToolDefinition(
-                name: "sequential_thinking",
-                description: "Break down a complex problem into structured reasoning steps. Use this when you need to think through a problem methodically before acting. Each step should build on the previous one: state the hypothesis, check assumptions, and converge on a conclusion. Do NOT use this for simple tasks — only when the problem genuinely requires multi-step deduction.",
-                parameters: [
-                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Analyze authentication flow', 'Plan database migration strategy'). Use the same language as the user."),
-                    "problem": AgentToolParam(type: .string, description: "The problem or question that needs structured reasoning. Be specific — include context, constraints, and what you're trying to determine."),
-                    "max_steps": AgentToolParam(type: .integer, description: "Maximum reasoning steps (default: 5). Each step is one hypothesis-check-conclusion cycle. Use more for complex architecture decisions, fewer for straightforward questions."),
-                ],
-                required: ["tool_title", "problem"],
-                propertyOrdering: ["tool_title", "problem", "max_steps"]
-            ),
             // [T-phase4] S3: Diff Apply — apply a unified diff patch to a file.
             // Uses the `patch` command backend in iSH. Complements file_edit for
             // multi-hunk changes.
@@ -172,6 +156,12 @@ extension AIChatViewModel {
         // master switch is off, this tool is invisible to the model, no
         // subagent sessions can be created, and all related UI is guarded.
         if deepModeEnabled {
+            // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
+            // The model calls this when it feels the need to structure its
+            // reasoning mid-task. Only registered in deep mode per the total
+            // switch contract — when off, the tool is invisible and the model
+            // falls back to its default (un-structured) reasoning behavior.
+            tools.append(SequentialThinkingTool.toolDefinition())
             tools.append(AgentToolDefinition(
                 name: "task_dispatch",
                 description: "Dispatch a sub-task to an independent subagent for execution. The subagent gets its own context window, limited tool access, and a bounded number of turns. Use this to parallelize independent subtasks (e.g. 'analyze security of module A' while you work on module B). The subagent returns a result summary that you can incorporate into your analysis. Do NOT use this for sequential tasks that depend on each other — use it for genuinely independent work.",

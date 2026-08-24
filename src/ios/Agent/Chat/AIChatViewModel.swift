@@ -980,6 +980,28 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// `deepModeEnabled`; memory-only, never persisted.
     @Published var clarifyState: ClarifyGate.State = .idle
 
+    // MARK: - P2 Cognitive: C9 Cognitive Load Monitor
+
+    /// [T-deep-mode-cognitive-p2-c9] Real-time cognitive load state. Updated
+    /// during `runAgentLoop` by merging the model's self-assessed sentinel
+    /// with client-computed metrics (context saturation, tool count, etc.).
+    /// The UI renders a warning banner when level >= .high.
+    /// Total-switch safe: reset to `.empty` in `deepModeDidDisableCleanup()`.
+    @Published var cognitiveLoadState: CognitiveLoadState = .empty
+
+    /// [T-deep-mode-cognitive-p2-c9] The model's self-assessed load signal
+    /// from the last turn's sentinel. Kept separately so the UI can show
+    /// both the model's and the client's assessment.
+    private var lastModelLoadSignal: CognitiveLoadSignal?
+
+    // MARK: - P2 Cognitive: C10 Dynamic Autonomy Exit
+
+    /// [T-deep-mode-cognitive-p2-c10] When the model emits
+    /// `<<GOAL_STATE>> need_more_context: <reason>`, the auto-continuation
+    /// loop stops and this state is set. The UI renders a "needs input" prompt.
+    /// Reset to nil in `deepModeDidDisableCleanup()` and on fresh send.
+    @Published var needMoreContextState: (reason: String?)? = nil
+
     /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
     /// execution prompt through the normal `send()` path so it inherits every
     /// existing guard (context check, persistence, session tracking, run loop).
@@ -987,8 +1009,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// path) re-enters the executing phase with the captured steps, so the
     /// progress tracker survives the confirm round-trip.
     func confirmPlan() {
-        guard case .awaitingApproval = planGateState else { return }
+        guard case .awaitingApproval(let pendingPlanText) = planGateState else { return }
         let capturedSteps = workflowSteps
+        // [T-deep-mode-cognitive-p2-c14] C14: Save the active project context
+        // when a plan is confirmed, so future sessions know what the user
+        // was last working on. Total-switch safe: this code path is only
+        // reachable when deepModeEnabled (PlanGate is gated on it).
+        if deepModeEnabled {
+            // Extract the first meaningful line of the plan as the project context.
+            let firstLine = pendingPlanText.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty && !$0.hasPrefix("```") } ?? String(pendingPlanText.prefix(100))
+            try? CrossSessionContextStore.setActiveProject(firstLine, sessionId: sessionId)
+            logger.info("[CrossSession] C14: active project context saved")
+        }
         planGateState = .idle
         inputText = String(localized: "计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
         send()
@@ -1244,9 +1278,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     logger.info("[VerifyGate] topped up goalRunner budget to 1 for fix round")
                 }
                 // Inject a "fix it" continue prompt and recurse.
+                // [T-deep-mode-cognitive-p2-c13] Instead of a plain "fix it"
+                // prompt, inject a root-cause analysis prompt that asks the
+                // model to: (1) analyze the fundamental reason for failure,
+                // (2) fix it, (3) generate a reusable avoidance rule wrapped
+                // in <<ROOT_CAUSE_RULE>> sentinels. After the fix turn
+                // completes, the rule is extracted and appended to
+                // deep-rules.md. Total-switch safe: only reachable when
+                // deepModeEnabled (guard at maybeProcessVerifyResult entry).
                 let fixReason = reason ?? "发现问题需要修复"
                 let cont = AgentMessage(role: .user, parts: [
-                    .text("<system-reminder>深度模式自检发现问题：\(fixReason)。请回到执行阶段，修复上述问题，修复完成后重新以 <<GOAL_STATE>> done 结束本回合。</system-reminder>")
+                    .text(ErrorRootCauseAnalyzer.rootCausePrompt(failureReason: fixReason))
                 ])
                 let ci = agentHistory.count
                 agentHistory.append(cont)
@@ -1255,6 +1297,19 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 }
                 do {
                     try await runAgentLoop()
+                    // [T-deep-mode-cognitive-p2-c13] After the fix turn
+                    // completes, extract the root-cause rule from the
+                    // model's last assistant response and append it to
+                    // deep-rules.md. The rule is wrapped in
+                    // <<ROOT_CAUSE_RULE>> sentinels. Total-switch safe:
+                    // only reachable when deepModeEnabled.
+                    if let lastMsg = messages.last,
+                       case .text = lastMsg.blocks.last?.kind,
+                       let lastText = lastMsg.blocks.last?.content,
+                       let rule = ErrorRootCauseAnalyzer.extractRule(from: lastText) {
+                        ErrorRootCauseAnalyzer.appendAutoRule(rule)
+                        logger.info("[RootCauseAnalyzer] C13: extracted and appended auto-rule: \(rule.prefix(80))")
+                    }
                 } catch is CancellationError {
                     logger.info("[VerifyGate] fix-round cancelled")
                     handleUserCancelledCleanup()
@@ -1324,6 +1379,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         retrospectiveHasRun = false
         isRetrospectiveRunning = false
         didInjectUncertaintyCheckThisRun = false
+        // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load state to
+        // empty so no warning banner survives the off switch.
+        cognitiveLoadState = .empty
+        lastModelLoadSignal = nil
+        // [T-deep-mode-cognitive-p2-c10] C10: Reset the need-more-context
+        // state so no "needs input" prompt survives the off switch.
+        needMoreContextState = nil
+        // [T-deep-mode-cognitive-p2-c14] C14: Clear the active project pointer
+        // in the cross-session store. Historical summaries are preserved
+        // (passive data, no behavioral impact when deep mode is off).
+        try? CrossSessionContextStore.clearActiveProject()
         // [T-phase5] Cancel and clear all active subagent sessions.
         // Ensures no subagent processes are left running when the master
         // switch is turned off. Total-switch safe: all UI is guarded by
@@ -1424,6 +1490,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // [T-deep-mode-workflow] Task complete: show an all-green completion
             // for a beat, then fade the tracker out (no lingering residue).
             await completeWorkflow()
+        // [T-deep-mode-cognitive-p2-c10] Dynamic autonomy exit: the model
+        // proactively asks for user input instead of guessing. Stop the
+        // auto-continuation loop, surface the reason, and wait for the user.
+        case .needMoreContext(let reason):
+            logger.info("[GoalRunner] need_more_context sentinel — stopping auto-continue, surfacing to user")
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            needMoreContextState = (reason: reason)
+            // The model's visible text already explains what it needs.
+            // We just stop the loop — the user sees the message and can reply.
+            finishWorkflow()
         case .pending(let reason):
             guard goalRunnerRoundsLeft > 0 else {
                 logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
@@ -2762,6 +2838,36 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         s += "4. PROACTIVE RISK FORESIGHT — Before the user asks, identify risks they haven't mentioned. If your plan has potential side effects, breaking changes, performance implications, or security concerns, surface them proactively in one line. Don't wait to be asked \"what could go wrong\" — tell the user first.\n"
         // C5: Fail-three-times-switch-method
         s += "5. FAIL-SWITCH — If the same approach fails 3 consecutive times (same error pattern or same dead-end), STOP and switch to a fundamentally different strategy. Do not attempt a 4th iteration of the same method. State: \"Approach X failed 3 times — switching to Y because Z.\" The auto-continue budget (3 rounds) exists for this: if you've used all 3 rounds without success, the next step must be a different approach, not a retry.\n"
+        // [T-deep-mode-cognitive-p2-c12] C12: Multi-path parallel thinking.
+        // When planning, the model should generate at least 3 candidate
+        // paths, assess risk for each, recommend the best, and let the
+        // user pick. Only triggered for non-trivial multi-step tasks;
+        // trivial tasks skip the plan gate entirely (per PLAN GATE rule).
+        s += "6. MULTI-PATH THINKING — When you produce a plan (fenced ```plan``` block), if the task is complex (more than 3 steps, or involves architecture/design decisions), generate AT LEAST 3 candidate paths. Format each path as:\n  ## PATH 1: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 2: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 3: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  RECOMMENDED: PATH <N>\n  Briefly explain why you recommend this path over the others (1-2 sentences). For trivial tasks (≤3 steps, no design decisions), use a standard single-path plan as before.\n"
+        // [T-deep-mode-cognitive-p2-c13] C13: Error → root cause → strategy
+        // update closed loop. When the self-verify fails and the client
+        // injects a root-cause analysis prompt, the model must analyze the
+        // fundamental reason, fix it, and emit a reusable avoidance rule.
+        s += "7. ROOT CAUSE LEARNING — When verification fails and you receive a root-cause analysis prompt, do NOT just fix the surface symptom. Analyze the FUNDAMENTAL reason it went wrong (wrong assumption? missing step? platform constraint?), fix it, then produce a single reusable rule that would prevent this class of error. Wrap the rule in <<ROOT_CAUSE_RULE>> ... <<ROOT_CAUSE_RULE>> tags. The rule will be auto-saved to your behavior rules for future sessions.\n"
+        // [T-deep-mode-cognitive-p2-c9] C9: Cognitive load real-time monitoring.
+        // The model self-assesses its cognitive load and emits a sentinel.
+        // The client merges this with objective metrics (context saturation,
+        // tool count) and shows a UI warning when load is high.
+        s += "8. COGNITIVE LOAD MONITORING — At the END of each turn where you used tools, assess your cognitive load and append exactly one line:\n  • <<COGNITIVE_LOAD>> low    (on track, confident, context is clear)\n  • <<COGNITIVE_LOAD>> medium  (some complexity, but manageable)\n  • <<COGNITIVE_LOAD>> high: <one-line note>   (losing track, context getting long, multiple failures)\n  • <<COGNITIVE_LOAD>> critical: <one-line note>   (context near limit, severe confusion, need to step back)\n  Be honest — under-reporting load leads to degraded output quality. If the client also detects high load from its own metrics, it will warn the user.\n"
+        // [T-deep-mode-cognitive-p2-c10] C10: Dynamic autonomy exit.
+        // When the model hits a gap it can't fill, it should emit
+        // need_more_context instead of guessing or hallucinating.
+        s += "9. DYNAMIC AUTONOMY EXIT — If you are in an auto-continue loop and discover you need information you don't have (ambiguous requirements, missing file access, need a design decision only the user can make), do NOT guess. Instead emit:\n  • <<GOAL_STATE>> need_more_context: <one-line description of what you need>\n  The client will STOP the auto-continuation loop and surface your question to the user. This is preferable to 3 rounds of increasingly-wrong assumptions.\n"
+        // [T-deep-mode-cognitive-p2-c14] C14: Unified cross-mode context.
+        // The model should proactively update cross-session context when
+        // meaningful state changes occur.
+        s += "10. CROSS-SESSION CONTEXT — When you complete a meaningful workflow (not a trivial single-step task), append a one-line summary of what was accomplished. The client will persist this as cross-session context so future sessions can pick up where you left off. Also, when you start a new workflow, briefly state the current project context so the client can persist it as the active project.\n"
+        // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
+        // The model has a `sequential_thinking` tool it can call mid-task
+        // when it needs to structure its reasoning. This is the "柔性版
+        // planning" — not forced like PlanGate, but called when the model
+        // itself decides it needs to think step by step.
+        s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
         return s
     }
 
@@ -2902,6 +3008,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                         source: "auto:deep-mode-c7"
                     )
                     logger.info("[Retrospective] C7 review saved to StructuredMemoryStore (\(reviewText.count) chars)")
+                    // [T-deep-mode-cognitive-p2-c14] C14: Also save a one-line
+                    // summary to the cross-session store so future sessions
+                    // have continuity. Use the first sentence of the review.
+                    let summary = String(reviewText.prefix(200)).components(separatedBy: "\n").first ?? String(reviewText.prefix(100))
+                    try? CrossSessionContextStore.appendWorkflowSummary(summary, sessionId: sessionId)
+                    logger.info("[CrossSession] C14: workflow summary saved to cross-session store")
                 }
             }
         } catch is CancellationError {
@@ -5448,6 +5560,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         didInjectEmptyToolReminderThisRun = false
         // [T-deep-mode-cognitive-p1] C8: Reset uncertainty check flag for this run.
         didInjectUncertaintyCheckThisRun = false
+        // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load model signal
+        // at the start of each agent loop. The @Published cognitiveLoadState
+        // is updated mid-loop; we don't reset it here so the last known load
+        // persists visually until the new turn's first signal arrives.
+        lastModelLoadSignal = nil
+        // [T-deep-mode-cognitive-p2-c10] C10: Clear the need-more-context state
+        // at the start of a fresh send — a new user message implies they've
+        // provided the context the model was asking for.
+        needMoreContextState = nil
 
         // Resolve provider from ProviderConfigStore
         guard let entry = resolveCurrentEntry() else {
@@ -5552,6 +5673,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         if deepModeEnabled {
             let t_deep = CFAbsoluteTimeGetCurrent()
             userSystemPrompt += deepModeFragment
+            // [T-deep-mode-cognitive-p2-c14] C14: Inject cross-session context
+            // fragment so the model has continuity from previous deep-mode
+            // sessions (active project, recent workflows, learned patterns).
+            // Total-switch safe: only injected when deepModeEnabled is on.
+            if let crossSessionFragment = CrossSessionContextStore.contextFragment() {
+                userSystemPrompt += "\n\n" + crossSessionFragment
+            }
             perfTimings["deepModeFragment"] = (t_deep - t0) * 1000
         }
 
@@ -5977,6 +6105,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 // deep agent posture.
                 if deepModeEnabled {
                     userSystemPrompt += deepModeFragment
+                    // [T-deep-mode-cognitive-p2-c14] C14: Also inject cross-session
+                    // context on the fallback path, same as the primary path.
+                    if let crossSessionFragment = CrossSessionContextStore.contextFragment() {
+                        userSystemPrompt += "\n\n" + crossSessionFragment
+                    }
                 }
                 fallbackTrigger += 1
                 if !fallbackReasons.isEmpty {
@@ -6245,6 +6378,19 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 if let clean = VerifyGate.textWithoutSentinel(assistantText) {
                     assistantText = clean
                 }
+                // [T-deep-mode-cognitive-p2-c9] C9: Parse + strip the cognitive
+                // load sentinel. The model emits `<<COGNITIVE_LOAD>> level` at
+                // the end of tool-bearing turns. The parsed signal is merged
+                // with client-computed metrics to produce the final load state.
+                // The sentinel line is stripped from visible text, same pattern
+                // as GOAL_STATE and VERIFY_STATE.
+                if let signal = CognitiveLoadMonitor.parseSentinel(assistantText) {
+                    lastModelLoadSignal = signal
+                    if let clean = CognitiveLoadMonitor.textWithoutSentinel(assistantText) {
+                        assistantText = clean
+                    }
+                    logger.info("[CognitiveLoad] C9: model-assessed load = \(signal.level.displayName)")
+                }
             }
             let toolEntries = streamResult.toolEntries
             let stopReason = streamResult.stopReason
@@ -6267,6 +6413,38 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     shouldInjectUncertaintyCheck = true
                     didInjectUncertaintyCheckThisRun = true
                     logger.info("[UncertaintyCheck] C8 uncertainty markers detected — will inject verification prompt")
+                }
+            }
+
+            // [T-deep-mode-cognitive-p2-c9] C9: Compute client-side cognitive
+            // load from objective metrics and merge with the model's
+            // self-assessed sentinel (if any). The merged state drives the
+            // UI warning banner. Total-switch safe: only inside
+            // `if deepModeEnabled` — when off, cognitiveLoadState stays .empty.
+            if deepModeEnabled {
+                let maxCtx = ProviderConfigStore.shared.entry(for: activeEntryId ?? "")?.model.contextWindowTokens ?? 0
+                let clientLoad = CognitiveLoadMonitor.computeClientLoad(
+                    contextTokens: turnUsage.latestContextTokens,
+                    maxContextTokens: maxCtx,
+                    toolCallCount: heartbeatToolCallCount,
+                    workflowStepCount: workflowSteps.count,
+                    verifyFailures: VerifyGate.maxVerifyRounds - verifyRoundsLeft,
+                    goalRunnerRoundsUsed: GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
+                )
+                let modelLevel = lastModelLoadSignal?.level
+                let merged = CognitiveLoadMonitor.merge(
+                    modelAssessed: modelLevel,
+                    clientComputed: clientLoad
+                )
+                let note = lastModelLoadSignal?.note
+                cognitiveLoadState = CognitiveLoadState(
+                    level: merged.level,
+                    modelAssessed: merged.modelAssessed,
+                    clientComputed: merged.clientComputed,
+                    note: note
+                )
+                if cognitiveLoadState.level >= .high {
+                    logger.info("[CognitiveLoad] C9: HIGH load detected — model=\(merged.modelAssessed.displayName) client=\(merged.clientComputed.displayName) merged=\(merged.level.displayName) ctx=\(turnUsage.latestContextTokens)/\(maxCtx) tools=\(heartbeatToolCallCount) steps=\(workflowSteps.count) verifyFails=\(VerifyGate.maxVerifyRounds - verifyRoundsLeft)")
                 }
             }
 
@@ -6912,12 +7090,29 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // ONLY behavior here — execution resumes only via confirmPlan().
         if deepModeEnabled, messages[msgIdx].error == nil, !canResume {
             if let plan = PlanGate.detectPlan(in: messages[msgIdx]) {
+                // [T-deep-mode-cognitive-p2-c12] Multi-path thinking: if the
+                // plan contains multiple candidate paths (## PATH markers),
+                // extract the model's recommended path as the execution plan.
+                // The full multi-path text is still shown to the user in the
+                // plan gate UI; only the step tracker uses the recommended
+                // path. Total-switch safe: deepModeEnabled is checked above.
+                let multiPathResult = MultiPathPlanner.parse(plan)
+                let planForSteps: String
+                switch multiPathResult {
+                case .multiPath(let paths, let recommendedIndex):
+                    let recommended = paths[recommendedIndex - 1]
+                    planForSteps = MultiPathPlanner.extractRecommendedPlan(from: multiPathResult) ?? plan
+                    logger.info("[MultiPath] C12: detected \(paths.count) paths, recommended #\(recommendedIndex): \(recommended.title) (risk: \(recommended.riskLevel.rawValue))")
+                case .singlePath:
+                    planForSteps = plan
+                }
+
                 if workflowPhase == .idle || workflowPhase == .planning {
                     // [T-deep-mode-plan-gate] Layer B: a plan-only turn from an
                     // idle/planning workflow raises the confirm/edit bar.
                     planGateState = .awaitingApproval(planText: plan)
                     workflowPhase = .planning
-                    workflowSteps = WorkflowPlanParser.parseSteps(from: plan)
+                    workflowSteps = WorkflowPlanParser.parseSteps(from: planForSteps)
                 } else {
                     // [T-deep-mode-workflow] Mid-execution or mid-verification
                     // plan-only turn: do NOT raise the top-level confirm gate

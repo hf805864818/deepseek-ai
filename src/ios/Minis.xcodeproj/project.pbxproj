@@ -352,6 +352,11 @@
 		E5SMEM001 /* StructuredMemoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SMEM101 /* StructuredMemoryStore.swift */; };
 		E5SUB001 /* SubagentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SUB101 /* SubagentSession.swift */; };
 		E5SUB002 /* SubagentCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SUB102 /* SubagentCard.swift */; };
+		E5MPATH001 /* MultiPathPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5MPATH101 /* MultiPathPlanner.swift */; };
+		E5COG9001 /* CognitiveLoadMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5COG9101 /* CognitiveLoadMonitor.swift */; };
+		E5SEQ9001 /* SequentialThinkingTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SEQ9101 /* SequentialThinkingTool.swift */; };
+		E5ROOT001 /* ErrorRootCauseAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5ROOT101 /* ErrorRootCauseAnalyzer.swift */; };
+		E5XSES001 /* CrossSessionContextStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5XSES101 /* CrossSessionContextStore.swift */; };
 		E5SOUL001 /* SoulStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SOUL101 /* SoulStore.swift */; };
 		E5SOUL002 /* SoulSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SOUL102 /* SoulSettingsView.swift */; };
 		E5SVP0021 /* ShadowVoiceProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SVP0031 /* ShadowVoiceProviderDetailView.swift */; };
@@ -999,6 +1004,11 @@
 		E5SMEM101 /* StructuredMemoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StructuredMemoryStore.swift; sourceTree = "<group>"; };
 		E5SUB101 /* SubagentSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentSession.swift; sourceTree = "<group>"; };
 		E5SUB102 /* SubagentCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentCard.swift; sourceTree = "<group>"; };
+		E5MPATH101 /* MultiPathPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiPathPlanner.swift; sourceTree = "<group>"; };
+		E5COG9101 /* CognitiveLoadMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CognitiveLoadMonitor.swift; sourceTree = "<group>"; };
+		E5SEQ9101 /* SequentialThinkingTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SequentialThinkingTool.swift; sourceTree = "<group>"; };
+		E5ROOT101 /* ErrorRootCauseAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ErrorRootCauseAnalyzer.swift; sourceTree = "<group>"; };
+		E5XSES101 /* CrossSessionContextStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CrossSessionContextStore.swift; sourceTree = "<group>"; };
 		E5SOUL101 /* SoulStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoulStore.swift; sourceTree = "<group>"; };
 		E5SOUL102 /* SoulSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoulSettingsView.swift; sourceTree = "<group>"; };
 		E5SVP0031 /* ShadowVoiceProviderDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowVoiceProviderDetailView.swift; sourceTree = "<group>"; };
@@ -2001,6 +2011,7 @@
 				E5DEEP101 /* DeepModeStore.swift */,
 				E5RULE101 /* DeepModeRule.swift */,
 				E5SMEM101 /* StructuredMemoryStore.swift */,
+				E5XSES101 /* CrossSessionContextStore.swift */,
 				E5SUB101 /* SubagentSession.swift */,
 				E5SOUL101 /* SoulStore.swift */,
 			);
@@ -2090,6 +2101,10 @@
 				E53000012 /* AIChatView.swift */,
 				E5DEEP105 /* WorkflowProgressView.swift */,
 				E5SUB102 /* SubagentCard.swift */,
+				E5MPATH101 /* MultiPathPlanner.swift */,
+				E5COG9101 /* CognitiveLoadMonitor.swift */,
+				E5SEQ9101 /* SequentialThinkingTool.swift */,
+				E5ROOT101 /* ErrorRootCauseAnalyzer.swift */,
 				E5F200011 /* MarkdownPrepRegex.swift */,
 				E5F200012 /* MinisMediaViews.swift */,
 				E5F200013 /* AssistantBlockView.swift */,
@@ -2889,6 +2904,11 @@
 				E5SMEM001 /* StructuredMemoryStore.swift in Sources */,
 				E5SUB001 /* SubagentSession.swift in Sources */,
 				E5SUB002 /* SubagentCard.swift in Sources */,
+				E5MPATH001 /* MultiPathPlanner.swift in Sources */,
+				E5COG9001 /* CognitiveLoadMonitor.swift in Sources */,
+				E5SEQ9001 /* SequentialThinkingTool.swift in Sources */,
+				E5ROOT001 /* ErrorRootCauseAnalyzer.swift in Sources */,
+				E5XSES001 /* CrossSessionContextStore.swift in Sources */,
 				E5SOUL001 /* SoulStore.swift in Sources */,
 				E5SOUL002 /* SoulSettingsView.swift in Sources */,
 				E5LOCK002 /* FaceIDProtectionSettingsView.swift in Sources */,

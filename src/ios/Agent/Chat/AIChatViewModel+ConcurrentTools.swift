@@ -800,39 +800,58 @@ extension AIChatViewModel {
             toolSuccess = memResult.success
 
         default:
-            // [T-phase4] S1: Sequential Thinking — structured reasoning tool.
-            // The model provides a problem and max_steps; we return a framework
-            // that guides the model through hypothesis-check-conclusion cycles.
-            // The actual reasoning is done by the model in its response; this
-            // tool structures the output format.
+            // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
+            // The model calls this tool when it needs to structure its reasoning.
+            // Only registered when deepModeEnabled is on; the guard below is
+            // defensive — if the toggle was turned off between registration and
+            // execution, return a safe error instead of running the tool.
             switch tu.name {
             case "sequential_thinking":
+                guard deepModeEnabled else {
+                    toolOutput = "Error: Deep mode was disabled after sequential_thinking was registered. Cannot execute structured reasoning."
+                    toolSuccess = false
+                    break
+                }
                 let problem = (tu.args["problem"] as? String) ?? ""
                 // [T-phase4-fix] Use NSNumber cast — JSONSerialization may
                 // return NSNumber (Double-backed) for integer fields, and
                 // `as? Int` silently fails → always default. Matches the
                 // pattern used for timeout/delay in SSEStream.swift.
-                let maxSteps = (tu.args["max_steps"] as? NSNumber)?.intValue ?? 5
-                let actualSteps = max(1, min(maxSteps, 20))
+                let maxSteps = (tu.args["max_steps"] as? NSNumber)?.intValue ?? SequentialThinkingTool.defaultSteps
 
-                if problem.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    toolOutput = "Error: 'problem' parameter is required. Please describe the problem you want to reason through."
+                // Validate input
+                if let error = SequentialThinkingTool.validateInput(problem: problem, maxSteps: maxSteps) {
+                    toolOutput = error
                     toolSuccess = false
                     break
                 }
 
-                // Build a structured reasoning framework. The model fills in
-                // each step in its response. We return the framework template.
-                var framework = "## 结构化推理框架\n\n**问题**: \(problem)\n\n"
-                for i in 1...actualSteps {
-                    framework += "### 步骤 \(i)\n"
-                    framework += "- **假设**: [在此陈述本步假设]\n"
-                    framework += "- **验证**: [在此检验假设是否成立]\n"
-                    framework += "- **结论**: [在此给出本步结论]\n\n"
+                // [T-deep-mode-cognitive-p2-c11] C11 enhancement: inject
+                // current context (workflow phase, step number, cognitive
+                // load level, multi-path status) so the reasoning framework
+                // is context-aware. This connects C11 to C9 (cognitive load)
+                // and C12 (multi-path).
+                let phaseStr: String
+                switch workflowPhase {
+                case .idle: phaseStr = "idle"
+                case .planning: phaseStr = "planning"
+                case .executing: phaseStr = "executing"
+                case .verifying: phaseStr = "verifying"
                 }
-                framework += "### 最终结论\n[在此综合所有步骤，给出最终结论]\n"
-                toolOutput = framework
+                let currentStep = workflowSteps.firstIndex(where: { $0.status == .active }).map { $0.id } ?? 0
+                let isMultiPath = pendingGoalSentinel != nil
+
+                let result = SequentialThinkingTool.generateFramework(
+                    problem: problem,
+                    maxSteps: maxSteps,
+                    workflowPhase: phaseStr,
+                    workflowStep: currentStep,
+                    cognitiveLoadLevel: cognitiveLoadState.level,
+                    isMultiPath: isMultiPath
+                )
+                toolOutput = result.framework
                 toolSuccess = true
+                ctLogger.info("[SequentialThinking] C11: framework generated — problem=\"\(problem.prefix(60))\" steps=\(result.steps.count) phase=\(phaseStr) load=\(cognitiveLoadState.level.displayName)")
 
             // [T-phase4] S3: Diff Apply — apply unified diff patch to a file.
             case "diff_apply":
