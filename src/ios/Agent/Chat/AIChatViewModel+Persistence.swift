@@ -212,6 +212,10 @@ extension AIChatViewModel {
         // vm.memoryEnabled from the DB/global default, and which session.
         AppLogger(category: "MemDiag").info("[MemDiag] loadSession sid=\(sessionId.prefix(8)) → vm.memoryEnabled=\(self.memoryEnabled)")
 
+        // [T-perf-memory-cache] Preload memory fragments in the background
+        // so the cache is warm by the time the user sends a message.
+        Self.preloadMemoryFragments()
+
         // Clear stale compact/pending state from previous lifecycle
         skipCompactCheck = false
         if isCompacting {

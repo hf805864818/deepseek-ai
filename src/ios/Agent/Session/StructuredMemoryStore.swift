@@ -164,6 +164,11 @@ enum StructuredMemoryStore {
     /// Invalidates when entries change.
     private static var cachedFragment: (fragment: String, modTime: Date)?
 
+    // [T-perf-stat-cache] Short-lived TTL cache to skip attributesOfItem
+    // (synchronous disk stat) on the main thread during send/resume.
+    private static var _fragmentCacheTimestamp: Date = .distantPast
+    private static let _fragmentCacheTTL: TimeInterval = 5.0
+
     /// Load all structured memory entries with caching.
     ///
     /// Phase 3.4 fix: avoids repeated disk reads by caching entries in memory
@@ -376,15 +381,26 @@ enum StructuredMemoryStore {
     static func categorizedMemoryFragment() -> String? {
         let entries = loadEntries()
         guard !entries.isEmpty else { return nil }
-        
-        // [T-deep-mode-perf] Use cached fragment if file hasn't changed
+
+        // [T-deep-mode-perf] Use cached fragment if file hasn't changed.
+        // [T-perf-stat-cache] Added short-lived TTL fast-path: within 5s of
+        // the last call, return the cached fragment without calling
+        // FileManager.attributesOfItem (synchronous disk stat) on the main
+        // thread. Falls through to the modTime check only after TTL expiry.
+        let now = Date()
+        if now.timeIntervalSince(_fragmentCacheTimestamp) < _fragmentCacheTTL,
+           let cached = cachedFragment {
+            return cached.fragment
+        }
+
         let fm = FileManager.default
         let url = fileURL
         let currentModTime = try? fm.attributesOfItem(atPath: url.path)[FileAttributeKey.modificationDate] as? Date
-        
+
         if let cached = cachedFragment,
            let modTime = currentModTime,
            cached.modTime == modTime {
+            _fragmentCacheTimestamp = now
             return cached.fragment
         }
 
@@ -427,6 +443,7 @@ enum StructuredMemoryStore {
         if let modTime = currentModTime {
             cachedFragment = (result, modTime)
         }
+        _fragmentCacheTimestamp = now
         
         return result
     }

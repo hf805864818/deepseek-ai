@@ -882,6 +882,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     var skipCompactCheck = false
     /// When false, memory_write tool calls are skipped (returns "Memory disabled") in this session.
     @Published var memoryEnabled = true
+
+    // [T-perf-estimate-cache] Cache for estimateContextTokens() to avoid
+    // repeated full-history traversal + JSON serialization on the main thread.
+    // Invalidated by history count change (send/resume adds entries → count
+    // differs → cache miss). Between checkContextBeforeSend and runAgentLoop
+    // entry, agentHistory doesn't change, so the cache hits and skips the
+    // expensive recomputation. Also used by defer-block logging (which used
+    // to call estimateContextTokens() twice more at round end).
+    private var _cachedEstimateTokens: Int? = nil
+    private var _cachedEstimateHistoryCount: Int = -1
+
+    /// Invalidate the estimate cache. Called at send()/resume() entry points
+    /// and whenever agentHistory is mutated by compaction/offload.
+    func invalidateEstimateCache() {
+        _cachedEstimateTokens = nil
+        _cachedEstimateHistoryCount = -1
+    }
     /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
     /// UserDefaults (the Settings toggle) so it applies across all sessions
     /// without per-session state. When on, an extra deep-mode behavior
@@ -1343,6 +1360,27 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             guard goalRunnerRoundsLeft > 0 else {
                 logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
                 goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+                // [T-deep-mode-cognitive-p0] C5: Fail-switch — when the auto-continue
+                // budget is exhausted (3 rounds used without reaching `done`), the
+                // model has effectively "failed the same approach 3 times". Instead
+                // of silently stopping, inject a fail-switch directive that tells the
+                // model to try a fundamentally different strategy on the next user
+                // interaction. This is a one-shot injected user message — it does
+                // NOT auto-continue (we're out of budget); it only surfaces the
+                // recommendation in the conversation so the user sees it and the
+                // model's next turn is primed to switch approach.
+                // Total-switch safe: this code path is already inside
+                // `guard deepModeEnabled` at maybeAutoContinueGoal entry, and the
+                // injected message is a normal AgentMessage — no new state, no
+                // persistence, no UI.
+                let failSwitchMsg = AgentMessage(role: .user, parts: [
+                    .text("<system-reminder>深度模式认知提示（C5 失败切换）：已连续尝试 \(GoalRunner.maxAutoRounds) 轮未完成任务。请勿重复同一方法。下次执行时必须切换到完全不同的策略路径，并说明切换理由。如果当前路径是唯一可行路径，请说明为何前 \(GoalRunner.maxAutoRounds) 次未能成功，以及需要用户提供什么才能突破。</system-reminder>")
+                ])
+                let fci = agentHistory.count
+                agentHistory.append(failSwitchMsg)
+                if let pid = await persistAgentMessage(failSwitchMsg), fci < agentHistory.count {
+                    agentHistory[fci].dbMessageId = pid
+                }
                 // [T-deep-mode-workflow] Stopping without a `done` sentinel:
                 // clear the tracker so it can't linger as "执行中".
                 finishWorkflow()
@@ -2488,10 +2526,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Phase 3: extracts file paths mentioned in recent conversation and
     /// keywords from the latest user message so DeepModeStore can select
     /// only the rules that are relevant to the current turn.
+    // [T-perf-scope-cache] Cache for buildDeepModeScopeContext() result.
+    // The scope context depends on the last user message + recent 10 messages'
+    // file path mentions. Between send() and runAgentLoop entry, messages don't
+    // change, so the cache hits and skips the regex traversal.
+    private var _cachedScopeContext: DeepModeScopeContext?
+    private var _cachedScopeLastUserMessage: String = ""
+
     private func buildDeepModeScopeContext() -> DeepModeScopeContext {
-        // Find the latest user message text
+        // [T-perf-scope-cache] Return cached result when the last user message
+        // hasn't changed (same send flow → same scope context → no recomputation).
         let lastUserMessage = messages
             .last(where: { $0.role == .user })?.content ?? ""
+
+        if let cached = _cachedScopeContext,
+           lastUserMessage == _cachedScopeLastUserMessage {
+            return cached
+        }
 
         // Extract file paths from recent messages (last 10 messages)
         let recentMessages = messages.suffix(10)
@@ -2506,10 +2557,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
         }
 
-        return DeepModeScopeContext(
+        let ctx = DeepModeScopeContext(
             mentionedFilePaths: Array(mentionedPaths),
             userInputLowercased: lastUserMessage.lowercased()
         )
+        _cachedScopeContext = ctx
+        _cachedScopeLastUserMessage = lastUserMessage
+        return ctx
     }
 
     // [T-deep-mode-s1-1] Precompiled regexes for filename extensions — compiled once, reused every call
@@ -2619,6 +2673,24 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         if memoryEnabled {
             s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, project fact, or taboo worth keeping, persist it via memory_write with an appropriate category (preference/convention/fact/taboo/project) and mention it in a single line, rather than waiting to be asked."
         }
+        // [T-deep-mode-cognitive-p0] Phase 4.5 P0: cognitive thinking abilities.
+        // Five prompt-injected directives that make the agent "think more like a
+        // human". All are pure prompt additions inside deepModeFragment, so the
+        // master switch controls them implicitly — when deepModeEnabled is off,
+        // deepModeFragment is never appended to the system prompt, and none of
+        // these directives appear. Zero runtime state, zero UI, zero persistence.
+        s += "\n"
+        s += "COGNITIVE ABILITIES (think like a senior engineer, not just execute):\n"
+        // C1: Three-layer intent decoding
+        s += "1. THREE-LAYER INTENT — Before acting on a request, silently decode three layers: (a) What is the user literally asking? (b) What is the real underlying need behind this request? (c) After this is solved, what will the user likely ask next? Design your solution for layer (b), not just (a). If layers (a) and (b) conflict, address (b) and briefly explain why.\n"
+        // C2: Reverse verification
+        s += "2. ADVERSARIAL SELF-CHECK — After reaching a conclusion or producing output, actively search for evidence that could DISPROVE your solution. Try to break your own work: what edge case fails? What assumption might be wrong? Only if you cannot find a disproof is the conclusion reliable. State what you tried to break and why it held.\n"
+        // C3: First-principles reasoning
+        s += "3. FIRST PRINCIPLES — Do not rely on \"this worked last time\". For each non-trivial decision, reason from fundamental constraints (what the platform/language/runtime actually guarantees), not from pattern-matching prior solutions. Past success does not justify current reuse if the fundamentals have changed.\n"
+        // C4: Proactive risk anticipation
+        s += "4. PROACTIVE RISK FORESIGHT — Before the user asks, identify risks they haven't mentioned. If your plan has potential side effects, breaking changes, performance implications, or security concerns, surface them proactively in one line. Don't wait to be asked \"what could go wrong\" — tell the user first.\n"
+        // C5: Fail-three-times-switch-method
+        s += "5. FAIL-SWITCH — If the same approach fails 3 consecutive times (same error pattern or same dead-end), STOP and switch to a fundamentally different strategy. Do not attempt a 4th iteration of the same method. State: \"Approach X failed 3 times — switching to Y because Z.\" The auto-continue budget (3 rounds) exists for this: if you've used all 3 rounds without success, the next step must be a different approach, not a retry.\n"
         return s
     }
 
@@ -2818,6 +2890,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     func send() {
         // Read-only mode — cannot send messages
         guard remoteDeviceId == nil else { return }
+
+        // [T-perf-estimate-cache] Invalidate token estimate cache at send
+        // entry so checkContextBeforeSend() computes fresh, then the
+        // runAgentLoop baseline log reuses the cached value (no recompute).
+        invalidateEstimateCache()
 
         // [T-ios-photo-pick-placeholder] Drop any non-ready attachments (failed
         // photo loads, or a stray still-loading placeholder) so only fully-loaded
@@ -3559,6 +3636,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     func resume() {
         guard !isProcessing, canResume else { return }
         guard let lastMsg = messages.last, lastMsg.role == .assistant else { return }
+
+        // [T-perf-estimate-cache] Invalidate token estimate cache at resume
+        // entry so the runAgentLoop baseline computes fresh.
+        invalidateEstimateCache()
 
         // [T-deep-mode-resume-log] Log resume trigger with workflow state
         logger.info("[WorkflowLog] resume() called - workflowPhase=\(workflowPhase) canResume=\(canResume) stepsCount=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
@@ -5119,9 +5200,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // triggered by a new user message send or a retry.
         let _diagRound = Self.bumpDiagRound()
         AppLogger(category: "RoundMarker").warning("══════════════ ROUND BEGIN \(_diagRound) ══════════════ vm=\(self.vmInstanceId) session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) resuming=\(existingMsgIdx != nil)")
-        defer { AppLogger(category: "RoundMarker").warning("══════════════ ROUND END \(_diagRound) ════════════════ vm=\(self.vmInstanceId) session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(self.estimateContextTokens()) tokens") }
+        // [T-perf-estimate-cache] Defer blocks used to call
+        // estimateContextTokens() which triggers a full-history traversal
+        // + JSON serialization at round END — right when the UI is resuming
+        // interactivity. Now reuse the cached value from round start (the
+        // defer runs after history has grown, so this is a lower bound, but
+        // it's only a diagnostic log line — not worth blocking the UI for).
+        defer { AppLogger(category: "RoundMarker").warning("══════════════ ROUND END \(_diagRound) ════════════════ vm=\(self.vmInstanceId) session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(_cachedEstimateTokens ?? -1) tokens") }
         logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop START session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) resuming=\(existingMsgIdx != nil)")
-        defer { logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop END session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(self.estimateContextTokens()) tokens") }
+        defer { logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop END session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(_cachedEstimateTokens ?? -1) tokens") }
 
         let loopSetupStart = CFAbsoluteTimeGetCurrent()
         let t0 = CFAbsoluteTimeGetCurrent()

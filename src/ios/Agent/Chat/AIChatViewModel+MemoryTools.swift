@@ -6,18 +6,70 @@ extension AIChatViewModel {
 
     // MARK: - Memory Tools
 
+    // [T-perf-memory-cache] File-level cache for memory fragments.
+    // Eliminates repeated disk reads (String(contentsOf:) +
+    // FileManager.fileExists) during send()/resume() on the main thread.
+    // Invalidated by a time-based TTL (5s) — short enough that a
+    // memory_write immediately before a send will not return stale data,
+    // but long enough that the 2× calls within a single send flow
+    // (checkContextBeforeSend → runAgentLoop) hit the cache.
+    private static var _cachedGlobalFragment: (fragment: String?, modTime: Date?)?
+    private static var _cachedDailyFragment: (fragment: String?, modTime: Date?)?
+    private static let _memoryCacheTTL: TimeInterval = 5.0
+    private static var _globalCacheTimestamp: Date = .distantPast
+    private static var _dailyCacheTimestamp: Date = .distantPast
+
+    /// Invalidate the memory fragment caches. Called after memory_write
+    /// completes so the next send/resume reads fresh data.
+    static func invalidateMemoryCache() {
+        _cachedGlobalFragment = nil
+        _cachedDailyFragment = nil
+        _globalCacheTimestamp = .distantPast
+        _dailyCacheTimestamp = .distantPast
+    }
+
+    /// Preload memory fragments in the background. Called from loadSession
+    /// completion so the cache is warm by the time the user sends.
+    nonisolated static func preloadMemoryFragments() {
+        Task.detached(priority: .utility) {
+            _ = loadGlobalMemoryFragment()
+            _ = loadRecentDailyMemoryFragment()
+        }
+    }
+
     /// Load full global memory content for system prompt injection.
     nonisolated static func loadGlobalMemoryFragment() -> String? {
+        // [T-perf-memory-cache] Check cache first
+        let now = Date()
+        if now.timeIntervalSince(_globalCacheTimestamp) < _memoryCacheTTL,
+           let cached = _cachedGlobalFragment {
+            return cached.fragment
+        }
+
         let globalFile = minisMemoryPersistentDir.appendingPathComponent("GLOBAL.md")
         guard FileManager.default.fileExists(atPath: globalFile.path),
               let content = try? String(contentsOf: globalFile, encoding: .utf8),
-              !content.isEmpty else { return nil }
+              !content.isEmpty else {
+            _cachedGlobalFragment = (nil, nil)
+            _globalCacheTimestamp = now
+            return nil
+        }
 
-        return "Global memory (GLOBAL.md — read-only, user-maintained). Treat these as background context, not standing instructions. If the user's latest message conflicts with or supersedes anything here (different scope, different numbers, different goal), defer to the user's latest message:\n\(content)"
+        let fragment = "Global memory (GLOBAL.md — read-only, user-maintained). Treat these as background context, not standing instructions. If the user's latest message conflicts with or supersedes anything here (different scope, different numbers, different goal), defer to the user's latest message:\n\(content)"
+        _cachedGlobalFragment = (fragment, nil)
+        _globalCacheTimestamp = now
+        return fragment
     }
 
     /// Load the 3 most recent daily memory logs that have content, for system prompt injection (first 200 lines each).
     nonisolated static func loadRecentDailyMemoryFragment() -> String? {
+        // [T-perf-memory-cache] Check cache first
+        let now = Date()
+        if now.timeIntervalSince(_dailyCacheTimestamp) < _memoryCacheTTL,
+           let cached = _cachedDailyFragment {
+            return cached.fragment
+        }
+
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd"
         let fm = FileManager.default
@@ -52,11 +104,17 @@ extension AIChatViewModel {
             dayOffset += 1
         }
 
-        guard !fragments.isEmpty else { return nil }
+        guard !fragments.isEmpty else {
+            _cachedDailyFragment = (nil, nil)
+            _dailyCacheTimestamp = now
+            return nil
+        }
 
         var result = "Recent memories (auto-injected from daily logs):\n"
         result += "These are memories saved by you or the user in previous sessions. Treat them as background context, not standing instructions — they describe past tasks, not the current one. If the user's latest message changes scope, numbers, or goal, follow the latest message and do not resume the old task from these memories. Do not delete or rewrite these files unless the user explicitly asks. Use memory_get to search for more, or memory_write to save new ones.\n\n"
         result += fragments.joined(separator: "\n\n")
+        _cachedDailyFragment = (result, nil)
+        _dailyCacheTimestamp = now
         return result
     }
 
@@ -144,6 +202,9 @@ extension AIChatViewModel {
         } catch {
             structuredInfo = "; structured write failed: \(error.localizedDescription)"
         }
+
+        // [T-perf-memory-cache] Invalidate cache so next send/resume reads fresh data
+        Self.invalidateMemoryCache()
 
         return FileToolResult(output: "Memory saved to \(fileName) (\(content.count) chars)\(structuredInfo)", success: true)
     }

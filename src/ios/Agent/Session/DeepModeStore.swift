@@ -126,6 +126,16 @@ enum DeepModeStore {
     private static var cachedRules: [DeepModeRule]?
     private static var cachedRulesModTime: Date?
 
+    // [T-perf-stat-cache] Short-lived TTL cache for loadRules() to avoid
+    // calling FileManager.attributesOfItem (a synchronous disk stat) on the
+    // main thread during every send/resume. Within the 5s TTL, the cached
+    // rules are returned directly without any disk I/O. The TTL is short
+    // enough that an external edit to deep-rules.md is picked up on the
+    // next send, but long enough that the 2× calls within a single send
+    // flow (deepModeFragment computed in send → runAgentLoop) skip the stat.
+    private static var _rulesCacheTimestamp: Date = .distantPast
+    private static let _rulesCacheTTL: TimeInterval = 5.0
+
     /// Load and parse all rules from `deep-rules.md` with caching.
     ///
     /// Phase 3.4 fix: avoids repeated disk reads and YAML parsing by caching
@@ -133,11 +143,20 @@ enum DeepModeStore {
     static func loadRules() -> [DeepModeRule] {
         ensureExists()
 
-        // Check cache first
+        // [T-perf-stat-cache] Fast path: within TTL, return cached rules
+        // without touching the disk at all.
+        let now = Date()
+        if now.timeIntervalSince(_rulesCacheTimestamp) < _rulesCacheTTL,
+           let cached = cachedRules {
+            return cached
+        }
+
+        // Check cache with modification time verification
         if let cached = cachedRules {
             if let currentModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationDate] as? Date,
                let cachedModTime = cachedRulesModTime,
                currentModTime == cachedModTime {
+                _rulesCacheTimestamp = now
                 return cached
             }
             // File changed — invalidate cache
@@ -150,6 +169,7 @@ enum DeepModeStore {
             let defaultParsed = DeepModeRuleParser.parse(defaultRulesBody)
             cachedRules = defaultParsed
             cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationDate] as? Date
+            _rulesCacheTimestamp = now
             return defaultParsed
         }
 
@@ -158,12 +178,14 @@ enum DeepModeStore {
             let defaultParsed = DeepModeRuleParser.parse(defaultRulesBody)
             cachedRules = defaultParsed
             cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationDate] as? Date
+            _rulesCacheTimestamp = now
             return defaultParsed
         }
 
         let parsed = DeepModeRuleParser.parse(trimmed)
         cachedRules = parsed
         cachedRulesModTime = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.modificationDate] as? Date
+        _rulesCacheTimestamp = now
         return parsed
     }
 

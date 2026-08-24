@@ -307,6 +307,17 @@ extension AIChatViewModel {
     /// what's sent; estimating against the raw log made post-compact usage
     /// look unchanged and fired the "near capacity" prompt before every send.
     func estimateContextTokens(_ caller: String = #function) -> Int {
+        // [T-perf-estimate-cache] Return cached value when agentHistory
+        // hasn't changed since the last computation. This eliminates the
+        // repeated full-history traversal + JSONSerialization on the main
+        // thread that caused UI stalls during send() and resume().
+        let currentCount = agentHistory.count
+        if let cached = _cachedEstimateTokens,
+           currentCount == _cachedEstimateHistoryCount {
+            logger.info("[CompactDiag] estimate cache HIT caller=\(caller) count=\(currentCount) cached=\(cached)tok")
+            return cached
+        }
+
         var totalChars = 0
         var imageTokens = 0
         let slice = effectiveAgentHistory()
@@ -363,6 +374,10 @@ extension AIChatViewModel {
         let top = biggest.prefix(5).map { "[\($0.msgIdx)\($0.kind)=\($0.chars)c]" }.joined(separator: " ")
         logger.info("[CompactDiag] estimate caller=\(caller) slice=\(slice.count) total=\(totalTokens)tok (\(totalChars)chars+\(imageTokens)imgTok) bigParts(≥2kc): \(top)")
         logger.info("[CompactDiag] estimate perMsg: \(perMsg.joined(separator: " "))")
+
+        // [T-perf-estimate-cache] Store result
+        _cachedEstimateTokens = totalTokens
+        _cachedEstimateHistoryCount = currentCount
         return totalTokens
     }
 
