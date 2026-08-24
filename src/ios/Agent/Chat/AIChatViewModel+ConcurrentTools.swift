@@ -808,7 +808,11 @@ extension AIChatViewModel {
             switch tu.name {
             case "sequential_thinking":
                 let problem = (tu.args["problem"] as? String) ?? ""
-                let maxSteps = (tu.args["max_steps"] as? Int) ?? 5
+                // [T-phase4-fix] Use NSNumber cast — JSONSerialization may
+                // return NSNumber (Double-backed) for integer fields, and
+                // `as? Int` silently fails → always default. Matches the
+                // pattern used for timeout/delay in SSEStream.swift.
+                let maxSteps = (tu.args["max_steps"] as? NSNumber)?.intValue ?? 5
                 let actualSteps = max(1, min(maxSteps, 20))
 
                 if problem.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -847,8 +851,13 @@ extension AIChatViewModel {
                 }
 
                 // Write the patch to a temp file, then apply with `patch`.
+                // [T-phase4-fix] Use a UUID-based heredoc delimiter to prevent
+                // injection — if the patch content contains "PATCH_EOF" on its
+                // own line, a static delimiter would terminate the heredoc
+                // early and execute the rest as shell commands.
                 let tempPatchPath = "/tmp/minis_patch_\(UUID().uuidString.prefix(8)).diff"
-                let writeCmd = "cat > '\(tempPatchPath)' << 'PATCH_EOF'\n\(patchContent)\nPATCH_EOF"
+                let heredocTag = "MINIS_PATCH_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))_EOF"
+                let writeCmd = "cat > '\(tempPatchPath)' << '\(heredocTag)'\n\(patchContent)\n\(heredocTag)"
                 let writeResult: CommandResult
                 do {
                     writeResult = try await executeCommand(writeCmd, timeout: 10) { _ in }
@@ -864,7 +873,11 @@ extension AIChatViewModel {
                 }
 
                 // Apply the patch. Use --no-backup to avoid .orig files.
-                let applyCmd = "cd / && patch -p0 < '\(tempPatchPath)' 2>&1 || patch -p1 < '\(tempPatchPath)' 2>&1"
+                // [T-phase4-fix] Use --dry-run to test before applying, so
+                // we don't partially apply a patch with -p0 and then try -p1
+                // on the already-modified file. Try -p0 dry-run, then -p1
+                // dry-run, then apply with whichever path level works.
+                let applyCmd = "cd / && if patch -p0 --dry-run < '\(tempPatchPath)' >/dev/null 2>&1; then patch -p0 < '\(tempPatchPath)' 2>&1; elif patch -p1 --dry-run < '\(tempPatchPath)' >/dev/null 2>&1; then patch -p1 < '\(tempPatchPath)' 2>&1; else patch -p0 < '\(tempPatchPath)' 2>&1; fi"
                 let applyResult: CommandResult
                 do {
                     applyResult = try await executeCommand(applyCmd, timeout: 30) { _ in }
@@ -891,7 +904,7 @@ extension AIChatViewModel {
                 let pattern = (tu.args["pattern"] as? String) ?? ""
                 let directory = (tu.args["directory"] as? String) ?? "/root"
                 let filePattern = (tu.args["file_pattern"] as? String)
-                let maxResults = (tu.args["max_results"] as? Int) ?? 50
+                let maxResults = (tu.args["max_results"] as? NSNumber)?.intValue ?? 50
 
                 if pattern.isEmpty {
                     toolOutput = "Error: 'pattern' parameter is required."
@@ -900,12 +913,16 @@ extension AIChatViewModel {
                 }
 
                 // Build grep command. Use grep -rnE for extended regex.
-                // If file_pattern is provided, use --include to filter.
+                // [T-phase4-fix] Escape single quotes in directory and
+                // file_pattern — without this, paths containing ' would
+                // break the command or allow injection.
+                let escapedDir = directory.replacingOccurrences(of: "'", with: "'\\''")
                 var cmd = "grep -rnE --include='*'"
                 if let fp = filePattern, !fp.isEmpty {
-                    cmd = "grep -rnE --include='\(fp)'"
+                    let escapedFp = fp.replacingOccurrences(of: "'", with: "'\\''")
+                    cmd = "grep -rnE --include='\(escapedFp)'"
                 }
-                cmd += " '\(pattern.replacingOccurrences(of: "'", with: "'\\''"))' '\(directory)' 2>/dev/null | head -\(maxResults)"
+                cmd += " '\(pattern.replacingOccurrences(of: "'", with: "'\\''"))' '\(escapedDir)' 2>/dev/null | head -\(maxResults)"
 
                 let searchResult: CommandResult
                 do {
@@ -940,7 +957,7 @@ extension AIChatViewModel {
 
                 let taskDesc = (tu.args["task_description"] as? String) ?? "Subtask"
                 let subPrompt = (tu.args["prompt"] as? String) ?? ""
-                let maxCalls = (tu.args["max_tool_calls"] as? Int) ?? 10
+                let maxCalls = (tu.args["max_tool_calls"] as? NSNumber)?.intValue ?? 10
                 let allowedToolsStr = (tu.args["allowed_tools"] as? String)
                 let allowedTools = allowedToolsStr?
                     .components(separatedBy: ",")
@@ -1004,6 +1021,10 @@ extension AIChatViewModel {
 
                         // Create a temporary assistant message with the
                         // tool block at the end of the messages array.
+                        // [T-phase5-fix] Use defer to guarantee cleanup —
+                        // even if executeSingleToolUse's internal await
+                        // points are cancelled, the temp message must be
+                        // removed from the chat list to avoid a leak.
                         let tempMsg = ChatMessage(role: .assistant, content: "", blocks: [])
                         let block = AssistantBlock(
                             kind: blockKind,
@@ -1016,6 +1037,14 @@ extension AIChatViewModel {
                         self.messages.append(tempMsg)
                         let tempIdx = self.messages.count - 1
                         let tempBlockIdx = 0
+
+                        // [T-phase5-fix] Guarantee temp message removal
+                        // even on cancellation/error paths.
+                        defer {
+                            if tempIdx < self.messages.count {
+                                self.messages.remove(at: tempIdx)
+                            }
+                        }
 
                         // Build a complete ToolEntry with all required fields.
                         let streamResult = StreamResult.ToolEntry(
@@ -1036,11 +1065,6 @@ extension AIChatViewModel {
                             tools: self.makeAgentTools(),
                             batchBudget: imageBudget
                         )
-
-                        // Remove the temporary message.
-                        if tempIdx < self.messages.count {
-                            self.messages.remove(at: tempIdx)
-                        }
 
                         // Extract (output, success) from the ToolExecOutcome.
                         if case .toolResult(_, _, let content, let isError, _, _, _, _) = outcome.resultPart {
