@@ -1089,6 +1089,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // [T-deep-mode-cognitive-p1] C7: Reset the retrospective flag for the
         // new workflow — each workflow gets one retrospective at completion.
         retrospectiveHasRun = false
+        // [T-deep-mode-cognitive-p1] C7 fix: Also clear isRetrospectiveRunning
+        // in case a previous retrospective was interrupted mid-execution.
+        isRetrospectiveRunning = false
         workflowPhase = .executing
         var s = steps
         if let i = s.firstIndex(where: { $0.status == .pending }) {
@@ -1319,6 +1322,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // C8 uncertainty flag for the same reason. Total-switch safe: both are
         // in-memory only and never persisted.
         retrospectiveHasRun = false
+        isRetrospectiveRunning = false
         didInjectUncertaintyCheckThisRun = false
     }
 
@@ -1340,6 +1344,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // One info line per turn makes it impossible to confuse "toggle off"
             // with a code deficiency again.
             logger.info("[GoalRunner] skipped — deep mode off")
+            return
+        }
+        // [T-deep-mode-cognitive-p1] C7 fix: If the retrospective's runAgentLoop
+        // is running, do NOT auto-continue — the review text might coincidentally
+        // contain a <<GOAL_STATE>> sentinel, which would trigger an unintended
+        // auto-continue chain inside the retrospective. The retrospective is a
+        // single-turn reflection, not a new task execution. Clear any sentinel
+        // that was parsed from the review text so it can't linger.
+        if isRetrospectiveRunning {
+            logger.info("[GoalRunner] skipped — retrospective in progress (C7 guard)")
+            pendingGoalSentinel = nil
             return
         }
         // A pending plan is awaiting user confirmation — don't auto-continue.
@@ -2748,6 +2763,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// in-memory only — never persisted.
     private var retrospectiveHasRun = false
 
+    /// [T-deep-mode-cognitive-p1] C7 fix: Flag that is true while the
+    /// retrospective's runAgentLoop() is executing. Checked by
+    /// maybeAutoContinueGoal to prevent the retrospective turn from
+    /// accidentally triggering a goal auto-continue (if the review text
+    /// coincidentally contains a <<GOAL_STATE>> sentinel). Total-switch
+    /// safe: only set inside maybeRunRetrospective(), which is guarded by
+    /// `guard deepModeEnabled`.
+    private var isRetrospectiveRunning = false
+
     /// [T-deep-mode-cognitive-p1] C8: Detect uncertainty markers in the model's
     /// output text. Returns true if any uncertainty marker is found. Pure
     /// function — no side effects, no state. Called only inside `if deepModeEnabled`.
@@ -2807,14 +2831,40 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // processing BEFORE calling runAgentLoop(), matching send()'s pattern.
         // Without this, the UI wouldn't show the processing state, and the
         // user could send another message during the retrospective — causing
-        // a race condition. Reset in the defer/finally block after the loop
-        // returns. Total-switch safe: this entire method is guarded by
-        // `guard deepModeEnabled` at entry.
+        // a race condition. Total-switch safe: this entire method is guarded
+        // by `guard deepModeEnabled` at entry.
         isProcessing = true
         beginBackgroundProcessing()
+        // [T-deep-mode-cognitive-p1] C7 fix: Set this flag so
+        // maybeAutoContinueGoal skips auto-continue during the retrospective.
+        // Without it, if the review text coincidentally contains a
+        // <<GOAL_STATE>> sentinel, the retrospective's runAgentLoop would
+        // trigger an unintended auto-continue chain.
+        isRetrospectiveRunning = true
+        // [T-deep-mode-cognitive-p1] C7 fix: Use defer for ALL cleanup to
+        // guarantee isProcessing and background processing are always
+        // restored, even if the guard below returns early or the loop
+        // throws. This matches send()'s epilogue pattern but is more robust
+        // because it handles the early-return case that send() doesn't have.
+        defer {
+            isRetrospectiveRunning = false
+            isProcessing = false
+            endBackgroundProcessing()
+        }
 
         do {
             try await runAgentLoop()
+            // [T-deep-mode-cognitive-p1] C7 fix: Re-check deepModeEnabled
+            // before saving — the user might have turned off the master
+            // switch while the retrospective's runAgentLoop was executing.
+            // If so, skip the memory save to honor the "no residual state"
+            // contract. The conversation history already has the review
+            // (as a normal AgentMessage), which is consistent with P0 C5
+            // fail-switch behavior.
+            guard deepModeEnabled else {
+                logger.info("[Retrospective] C7 skipping memory save — deep mode disabled during retrospective")
+                return
+            }
             // After the review turn, check if the model's response is worth
             // saving. We look at the last assistant message in agentHistory.
             if let lastAssistant = agentHistory.last(where: { $0.role == .assistant }) {
@@ -2840,12 +2890,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         } catch {
             logger.error("[Retrospective] C7 error: \(String(describing: error))")
         }
-
-        // [T-deep-mode-cognitive-p1] C7 fix: Always restore isProcessing and
-        // background processing state after the retrospective, regardless of
-        // success/failure/cancellation. This matches send()'s epilogue pattern.
-        isProcessing = false
-        endBackgroundProcessing()
     }
 
     /// Session ID for persistence integration. Set by the view on appear.
