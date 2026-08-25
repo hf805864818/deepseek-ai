@@ -193,24 +193,23 @@ object GoogleDriveAPI {
     }
 
     /**
-     * List files in a parent folder (or in the app data folder when [parentId]
-     * is null). Returns a list of [GoogleDriveFile] entries.
-     * When parentId is "appDataFolder" or null, uses the appDataFolder space.
+     * List files in a parent folder. Always includes spaces=appDataFolder
+     * because our app folder ("Minis") is created inside Google Drive's
+     * appDataFolder space (hidden, app-specific). Without the spaces
+     * parameter, Google Drive returns 0 files even though they exist.
      */
     suspend fun listFiles(parentId: String?, pageSize: Int = 100): List<GoogleDriveFile> =
         withContext(Dispatchers.IO) {
             val token = accessToken()
-            val useAppDataSpace = parentId == null || parentId == "appDataFolder"
             val queryParts = mutableListOf("trashed=false")
             if (parentId != null && parentId != "appDataFolder") {
                 queryParts.add("'$parentId' in parents")
             }
             val query = Uri.encode(queryParts.joinToString(" and "))
             val fields = Uri.encode("files(id,name,mimeType,modifiedTime,size,md5Checksum)")
-            var url = "$BASE_URL/files?q=$query&pageSize=$pageSize&fields=$fields"
-            if (useAppDataSpace) {
-                url += "&spaces=appDataFolder"
-            }
+            // Always include spaces=appDataFolder — our folder hierarchy
+            // lives entirely within the appDataFolder space.
+            val url = "$BASE_URL/files?q=$query&pageSize=$pageSize&fields=$fields&spaces=appDataFolder"
             val request = Request.Builder()
                 .url(url)
                 .addHeader("Authorization", "Bearer $token")

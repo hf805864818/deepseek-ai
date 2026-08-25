@@ -344,28 +344,31 @@ enum GoogleDriveAPI {
     // MARK: - File Listing
 
     /// Lists files in a parent folder (or app data folder root if parentId is nil).
-    /// When parentId is "appDataFolder" or nil, uses the appDataFolder space.
+    /// Lists files in a folder. Always includes spaces=appDataFolder
+    /// because our app folder ("Minis") is created inside Google Drive's
+    /// appDataFolder space (hidden, app-specific). Without the spaces
+    /// parameter, Google Drive returns 0 files even though they exist.
     static func listFiles(parentId: String?, pageSize: Int = 100) async throws -> [GoogleDriveFile] {
         logger.info("listFiles: parentId=\(parentId ?? "appDataFolder")")
 
-        let useAppDataSpace = parentId == nil || parentId == "appDataFolder"
         var q = "trashed = false"
         if let parentId = parentId, parentId != "appDataFolder" {
             q = "trashed = false and '\(parentId)' in parents"
         }
 
         var components = URLComponents(string: "\(baseURL)/files")!
-        var queryItems: [URLQueryItem] = [
+        // Always include spaces=appDataFolder — our folder hierarchy lives
+        // entirely within the appDataFolder space. Without this, files
+        // uploaded to a sub-folder of appDataFolder are invisible to list.
+        let queryItems: [URLQueryItem] = [
             URLQueryItem(name: "pageSize", value: "\(pageSize)"),
             URLQueryItem(
                 name: "fields",
                 value: "files(id, name, mimeType, modifiedTime, size, md5Checksum)"
             ),
             URLQueryItem(name: "q", value: q),
+            URLQueryItem(name: "spaces", value: "appDataFolder"),
         ]
-        if useAppDataSpace {
-            queryItems.append(URLQueryItem(name: "spaces", value: "appDataFolder"))
-        }
         components.queryItems = queryItems
 
         let request = try await authorizedRequest(

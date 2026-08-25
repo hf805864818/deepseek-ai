@@ -89,12 +89,28 @@ final class GoogleDriveSyncManager: ObservableObject {
             isBackingUp = true
             syncError = nil
         }
-        defer {
-            Task { @MainActor in
-                isBackingUp = false
-            }
-        }
 
+        // Use do-catch instead of defer+Task so the flag is reset
+        // synchronously in both success and error paths. The old
+        // `Task { @MainActor in isBackingUp = false }` in defer was
+        // fire-and-forget — the async Task might not run for seconds,
+        // leaving "正在备份..." spinning even after the backup finished.
+        do {
+            try await backupInternal()
+        } catch {
+            await MainActor.run {
+                isBackingUp = false
+                syncError = error.localizedDescription
+            }
+            throw error
+        }
+        // Reset on success path
+        await MainActor.run {
+            isBackingUp = false
+        }
+    }
+
+    private func backupInternal() async throws {
         logger.info("=== Google Drive backup started ===")
 
         // 1. Collect all files from documents directory (I/O — runs on background)
@@ -167,12 +183,22 @@ final class GoogleDriveSyncManager: ObservableObject {
             isRestoring = true
             syncError = nil
         }
-        defer {
-            Task { @MainActor in
-                isRestoring = false
-            }
-        }
 
+        do {
+            try await restoreInternal()
+        } catch {
+            await MainActor.run {
+                isRestoring = false
+                syncError = error.localizedDescription
+            }
+            throw error
+        }
+        await MainActor.run {
+            isRestoring = false
+        }
+    }
+
+    private func restoreInternal() async throws {
         logger.info("=== Google Drive restore started ===")
 
         // 1. Get latest backup
@@ -204,12 +230,22 @@ final class GoogleDriveSyncManager: ObservableObject {
             isRestoring = true
             syncError = nil
         }
-        defer {
-            Task { @MainActor in
-                isRestoring = false
-            }
-        }
 
+        do {
+            try await restoreFromInternal(fileId: fileId)
+        } catch {
+            await MainActor.run {
+                isRestoring = false
+                syncError = error.localizedDescription
+            }
+            throw error
+        }
+        await MainActor.run {
+            isRestoring = false
+        }
+    }
+
+    private func restoreFromInternal(fileId: String) async throws {
         logger.info("=== Google Drive restore from \(fileId) started ===")
 
         // 1. Download backup file
