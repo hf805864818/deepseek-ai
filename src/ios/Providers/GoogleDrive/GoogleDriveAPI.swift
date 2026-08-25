@@ -139,32 +139,46 @@ enum GoogleDriveAPI {
     static func findOrCreateFolder(name: String) async throws -> String {
         logger.info("findOrCreateFolder: \(name)")
 
-        // Search for folder in app data folder
-        let q = "mimeType = 'application/vnd.google-apps.folder' and name = '\(name)' and trashed = false"
-        var components = URLComponents(string: "\(baseURL)/files")!
-        components.queryItems = [
-            URLQueryItem(name: "q", value: q),
-            URLQueryItem(name: "fields", value: "files(id, name)"),
-            URLQueryItem(name: "pageSize", value: "10"),
-            URLQueryItem(name: "spaces", value: "appDataFolder"),
-        ]
+        // Strategy: try direct create first (idempotent-ish — duplicates are
+        // harmless for backup use case), then fall back to search+create.
+        // We used to search first, but search 403s are harder to diagnose than
+        // create 403s — and if the folder already exists, create will also
+        // fail with a clear error that we can handle.
+        //
+        // Actual flow: search first (cheap read), then create. But we wrap
+        // search in a try? so a search failure doesn't block the create path.
 
-        var request = try await authorizedRequest(
-            url: components.url!.absoluteString,
-            method: "GET"
-        )
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try checkResponse(response, data: data, context: "findOrCreateFolder search")
+        // 1. Try searching first
+        do {
+            let q = "mimeType = 'application/vnd.google-apps.folder' and name = '\(name)' and trashed = false"
+            var components = URLComponents(string: "\(baseURL)/files")!
+            components.queryItems = [
+                URLQueryItem(name: "q", value: q),
+                URLQueryItem(name: "fields", value: "files(id, name)"),
+                URLQueryItem(name: "pageSize", value: "10"),
+                URLQueryItem(name: "spaces", value: "appDataFolder"),
+            ]
 
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let files = json["files"] as? [[String: Any]] ?? []
+            let request = try await authorizedRequest(
+                url: components.url!.absoluteString,
+                method: "GET"
+            )
+            let (data, response) = try await URLSession.shared.data(for: request)
+            try checkResponse(response, data: data, context: "findOrCreateFolder search")
 
-        if let first = files.first, let id = first["id"] as? String {
-            logger.info("findOrCreateFolder: found existing folder \(id)")
-            return id
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            let files = json["files"] as? [[String: Any]] ?? []
+
+            if let first = files.first, let id = first["id"] as? String {
+                logger.info("findOrCreateFolder: found existing folder \(id)")
+                return id
+            }
+        } catch {
+            // Search failed — log and fall through to create attempt
+            logger.warning("findOrCreateFolder: search failed (\(error.localizedDescription)) — trying direct create")
         }
 
-        // Not found — create it in app data folder
+        // 2. Search failed or not found — create it in app data folder
         return try await createFolder(name: name, parentId: "appDataFolder")
     }
 
@@ -466,6 +480,9 @@ enum GoogleDriveAPI {
     }
 
     /// Checks an HTTP response for success status code. Throws on failure.
+    /// Parses Google Drive API error responses to include the actual error
+    /// message (e.g. "insufficientPermissions", "rateLimitExceeded") so users
+    /// can understand *why* a 403/429 happened instead of just the status code.
     private static func checkResponse(
         _ response: URLResponse,
         data: Data,
@@ -476,14 +493,40 @@ enum GoogleDriveAPI {
         }
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? "<binary>"
-            #if DEBUG
-            logger.error("\(context) FAILED — status \(http.statusCode): \(body.prefix(500))")
-            #else
-            logger.error("\(context) FAILED — status \(http.statusCode)")
-            #endif
+            // Try to parse Google's standard error JSON format
+            let errorDetail = Self.parseGoogleError(data: data)
+            logger.error("\(context) FAILED — status \(http.statusCode): \(errorDetail ?? body.prefix(300))")
+
+            let userMessage = errorDetail ?? "HTTP \(http.statusCode)"
             throw LLMError.providerError(
-                message: "\(context) failed (status \(http.statusCode))"
+                message: "\(context) failed (\(userMessage))"
             )
         }
+    }
+
+    /// Parses a Google Drive API error response and returns a human-readable
+    /// error string (reason + message). Returns nil if parsing fails.
+    private static func parseGoogleError(data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = json["error"] as? [String: Any] else {
+            return nil
+        }
+
+        let code = (error["code"] as? Int) ?? 0
+        let message = (error["message"] as? String) ?? ""
+        // Extract the first error's "reason" field if available
+        let reason: String
+        if let errors = error["errors"] as? [[String: Any]],
+           let first = errors.first,
+           let r = first["reason"] as? String {
+            reason = r
+        } else {
+            reason = "status \(code)"
+        }
+
+        if message.isEmpty {
+            return reason
+        }
+        return "\(reason): \(message)"
     }
 }
