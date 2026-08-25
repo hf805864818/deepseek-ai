@@ -903,12 +903,20 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     // different file — `private` only permits same-file access in Swift).
     var _cachedEstimateTokens: Int? = nil
     var _cachedEstimateHistoryCount: Int = -1
+    /// [T-perf-estimate-incremental] Track the effective slice count and
+    /// compaction marker from the last computation. When agentHistory grows
+    /// but the marker is unchanged, the effective slice only grew at the tail,
+    /// so we compute only the new messages' tokens and add to the cached total.
+    var _cachedEstimateSliceCount: Int = 0
+    var _cachedEstimateMarkerId: String? = nil
 
     /// Invalidate the estimate cache. Called at send()/resume() entry points
     /// and whenever agentHistory is mutated by compaction/offload.
     func invalidateEstimateCache() {
         _cachedEstimateTokens = nil
         _cachedEstimateHistoryCount = -1
+        _cachedEstimateSliceCount = 0
+        _cachedEstimateMarkerId = nil
     }
     /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
     /// UserDefaults (the Settings toggle) so it applies across all sessions
@@ -1545,9 +1553,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 ])
                 let fci = agentHistory.count
                 agentHistory.append(failSwitchMsg)
-                if let pid = await persistAgentMessage(failSwitchMsg), fci < agentHistory.count {
-                    agentHistory[fci].dbMessageId = pid
-                }
+                // [T-perf-goalrunner-transient] Do NOT persist synthetic
+                // fail-switch messages to the DB. They are only needed during
+                // the active run; persisting them bloats agentHistory on
+                // session reload, causing estimateContextTokens O(n) stalls
+                // and loadSession delays. The continuation state
+                // (goalRunnerRoundsLeft) is reset on reload, so these messages
+                // are useless after reload and only add to context bloat.
                 // [T-deep-mode-workflow] Stopping without a `done` sentinel:
                 // clear the tracker so it can't linger as "执行中".
                 finishWorkflow()
@@ -1569,9 +1581,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             ])
             let ci = agentHistory.count
             agentHistory.append(cont)
-            if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
-                agentHistory[ci].dbMessageId = pid
-            }
+            // [T-perf-goalrunner-transient] Do NOT persist synthetic
+            // auto-continuation messages to the DB. They are only needed
+            // during the active run for the agent loop; persisting them bloats
+            // agentHistory on session reload, compounding estimateContextTokens
+            // O(n) traversal cost and loadSession DB-query overhead. The
+            // continuation state (goalRunnerRoundsLeft) is reset to
+            // maxAutoRounds on reload, so a persisted continuation message
+            // without the matching round state would be an orphan that the
+            // model can't act on — it just inflates the context window.
 
             // Recurse: the next runAgentLoop() reuses every existing backstop —
             // maxAgentTurns per round, ToolLoopDetector, in-loop compaction.
@@ -3278,10 +3296,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // Read-only mode — cannot send messages
         guard remoteDeviceId == nil else { return }
 
-        // [T-perf-estimate-cache] Invalidate token estimate cache at send
-        // entry so checkContextBeforeSend() computes fresh, then the
-        // runAgentLoop baseline log reuses the cached value (no recompute).
-        invalidateEstimateCache()
+        // [T-perf-estimate-incremental] Do NOT invalidate the estimate cache
+        // here. The incremental cache handles the normal case (agentHistory
+        // grew by 1-2 messages since last computation) in O(delta) instead of
+        // O(n). Compaction/offloading already invalidate the cache when they
+        // mutate agentHistory, so the only case where the cache is stale is
+        // already covered. Removing the unconditional invalidate here avoids
+        // forcing a full O(n) recompute on every send — the primary cause of
+        // send-message lag on long sessions.
 
         // [T-ios-photo-pick-placeholder] Drop any non-ready attachments (failed
         // photo loads, or a stray still-loading placeholder) so only fully-loaded
@@ -4025,9 +4047,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         guard !isProcessing, canResume else { return }
         guard let lastMsg = messages.last, lastMsg.role == .assistant else { return }
 
-        // [T-perf-estimate-cache] Invalidate token estimate cache at resume
-        // entry so the runAgentLoop baseline computes fresh.
-        invalidateEstimateCache()
+        // [T-perf-estimate-incremental] Do NOT invalidate the estimate cache
+        // here. The incremental cache handles the resume case (agentHistory
+        // grew by the continue-reminder message) in O(delta) instead of O(n).
+        // Compaction/offloading already invalidate the cache when they mutate
+        // agentHistory. Removing this avoids a full O(n) recompute on every
+        // resume — the primary cause of pause/resume lag on long sessions.
 
         // [T-deep-mode-resume-log] Log resume trigger with workflow state
         logger.info("[WorkflowLog] resume() called - workflowPhase=\(workflowPhase) canResume=\(canResume) stepsCount=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")

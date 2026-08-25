@@ -268,97 +268,98 @@ extension AIChatViewModel {
         // Phase 2: Build UI messages and agent history
         let buildStart = CFAbsoluteTimeGetCurrent()
         let phase2aStart = CFAbsoluteTimeGetCurrent()
-        var loadedUIMessages: [ChatMessage] = []
-        var loadedHistory: [AgentMessage] = []
 
-        // The current merged assistant ChatMessage (accumulates blocks across loop iterations)
-        var currentAssistant: ChatMessage? = nil
-
-        // Determine whether thinking blocks should be shown based on session config
+        // [T-perf-loadsession-bg] Move the O(n) message-processing loop to a
+        // background thread. The loop iterates every raw DB row, calls
+        // toAgentMessage/toChatMessage (which parse JSON + decode media), and
+        // merges assistant continuation rows — all pure-value operations on
+        // value-type structs. Running this on the main thread caused the
+        // "entering old session" stall on sessions with 100+ messages. The
+        // detached task captures the inputs by value and returns the built
+        // arrays; only the final assignment to self.messages/agentHistory
+        // happens on the main thread.
         let showThinking = ProviderConfigStore.shared.inferenceConfig(for: sessionId)?.thinkingLevel.isEnabled ?? false
 
-        for raw in rawMessages {
-            // Always rebuild agent history (every message matters for API context).
-            // Phase B: stamp the DB row id into dbMessageId so compact can resolve
-            // boundaries by id after restore.
-            var agentMsg = raw.toAgentMessage(mediaResolver: resolver)
-            agentMsg.dbMessageId = raw.id
-            loadedHistory.append(agentMsg)
+        // Captured inputs for the background task — all value types or
+        // sendable references, safe to use off the main thread.
+        let rawInput = rawMessages
+        let resolverInput = resolver
+        let sid = sessionId
 
-            // [T-bridge-message-ui-leak] The #579 role-alternation bridge is
-            // LLM-context-only: it stays in loadedHistory (appended above, so
-            // the …user(tool_result) → assistant(bridge) → user(queued)…
-            // sequence survives reload) but must never surface as a chat
-            // bubble. Without this skip it either merged into the previous
-            // assistant message's blocks or rendered standalone after app
-            // restart. currentAssistant is deliberately left untouched — the
-            // bridge is invisible, so it must not affect the merge chain
-            // either (the queued user message that follows breaks it anyway).
-            if raw.isInternalBridge {
-                continue
-            }
+        let (loadedUIMessages, loadedHistory) = await Task.detached(priority: .userInitiated) {
+            // [T-perf-loadsession-bg] All processing here is pure-value:
+            // RawMessage.toAgentMessage/toChatMessage are struct methods that
+            // parse JSON + decode media references, with no main-thread or
+            // shared-mutable-state dependencies.
+            var uiMsgs: [ChatMessage] = []
+            var history: [AgentMessage] = []
+            var currentAssistant: ChatMessage? = nil
 
-            if raw.role == .user && raw.isToolResultOnly {
-                // Tool-result user messages: apply results to the current assistant's tool blocks
-                if let assistant = currentAssistant {
-                    Self.applyToolResults(from: raw, to: assistant, mediaResolver: resolver)
-                }
-                // Don't create a UI message for tool results
-                continue
-            }
+            for raw in rawInput {
+                // Always rebuild agent history (every message matters for API context).
+                var agentMsg = raw.toAgentMessage(mediaResolver: resolverInput)
+                agentMsg.dbMessageId = raw.id
+                history.append(agentMsg)
 
-            if raw.role == .assistant {
-                if let assistant = currentAssistant {
-                    // Continuation of an agent loop — append new blocks to
-                    // existing assistant message AND extend the source-sort
-                    // range so compact-marker resolution can map raw[i] back
-                    // to this merged UI row even when i is mid-stream.
-                    let continuation = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
-                    let textParts = raw.parts.compactMap { if case .text(let s) = $0 { return s }; return nil }
-                    let textBlockSummary = continuation.blocks.enumerated().compactMap { (i, b) -> String? in
-                        guard b.kind == .text else { return nil }
-                        return "len=\(b.content.count)"
-                    }.joined(separator: ",")
-                    // [T-log-noise-privacy 2026-07-18] info → debug: fires once
-                    // per raw assistant row on EVERY session load.
-                    logger.debug("[BlocksLost] RAW-MERGE so=\(raw.sortOrder) id=\(raw.id.prefix(8)) partsCount=\(raw.parts.count) textParts=\(textParts.count) rawTextLens=[\(textParts.map { "\($0.count)" }.joined(separator: ","))] blocks=\(continuation.blocks.count) textBlocks=[\(textBlockSummary)]")
-                    for block in continuation.blocks {
-                        assistant.blocks.append(block)
+                if raw.isInternalBridge { continue }
+
+                if raw.role == .user && raw.isToolResultOnly {
+                    if let assistant = currentAssistant {
+                        Self.applyToolResults(from: raw, to: assistant, mediaResolver: resolverInput)
                     }
-                    if let usage = continuation.usage {
-                        assistant.usage = usage
-                    }
-                    assistant.lastSourceSortOrder = raw.sortOrder
-                } else {
-                    // First assistant message in this turn
-                    let msg = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
-                    msg.sourceSortOrder = raw.sortOrder
-                    msg.lastSourceSortOrder = raw.sortOrder
-                    currentAssistant = msg
-                    loadedUIMessages.append(msg)
+                    continue
                 }
-                continue
+
+                if raw.role == .assistant {
+                    if let assistant = currentAssistant {
+                        let continuation = raw.toChatMessage(mediaResolver: resolverInput, showThinking: showThinking)
+                        for block in continuation.blocks {
+                            assistant.blocks.append(block)
+                        }
+                        if let usage = continuation.usage {
+                            assistant.usage = usage
+                        }
+                        assistant.lastSourceSortOrder = raw.sortOrder
+                    } else {
+                        let msg = raw.toChatMessage(mediaResolver: resolverInput, showThinking: showThinking)
+                        msg.sourceSortOrder = raw.sortOrder
+                        msg.lastSourceSortOrder = raw.sortOrder
+                        currentAssistant = msg
+                        uiMsgs.append(msg)
+                    }
+                    continue
+                }
+
+                // Real user message
+                currentAssistant = nil
+                let msg = raw.toChatMessage(mediaResolver: resolverInput, showThinking: showThinking)
+                if msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   msg.attachments.isEmpty,
+                   msg.blocks.isEmpty {
+                    continue
+                }
+                msg.sourceSortOrder = raw.sortOrder
+                msg.lastSourceSortOrder = raw.sortOrder
+                uiMsgs.append(msg)
             }
 
-            // Real user message — finalize any pending assistant and start fresh
-            if currentAssistant != nil {
-                let chainBreakBlocks = currentAssistant!.blocks.count
-                // [T-log-noise-privacy 2026-07-18] Log the tail LENGTH, not the
-                // tail text — message content must not land in log files.
-                let lastTextLen = currentAssistant!.blocks.last(where: { $0.kind == .text })?.content.count ?? -1
-                logger.info("[BlocksLost] MERGE-CHAIN-BREAK at so=\(raw.sortOrder) userParts=\(raw.parts.count) isToolResultOnly=\(raw.isToolResultOnly) prevAssistantBlocks=\(chainBreakBlocks) prevLastTextLen=\(lastTextLen) sid=\(sessionId.prefix(8))")
+            // Finalize orphaned tool blocks (same as before, runs on bg thread)
+            for uiMsg in uiMsgs {
+                for block in uiMsg.blocks {
+                    guard let status = block.toolStatus else { continue }
+                    switch status {
+                    case .running, .streaming:
+                        block.toolStatus = .cancelled
+                    default:
+                        break
+                    }
+                }
             }
-            currentAssistant = nil
-            let msg = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
-            if msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               msg.attachments.isEmpty,
-               msg.blocks.isEmpty {
-                continue
-            }
-            msg.sourceSortOrder = raw.sortOrder
-            msg.lastSourceSortOrder = raw.sortOrder
-            loadedUIMessages.append(msg)
-        }
+
+            return (uiMsgs, history)
+        }.value
+
+        let phase2aElapsed = (CFAbsoluteTimeGetCurrent() - phase2aStart) * 1000
 
         // [BlocksLost] MERGE TRACE — log every text block of the last assistant
         // message so we can confirm whether the final 839-char (or whatever)

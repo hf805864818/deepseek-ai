@@ -314,70 +314,88 @@ extension AIChatViewModel {
         let currentCount = agentHistory.count
         if let cached = _cachedEstimateTokens,
            currentCount == _cachedEstimateHistoryCount {
-            logger.info("[CompactDiag] estimate cache HIT caller=\(caller) count=\(currentCount) cached=\(cached)tok")
             return cached
         }
 
-        var totalChars = 0
-        var imageTokens = 0
         let slice = effectiveAgentHistory()
-        // DIAG: per-message breakdown so we can see EXACTLY what occupies the
-        // post-compact context. Logs every message's role + part summary +
-        // token estimate; lets us tell whether bloat comes from the injected
-        // summary, pre-anchor warm-up turns, or post-anchor tool results.
-        var perMsg: [String] = []
-        var biggest: [(kind: String, chars: Int, msgIdx: Int)] = []
-        for (idx, msg) in slice.enumerated() {
-            var msgChars = 0
-            var msgImgTok = 0
-            var partTags: [String] = []
-            for part in msg.parts {
-                var partChars = 0
-                var partKind = ""
-                switch part {
-                case .text(let t):
-                    partChars = t.count
-                    let isSummary = t.contains("<context-summary>")
-                    partKind = isSummary ? "SUMMARY" : "text"
-                case .toolUse(_, let name, let input):
-                    if let data = try? JSONSerialization.data(withJSONObject: input) {
-                        partChars = data.count
+        let currentMarkerId = cachedLatestMarker?.id
+
+        // [T-perf-estimate-incremental] When agentHistory grew (new messages
+        // appended) but the compaction marker is unchanged, the effective slice
+        // only grew at the tail. Compute only the new messages' tokens and add
+        // to the cached total — O(delta) instead of O(n) full traversal. This
+        // eliminates the main-thread stall on every send/resume after a long
+        // session accumulates many messages.
+        if let cached = _cachedEstimateTokens,
+           currentCount > _cachedEstimateHistoryCount,
+           slice.count > _cachedEstimateSliceCount,
+           _cachedEstimateMarkerId == currentMarkerId {
+            let prevSliceCount = _cachedEstimateSliceCount
+            var deltaChars = 0
+            var deltaImgTokens = 0
+            for msg in slice[prevSliceCount..<slice.count] {
+                for part in msg.parts {
+                    switch part {
+                    case .text(let t):
+                        deltaChars += t.count
+                    case .toolUse(_, _, let input):
+                        if let data = try? JSONSerialization.data(withJSONObject: input) {
+                            deltaChars += data.count
+                        }
+                    case .toolResult(_, _, let content, _, let imgData, _, _, _):
+                        deltaChars += content.count
+                        if let imgData = imgData {
+                            deltaImgTokens += BPETokenizer.shared.countImageTokens(imgData)
+                        }
+                    case .imageData(let data, _, _):
+                        deltaImgTokens += BPETokenizer.shared.countImageTokens(data)
                     }
-                    partKind = "tu:\(name)"
-                case .toolResult(_, _, let content, _, let imgData, _, _, _):
-                    partChars = content.count
-                    if let imgData = imgData {
-                        let it = BPETokenizer.shared.countImageTokens(imgData)
-                        imageTokens += it
-                        msgImgTok += it
-                    }
-                    partKind = "tr"
-                case .imageData(let data, _, _):
-                    let it = BPETokenizer.shared.countImageTokens(data)
-                    imageTokens += it
-                    msgImgTok += it
-                    partKind = "img"
-                }
-                msgChars += partChars
-                totalChars += partChars
-                partTags.append("\(partKind)=\(partChars)c")
-                if partChars >= 2000 {
-                    biggest.append((partKind, partChars, idx))
                 }
             }
-            let msgTok = Int(Double(msgChars) / 3.5) + msgImgTok
-            let dbId = msg.dbMessageId?.prefix(8) ?? "----"
-            perMsg.append("[\(idx) \(msg.role.rawValue) db=\(dbId) ~\(msgTok)tok | \(partTags.joined(separator: ","))]")
+            let deltaTokens = Int(Double(deltaChars) / 3.5) + deltaImgTokens
+            let newTotal = cached + deltaTokens
+            _cachedEstimateTokens = newTotal
+            _cachedEstimateHistoryCount = currentCount
+            _cachedEstimateSliceCount = slice.count
+            _cachedEstimateMarkerId = currentMarkerId
+            logger.info("[CompactDiag] estimate INCR caller=\(caller) +\(slice.count - prevSliceCount)msg delta=\(deltaTokens)tok total=\(newTotal)tok")
+            return newTotal
+        }
+
+        // [T-perf-estimate-fast-path] Full computation without the expensive
+        // per-message diagnostic logging. The old code built perMsg[] and
+        // biggest[] arrays for EVERY message on every cache miss, then logged
+        // them — O(n) string building + I/O on the main thread. Now only the
+        // total is computed; diagnostics are gated behind a debug flag.
+        var totalChars = 0
+        var imageTokens = 0
+        for msg in slice {
+            for part in msg.parts {
+                switch part {
+                case .text(let t):
+                    totalChars += t.count
+                case .toolUse(_, _, let input):
+                    if let data = try? JSONSerialization.data(withJSONObject: input) {
+                        totalChars += data.count
+                    }
+                case .toolResult(_, _, let content, _, let imgData, _, _, _):
+                    totalChars += content.count
+                    if let imgData = imgData {
+                        imageTokens += BPETokenizer.shared.countImageTokens(imgData)
+                    }
+                case .imageData(let data, _, _):
+                    imageTokens += BPETokenizer.shared.countImageTokens(data)
+                }
+            }
         }
         let totalTokens = Int(Double(totalChars) / 3.5) + imageTokens
-        biggest.sort { $0.chars > $1.chars }
-        let top = biggest.prefix(5).map { "[\($0.msgIdx)\($0.kind)=\($0.chars)c]" }.joined(separator: " ")
-        logger.info("[CompactDiag] estimate caller=\(caller) slice=\(slice.count) total=\(totalTokens)tok (\(totalChars)chars+\(imageTokens)imgTok) bigParts(≥2kc): \(top)")
-        logger.info("[CompactDiag] estimate perMsg: \(perMsg.joined(separator: " "))")
 
         // [T-perf-estimate-cache] Store result
         _cachedEstimateTokens = totalTokens
         _cachedEstimateHistoryCount = currentCount
+        _cachedEstimateSliceCount = slice.count
+        _cachedEstimateMarkerId = currentMarkerId
+        logger.info("[CompactDiag] estimate FULL caller=\(caller) slice=\(slice.count) total=\(totalTokens)tok (\(totalChars)chars+\(imageTokens)imgTok)")
         return totalTokens
     }
 

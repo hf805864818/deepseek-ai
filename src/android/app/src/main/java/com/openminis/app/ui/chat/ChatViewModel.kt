@@ -815,6 +815,25 @@ class ChatViewModel(
     /** Structured agent history for the agent loop (contentParts-based). */
     private val agentHistory = mutableListOf<LLMMessage>()
 
+    // [T-perf-estimate-cache-android] Cached token estimate and the
+    // agentHistory size + compaction marker it was computed for. When
+    // agentHistory grows (new messages appended) but the marker is unchanged,
+    // only the new messages' tokens are computed and added to the cached
+    // total — O(delta) instead of O(n) full traversal every call.
+    private var cachedEstimateTokens: Int = -1
+    private var cachedEstimateHistoryCount: Int = -1
+    private var cachedEstimateSliceCount: Int = 0
+    private var cachedEstimateMarkerId: String? = null
+
+    /** Invalidate the estimate cache. Call when agentHistory is mutated by
+     *  compaction/offload or on session switch. */
+    private fun invalidateEstimateCache() {
+        cachedEstimateTokens = -1
+        cachedEstimateHistoryCount = -1
+        cachedEstimateSliceCount = 0
+        cachedEstimateMarkerId = null
+    }
+
     /**
      * All agent tool definitions, recomputed on each read so the memory
      * toggle gate (see [_memoryEnabled]) takes effect immediately when
@@ -3691,6 +3710,7 @@ class ChatViewModel(
             // bulk-addAll here because loadSession runs once at init before
             // any sender writes into agentHistory.
             agentHistory.addAll(loaded.llmHistory)
+            invalidateEstimateCache()  // [T-perf-estimate-cache-android]
             val tHangDiagAfterAgentHistory = System.currentTimeMillis()
             println(
                 "[T-HANG-DIAG] agentHistory rebuilt session=$sessionId tookMs=${tHangDiagAfterAgentHistory - tHangDiagAfterTransform}",
@@ -4362,6 +4382,7 @@ class ChatViewModel(
         agentHistory.clear()
         _error.value = null
         _cachedLatestMarker = null
+        invalidateEstimateCache()  // [T-perf-estimate-cache-android]
         toolLoopDetector.reset()
         _canResume.value = false
         _attachments.value = emptyList()
@@ -5055,11 +5076,13 @@ class ChatViewModel(
             chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
         }
         agentHistory.clear()
+        invalidateEstimateCache()  // [T-perf-estimate-cache-android]
         toolLoopDetector.reset()
         val remaining = chatRepository.loadMessages(sid)
         for (entity in remaining) {
             agentHistory.add(entity.toLLMMessage())
         }
+        invalidateEstimateCache()  // [T-perf-estimate-cache-android] after rebuild
         AppLogger.info(
             TAG_STREAM,
             "✏️ truncateBeforeEdit cutoffSortOrder=$cutoffSortOrder remaining=${remaining.size}"
@@ -6128,6 +6151,54 @@ class ChatViewModel(
      * for the candidate ranking.
      */
     private fun estimateContextTokens(): Int {
+        // [T-perf-estimate-cache-android] Return cached value when agentHistory
+        // hasn't changed since the last computation. Eliminates the repeated
+        // full-history traversal on every send/resume that caused UI stalls
+        // after multiple conversations accumulated in the session.
+        val currentCount = agentHistory.size
+        if (cachedEstimateTokens >= 0 && currentCount == cachedEstimateHistoryCount) {
+            return cachedEstimateTokens
+        }
+
+        // [T-perf-estimate-incremental-android] When agentHistory grew (new
+        // messages appended) but the compaction marker is unchanged, compute
+        // only the new messages' tokens and add to the cached total — O(delta)
+        // instead of O(n) full traversal.
+        val currentMarkerId = _cachedLatestMarker?.id
+        if (cachedEstimateTokens >= 0
+            && currentCount > cachedEstimateHistoryCount
+            && currentCount > cachedEstimateSliceCount
+            && cachedEstimateMarkerId == currentMarkerId
+        ) {
+            val prevCount = cachedEstimateSliceCount
+            var deltaChars = 0
+            var deltaImgTokens = 0
+            for (i in prevCount until currentCount) {
+                val msg = agentHistory[i]
+                for (part in msg.contentParts) {
+                    when (part) {
+                        is AgentContentPart.Text -> deltaChars += part.text.length
+                        is AgentContentPart.ToolUse -> deltaChars += part.input.toString().length
+                        is AgentContentPart.ToolResult -> {
+                            deltaChars += part.content.length
+                            part.imageData?.let { deltaImgTokens += BPETokenizer.countImageTokens(it) }
+                        }
+                        is AgentContentPart.ImageData -> {
+                            deltaImgTokens += BPETokenizer.countImageTokens(part.data)
+                        }
+                    }
+                }
+            }
+            val deltaTokens = (deltaChars / 3.5).toInt() + deltaImgTokens
+            val newTotal = cachedEstimateTokens + deltaTokens
+            cachedEstimateTokens = newTotal
+            cachedEstimateHistoryCount = currentCount
+            cachedEstimateSliceCount = currentCount
+            cachedEstimateMarkerId = currentMarkerId
+            return newTotal
+        }
+
+        // Full computation
         var totalChars = 0
         var imageTokens = 0
         for (msg in agentHistory) {
@@ -6145,7 +6216,13 @@ class ChatViewModel(
                 }
             }
         }
-        return (totalChars / 3.5).toInt() + imageTokens
+        val totalTokens = (totalChars / 3.5).toInt() + imageTokens
+        // [T-perf-estimate-cache-android] Store result
+        cachedEstimateTokens = totalTokens
+        cachedEstimateHistoryCount = currentCount
+        cachedEstimateSliceCount = currentCount
+        cachedEstimateMarkerId = currentMarkerId
+        return totalTokens
     }
 
     /**
@@ -10384,6 +10461,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         }
         _canResume.value = false
         _error.value = null
+        // [T-perf-estimate-incremental-android] Do NOT invalidate the cache
+        // here — the incremental path computes the delta (the continue
+        // reminder message) in O(delta) instead of forcing O(n) recompute.
+        // Compaction/offloading already invalidate when they mutate history.
         // [T-error-persist-android] resume() follows finalizeAtTurnLimit's
         // setInlineError (which persisted an error sticker on the last assistant
         // row). Clear it now so a successful resume doesn't merge-resurrect the
