@@ -1,3 +1,3 @@
-1.0.81
-build=83
-android_code=105
+1.0.82
+build=84
+android_code=106
