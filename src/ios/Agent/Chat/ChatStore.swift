@@ -5303,8 +5303,17 @@ extension ChatStore {
     private func runHistoricalBacklogScan() async {
         let cursorKey = "cloudSync.v2.backlogScanCursorAt"
         let cancelKey = "cloudSync.v2.backlogScanCanceled"
-        let windowSize = 100
+        // [T-ios-icloud-backlog-throttle] Reduced window size and increased
+        // drain-wait intervals to cut CPU usage during initial sync. Previously
+        // 100 sessions per window with 5s drain polls caused sustained DB
+        // churn on large histories; smaller windows + longer waits keep the
+        // dirty queue smaller and give the main thread / UI more breathing room.
+        let windowSize = 50             // was 100 — smaller batches = less DB churn per pass
         let backlogPriority = 1
+        let drainPollInterval: UInt64 = 10_000_000_000  // was 5s — 10s between DB checks
+        let drainThreshold = 2_000      // was 5_000 — wait for a smaller backlog before next batch
+        let interWindowSleep: UInt64 = 1_000_000_000  // was 0.25s — 1s rest between windows
+        let drainDeadlineSeconds: TimeInterval = 60 * 60  // was 30min — 60min (slower pace is fine)
         var totalStaged = 0
         var passes = 0
         while !Task.isCancelled {
@@ -5374,22 +5383,21 @@ extension ChatStore {
             // children: ~100 sessions × ~70 messages + files, give it
             // room without letting it stall forever.
             //
-            // Poll every 5s; bail with a hard cap of 30 min per window
+            // Poll every 10s; bail with a hard cap of 60 min per window
             // so a stuck push doesn't permanently freeze pagination.
             // Note: countDirtyRecords includes user-driven priority=0
             // writes, but those are usually a tiny fraction of the
             // backlog priority=1 rows during initial migration.
-            let drainThreshold = 5_000
-            let drainDeadline = Date().addingTimeInterval(30 * 60)
+            let drainDeadline = Date().addingTimeInterval(drainDeadlineSeconds)
             while Date() < drainDeadline, !Task.isCancelled {
                 let dirty = countDirtyRecords()
                 if dirty.total < drainThreshold { break }
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                try? await Task.sleep(nanoseconds: drainPollInterval)
             }
             // Brief pause between successful drains so other actor work
             // (chat writes, view loads) gets cycles even if push is
             // saturating CK.
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            try? await Task.sleep(nanoseconds: interWindowSleep)
         }
     }
 
