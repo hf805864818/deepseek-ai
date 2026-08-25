@@ -6455,6 +6455,12 @@ class ChatViewModel(
             AppLogger.info(TAG, "  Before: $beforeTokens/$contextWindow ($pct%)")
             AppLogger.info(TAG, "  After:  $currentTokens/$contextWindow ($afterPct%)")
             AppLogger.info(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            // [T-perf-estimate-cache-correctness-android] Offloading modified
+            // the content of existing messages (tool results → stubs) without
+            // changing agentHistory.size. The estimate cache keys on size, so
+            // it would return stale (too-high) values. Invalidate so the next
+            // estimateContextTokens() recomputes from scratch.
+            invalidateEstimateCache()
         }
     }
 

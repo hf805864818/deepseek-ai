@@ -909,6 +909,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// so we compute only the new messages' tokens and add to the cached total.
     var _cachedEstimateSliceCount: Int = 0
     var _cachedEstimateMarkerId: String? = nil
+    /// [T-perf-trim-images-skip] Cached image count + history count to avoid
+    /// the O(n*m) first-pass traversal on every runAgentLoop entry when no
+    /// new images have been added since the last check.
+    var _cachedImageCount: Int = -1
+    var _cachedImageCountHistorySize: Int = -1
 
     /// Invalidate the estimate cache. Called at send()/resume() entry points
     /// and whenever agentHistory is mutated by compaction/offload.
@@ -917,6 +922,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         _cachedEstimateHistoryCount = -1
         _cachedEstimateSliceCount = 0
         _cachedEstimateMarkerId = nil
+        // [T-perf-trim-images-skip] Also invalidate the image count cache when
+        // compaction/offload mutates agentHistory (images may have been evicted).
+        _cachedImageCount = -1
+        _cachedImageCountHistorySize = -1
     }
     /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
     /// UserDefaults (the Settings toggle) so it applies across all sessions

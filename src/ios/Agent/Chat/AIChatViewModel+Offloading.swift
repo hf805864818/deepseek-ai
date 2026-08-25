@@ -188,26 +188,51 @@ extension AIChatViewModel {
     func trimOldImagesFromHistory() {
         let keep = Self.kImageContextKeepCount
 
-        // First pass: index tool_use calls by id (for name + input lookup)
-        // and count total images across the history. Rehydrated messages
-        // lose the name on `.toolResult`, so the index is the canonical
-        // source of truth for tool metadata.
-        var toolCallById: [String: (name: String, input: [String: Any])] = [:]
-        var totalImages = 0
-        for msg in agentHistory {
-            for part in msg.parts {
-                switch part {
-                case .toolUse(let id, let name, let input):
-                    toolCallById[id] = (name: name, input: input)
-                case .toolResult(_, _, _, _, let imgData, _, _, _):
-                    if imgData != nil { totalImages += 1 }
-                case .imageData:
-                    totalImages += 1
-                default:
-                    break
+        // [T-perf-trim-images-skip] If agentHistory hasn't changed since the
+        // last image count, reuse the cached count. This avoids the O(n*m)
+        // first-pass traversal (iterating every message × every part to count
+        // images) on every runAgentLoop entry — the send/resume hot path.
+        // Only when agentHistory has grown do we need to recount, and even
+        // then we only need to scan the NEW messages.
+        let currentHistoryCount = agentHistory.count
+        var totalImages: Int
+
+        if _cachedImageCount >= 0 && currentHistoryCount == _cachedImageCountHistorySize {
+            totalImages = _cachedImageCount
+        } else if _cachedImageCount >= 0 && currentHistoryCount > _cachedImageCountHistorySize {
+            // Only scan the newly appended messages for additional images
+            totalImages = _cachedImageCount
+            for msg in agentHistory[_cachedImageCountHistorySize..<currentHistoryCount] {
+                for part in msg.parts {
+                    switch part {
+                    case .toolResult(_, _, _, _, let imgData, _, _, _):
+                        if imgData != nil { totalImages += 1 }
+                    case .imageData:
+                        totalImages += 1
+                    default:
+                        break
+                    }
+                }
+            }
+        } else {
+            // Full scan (first call, after compaction/offload, or history shrank)
+            totalImages = 0
+            for msg in agentHistory {
+                for part in msg.parts {
+                    switch part {
+                    case .toolResult(_, _, _, _, let imgData, _, _, _):
+                        if imgData != nil { totalImages += 1 }
+                    case .imageData:
+                        totalImages += 1
+                    default:
+                        break
+                    }
                 }
             }
         }
+        _cachedImageCount = totalImages
+        _cachedImageCountHistorySize = currentHistoryCount
+
         guard totalImages > keep else { return }
 
         // Evict the oldest `totalImages - keep` images so the most recent
@@ -215,6 +240,19 @@ extension AIChatViewModel {
         let evictCount = totalImages - keep
         var evicted = 0
         var snapshotsWritten = 0
+
+        // [T-perf-trim-images-lazy] Build toolCallById only when eviction is
+        // actually needed (totalImages > keep). Most calls return early above
+        // without reaching here, so this dictionary is only built when there
+        // are too many images to keep.
+        var toolCallById: [String: (name: String, input: [String: Any])] = [:]
+        for msg in agentHistory {
+            for part in msg.parts {
+                if case .toolUse(let id, let name, let input) = part {
+                    toolCallById[id] = (name: name, input: input)
+                }
+            }
+        }
 
         for mi in agentHistory.indices {
             if evicted >= evictCount { break }
@@ -289,6 +327,12 @@ extension AIChatViewModel {
 
         if evicted > 0 {
             logger.info("🖼️ Context image trim: evicted \(evicted) old image(s) (snapshots: \(snapshotsWritten)), kept last \(keep) (total was \(totalImages))")
+            // [T-perf-estimate-cache-correctness] Image eviction modified the
+            // content of existing messages (image bytes → text placeholders)
+            // without changing agentHistory.count. The estimate cache keys on
+            // count, so it would return stale (too-high) values. Invalidate
+            // so the next estimateContextTokens() recomputes from scratch.
+            invalidateEstimateCache()
         }
     }
 
@@ -317,23 +361,32 @@ extension AIChatViewModel {
             return cached
         }
 
-        let slice = effectiveAgentHistory()
         let currentMarkerId = cachedLatestMarker?.id
 
         // [T-perf-estimate-incremental] When agentHistory grew (new messages
         // appended) but the compaction marker is unchanged, the effective slice
         // only grew at the tail. Compute only the new messages' tokens and add
-        // to the cached total — O(delta) instead of O(n) full traversal. This
-        // eliminates the main-thread stall on every send/resume after a long
-        // session accumulates many messages.
+        // to the cached total — O(delta) instead of O(n) full traversal.
+        //
+        // [T-perf-estimate-no-effective-slice] CRITICAL: do NOT call
+        // effectiveAgentHistory() here. That function calls
+        // dropOrphanedToolParts() which is O(n*m) — iterating every message ×
+        // every part to build toolUseIds/toolResultIds sets. Calling it on
+        // every estimateContextTokens() (even on the incremental path) would
+        // negate the entire O(delta) optimization. Instead, compute the delta
+        // directly from agentHistory — the new messages are the same objects
+        // regardless of whether they're in the effective slice or the raw
+        // history. The marker boundary only affects which OLD messages are
+        // included, not the NEW ones (which are always appended to the tail
+        // and thus always in the post-anchor section).
         if let cached = _cachedEstimateTokens,
            currentCount > _cachedEstimateHistoryCount,
-           slice.count > _cachedEstimateSliceCount,
            _cachedEstimateMarkerId == currentMarkerId {
-            let prevSliceCount = _cachedEstimateSliceCount
+            let prevCount = _cachedEstimateHistoryCount
             var deltaChars = 0
             var deltaImgTokens = 0
-            for msg in slice[prevSliceCount..<slice.count] {
+            // Iterate only the newly appended messages from raw agentHistory
+            for msg in agentHistory[prevCount..<currentCount] {
                 for part in msg.parts {
                     switch part {
                     case .text(let t):
@@ -356,9 +409,9 @@ extension AIChatViewModel {
             let newTotal = cached + deltaTokens
             _cachedEstimateTokens = newTotal
             _cachedEstimateHistoryCount = currentCount
-            _cachedEstimateSliceCount = slice.count
+            _cachedEstimateSliceCount = currentCount  // raw count as proxy
             _cachedEstimateMarkerId = currentMarkerId
-            logger.info("[CompactDiag] estimate INCR caller=\(caller) +\(slice.count - prevSliceCount)msg delta=\(deltaTokens)tok total=\(newTotal)tok")
+            logger.info("[CompactDiag] estimate INCR caller=\(caller) +\(currentCount - prevCount)msg delta=\(deltaTokens)tok total=\(newTotal)tok")
             return newTotal
         }
 
@@ -367,6 +420,11 @@ extension AIChatViewModel {
         // biggest[] arrays for EVERY message on every cache miss, then logged
         // them — O(n) string building + I/O on the main thread. Now only the
         // total is computed; diagnostics are gated behind a debug flag.
+        //
+        // Only call effectiveAgentHistory() on the full-computation path —
+        // this is the path that runs after compaction/offload changed the
+        // history, so we need the accurate slice.
+        let slice = effectiveAgentHistory()
         var totalChars = 0
         var imageTokens = 0
         for msg in slice {
