@@ -38,7 +38,8 @@ final class GoogleDriveSyncManager: ObservableObject {
 
     // MARK: - Published State (must be accessed on main actor)
 
-    @MainActor @Published private(set) var isSyncing = false
+    @MainActor @Published private(set) var isBackingUp = false
+    @MainActor @Published private(set) var isRestoring = false
     @MainActor @Published private(set) var syncError: String?
     @MainActor @Published private(set) var backupCount = 0
     @MainActor @Published private(set) var totalBackupSize: Int64 = 0
@@ -77,20 +78,20 @@ final class GoogleDriveSyncManager: ObservableObject {
     /// Heavy work (file collection, ZIP building) runs on the calling
     /// cooperative thread; only UI state updates hop to the main actor.
     func backup() async throws {
-        // Check syncing flag on main actor
-        let alreadySyncing = await MainActor.run { isSyncing }
-        guard !alreadySyncing else {
+        // Check backing up flag on main actor
+        let alreadyBackingUp = await MainActor.run { isBackingUp }
+        guard !alreadyBackingUp else {
             logger.warning("Backup already in progress — skipping")
             return
         }
 
         await MainActor.run {
-            isSyncing = true
+            isBackingUp = true
             syncError = nil
         }
         defer {
             Task { @MainActor in
-                isSyncing = false
+                isBackingUp = false
             }
         }
 
@@ -156,19 +157,19 @@ final class GoogleDriveSyncManager: ObservableObject {
     /// Downloads the latest backup from Google Drive and restores it
     /// to the app's documents directory.
     func restore() async throws {
-        let alreadySyncing = await MainActor.run { isSyncing }
-        guard !alreadySyncing else {
+        let alreadyRestoring = await MainActor.run { isRestoring }
+        guard !alreadyRestoring else {
             logger.warning("Restore already in progress — skipping")
             return
         }
 
         await MainActor.run {
-            isSyncing = true
+            isRestoring = true
             syncError = nil
         }
         defer {
             Task { @MainActor in
-                isSyncing = false
+                isRestoring = false
             }
         }
 
@@ -193,19 +194,19 @@ final class GoogleDriveSyncManager: ObservableObject {
 
     /// Restores from a specific backup file by its ID.
     func restoreFrom(fileId: String) async throws {
-        let alreadySyncing = await MainActor.run { isSyncing }
-        guard !alreadySyncing else {
+        let alreadyRestoring = await MainActor.run { isRestoring }
+        guard !alreadyRestoring else {
             logger.warning("Restore already in progress — skipping")
             return
         }
 
         await MainActor.run {
-            isSyncing = true
+            isRestoring = true
             syncError = nil
         }
         defer {
             Task { @MainActor in
-                isSyncing = false
+                isRestoring = false
             }
         }
 

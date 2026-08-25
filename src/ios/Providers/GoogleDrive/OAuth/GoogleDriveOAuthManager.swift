@@ -43,7 +43,7 @@ final class GoogleDriveOAuthManager: NSObject, ObservableObject {
     private let clientSecret = "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"
     private let callbackPort: UInt16 = 8086
     private var redirectURI: String { "http://localhost:\(callbackPort)/oauth2callback" }
-    private let scopes = "https://www.googleapis.com/auth/drive.file"
+    private let scopes = "https://www.googleapis.com/auth/drive.appdata"
 
     // MARK: - Keychain Config
 

@@ -86,8 +86,9 @@ object GoogleDriveAPI {
     }
 
     /**
-     * Find a folder by name in the user's Drive root, or create it if
+     * Find a folder by name in the app data folder, or create it if
      * it does not exist. Returns the folder file ID.
+     * Uses the special "appDataFolder" space which requires the drive.appdata scope.
      */
     suspend fun findOrCreateFolder(name: String): String = withContext(Dispatchers.IO) {
         val token = accessToken()
@@ -95,26 +96,20 @@ object GoogleDriveAPI {
             "name='$name' and mimeType='application/vnd.google-apps.folder' and trashed=false",
         )
         val request = Request.Builder()
-            .url("$BASE_URL/files?q=$query&fields=files(id,name)")
+            .url("$BASE_URL/files?q=$query&fields=files(id,name)&spaces=appDataFolder")
             .addHeader("Authorization", "Bearer $token")
             .build()
         val response = httpClient.newCall(request).execute()
         val body = response.body?.string() ?: ""
         response.close()
-        if (response.code == 403) {
-            // 403 on search may mean the folder exists but we can't search for it.
-            // Fall back to creating it directly (create also returns existing folder ID
-            // if one with the same name already exists in the same location).
-            Log.w(TAG, "findOrCreateFolder search returned 403, falling back to create")
-            return@withContext createFolder(name)
-        } else if (response.code !in 200..299) {
+        if (response.code !in 200..299) {
             throw IOException("findOrCreateFolder search failed: ${response.code} $body")
         }
         val files = JSONObject(body).optJSONArray("files")
         if (files != null && files.length() > 0) {
             files.getJSONObject(0).getString("id")
         } else {
-            createFolder(name)
+            createFolder(name, parentId = "appDataFolder")
         }
     }
 
@@ -178,20 +173,26 @@ object GoogleDriveAPI {
     }
 
     /**
-     * List files in a parent folder (or in the Drive root when [parentId]
+     * List files in a parent folder (or in the app data folder when [parentId]
      * is null). Returns a list of [GoogleDriveFile] entries.
+     * When parentId is "appDataFolder" or null, uses the appDataFolder space.
      */
     suspend fun listFiles(parentId: String?, pageSize: Int = 100): List<GoogleDriveFile> =
         withContext(Dispatchers.IO) {
             val token = accessToken()
+            val useAppDataSpace = parentId == null || parentId == "appDataFolder"
             val queryParts = mutableListOf("trashed=false")
-            if (parentId != null) {
+            if (parentId != null && parentId != "appDataFolder") {
                 queryParts.add("'$parentId' in parents")
             }
             val query = Uri.encode(queryParts.joinToString(" and "))
             val fields = Uri.encode("files(id,name,mimeType,modifiedTime,size,md5Checksum)")
+            var url = "$BASE_URL/files?q=$query&pageSize=$pageSize&fields=$fields"
+            if (useAppDataSpace) {
+                url += "&spaces=appDataFolder"
+            }
             val request = Request.Builder()
-                .url("$BASE_URL/files?q=$query&pageSize=$pageSize&fields=$fields")
+                .url(url)
                 .addHeader("Authorization", "Bearer $token")
                 .build()
             val response = httpClient.newCall(request).execute()

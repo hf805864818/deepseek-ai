@@ -40,7 +40,7 @@ class GoogleDriveOAuthManager(context: Context, instanceId: String) : OAuthManag
     override val clientSecret: String? = "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"
     override val callbackPort = 8087
     override val redirectPath = "/oauth2callback"
-    override val scopes = "https://www.googleapis.com/auth/drive.file"
+    override val scopes = "https://www.googleapis.com/auth/drive.appdata"
 
     override fun buildAuthorizationUrl(): String {
         val (_, challenge) = generatePKCE()

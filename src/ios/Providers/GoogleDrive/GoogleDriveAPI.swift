@@ -134,17 +134,19 @@ enum GoogleDriveAPI {
         return fileId
     }
 
-    /// Finds a folder by name in the root directory, or creates it if not found.
+    /// Finds a folder by name in the app data folder, or creates it if not found.
+    /// Uses the special "appDataFolder" space which requires the drive.appdata scope.
     static func findOrCreateFolder(name: String) async throws -> String {
         logger.info("findOrCreateFolder: \(name)")
 
-        // Search for folder in root (no parent constraint = root)
+        // Search for folder in app data folder
         let q = "mimeType = 'application/vnd.google-apps.folder' and name = '\(name)' and trashed = false"
         var components = URLComponents(string: "\(baseURL)/files")!
         components.queryItems = [
             URLQueryItem(name: "q", value: q),
             URLQueryItem(name: "fields", value: "files(id, name)"),
             URLQueryItem(name: "pageSize", value: "10"),
+            URLQueryItem(name: "spaces", value: "appDataFolder"),
         ]
 
         var request = try await authorizedRequest(
@@ -152,15 +154,6 @@ enum GoogleDriveAPI {
             method: "GET"
         )
         let (data, response) = try await URLSession.shared.data(for: request)
-        let httpResp = response as? HTTPURLResponse
-
-        // 403 on search may mean the folder exists but we can't search for it.
-        // Fall back to creating it directly (create also returns existing folder ID
-        // if one with the same name already exists in the same location).
-        if httpResp?.statusCode == 403 {
-            logger.warning("findOrCreateFolder search returned 403, falling back to create")
-            return try await createFolder(name: name, parentId: nil)
-        }
         try checkResponse(response, data: data, context: "findOrCreateFolder search")
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -171,8 +164,8 @@ enum GoogleDriveAPI {
             return id
         }
 
-        // Not found — create it in root
-        return try await createFolder(name: name, parentId: nil)
+        // Not found — create it in app data folder
+        return try await createFolder(name: name, parentId: "appDataFolder")
     }
 
     // MARK: - File Upload
@@ -336,17 +329,19 @@ enum GoogleDriveAPI {
 
     // MARK: - File Listing
 
-    /// Lists files in a parent folder (or root if parentId is nil).
+    /// Lists files in a parent folder (or app data folder root if parentId is nil).
+    /// When parentId is "appDataFolder" or nil, uses the appDataFolder space.
     static func listFiles(parentId: String?, pageSize: Int = 100) async throws -> [GoogleDriveFile] {
-        logger.info("listFiles: parentId=\(parentId ?? "root")")
+        logger.info("listFiles: parentId=\(parentId ?? "appDataFolder")")
 
+        let useAppDataSpace = parentId == nil || parentId == "appDataFolder"
         var q = "trashed = false"
-        if let parentId = parentId {
+        if let parentId = parentId, parentId != "appDataFolder" {
             q = "trashed = false and '\(parentId)' in parents"
         }
 
         var components = URLComponents(string: "\(baseURL)/files")!
-        components.queryItems = [
+        var queryItems: [URLQueryItem] = [
             URLQueryItem(name: "pageSize", value: "\(pageSize)"),
             URLQueryItem(
                 name: "fields",
@@ -354,6 +349,10 @@ enum GoogleDriveAPI {
             ),
             URLQueryItem(name: "q", value: q),
         ]
+        if useAppDataSpace {
+            queryItems.append(URLQueryItem(name: "spaces", value: "appDataFolder"))
+        }
+        components.queryItems = queryItems
 
         let request = try await authorizedRequest(
             url: components.url!.absoluteString,

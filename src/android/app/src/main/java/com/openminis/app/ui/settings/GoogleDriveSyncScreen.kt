@@ -88,7 +88,8 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
     val oauthManager = remember { GoogleDriveOAuthManager.forSync(context.applicationContext) }
     val snackbarHostState = remember { SnackbarHostState() }
 
-    val isSyncing by GoogleDriveSyncManager.isSyncing.collectAsState()
+    val isBackingUp by GoogleDriveSyncManager.isBackingUp.collectAsState()
+    val isRestoring by GoogleDriveSyncManager.isRestoring.collectAsState()
     val syncError by GoogleDriveSyncManager.syncError.collectAsState()
     val lastSyncTime by GoogleDriveSyncManager.lastSyncTime.collectAsState()
     val backupCount by GoogleDriveSyncManager.backupCount.collectAsState()
@@ -225,10 +226,10 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                             onClick = {
                                 scope.launch { GoogleDriveSyncManager.backup(oauthManager) }
                             },
-                            enabled = !isSyncing,
+                            enabled = !isBackingUp && !isRestoring,
                             modifier = Modifier.weight(1f),
                         ) {
-                            if (isSyncing) {
+                            if (isBackingUp) {
                                 CircularProgressIndicator(
                                     modifier = Modifier.size(16.dp),
                                     strokeWidth = 2.dp,
@@ -243,10 +244,17 @@ fun GoogleDriveSyncScreen(onBack: () -> Unit) {
                             onClick = {
                                 scope.launch { GoogleDriveSyncManager.restore(oauthManager) }
                             },
-                            enabled = !isSyncing,
+                            enabled = !isBackingUp && !isRestoring,
                             modifier = Modifier.weight(1f),
                         ) {
-                            Icon(Icons.Outlined.Restore, contentDescription = null, modifier = Modifier.size(18.dp))
+                            if (isRestoring) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(Icons.Outlined.Restore, contentDescription = null, modifier = Modifier.size(18.dp))
+                            }
                             Spacer(Modifier.width(8.dp))
                             Text(stringResource(R.string.gdrive_restore_latest))
                         }

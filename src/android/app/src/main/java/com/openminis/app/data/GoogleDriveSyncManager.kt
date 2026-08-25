@@ -50,8 +50,11 @@ object GoogleDriveSyncManager {
 
     private lateinit var appContext: Context
 
-    private val _isSyncing = MutableStateFlow(false)
-    val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
+    private val _isBackingUp = MutableStateFlow(false)
+    val isBackingUp: StateFlow<Boolean> = _isBackingUp.asStateFlow()
+
+    private val _isRestoring = MutableStateFlow(false)
+    val isRestoring: StateFlow<Boolean> = _isRestoring.asStateFlow()
 
     private val _syncError = MutableStateFlow<String?>(null)
     val syncError: StateFlow<String?> = _syncError.asStateFlow()
@@ -95,11 +98,11 @@ object GoogleDriveSyncManager {
      * Updates [lastSyncTime], [backupCount], and [totalBackupSize] on success.
      */
     suspend fun backup(oauthManager: GoogleDriveOAuthManager) {
-        if (_isSyncing.value) {
-            Log.w(TAG, "backup: already syncing, skipping")
+        if (_isBackingUp.value) {
+            Log.w(TAG, "backup: already backing up, skipping")
             return
         }
-        _isSyncing.value = true
+        _isBackingUp.value = true
         _syncError.value = null
         try {
             GoogleDriveAPI.configure(oauthManager)
@@ -129,7 +132,7 @@ object GoogleDriveSyncManager {
             Log.e(TAG, "Backup failed", e)
             _syncError.value = e.message ?: "Backup failed"
         } finally {
-            _isSyncing.value = false
+            _isBackingUp.value = false
         }
     }
 
@@ -152,11 +155,11 @@ object GoogleDriveSyncManager {
      * its contents to [Context.filesDir].
      */
     suspend fun restoreFrom(oauthManager: GoogleDriveOAuthManager, fileId: String) {
-        if (_isSyncing.value) {
-            Log.w(TAG, "restoreFrom: already syncing, skipping")
+        if (_isRestoring.value) {
+            Log.w(TAG, "restoreFrom: already restoring, skipping")
             return
         }
-        _isSyncing.value = true
+        _isRestoring.value = true
         _syncError.value = null
         try {
             GoogleDriveAPI.configure(oauthManager)
@@ -171,7 +174,7 @@ object GoogleDriveSyncManager {
             Log.e(TAG, "Restore failed", e)
             _syncError.value = e.message ?: "Restore failed"
         } finally {
-            _isSyncing.value = false
+            _isRestoring.value = false
         }
     }
 

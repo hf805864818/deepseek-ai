@@ -152,7 +152,7 @@ struct GoogleDriveSyncView: View {
             } label: {
                 HStack {
                     settingsIcon("arrow.up.circle.fill", color: .blue)
-                    if syncManager.isSyncing {
+                    if syncManager.isBackingUp {
                         Text(String(localized: "Backing Up...", comment: "Backup in progress status"))
                         Spacer()
                         ProgressView()
@@ -164,14 +164,14 @@ struct GoogleDriveSyncView: View {
                 }
             }
             .buttonStyle(.plain)
-            .disabled(syncManager.isSyncing)
+            .disabled(syncManager.isBackingUp || syncManager.isRestoring)
 
             Button {
                 performRestoreLatest()
             } label: {
                 HStack {
                     settingsIcon("arrow.down.circle.fill", color: .green)
-                    if syncManager.isSyncing {
+                    if syncManager.isRestoring {
                         Text(String(localized: "Restoring...", comment: "Restore in progress status"))
                         Spacer()
                         ProgressView()
@@ -183,7 +183,7 @@ struct GoogleDriveSyncView: View {
                 }
             }
             .buttonStyle(.plain)
-            .disabled(syncManager.isSyncing)
+            .disabled(syncManager.isBackingUp || syncManager.isRestoring)
         } header: {
             Text(String(localized: "Sync", comment: "Google Drive sync section header"))
         }
@@ -269,7 +269,7 @@ struct GoogleDriveSyncView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(syncManager.isSyncing)
+                    .disabled(syncManager.isBackingUp || syncManager.isRestoring)
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) {
                             performDelete(fileId: backup.id)
