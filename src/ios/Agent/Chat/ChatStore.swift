@@ -5308,24 +5308,73 @@ extension ChatStore {
         // 100 sessions per window with 5s drain polls caused sustained DB
         // churn on large histories; smaller windows + longer waits keep the
         // dirty queue smaller and give the main thread / UI more breathing room.
-        let windowSize = 50             // was 100 — smaller batches = less DB churn per pass
+        //
+        // [T-ios-icloud-backlog-thermal-aware] Further dynamic throttling based
+        // on thermal state + foreground/background. When the device is hot or
+        // the user is actively using the app (foreground, not on the sync
+        // sheet), we back way off so typing / scrolling stays smooth. When
+        // background or on the sync sheet, we run at the base pace.
+        let baseWindowSize = 50
         let backlogPriority = 1
-        let drainPollInterval: UInt64 = 10_000_000_000  // was 5s — 10s between DB checks
-        let drainThreshold = 2_000      // was 5_000 — wait for a smaller backlog before next batch
-        let interWindowSleep: UInt64 = 1_000_000_000  // was 0.25s — 1s rest between windows
-        let drainDeadlineSeconds: TimeInterval = 60 * 60  // was 30min — 60min (slower pace is fine)
+        let baseDrainPollInterval: UInt64 = 10_000_000_000  // 10s
+        let baseDrainThreshold = 2_000
+        let baseInterWindowSleep: UInt64 = 1_000_000_000  // 1s
+        let drainDeadlineSeconds: TimeInterval = 60 * 60  // 60min
         var totalStaged = 0
         var passes = 0
         while !Task.isCancelled {
             // Honor explicit user cancel from MigrationEngine.cancelMigration.
-            // Without this, the loop would keep paginating older sessions and
-            // immediately re-stage the priority=1 dirty rows that
-            // clearMigrationBacklog() just removed — the user sees migration
-            // "still running" because it really is.
             if UserDefaults.standard.bool(forKey: cancelKey) {
                 iCloudLogger.info("[iCloud] historicalBacklogScan: cancel flag set, stopping. totalStaged=\(totalStaged) passes=\(passes)")
                 return
             }
+
+            // [T-ios-icloud-backlog-thermal-aware] Check thermal + app state
+            // and decide how aggressively to run this pass.
+            //   thermal critical → sleep 30s and skip this pass entirely
+            //   thermal serious + foreground → 1/4 window size, 4x sleep
+            //   foreground (not on sync sheet) → 1/2 window size, 2x sleep
+            //   background or sync sheet → base pace
+            //
+            // Note: ChatStore is a plain actor, SyncCore is @MainActor.
+            // Use the async throttleSnapshot() to hop safely across.
+            let throttle = await SyncCore.shared.throttleSnapshot()
+            let thermal = throttle.thermalLevel
+            let isBg = throttle.isAppInBackground
+            let onSyncSheet = throttle.userOnSyncSheet
+
+            if thermal == .critical {
+                iCloudLogger.info("[iCloud] historicalBacklogScan: thermal critical — sleeping 30s")
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                continue
+            }
+
+            let windowSize: Int
+            let drainPollInterval: UInt64
+            let drainThreshold: Int
+            let interWindowSleep: UInt64
+
+            if isBg || onSyncSheet {
+                // Background or user explicitly watching sync → base pace
+                windowSize = baseWindowSize
+                drainPollInterval = baseDrainPollInterval
+                drainThreshold = baseDrainThreshold
+                interWindowSleep = baseInterWindowSleep
+            } else if thermal == .serious {
+                // Foreground + hot → very slow pace
+                windowSize = baseWindowSize / 4  // 12-13 sessions per batch
+                drainPollInterval = baseDrainPollInterval * 4  // 40s between checks
+                drainThreshold = baseDrainThreshold / 2  // 1000
+                interWindowSleep = baseInterWindowSleep * 4  // 4s rest
+            } else {
+                // Foreground, normal temp → moderate pace
+                // (user is typing/browsing — keep sync unobtrusive)
+                windowSize = baseWindowSize / 2  // 25 sessions per batch
+                drainPollInterval = baseDrainPollInterval * 2  // 20s between checks
+                drainThreshold = baseDrainThreshold  // same threshold
+                interWindowSleep = baseInterWindowSleep * 2  // 2s rest
+            }
+
             let cursor = UserDefaults.standard.double(forKey: cursorKey)
             // Cursor sentinel: negative or zero means "no work" only if
             // we've also recorded at least one Phase B pass. Default 0
@@ -5372,24 +5421,23 @@ extension ChatStore {
                 UserDefaults.standard.set(oldest, forKey: cursorKey)
             }
             passes += 1
-            iCloudLogger.info("[iCloud] historicalBacklogScan: pass=\(passes) staged=\(batch.count) cumulative=\(totalStaged) cursorNext=\(batch.last?.updatedAt ?? 0)")
+            iCloudLogger.info("[iCloud] historicalBacklogScan: pass=\(passes) staged=\(batch.count) cumulative=\(totalStaged) cursorNext=\(batch.last?.updatedAt ?? 0) window=\(windowSize) bg=\(isBg) thermal=\(String(describing: thermal))")
 
             // Wait for the previous batch to drain before staging the
             // next one. Otherwise the dirty queue grows monotonically
-            // (12 windows × 100 sessions = 1200 staged in ~3s, push
-            // hasn't kept up) and we lose the "small bites" benefit —
-            // SyncCore would just see the same single-shot 200k+
-            // backlog at the end. Threshold is one-window-worth of
-            // children: ~100 sessions × ~70 messages + files, give it
-            // room without letting it stall forever.
+            // and we lose the "small bites" benefit.
             //
-            // Poll every 10s; bail with a hard cap of 60 min per window
-            // so a stuck push doesn't permanently freeze pagination.
-            // Note: countDirtyRecords includes user-driven priority=0
-            // writes, but those are usually a tiny fraction of the
-            // backlog priority=1 rows during initial migration.
+            // Poll every drainPollInterval; bail with a hard cap of 60 min
+            // per window so a stuck push doesn't permanently freeze pagination.
             let drainDeadline = Date().addingTimeInterval(drainDeadlineSeconds)
             while Date() < drainDeadline, !Task.isCancelled {
+                // Re-check thermal inside the drain loop too — if the
+                // device heats up while waiting, slow down further.
+                let currentThrottle = await SyncCore.shared.throttleSnapshot()
+                if currentThrottle.thermalLevel == .critical {
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    continue
+                }
                 let dirty = countDirtyRecords()
                 if dirty.total < drainThreshold { break }
                 try? await Task.sleep(nanoseconds: drainPollInterval)
@@ -5557,7 +5605,7 @@ extension ChatStore {
         return result
     }
 
-    func loadDirtyRecords(v2Only: Bool = false) -> [DirtyRecord] {
+    func loadDirtyRecords(v2Only: Bool = false, limit: Int = 100) -> [DirtyRecord] {
         // Order Sessions first so receiving device creates sessions before messages arrive
         // Order:
         //   1. priority ASC — user-driven writes (priority=0) before
@@ -5586,7 +5634,7 @@ extension ChatStore {
                     ELSE 2
                 END,
                 created_at DESC
-            LIMIT 100
+            LIMIT \(limit)
         """
         var stmt: OpaquePointer?
         var records: [DirtyRecord] = []

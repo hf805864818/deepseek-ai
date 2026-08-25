@@ -199,9 +199,14 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
     private static let recentFetchLastKey = "cloudSync.v2.recentFetchLastAt"
     /// In-flight guard.
     private var recentFetchInFlight: Bool = false
-    /// Repeating timer that re-runs fetchRecentV2 every recentFetchInterval
-    /// seconds while the engine is up.
+    /// One-shot timer that re-runs fetchRecentV2 and then re-schedules
+    /// itself with a dynamically-adjusted interval. Replaces the old
+    /// fixed-interval repeating timer so we can back off aggressively
+    /// when the app is backgrounded, the device is hot, or LPM is on.
     private var recentFetchTimer: DispatchSourceTimer?
+    /// Set to true when we want the timer to stop re-arming itself
+    /// (e.g. during stop()).
+    private var recentFetchTimerStopped: Bool = false
     // [T-ios-cloudkit-nsoperation-weak-clear-crash] Each fetchRecentV2 run
     // fires one CKQuery (records(matching:)) per record type — 10 XPC
     // round-trips through cloudd, each serializing an NSPredicate. iOS 26.5
@@ -214,8 +219,37 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
     // 60s→120s for halving the XPC surface), and back off exponentially on
     // ANY fetch error (not just server-signalled throttle) so a flaky/
     // crashing CloudKit layer is given room instead of being hammered.
-    private static let recentFetchInterval: TimeInterval = 120  // 2 min (was 60)
     private static let recentFetchWindow: TimeInterval = 24 * 60 * 60   // last 24 h
+
+    // [T-ios-icloud-dynamic-recentfetch] Dynamic recent-fetch interval based
+    // on app state, thermal level, and low-power mode. Reduces XPC traffic
+    // and CPU wakeups when the user isn't actively using the app or when
+    // the device is running hot — especially important on iPhone 14 Pro
+    // where sustained iCloud sync causes noticeable warmth.
+    //
+    // Base intervals (seconds):
+    //                         Nominal    Fair      Serious    Critical
+    //   Foreground (active)   120s       240s      600s       1800s
+    //   Background            600s       900s      1800s      3600s
+    // Low Power Mode adds ×1.5 on top of the above.
+    private var currentRecentFetchInterval: TimeInterval {
+        let isBg = SyncCore.shared.isAppInBackground
+        let thermal = SyncCore.shared.thermalLevel
+        let lpm = SyncCore.shared.isLowPowerMode
+
+        let base: TimeInterval
+        switch (isBg, thermal) {
+        case (false, .nominal):  base = 120
+        case (false, .fair):     base = 240
+        case (false, .serious):  base = 600
+        case (false, .critical): base = 1800
+        case (true, .nominal):   base = 600
+        case (true, .fair):      base = 900
+        case (true, .serious):   base = 1800
+        case (true, .critical):  base = 3600
+        }
+        return lpm ? base * 1.5 : base
+    }
 
     // [T-icloud-fresh-restore-provider-groups] Secrets-zone "config" record
     // types whose payload is low-volume but long-lived (created once, edited
@@ -536,8 +570,13 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
 
     private func scheduleRecentFetchTimer() {
         recentFetchTimer?.cancel()
+        recentFetchTimerStopped = false
+        let interval = currentRecentFetchInterval
         let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.openminis.sync.recentFetch", qos: .utility))
-        t.schedule(deadline: .now() + Self.recentFetchInterval, repeating: Self.recentFetchInterval)
+        // One-shot: fire once, then fetchRecentV2 will re-arm us with a
+        // freshly-computed interval. This way the timer adapts to app
+        // state / thermal changes without needing external rescheduling.
+        t.schedule(deadline: .now() + interval)
         t.setEventHandler { [weak self] in
             logger.info("[iCloudTrace] recentFetchTimer fired")
             Task { @MainActor [weak self] in
@@ -546,7 +585,15 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
         }
         t.resume()
         recentFetchTimer = t
-        logger.info("[iCloudTrace] recentFetchTimer scheduled interval=\(Int(Self.recentFetchInterval))s")
+        logger.info("[iCloudTrace] recentFetchTimer scheduled interval=\(Int(interval))s (bg=\(SyncCore.shared.isAppInBackground) thermal=\(String(describing: SyncCore.shared.thermalLevel)) lpm=\(SyncCore.shared.isLowPowerMode))")
+    }
+
+    /// Re-arm the recent-fetch timer with the current dynamic interval.
+    /// Called after fetchRecentV2 completes so the next wakeup uses the
+    /// latest app/thermal state.
+    private func rearmRecentFetchTimer() {
+        guard !recentFetchTimerStopped else { return }
+        scheduleRecentFetchTimer()
     }
 
     /// Periodic active fetch: ask CKSyncEngine to pull whatever changes
@@ -560,6 +607,11 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
     @MainActor
     private func fetchRecentV2() async {
         logger.info("[iCloudTrace] fetchRecentV2 entering")
+        // Always re-arm the one-shot timer on exit (even on early returns
+        // like "already in flight" or "throttled") so the poll loop never
+        // dies. The interval is re-computed each time from current app
+        // state + thermal + LPM.
+        defer { rearmRecentFetchTimer() }
         guard !recentFetchInFlight else {
             logger.info("[iCloudTrace] fetchRecentV2 skip — already in flight")
             // Safety net: if a previous run got stuck for any reason
@@ -945,6 +997,7 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
 
     func stop() async {
         syncEngine = nil
+        recentFetchTimerStopped = true
         recentFetchTimer?.cancel()
         recentFetchTimer = nil
     }

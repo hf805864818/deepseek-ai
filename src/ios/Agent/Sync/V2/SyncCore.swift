@@ -80,10 +80,28 @@ final class SyncCore {
     private(set) var networkClass: NetworkClass = .wifi
     private var pathMonitor: NWPathMonitor?
 
+    // [T-ios-icloud-thermal-throttle] Thermal state awareness.
+    // When the device runs hot, we back off sync intensity to reduce CPU
+    // usage and let the device cool down. iPhone 14 Pro is known to run
+    // warm during sustained iCloud sync of large histories.
+    enum ThermalLevel: Sendable {
+        case nominal    // normal temperature — full sync speed
+        case fair       // slightly warm — mild backoff
+        case serious    // noticeably hot — significant backoff
+        case critical   // very hot — pause non-essential sync
+    }
+    private(set) var thermalLevel: ThermalLevel = .nominal
+    private var thermalObserver: NSObjectProtocol?
+
+    /// Low Power Mode. When enabled, we further throttle sync to save battery.
+    private(set) var isLowPowerMode: Bool = false
+    private var lowPowerObserver: NSObjectProtocol?
+
     /// Effective chained-send delay seconds for the current context.
     /// Base 5s when the user is staring at the sync sheet. Foreground
     /// (default) ×3. Background ×4 (overrides foreground). Cellular ×2
-    /// stacks on top.
+    /// stacks on top. Thermal adds 1.5× / 3× / pause at fair / serious / critical.
+    /// Low Power Mode adds another 1.5× on top.
     var currentSendDelay: TimeInterval {
         let base: TimeInterval = 5
         let foregroundMultiplier: TimeInterval
@@ -91,7 +109,15 @@ final class SyncCore {
         else if userOnSyncSheet { foregroundMultiplier = 1.0 }
         else { foregroundMultiplier = 3.0 }
         let networkMultiplier: TimeInterval = networkClass == .cellular ? 2.0 : 1.0
-        return base * foregroundMultiplier * networkMultiplier
+        let thermalMultiplier: TimeInterval
+        switch thermalLevel {
+        case .nominal:  thermalMultiplier = 1.0
+        case .fair:     thermalMultiplier = 1.5
+        case .serious:  thermalMultiplier = 3.0
+        case .critical: thermalMultiplier = 10.0  // effectively pauses chained send
+        }
+        let lpmMultiplier: TimeInterval = isLowPowerMode ? 1.5 : 1.0
+        return base * foregroundMultiplier * networkMultiplier * thermalMultiplier * lpmMultiplier
     }
     /// Human-readable label for the current throttle multiplier.
     var throttleLabel: String {
@@ -100,7 +126,57 @@ final class SyncCore {
         else if userOnSyncSheet { f = "1×" }
         else { f = "1/3×" }
         let n = networkClass == .cellular ? " · cellular ½" : ""
-        return f + n
+        let t: String
+        switch thermalLevel {
+        case .nominal:  t = ""
+        case .fair:     t = " · warm ⅔"
+        case .serious:  t = " · hot ⅓"
+        case .critical: t = " · critical 1/10"
+        }
+        let l = isLowPowerMode ? " · LPM ⅔" : ""
+        return f + n + t + l
+    }
+
+    /// Returns true if background / historical sync work should be
+    /// completely paused right now (thermal critical or extreme conditions).
+    var shouldPauseBackgroundSync: Bool {
+        thermalLevel == .critical
+    }
+
+    /// Send batch size — number of dirty records to pull per sendNow()
+    /// cycle. Smaller when hot to spread work across more cycles and
+    /// keep each individual burst shorter.
+    var currentSendBatchSize: Int {
+        switch thermalLevel {
+        case .nominal:  return 100
+        case .fair:     return 60
+        case .serious:  return 30
+        case .critical: return 15
+        }
+    }
+
+    /// Snapshot of throttling-relevant state, safe to read from any
+    /// actor. Used by ChatStore (a plain actor) to decide how
+    /// aggressively to run the historical backlog scan without having
+    /// to hop to MainActor on every loop iteration.
+    struct ThrottleSnapshot: Sendable {
+        var thermalLevel: ThermalLevel
+        var isAppInBackground: Bool
+        var userOnSyncSheet: Bool
+        var isLowPowerMode: Bool
+    }
+
+    /// Async getter for throttle state — hops to MainActor to read the
+    /// values and returns a Sendable snapshot. Callable from any actor.
+    nonisolated func throttleSnapshot() async -> ThrottleSnapshot {
+        await MainActor.run {
+            ThrottleSnapshot(
+                thermalLevel: self.thermalLevel,
+                isAppInBackground: self.isAppInBackground,
+                userOnSyncSheet: self.userOnSyncSheet,
+                isLowPowerMode: self.isLowPowerMode
+            )
+        }
     }
 
     /// Sliding window of (timestamp, recordCount) successful save events
@@ -227,6 +303,8 @@ final class SyncCore {
         isRunning = true
         logger.info("[SyncCore] start STEP=exit isRunning=true")
         startPathMonitor()
+        startThermalMonitor()
+        startLowPowerMonitor()
         // Drain any dirty rows left over from a previous session (e.g. a
         // markDirty that happened before the last shutdown). Without this
         // kick, leftover priority=0 rows just sit forever until the user
@@ -255,12 +333,96 @@ final class SyncCore {
         pathMonitor = m
     }
 
+    // MARK: - Thermal & Low Power monitoring
+
+    private func startThermalMonitor() {
+        guard thermalObserver == nil else { return }
+        // Read initial state
+        updateThermalLevel(from: ProcessInfo.processInfo.thermalState)
+        // Observe changes
+        let center = NotificationCenter.default
+        thermalObserver = center.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.updateThermalLevel(from: ProcessInfo.processInfo.thermalState)
+            }
+        }
+    }
+
+    private func stopThermalMonitor() {
+        if let observer = thermalObserver {
+            NotificationCenter.default.removeObserver(observer)
+            thermalObserver = nil
+        }
+    }
+
+    private func updateThermalLevel(from state: ProcessInfo.ThermalState) {
+        let newLevel: ThermalLevel
+        switch state {
+        case .nominal:   newLevel = .nominal
+        case .fair:      newLevel = .fair
+        case .serious:   newLevel = .serious
+        case .critical:  newLevel = .critical
+        @unknown default: newLevel = .nominal
+        }
+        if newLevel != thermalLevel {
+            thermalLevel = newLevel
+            logger.info("[SyncCore] thermal state changed → \(String(describing: newLevel)) (throttle=\(throttleLabel))")
+            // When cooling down from critical/fair, kick a send so the
+            // queue resumes draining promptly instead of waiting for the
+            // next markDirty.
+            if newLevel == .nominal || newLevel == .fair {
+                scheduleSend(delay: 2)
+            }
+        }
+    }
+
+    private func startLowPowerMonitor() {
+        guard lowPowerObserver == nil else { return }
+        // Read initial state
+        isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+        // Observe changes
+        let center = NotificationCenter.default
+        lowPowerObserver = center.addObserver(
+            forName: NSNotification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let newVal = ProcessInfo.processInfo.isLowPowerModeEnabled
+                if newVal != self.isLowPowerMode {
+                    self.isLowPowerMode = newVal
+                    self.logger.info("[SyncCore] low power mode → \(newVal) (throttle=\(self.throttleLabel))")
+                    if !newVal {
+                        self.scheduleSend(delay: 2)
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopLowPowerMonitor() {
+        if let observer = lowPowerObserver {
+            NotificationCenter.default.removeObserver(observer)
+            lowPowerObserver = nil
+        }
+    }
+
     func stop() async {
         pendingSendTask?.cancel()
         pendingSendTask = nil
         for t in transports {
             await t.stop()
         }
+        stopThermalMonitor()
+        stopLowPowerMonitor()
+        pathMonitor?.cancel()
+        pathMonitor = nil
         isRunning = false
         logger.info("[SyncCore] stopped")
     }
@@ -360,7 +522,10 @@ final class SyncCore {
         await drainSessionFileChangesIntoDirty()
 
         // Snapshot dirty rows.
-        let dirty = await ChatStore.shared.loadDirtyRecords(v2Only: true)
+        let dirty = await ChatStore.shared.loadDirtyRecords(
+            v2Only: true,
+            limit: currentSendBatchSize
+        )
         guard !dirty.isEmpty else {
             // DIAG: was debug-level, but "nothing dirty when user expects
             // a write to have just happened" is the single most useful
@@ -521,8 +686,9 @@ final class SyncCore {
             scheduleSend(delay: delay)
         } else {
             // Even on full success, the dirty queue may still have rows
-            // we couldn't fit in this batch (loadDirtyRecords LIMIT 395
-            // when 100k+ rows pending — the migration initial-push case).
+            // we couldn't fit in this batch (loadDirtyRecords has a LIMIT
+            // — dynamic based on thermal state, ~100 at nominal — so
+            // 100k+ rows pending takes many cycles, e.g. migration).
             // Schedule another debounced send so the queue actually
             // drains. Skip when queue is empty.
             let after = await ChatStore.shared.countDirtyRecords()
@@ -596,18 +762,40 @@ final class SyncCore {
             totalReceived += batch.records.count + batch.deletes.count
         }
         let registry = SyncableTypeRegistry.shared
-        // Hydrate inbound in 25-record chunks with a 50ms yield between
-        // chunks. Without this, a 600-record fetch holds the full
-        // PortableRecord array (each carrying message content + maybe
-        // inline attachments) in main-actor scope while the merger
-        // thrashes ChatStore + UI for tens of seconds, and ARC has no
-        // chance to release intermediate Codable structs. Observed:
-        // 3+GB resident before OOM crash on a 1196-session migration.
+        // Hydrate inbound in chunks with a yield between chunks. Without
+        // this, a 600-record fetch holds the full PortableRecord array
+        // (each carrying message content + maybe inline attachments) in
+        // main-actor scope while the merger thrashes ChatStore + UI for
+        // tens of seconds, and ARC has no chance to release intermediate
+        // Codable structs. Observed: 3+GB resident before OOM crash on
+        // a 1196-session migration.
+        //
+        // [T-ios-icloud-inbound-thermal] Chunk size and sleep are dynamic
+        // based on thermal state. When the device is hot, we use smaller
+        // chunks and longer sleeps so the main thread stays responsive
+        // for typing, scrolling, and other user interactions.
         Task { @MainActor [weak self] in
             var applied = 0, skipped = 0, blocked = 0, ownEcho = 0
             let allRecords = batch.records
             let allDeletes = batch.deletes
-            let chunkSize = 25
+            // Dynamic chunk sizing based on thermal state
+            let thermal = self?.thermalLevel ?? .nominal
+            let chunkSize: Int
+            let chunkSleepNs: UInt64
+            switch thermal {
+            case .nominal:
+                chunkSize = 25
+                chunkSleepNs = 50_000_000       // 50ms
+            case .fair:
+                chunkSize = 15
+                chunkSleepNs = 100_000_000      // 100ms
+            case .serious:
+                chunkSize = 8
+                chunkSleepNs = 200_000_000      // 200ms
+            case .critical:
+                chunkSize = 5
+                chunkSleepNs = 500_000_000      // 500ms
+            }
             var i = 0
             // Prune stale echo-suppress entries once per batch so the map
             // doesn't grow unbounded over an idle session.
@@ -664,7 +852,8 @@ final class SyncCore {
                 // diff for whatever the user is doing in the foreground,
                 // and so ARC has a chance to release the chunk's Codable
                 // intermediaries before the next chunk allocates more.
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                // Sleep duration is thermal-aware — longer when hot.
+                try? await Task.sleep(nanoseconds: chunkSleepNs)
             }
             for deleteId in allDeletes {
                 guard registry.metadata(for: deleteId.type) != nil else {
