@@ -152,6 +152,15 @@ enum GoogleDriveAPI {
             method: "GET"
         )
         let (data, response) = try await URLSession.shared.data(for: request)
+        let httpResp = response as? HTTPURLResponse
+
+        // 403 on search may mean the folder exists but we can't search for it.
+        // Fall back to creating it directly (create also returns existing folder ID
+        // if one with the same name already exists in the same location).
+        if httpResp?.statusCode == 403 {
+            logger.warning("findOrCreateFolder search returned 403, falling back to create")
+            return try await createFolder(name: name, parentId: nil)
+        }
         try checkResponse(response, data: data, context: "findOrCreateFolder search")
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
