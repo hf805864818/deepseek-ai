@@ -495,7 +495,7 @@ enum GoogleDriveAPI {
             let body = String(data: data, encoding: .utf8) ?? "<binary>"
             // Try to parse Google's standard error JSON format
             let errorDetail = Self.parseGoogleError(data: data)
-            logger.error("\(context) FAILED — status \(http.statusCode): \(errorDetail ?? body.prefix(300))")
+            logger.error("\(context) FAILED — status \(http.statusCode): \(errorDetail ?? String(body.prefix(300)))")
 
             let userMessage = errorDetail ?? "HTTP \(http.statusCode)"
             throw LLMError.providerError(

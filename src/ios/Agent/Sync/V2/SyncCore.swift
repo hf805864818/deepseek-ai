@@ -397,7 +397,7 @@ final class SyncCore {
                 let newVal = ProcessInfo.processInfo.isLowPowerModeEnabled
                 if newVal != self.isLowPowerMode {
                     self.isLowPowerMode = newVal
-                    self.logger.info("[SyncCore] low power mode → \(newVal) (throttle=\(self.throttleLabel))")
+                    logger.info("[SyncCore] low power mode → \(newVal) (throttle=\(self.throttleLabel))")
                     if !newVal {
                         self.scheduleSend(delay: 2)
                     }
