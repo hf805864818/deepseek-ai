@@ -286,7 +286,7 @@ extension AIChatViewModel {
         let resolverInput = resolver
         let sid = sessionId
 
-        let (loadedUIMessages, loadedHistory) = await Task.detached(priority: .userInitiated) {
+        var (loadedUIMessages, loadedHistory) = await Task.detached(priority: .userInitiated) {
             // [T-perf-loadsession-bg] All processing here is pure-value:
             // RawMessage.toAgentMessage/toChatMessage are struct methods that
             // parse JSON + decode media references, with no main-thread or
@@ -397,8 +397,7 @@ extension AIChatViewModel {
             }
         }
 
-        let phase2aElapsed = (CFAbsoluteTimeGetCurrent() - phase2aStart) * 1000
-
+        // phase2aElapsed is already declared above (after Task.detached returns).
         // Phase 2.5 (Phase B): Apply compact marker if present.
         //
         // New model: marker.firstKeptMessageId is the authoritative boundary. agentHistory
@@ -880,7 +879,7 @@ extension AIChatViewModel {
     }
 
     /// Apply tool results from a tool-result RawMessage onto an assistant ChatMessage's tool blocks.
-    private static func applyToolResults(from raw: RawMessage, to assistant: ChatMessage, mediaResolver: (MediaRef) -> URL) {
+    private nonisolated static func applyToolResults(from raw: RawMessage, to assistant: ChatMessage, mediaResolver: (MediaRef) -> URL) {
         let toolResults: [ToolResult] = raw.parts.compactMap {
             if case .toolResult(let tr) = $0 { return tr }
             return nil

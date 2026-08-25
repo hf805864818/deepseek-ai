@@ -106,7 +106,7 @@ object GoogleDriveAPI {
             // Fall back to creating it directly (create also returns existing folder ID
             // if one with the same name already exists in the same location).
             Log.w(TAG, "findOrCreateFolder search returned 403, falling back to create")
-            return createFolder(name)
+            return@withContext createFolder(name)
         } else if (response.code !in 200..299) {
             throw IOException("findOrCreateFolder search failed: ${response.code} $body")
         }
