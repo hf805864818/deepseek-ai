@@ -461,6 +461,17 @@
                     android:port="3002"
                     android:path="/callback" />
             </intent-filter>
+            <!-- Google Drive: http://localhost:8087/oauth2callback -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="localhost"
+                    android:port="8087"
+                    android:path="/oauth2callback" />
+            </intent-filter>
         </activity>
 
         <!-- Agent foreground service -->
