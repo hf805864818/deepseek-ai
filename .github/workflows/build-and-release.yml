@@ -53,6 +53,9 @@ jobs:
           git config user.email "bot@deepseek-ai.local"
           git add -A
           git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          # Pull with rebase before push to handle concurrent commits
+          # (e.g. direct pushes to main during the prepare step)
+          git pull --rebase origin main
           git push
 
   # === Step 2: Build iOS IPA (TrollStore compatible) ===
