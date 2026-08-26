@@ -446,6 +446,7 @@
 		E5W00000B /* TombstoneManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5W00001B /* TombstoneManager.swift */; };
 		E5W00000C /* SyncV2Bootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5W00001C /* SyncV2Bootstrap.swift */; };
 		E5W00000D /* ChatStoreSyncHydrators.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5W00001D /* ChatStoreSyncHydrators.swift */; };
+		E5W00000E /* AppSettingsSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5W00001E /* AppSettingsSync.swift */; };
 		E5W000031 /* WebAppShortcut.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAB00001A /* WebAppShortcut.swift */; };
 		E5W000032 /* WebAppPathResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAB00001B /* WebAppPathResolver.swift */; };
 		E5W000033 /* WebAppWebViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAB00001C /* WebAppWebViewController.swift */; };
@@ -1088,6 +1089,7 @@
 		E5W00001B /* TombstoneManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TombstoneManager.swift; sourceTree = "<group>"; };
 		E5W00001C /* SyncV2Bootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Bootstrap.swift; sourceTree = "<group>"; };
 		E5W00001D /* ChatStoreSyncHydrators.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreSyncHydrators.swift; sourceTree = "<group>"; };
+		E5W00001E /* AppSettingsSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettingsSync.swift; sourceTree = "<group>"; };
 		E5W00003B /* SessionFileChangeTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionFileChangeTracker.swift; sourceTree = "<group>"; };
 		E5W000180 /* ForceSyncHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ForceSyncHelper.swift; sourceTree = "<group>"; };
 		E5X000011 /* SwiftMathRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftMathRenderer.swift; sourceTree = "<group>"; };
@@ -2074,6 +2076,7 @@
 				E5W00001C /* SyncV2Bootstrap.swift */,
 				EAB000070 /* UploadPolicy.swift */,
 				E5W00001D /* ChatStoreSyncHydrators.swift */,
+				E5W00001E /* AppSettingsSync.swift */,
 				E5W00003B /* SessionFileChangeTracker.swift */,
 			);
 			path = V2;
@@ -2964,6 +2967,7 @@
 				E5W00000B /* TombstoneManager.swift in Sources */,
 				E5W00000C /* SyncV2Bootstrap.swift in Sources */,
 				E5W00000D /* ChatStoreSyncHydrators.swift in Sources */,
+				E5W00000E /* AppSettingsSync.swift in Sources */,
 				E5W00003A /* SessionFileChangeTracker.swift in Sources */,
 				E8A000001 /* OffloadPermissionManager.swift in Sources */,
 				E8A000002 /* OffloadPermissionDialog.swift in Sources */,

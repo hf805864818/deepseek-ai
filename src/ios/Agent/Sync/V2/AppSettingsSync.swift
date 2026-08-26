@@ -3,10 +3,18 @@ import os.log
 
 private let logger = AppLogger(category: "AppSettingsSync")
 
-/// Helper that bridges user-facing UserDefaults settings into the v2 sync
-/// engine. Collects a curated set of preferences into a JSON blob, pushes
-/// them as a single `AppSettingsV2` PortableRecord, and applies inbound
-/// settings locally with last-write-wins (LWW) by `updatedAt`.
+/// Helper that bridges user-facing UserDefaults settings into cross-device
+/// sync. Collects a curated set of preferences into a JSON blob and applies
+/// inbound settings locally with last-write-wins (LWW) by `updatedAt`.
+///
+/// Two transport paths are supported:
+///   1. **iCloud sync** (if enabled): pushes settings as a single
+///      `AppSettingsV2` PortableRecord via SyncCore.
+///   2. **Google Drive backup**: settings JSON is included in the backup
+///      ZIP as `settings/settings.json` and applied on restore.
+///
+/// Both paths share the same `collectSettings()` / `applySettings()` core,
+/// so the transport is transparent to the data layer.
 ///
 /// Device-specific settings (Google Drive auth, iCloud toggle, rootfs state,
 /// logging, auth tokens) are intentionally excluded — each device owns those.
@@ -36,19 +44,19 @@ enum AppSettingsSync {
     ]
 
     /// UserDefaults key tracking the last time local settings were changed.
-    /// Used as the LWW clock for the AppSettingsV2 record.
+    /// Used as the LWW clock for settings — shared by both iCloud and
+    /// Google Drive paths.
     private static let localUpdatedAtKey = "appSettings.localUpdatedAt"
 
     /// Snapshot of the last-collected settings JSON. Compared on each
     /// `checkAndMarkDirty()` call to detect whether any syncable setting
-    /// changed since the last push. Avoids the need to hook every
-    /// individual UserDefaults write path.
+    /// changed since the last push.
     private static let lastPushedSnapshotKey = "appSettings.lastPushedSnapshot"
 
     // MARK: - Collect (local → JSON)
 
     /// Reads all syncable settings from UserDefaults and returns them as a
-    /// JSON string suitable for the `settingsJson` field on SyncedAppSettings.
+    /// JSON string. The same format is used for both iCloud and Google Drive.
     static func collectSettings() -> String {
         var dict: [String: String] = [:]
         for key in syncableKeys {
@@ -83,6 +91,9 @@ enum AppSettingsSync {
     /// only applies if the remote `updatedAt` is strictly newer than the
     /// local `localUpdatedAt`. After applying, stamps the local updatedAt
     /// to the remote value so future remote changes are compared correctly.
+    ///
+    /// This method is called from both iCloud sync (mergeAppSettings) and
+    /// Google Drive restore (mergeBackupNewFormat).
     static func applySettings(_ json: String, remoteUpdatedAt: Date) {
         // LWW guard — skip if local is newer or equal
         let local = localUpdatedAt()
@@ -118,32 +129,89 @@ enum AppSettingsSync {
         logger.info("Applied remote settings (updatedAt=\(remoteUpdatedAt))")
     }
 
-    // MARK: - Mark dirty
+    // MARK: - Google Drive backup support
+
+    /// Builds a complete settings JSON payload for Google Drive backup,
+    /// including the `updatedAt` timestamp wrapper. Returns nil if no
+    /// local settings have ever been changed.
+    static func buildBackupPayload() -> Data? {
+        let updatedAt = localUpdatedAt()
+        guard updatedAt > .distantPast else {
+            logger.info("buildBackupPayload: no local settings change — skipping")
+            return nil
+        }
+
+        let settingsJson = collectSettings()
+        let payload: [String: Any] = [
+            "updatedAt": updatedAt.timeIntervalSince1970,
+            "settings": (try? JSONSerialization.jsonObject(with: settingsJson.data(using: .utf8) ?? Data())) ?? [:]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            logger.error("Failed to serialize settings backup payload")
+            return nil
+        }
+        return data
+    }
+
+    /// Applies settings from a Google Drive backup JSON payload. Extracts
+    /// the `updatedAt` and `settings` fields and delegates to
+    /// `applySettings(_:remoteUpdatedAt:)` with LWW.
+    static func applyBackupPayload(_ data: Data) {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let updatedAtTs = payload["updatedAt"] as? TimeInterval,
+              let settingsDict = payload["settings"] as? [String: Any] else {
+            logger.error("Failed to parse settings backup payload")
+            return
+        }
+
+        // Re-serialize the settings dict to a string for applySettings
+        guard let settingsData = try? JSONSerialization.data(withJSONObject: settingsDict, options: [.sortedKeys]),
+              let settingsJson = String(data: settingsData, encoding: .utf8) else {
+            logger.error("Failed to re-serialize settings from backup payload")
+            return
+        }
+
+        let remoteUpdatedAt = Date(timeIntervalSince1970: updatedAtTs)
+        applySettings(settingsJson, remoteUpdatedAt: remoteUpdatedAt)
+    }
+
+    // MARK: - Mark dirty (iCloud path)
 
     /// Stamps the local `updatedAt` to now and marks the AppSettingsV2
-    /// record dirty so it will be pushed on the next sync cycle. Call this
-    /// whenever a syncable setting changes.
+    /// record dirty so it will be pushed on the next iCloud sync cycle.
+    /// Only effective if iCloud sync is enabled; if not, the stamp still
+    /// updates the LWW clock so Google Drive backup includes the change.
     static func markDirty() {
         let now = Date()
         UserDefaults.standard.set(now.timeIntervalSince1970, forKey: localUpdatedAtKey)
         UserDefaults.standard.set(collectSettings(), forKey: lastPushedSnapshotKey)
-        Task {
-            await SyncCore.shared.markDirty(
-                SyncedAppSettings(id: "app-settings",
-                                  settingsJson: collectSettings(),
-                                  updatedAt: now),
-                reason: .localUpsert
-            )
+
+        // Only push to SyncCore if iCloud sync is enabled
+        if UserDefaults.standard.bool(forKey: "cloudSync.v2.enabled") {
+            Task {
+                await SyncCore.shared.markDirty(
+                    SyncedAppSettings(id: "app-settings",
+                                      settingsJson: collectSettings(),
+                                      updatedAt: now),
+                    reason: .localUpsert
+                )
+            }
+            logger.info("AppSettings marked dirty for iCloud (updatedAt=\(now))")
+        } else {
+            logger.info("AppSettings stamped for Google Drive backup (updatedAt=\(now))")
         }
-        logger.info("AppSettings marked dirty (updatedAt=\(now))")
     }
 
     /// Compares the current settings snapshot with the last-pushed one.
-    /// If they differ, marks the AppSettingsV2 record dirty so the change
-    /// will be pushed on the next sync cycle. Called periodically from
-    /// SyncCore.sendNow — avoids the need to hook every individual
-    /// UserDefaults write path.
+    /// If they differ, stamps the local updatedAt and marks the record dirty
+    /// for the next sync cycle. Called periodically from SyncCore.sendNow —
+    /// avoids the need to hook every individual UserDefaults write path.
+    ///
+    /// If iCloud is not enabled, this is a no-op (Google Drive captures
+    /// the latest settings at backup time via `buildBackupPayload()`).
     static func checkAndMarkDirty() {
+        guard UserDefaults.standard.bool(forKey: "cloudSync.v2.enabled") else { return }
+
         let current = collectSettings()
         let lastPushed = UserDefaults.standard.string(forKey: lastPushedSnapshotKey) ?? ""
         guard current != lastPushed else { return }

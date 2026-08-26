@@ -258,7 +258,7 @@ object GoogleDriveSyncManager {
         try {
             val allBackups = GoogleDriveAPI.listFiles(folderId)
                 .filter { it.name.startsWith(BACKUP_PREFIX) && it.name.endsWith(".zip") }
-                .sortedByDescending { it.modifiedTime ?: 0L }
+                .sortedByDescending { it.modifiedTime ?: "" }
 
             val limit = maxOf(getMaxBackups(), 1)
             if (allBackups.size <= limit) {
@@ -575,8 +575,8 @@ object GoogleDriveSyncManager {
 
                 // INSERT OR IGNORE handles the "new record" case;
                 // UPDATE handles the "overwrite older record" case.
-                liveDb.insertWithOnConflict("sessions", SQLiteDatabase.CONFLICT_IGNORE, v)
-                liveDb.update("sessions", SQLiteDatabase.CONFLICT_REPLACE, v, "id = ?", arrayOf(id))
+                liveDb.insert("sessions", SQLiteDatabase.CONFLICT_IGNORE, v)
+                liveDb.update("sessions", SQLiteDatabase.CONFLICT_REPLACE, v, "id = ?", arrayOf<Any?>(id))
                 count++
             }
         } finally {
@@ -630,8 +630,8 @@ object GoogleDriveSyncManager {
                     put("updated_at", if (cursor.isNull(9)) null else cursor.getLong(9))
                     put("error_info", if (cursor.isNull(10)) null else cursor.getString(10))
                 }
-                liveDb.insertWithOnConflict("messages", SQLiteDatabase.CONFLICT_IGNORE, v)
-                liveDb.update("messages", SQLiteDatabase.CONFLICT_REPLACE, v, "id = ?", arrayOf(id))
+                liveDb.insert("messages", SQLiteDatabase.CONFLICT_IGNORE, v)
+                liveDb.update("messages", SQLiteDatabase.CONFLICT_REPLACE, v, "id = ?", arrayOf<Any?>(id))
                 count++
             }
         } finally {
@@ -673,7 +673,7 @@ object GoogleDriveSyncManager {
                     put("created_at", cursor.getLong(8))
                     put("updated_at", backupUpdatedAt)
                 }
-                liveDb.insertWithOnConflict("folders", SQLiteDatabase.CONFLICT_REPLACE, v)
+                liveDb.insert("folders", SQLiteDatabase.CONFLICT_REPLACE, v)
                 count++
             }
         } finally {
@@ -713,7 +713,7 @@ object GoogleDriveSyncManager {
                     put("last_compacted_message_id", if (cursor.isNull(9)) null else cursor.getString(9))
                     put("version", cursor.getInt(10))
                 }
-                liveDb.insertWithOnConflict("compact_markers", SQLiteDatabase.CONFLICT_IGNORE, v)
+                liveDb.insert("compact_markers", SQLiteDatabase.CONFLICT_IGNORE, v)
                 count++
             }
         } finally {
@@ -749,7 +749,7 @@ object GoogleDriveSyncManager {
                     put("created_at", cursor.getLong(7))
                     put("source_session_id", if (cursor.isNull(8)) null else cursor.getString(8))
                 }
-                liveDb.insertWithOnConflict("webapp_shortcuts", SQLiteDatabase.CONFLICT_REPLACE, v)
+                liveDb.insert("webapp_shortcuts", SQLiteDatabase.CONFLICT_REPLACE, v)
                 count++
             }
         } finally {
@@ -813,7 +813,7 @@ object GoogleDriveSyncManager {
                             put("updated_at", backupUpdatedAt)
                             put("use_count", cursor.getDouble(9))
                         }
-                        liveDb.insertWithOnConflict("skills", SQLiteDatabase.CONFLICT_REPLACE, v)
+                        liveDb.insertWithOnConflict("skills", null, v, SQLiteDatabase.CONFLICT_REPLACE)
 
                         // Copy SKILL.md file from backup temp dir
                         val backupSkillMd = File(tempDir, "files/minis-global/skills/$id/SKILL.md")
@@ -842,7 +842,7 @@ object GoogleDriveSyncManager {
                             put("is_enabled", overrideCursor.getInt(2))
                         }
                         liveDb.insertWithOnConflict(
-                            "session_skill_overrides", SQLiteDatabase.CONFLICT_REPLACE, v
+                            "session_skill_overrides", null, v, SQLiteDatabase.CONFLICT_REPLACE
                         )
                         overrideCount++
                     }
@@ -991,7 +991,7 @@ object GoogleDriveSyncManager {
                         v.put(colName, cursor.getString(colIndex))
                     }
                 }
-                liveDb.insertWithOnConflict(tableName, conflictStrategy, v)
+                liveDb.insert(tableName, conflictStrategy, v)
                 count++
             }
         } finally {

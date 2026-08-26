@@ -129,6 +129,12 @@ final class GoogleDriveSyncManager: ObservableObject {
         files.append(contentsOf: collectFiles(in: libDir, prefix: "lib/MinisChat/"))
         logger.info("Collected \(files.count) files (docs + library)")
 
+        // 1b. Include app settings snapshot (independent of iCloud sync)
+        if let settingsData = await MainActor.run(body: { AppSettingsSync.buildBackupPayload() }) {
+            files.append((relativePath: "settings/settings.json", data: settingsData))
+            logger.info("Added settings/settings.json to backup")
+        }
+
         if files.isEmpty {
             throw LLMError.providerError(message: "No files found to back up")
         }
@@ -470,7 +476,7 @@ final class GoogleDriveSyncManager: ObservableObject {
         }
 
         let fileEntries = entries.filter { !$0.isDirectory }
-        let isNewFormat = fileEntries.contains { $0.name.hasPrefix("docs/") || $0.name.hasPrefix("lib/") }
+        let isNewFormat = fileEntries.contains { $0.name.hasPrefix("docs/") || $0.name.hasPrefix("lib/") || $0.name.hasPrefix("settings/") }
 
         if isNewFormat {
             try await mergeBackupNewFormat(fileEntries)
@@ -513,6 +519,14 @@ final class GoogleDriveSyncManager: ObservableObject {
 
         // 4. Copy file assets with deduplication
         try copyFileAssets(from: tempDir)
+
+        // 4b. Apply settings snapshot (independent of iCloud sync)
+        let settingsURL = tempDir.appendingPathComponent("settings/settings.json")
+        if FileManager.default.fileExists(atPath: settingsURL.path),
+           let settingsData = try? Data(contentsOf: settingsURL) {
+            await MainActor.run { AppSettingsSync.applyBackupPayload(settingsData) }
+            logger.info("Applied settings from backup")
+        }
 
         // 5. Reload databases so in-memory caches pick up merged data
         await ChatStore.shared.reloadDatabase()
