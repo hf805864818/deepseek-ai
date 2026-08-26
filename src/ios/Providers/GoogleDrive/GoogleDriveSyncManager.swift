@@ -81,9 +81,12 @@ final class GoogleDriveSyncManager: ObservableObject {
     /// Creates a ZIP archive of the app's documents directory and uploads
     /// it to Google Drive. Updates sync state on completion.
     ///
-    /// Heavy work (file collection, ZIP building) runs on the calling
-    /// cooperative thread; only UI state updates hop to the main actor.
-    func backup() async throws {
+    /// Heavy work (file collection, ZIP building) runs on a background
+    /// thread via `Task.detached` so the MainActor / UI thread is never
+    /// blocked. The caller does NOT need to catch errors — all errors
+    /// are handled internally by setting `syncError` and resetting
+    /// `isBackingUp`.
+    func backup() async {
         // Check backing up flag on main actor
         let alreadyBackingUp = await MainActor.run { isBackingUp }
         guard !alreadyBackingUp else {
@@ -96,19 +99,21 @@ final class GoogleDriveSyncManager: ObservableObject {
             syncError = nil
         }
 
-        // Use do-catch instead of defer+Task so the flag is reset
-        // synchronously in both success and error paths. The old
-        // `Task { @MainActor in isBackingUp = false }` in defer was
-        // fire-and-forget — the async Task might not run for seconds,
-        // leaving "正在备份..." spinning even after the backup finished.
+        // Run the entire backup on a detached task so file I/O and ZIP
+        // building don't block the MainActor. Previous code ran on the
+        // MainActor (because SwiftUI's Task inherits MainActor context),
+        // causing the UI to freeze during backup.
         do {
-            try await backupInternal()
+            try await Task.detached(priority: .userInitiated) {
+                try await self.backupInternal()
+            }.value
         } catch {
+            logger.error("Backup failed: \(error.localizedDescription)")
             await MainActor.run {
                 isBackingUp = false
                 syncError = error.localizedDescription
             }
-            throw error
+            return
         }
         // Reset on success path
         await MainActor.run {
@@ -125,11 +130,14 @@ final class GoogleDriveSyncManager: ObservableObject {
         //    the backup only covers the iSH rootfs but not the actual chat data.
         let docsDir = documentsDirectory
         let libDir = libraryMinisChatDirectory
+        logger.info("Step 1a: collecting files from docs dir...")
         var files = collectFiles(in: docsDir, prefix: "docs/")
+        logger.info("Step 1a: collected \(files.count) files from docs")
+        logger.info("Step 1b: collecting files from library/MinisChat...")
         files.append(contentsOf: collectFiles(in: libDir, prefix: "lib/MinisChat/"))
-        logger.info("Collected \(files.count) files (docs + library)")
+        logger.info("Step 1b: collected \(files.count) total files (docs + library)")
 
-        // 1b. Include app settings snapshot (independent of iCloud sync)
+        // 1c. Include app settings snapshot (independent of iCloud sync)
         if let settingsData = await MainActor.run(body: { AppSettingsSync.buildBackupPayload() }) {
             files.append((relativePath: "settings/settings.json", data: settingsData))
             logger.info("Added settings/settings.json to backup")
@@ -139,16 +147,22 @@ final class GoogleDriveSyncManager: ObservableObject {
             throw LLMError.providerError(message: "No files found to back up")
         }
 
+        // Log total size before ZIP
+        let totalRawSize = files.reduce(0) { $0 + $1.data.count }
+        logger.info("Step 2: building ZIP archive (\(files.count) files, \(totalRawSize) bytes raw)...")
+
         // 2. Create ZIP archive (CPU + memory heavy — runs on background)
         let zipData = SkillStore.buildZipArchive(files: files)
         let fileSize = zipData.count
-        logger.info("ZIP archive built: \(fileSize) bytes")
+        logger.info("Step 2: ZIP built: \(fileSize) bytes")
 
         // 3. Ensure app folder exists in Drive
+        logger.info("Step 3: ensuring app folder exists in Drive...")
         let folderId = try await ensureAppFolder()
-        logger.info("App folder ID: \(folderId)")
+        logger.info("Step 3: app folder ID: \(folderId)")
 
         // 4. Upload backup file
+        logger.info("Step 4: uploading \(fileSize) bytes to Drive...")
         let timestamp = Self.backupDateFormatter.string(from: Date())
         let fileName = "\(backupPrefix)\(timestamp).zip"
         let mimeType = "application/zip"
@@ -156,7 +170,7 @@ final class GoogleDriveSyncManager: ObservableObject {
         let fileId: String
         if fileSize > 5 * 1024 * 1024 {
             // Large file — use resumable upload
-            logger.info("Using resumable upload for \(fileSize) bytes")
+            logger.info("Step 4: using resumable upload for \(fileSize) bytes")
             fileId = try await GoogleDriveAPI.uploadFileResumable(
                 name: fileName,
                 data: zipData,
@@ -167,7 +181,7 @@ final class GoogleDriveSyncManager: ObservableObject {
                 }
             )
         } else {
-            logger.info("Using multipart upload for \(fileSize) bytes")
+            logger.info("Step 4: using multipart upload for \(fileSize) bytes")
             fileId = try await GoogleDriveAPI.uploadFile(
                 name: fileName,
                 data: zipData,
@@ -175,6 +189,7 @@ final class GoogleDriveSyncManager: ObservableObject {
                 mimeType: mimeType
             )
         }
+        logger.info("Step 4: upload complete, fileId: \(fileId)")
 
         // 5. Update sync state
         lastSyncTimestamp = Date().timeIntervalSince1970
@@ -359,14 +374,7 @@ final class GoogleDriveSyncManager: ObservableObject {
                 if Task.isCancelled { break }
                 guard let self else { return }
                 logger.info("Auto-sync triggered")
-                do {
-                    try await self.backup()
-                } catch {
-                    logger.error("Auto-sync backup failed: \(error.localizedDescription)")
-                    await MainActor.run {
-                        self.syncError = error.localizedDescription
-                    }
-                }
+                await self.backup()
             }
         }
         logger.info("Auto-sync started (interval: \(Int(interval / 60)) min)")

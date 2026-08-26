@@ -300,13 +300,8 @@ struct GoogleDriveSyncView: View {
 
     private func performBackup() {
         Task {
-            do {
-                try await syncManager.backup()
-                await loadBackups()
-            } catch {
-                errorMessage = error.localizedDescription
-                showError = true
-            }
+            await syncManager.backup()
+            await loadBackups()
         }
     }
 

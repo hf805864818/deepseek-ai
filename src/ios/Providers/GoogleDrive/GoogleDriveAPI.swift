@@ -99,6 +99,18 @@ enum GoogleDriveAPI {
     private static let baseURL = "https://www.googleapis.com/drive/v3"
     private static let uploadURL = "https://www.googleapis.com/upload/drive/v3"
 
+    /// Custom URLSession with generous timeouts for large file uploads.
+    /// `URLSession.shared` defaults to 60s request timeout which can be
+    /// too short for multi-MB backups on slow connections. We use 120s
+    /// per request and 10 minutes for the entire resource transfer.
+    static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 120   // 2 min per network request
+        config.timeoutIntervalForResource = 600  // 10 min total for large uploads
+        config.waitsForConnectivity = true       // wait for network if unavailable
+        return URLSession(configuration: config)
+    }()
+
     // MARK: - Folder Operations
 
     /// Creates a folder in Google Drive. Returns the new folder's file ID.
@@ -120,7 +132,7 @@ enum GoogleDriveAPI {
         )
         request.httpBody = body
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try checkResponse(response, data: data, context: "createFolder")
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -163,7 +175,7 @@ enum GoogleDriveAPI {
                 url: components.url!.absoluteString,
                 method: "GET"
             )
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             try checkResponse(response, data: data, context: "findOrCreateFolder search")
 
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -219,7 +231,7 @@ enum GoogleDriveAPI {
         )
         request.httpBody = body
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let (responseData, response) = try await session.data(for: request)
         try checkResponse(response, data: responseData, context: "uploadFile")
 
         let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] ?? [:]
@@ -262,7 +274,7 @@ enum GoogleDriveAPI {
         sessionRequest.setValue("\(data.count)", forHTTPHeaderField: "X-Upload-Content-Length")
         sessionRequest.httpBody = metadataData
 
-        let (_, sessionResponse) = try await URLSession.shared.data(for: sessionRequest)
+        let (_, sessionResponse) = try await session.data(for: sessionRequest)
         guard let sessionHTTP = sessionResponse as? HTTPURLResponse,
               (200..<300).contains(sessionHTTP.statusCode) else {
             throw LLMError.providerError(message: "Failed to start resumable session")
@@ -295,7 +307,7 @@ enum GoogleDriveAPI {
             )
             chunkRequest.httpBody = Data(chunk)
 
-            let (responseData, chunkResponse) = try await URLSession.shared.data(for: chunkRequest)
+            let (responseData, chunkResponse) = try await session.data(for: chunkRequest)
             guard let chunkHTTP = chunkResponse as? HTTPURLResponse else {
                 throw LLMError.providerError(message: "Invalid chunk response")
             }
@@ -335,7 +347,7 @@ enum GoogleDriveAPI {
             url: "\(baseURL)/files/\(fileId)?alt=media",
             method: "GET"
         )
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try checkResponse(response, data: data, context: "downloadFile(\(fileId))")
         logger.info("downloadFile success: \(data.count) bytes")
         return data
@@ -375,7 +387,7 @@ enum GoogleDriveAPI {
             url: components.url!.absoluteString,
             method: "GET"
         )
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try checkResponse(response, data: data, context: "listFiles")
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -411,7 +423,7 @@ enum GoogleDriveAPI {
             url: "\(baseURL)/files/\(fileId)",
             method: "DELETE"
         )
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try checkResponse(response, data: data, context: "deleteFile(\(fileId))")
         logger.info("deleteFile success: \(fileId)")
     }
@@ -434,7 +446,7 @@ enum GoogleDriveAPI {
             url: components.url!.absoluteString,
             method: "GET"
         )
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try checkResponse(response, data: data, context: "getFileMetadata(\(fileId))")
 
         let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
