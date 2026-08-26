@@ -50,6 +50,11 @@ final class GoogleDriveSyncManager: ObservableObject {
     @AppStorage("gdrive.lastSync") private var lastSyncTimestamp: Double = 0
     @AppStorage("gdrive.appFolderId") private var storedAppFolderId: String = ""
 
+    /// Maximum number of backup files to keep in Google Drive.
+    /// Older backups beyond this limit are automatically deleted after
+    /// each successful backup. Default is 5 to conserve Drive storage.
+    @AppStorage("gdrive.maxBackups") var maxBackups: Int = 5
+
     // MARK: - Computed Properties
 
     var lastSyncDate: Date? {
@@ -164,7 +169,10 @@ final class GoogleDriveSyncManager: ObservableObject {
         await MainActor.run { syncError = nil }
         logger.info("=== Google Drive backup complete: \(fileId) ===")
 
-        // 6. Refresh backup list
+        // 6. Clean up old backups beyond maxBackups limit
+        try? await cleanupOldBackups(folderId: folderId)
+
+        // 7. Refresh backup list
         try? await refreshBackupStats(folderId: folderId)
     }
 
@@ -294,6 +302,36 @@ final class GoogleDriveSyncManager: ObservableObject {
         // Refresh stats
         if let folderId = appFolderId {
             try? await refreshBackupStats(folderId: folderId)
+        }
+    }
+
+    /// Removes oldest backups that exceed the maxBackups limit.
+    /// Called automatically after each successful backup. Uses
+    /// try? so cleanup failures never block the backup itself.
+    private func cleanupOldBackups(folderId: String) async throws {
+        let allFiles = try await GoogleDriveAPI.listFiles(parentId: folderId)
+        let backups = allFiles
+            .filter { $0.name.hasPrefix(backupPrefix) && $0.name.hasSuffix(".zip") }
+            .sorted { a, b in
+                (a.modifiedTime ?? .distantPast) > (b.modifiedTime ?? .distantPast)
+            }
+
+        let limit = max(maxBackups, 1)
+        guard backups.count > limit else {
+            logger.info("Cleanup: \(backups.count) backups, limit is \(limit) — nothing to delete")
+            return
+        }
+
+        let toDelete = Array(backups.dropFirst(limit))
+        logger.info("Cleanup: deleting \(toDelete.count) old backup(s) to stay within limit of \(limit)")
+
+        for backup in toDelete {
+            do {
+                try await GoogleDriveAPI.deleteFile(fileId: backup.id)
+                logger.info("Deleted old backup: \(backup.name)")
+            } catch {
+                logger.warning("Failed to delete old backup \(backup.name): \(error.localizedDescription)")
+            }
         }
     }
 

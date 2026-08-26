@@ -46,6 +46,8 @@ object GoogleDriveSyncManager {
     private const val PREFS_NAME = "gdrive_sync_prefs"
     private const val KEY_LAST_SYNC = "last_sync_time"
     private const val KEY_AUTO_SYNC = "auto_sync_enabled"
+    private const val KEY_MAX_BACKUPS = "max_backups"
+    private const val DEFAULT_MAX_BACKUPS = 5
     private const val SYNC_INTERVAL_MS = 4L * 60 * 60 * 1000 // 4 hours
 
     private lateinit var appContext: Context
@@ -120,6 +122,9 @@ object GoogleDriveSyncManager {
             val now = System.currentTimeMillis()
             _lastSyncTime.value = now
             getPrefs().edit().putLong(KEY_LAST_SYNC, now).apply()
+
+            // Clean up old backups beyond maxBackups limit
+            cleanupOldBackups(folderId)
 
             // Refresh backup statistics
             val files = GoogleDriveAPI.listFiles(folderId)
@@ -224,6 +229,49 @@ object GoogleDriveSyncManager {
                 _syncError.value = e.message ?: "Failed to delete backup"
             }
         }
+    }
+
+    /**
+     * Removes oldest backups that exceed the maxBackups limit.
+     * Called automatically after each successful backup. Errors are
+     * logged but never block the backup itself.
+     */
+    private suspend fun cleanupOldBackups(folderId: String) {
+        try {
+            val allBackups = GoogleDriveAPI.listFiles(folderId)
+                .filter { it.name.startsWith(BACKUP_PREFIX) && it.name.endsWith(".zip") }
+                .sortedByDescending { it.modifiedTime ?: 0L }
+
+            val limit = maxOf(getMaxBackups(), 1)
+            if (allBackups.size <= limit) {
+                Log.i(TAG, "Cleanup: ${allBackups.size} backups, limit is $limit — nothing to delete")
+                return
+            }
+
+            val toDelete = allBackups.drop(limit)
+            Log.i(TAG, "Cleanup: deleting ${toDelete.size} old backup(s) to stay within limit of $limit")
+
+            for (backup in toDelete) {
+                try {
+                    GoogleDriveAPI.deleteFile(backup.id)
+                    Log.i(TAG, "Deleted old backup: ${backup.name}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to delete old backup ${backup.name}: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "cleanupOldBackups failed (non-fatal): ${e.message}")
+        }
+    }
+
+    /** Reads the maxBackups setting from prefs, default 5. */
+    fun getMaxBackups(): Int {
+        return getPrefs().getInt(KEY_MAX_BACKUPS, DEFAULT_MAX_BACKUPS)
+    }
+
+    /** Sets the maxBackups setting. Takes effect on next backup. */
+    fun setMaxBackups(value: Int) {
+        getPrefs().edit().putInt(KEY_MAX_BACKUPS, maxOf(value, 1)).apply()
     }
 
     /**
