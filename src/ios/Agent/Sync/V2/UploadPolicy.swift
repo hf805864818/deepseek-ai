@@ -91,6 +91,11 @@ enum UploadPolicy {
         if recordType == "SyncDevice" || recordType == "SyncDeviceV2" {
             return true
         }
+        // AppSettings is always synced — it's a small singleton record
+        // carrying user preferences. No reason to let a user opt out.
+        if recordType == "AppSettingsV2" {
+            return true
+        }
         for cat in Category.allCases where cat.recordTypes.contains(recordType) {
             return isEnabled(cat)
         }

@@ -521,6 +521,12 @@ final class SyncCore {
         // up in this push cycle. Cheap when nothing pending.
         await drainSessionFileChangesIntoDirty()
 
+        // Check if any syncable UserDefaults settings changed since the
+        // last push. If so, mark the AppSettingsV2 record dirty so it's
+        // picked up in this push cycle. Avoids hooking every individual
+        // UserDefaults write path in the UI.
+        await MainActor.run { AppSettingsSync.checkAndMarkDirty() }
+
         // Snapshot dirty rows.
         let dirty = await ChatStore.shared.loadDirtyRecords(
             v2Only: true,

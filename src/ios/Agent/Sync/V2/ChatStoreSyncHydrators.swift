@@ -155,6 +155,11 @@ enum ChatStoreSyncHydrators {
             builder: { id in await buildMemoryDaily(dateKey: id) },
             merger: { record in await mergeMemoryDaily(record: record) }
         )
+        h.register(
+            recordType: "AppSettingsV2",
+            builder: { _ in await buildAppSettings() },
+            merger: { record in await mergeAppSettings(record: record) }
+        )
 
         logger.info("[SyncCore] ChatStoreSyncHydrators registered: \(SyncCoreHydrators.shared.registeredRecordTypes.count) types")
     }
@@ -1766,6 +1771,37 @@ enum ChatStoreSyncHydrators {
         let fresh = await db.dumpProviderConfig()
         await MainActor.run {
             ProviderConfigStore.shared.applyMergedConfigFromSync(fresh)
+        }
+    }
+
+    // MARK: - AppSettings
+
+    /// Outbound builder: reads syncable UserDefaults settings, packs them
+    /// into a JSON blob, and returns a PortableRecord for AppSettingsV2.
+    private static func buildAppSettings() async -> PortableRecord? {
+        let json = AppSettingsSync.collectSettings()
+        let updatedAt = AppSettingsSync.localUpdatedAt()
+        // Don't push if settings have never been changed locally
+        guard updatedAt > .distantPast else {
+            logger.info("[SyncCore] buildAppSettings: no local settings change — skipping push")
+            return nil
+        }
+        let synced = SyncedAppSettings(settingsJson: json, updatedAt: updatedAt)
+        return SyncableTypeRegistry.shared
+            .metadata(for: "AppSettingsV2")?
+            .buildPortable(synced)
+    }
+
+    /// Inbound merger: unpacks the JSON settings blob from a PortableRecord
+    /// and applies it to local UserDefaults with LWW by updatedAt.
+    private static func mergeAppSettings(record: PortableRecord) async {
+        guard let jsonStr = stringField(record, "settingsJson") else {
+            logger.warning("[SyncCore] mergeAppSettings: missing settingsJson field")
+            return
+        }
+        let remoteUpdatedAt = dateField(record, "updatedAt") ?? record.updatedAt
+        await MainActor.run {
+            AppSettingsSync.applySettings(jsonStr, remoteUpdatedAt: remoteUpdatedAt)
         }
     }
 }

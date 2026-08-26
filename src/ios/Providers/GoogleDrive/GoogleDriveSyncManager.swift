@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import os.log
+import SQLite3
 
 private let logger = AppLogger(category: "GoogleDriveSync")
 
@@ -118,10 +119,15 @@ final class GoogleDriveSyncManager: ObservableObject {
     private func backupInternal() async throws {
         logger.info("=== Google Drive backup started ===")
 
-        // 1. Collect all files from documents directory (I/O — runs on background)
+        // 1. Collect all files from documents directory AND Library/MinisChat
+        //    (I/O — runs on background). Library/MinisChat contains minis.db,
+        //    skills.db, and the minis/ file assets directory. Without these,
+        //    the backup only covers the iSH rootfs but not the actual chat data.
         let docsDir = documentsDirectory
-        let files = collectFiles(in: docsDir)
-        logger.info("Collected \(files.count) files from documents directory")
+        let libDir = libraryMinisChatDirectory
+        var files = collectFiles(in: docsDir, prefix: "docs/")
+        files.append(contentsOf: collectFiles(in: libDir, prefix: "lib/MinisChat/"))
+        logger.info("Collected \(files.count) files (docs + library)")
 
         if files.isEmpty {
             throw LLMError.providerError(message: "No files found to back up")
@@ -220,8 +226,8 @@ final class GoogleDriveSyncManager: ObservableObject {
         let zipData = try await GoogleDriveAPI.downloadFile(fileId: latest.id)
         logger.info("Backup downloaded: \(zipData.count) bytes")
 
-        // 3. Extract and restore (I/O heavy — runs on background)
-        try extractBackup(zipData)
+        // 3. Merge backup into local storage (LWW conflict resolution)
+        try await mergeBackup(zipData)
 
         logger.info("=== Google Drive restore complete ===")
     }
@@ -260,8 +266,8 @@ final class GoogleDriveSyncManager: ObservableObject {
         let zipData = try await GoogleDriveAPI.downloadFile(fileId: fileId)
         logger.info("Backup downloaded: \(zipData.count) bytes")
 
-        // 2. Extract and restore (I/O heavy — runs on background)
-        try extractBackup(zipData)
+        // 2. Merge backup into local storage (LWW conflict resolution)
+        try await mergeBackup(zipData)
 
         logger.info("=== Google Drive restore complete ===")
     }
@@ -374,6 +380,13 @@ final class GoogleDriveSyncManager: ObservableObject {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
     }
 
+    /// Returns the Library/MinisChat directory URL (where minis.db,
+    /// skills.db, and the minis/ file assets directory live).
+    private var libraryMinisChatDirectory: URL {
+        let libraryURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+        return libraryURL.appendingPathComponent("MinisChat", isDirectory: true)
+    }
+
     /// Ensures the "Minis" app folder exists in Google Drive root.
     /// Caches the folder ID in @AppStorage for subsequent calls.
     private func ensureAppFolder() async throws -> String {
@@ -395,9 +408,10 @@ final class GoogleDriveSyncManager: ObservableObject {
         return folderId
     }
 
-    /// Walks the documents directory and collects all files with their
-    /// relative paths and data.
-    private func collectFiles(in directory: URL) -> [(relativePath: String, data: Data)] {
+    /// Walks a directory and collects all files with their relative paths
+    /// and data. The optional prefix is prepended to each relative path
+    /// so multiple source directories can be distinguished in the ZIP.
+    private func collectFiles(in directory: URL, prefix: String = "") -> [(relativePath: String, data: Data)] {
         var files: [(relativePath: String, data: Data)] = []
         let fm = FileManager.default
 
@@ -406,7 +420,7 @@ final class GoogleDriveSyncManager: ObservableObject {
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {
-            logger.error("Failed to enumerate documents directory")
+            logger.error("Failed to enumerate directory: \(directory.path)")
             return files
         }
 
@@ -420,7 +434,11 @@ final class GoogleDriveSyncManager: ObservableObject {
             let name = fileURL.lastPathComponent
             if name.hasPrefix(backupPrefix) && name.hasSuffix(".zip") { continue }
 
-            let relativePath = fileURL.path.replacingOccurrences(of: basePath, with: "")
+            // Skip SQLite WAL/SHM temp files — they are transient and
+            // including them in the backup can corrupt the DB on restore.
+            if name.hasSuffix("-wal") || name.hasSuffix("-shm") { continue }
+
+            let relativePath = prefix + fileURL.path.replacingOccurrences(of: basePath, with: "")
             if let data = try? Data(contentsOf: fileURL) {
                 files.append((relativePath: relativePath, data: data))
             } else {
@@ -431,9 +449,18 @@ final class GoogleDriveSyncManager: ObservableObject {
         return files
     }
 
-    /// Extracts a ZIP archive and restores files to the documents directory.
-    /// Overwrites existing files; creates subdirectories as needed.
-    private func extractBackup(_ zipData: Data) throws {
+    /// Merges a backup ZIP into local storage. Instead of overwriting all
+    /// files, this walks the backup and applies records with LWW (last-write-
+    /// wins) conflict resolution — the same logic used by iCloud sync.
+    ///
+    /// For SQLite databases (minis.db, skills.db), records are read from the
+    /// backup DB and merged into the live DB through the existing mergeRemote*
+    /// methods. For file assets, files are copied only if they are missing
+    /// locally or the backup copy is newer.
+    ///
+    /// Old-format backups (without docs/ or lib/ prefixes) fall back to
+    /// the original extract-and-overwrite behavior for backward compatibility.
+    private func mergeBackup(_ zipData: Data) async throws {
         let entries: [SkillStore.ZipEntry]
         do {
             entries = try SkillStore.readZipEntries(data: zipData)
@@ -442,27 +469,367 @@ final class GoogleDriveSyncManager: ObservableObject {
             throw LLMError.providerError(message: "Failed to read backup archive: \(error.localizedDescription)")
         }
 
-        logger.info("Extracting \(entries.count) entries from backup")
+        let fileEntries = entries.filter { !$0.isDirectory }
+        let isNewFormat = fileEntries.contains { $0.name.hasPrefix("docs/") || $0.name.hasPrefix("lib/") }
 
-        let fm = FileManager.default
-        let docsDir = documentsDirectory
+        if isNewFormat {
+            try await mergeBackupNewFormat(fileEntries)
+        } else {
+            // Old format backup — extract directly to documents (backward compat)
+            logger.info("Old-format backup detected — extracting to documents directory")
+            try extractBackupOldFormat(fileEntries)
+        }
+    }
+
+    /// Merges a new-format backup (with docs/ and lib/ prefixes).
+    private func mergeBackupNewFormat(_ entries: [SkillStore.ZipEntry]) async throws {
+        // 1. Extract everything to a temp directory
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("minis-restore-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
 
         for entry in entries {
-            if entry.isDirectory { continue }
+            let destURL = tempDir.appendingPathComponent(entry.name)
+            let parentDir = destURL.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            try entry.data.write(to: destURL)
+        }
+        logger.info("Extracted \(entries.count) entries to temp directory for merging")
 
-            let destURL = docsDir.appendingPathComponent(entry.name)
+        // 2. Merge minis.db (sessions, messages, folders, compact_markers)
+        let backupDBURL = tempDir.appendingPathComponent("lib/MinisChat/minis.db")
+        if FileManager.default.fileExists(atPath: backupDBURL.path) {
+            try await mergeMinisDatabase(from: backupDBURL)
+        } else {
+            logger.warning("Backup does not contain minis.db — skipping DB merge")
+        }
 
-            // Create parent directories if needed
+        // 3. Merge skills.db + skill files
+        let backupSkillsURL = tempDir.appendingPathComponent("lib/MinisChat/skills.db")
+        if FileManager.default.fileExists(atPath: backupSkillsURL.path) {
+            try await mergeSkillsDatabase(from: backupSkillsURL, tempDir: tempDir)
+        }
+
+        // 4. Copy file assets with deduplication
+        try copyFileAssets(from: tempDir)
+
+        // 5. Reload databases so in-memory caches pick up merged data
+        await ChatStore.shared.reloadDatabase()
+        await MainActor.run {
+            SkillStore.shared.reloadDatabase()
+        }
+        logger.info("=== Backup merge complete ===")
+    }
+
+    // MARK: - Database Merge
+
+    /// Opens the backup minis.db and merges all records into the live
+    /// ChatStore using existing LWW (last-write-wins) merge methods.
+    private func mergeMinisDatabase(from backupDBURL: URL) async throws {
+        var backupDB: OpaquePointer?
+        guard sqlite3_open_v2(backupDBURL.path, &backupDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let backupDB else {
+            logger.error("Failed to open backup minis.db at \(backupDBURL.path)")
+            throw LLMError.providerError(message: "Failed to open backup database")
+        }
+        defer { sqlite3_close(backupDB) }
+
+        logger.info("Merging minis.db from backup...")
+
+        // --- Sessions ---
+        var sessionCount = 0
+        var sessionStmt: OpaquePointer?
+        if sqlite3_prepare_v2(backupDB,
+            "SELECT id, title, model_id, created_at, updated_at, category, model_binding, memory_enabled, pinned_at, folder_id FROM sessions WHERE remote_tombstoned_at IS NULL",
+            -1, &sessionStmt, nil) == SQLITE_OK {
+            while sqlite3_step(sessionStmt) == SQLITE_ROW {
+                let id = String(cString: sqlite3_column_text(sessionStmt, 0))
+                let title = sqlite3_column_text(sessionStmt, 1).map { String(cString: $0) }
+                let modelId = sqlite3_column_text(sessionStmt, 2).map { String(cString: $0) } ?? "unknown"
+                let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(sessionStmt, 3))
+                let updatedAt = Date(timeIntervalSince1970: sqlite3_column_double(sessionStmt, 4))
+                let category = sqlite3_column_text(sessionStmt, 5).map { String(cString: $0) }
+                let modelBinding = sqlite3_column_text(sessionStmt, 6).map { String(cString: $0) }
+                let memoryEnabled = sqlite3_column_int(sessionStmt, 7) != 0
+                let pinnedAt: Date? = sqlite3_column_type(sessionStmt, 8) == SQLITE_NULL
+                    ? nil
+                    : Date(timeIntervalSince1970: sqlite3_column_double(sessionStmt, 8))
+                let folderId = sqlite3_column_text(sessionStmt, 9).map { String(cString: $0) }
+
+                var session = ChatSession(
+                    id: id, title: title, category: category,
+                    modelId: modelId, createdAt: createdAt, updatedAt: updatedAt
+                )
+                session.pinnedAt = pinnedAt
+                session.folderId = folderId
+
+                await ChatStore.shared.mergeRemoteSession(
+                    session, fromDeviceId: "",
+                    memoryEnabled: memoryEnabled,
+                    modelBinding: modelBinding,
+                    remotePinnedAtRaw: pinnedAt,
+                    remoteFolderId: folderId,
+                    remoteHasFolderField: true
+                )
+                sessionCount += 1
+            }
+        }
+        sqlite3_finalize(sessionStmt)
+        logger.info("Merged \(sessionCount) sessions from backup")
+
+        // --- Messages ---
+        var messageCount = 0
+        var msgStmt: OpaquePointer?
+        if sqlite3_prepare_v2(backupDB,
+            "SELECT id, session_id, role, parts_json, created_at, token_usage, sort_order, reasoning_content, stream_interrupt_count, updated_at FROM messages",
+            -1, &msgStmt, nil) == SQLITE_OK {
+            while sqlite3_step(msgStmt) == SQLITE_ROW {
+                let id = String(cString: sqlite3_column_text(msgStmt, 0))
+                let sessionId = String(cString: sqlite3_column_text(msgStmt, 1))
+                let role = String(cString: sqlite3_column_text(msgStmt, 2))
+                let partsJson = String(cString: sqlite3_column_text(msgStmt, 3))
+                let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(msgStmt, 4))
+                let tokenUsage = sqlite3_column_text(msgStmt, 5).map { String(cString: $0) }
+                let sortOrder = Int(sqlite3_column_int(msgStmt, 6))
+                let reasoningContent = sqlite3_column_text(msgStmt, 7).map { String(cString: $0) }
+                let streamInterruptCount = Int(sqlite3_column_int(msgStmt, 8))
+                let updatedAt: Date? = sqlite3_column_type(msgStmt, 9) == SQLITE_NULL
+                    ? nil
+                    : Date(timeIntervalSince1970: sqlite3_column_double(msgStmt, 9))
+
+                await ChatStore.shared.mergeRemoteMessage(
+                    id: id, sessionId: sessionId, role: role, partsJson: partsJson,
+                    createdAt: createdAt, tokenUsageJson: tokenUsage, sortOrder: sortOrder,
+                    reasoningContent: reasoningContent, streamInterruptCount: streamInterruptCount,
+                    updatedAt: updatedAt
+                )
+                messageCount += 1
+            }
+        }
+        sqlite3_finalize(msgStmt)
+        logger.info("Merged \(messageCount) messages from backup")
+
+        // --- Folders ---
+        var folderCount = 0
+        var folderStmt: OpaquePointer?
+        if sqlite3_prepare_v2(backupDB,
+            "SELECT id, name, icon, color, origin, sort_index, pinned_at, description, created_at, updated_at FROM folders",
+            -1, &folderStmt, nil) == SQLITE_OK {
+            while sqlite3_step(folderStmt) == SQLITE_ROW {
+                let id = String(cString: sqlite3_column_text(folderStmt, 0))
+                let name = String(cString: sqlite3_column_text(folderStmt, 1))
+                let icon = sqlite3_column_text(folderStmt, 2).map { String(cString: $0) }
+                let color = sqlite3_column_text(folderStmt, 3).map { String(cString: $0) }
+                let origin = sqlite3_column_text(folderStmt, 4).map { String(cString: $0) } ?? "manual"
+                let sortIndex = Int(sqlite3_column_int(folderStmt, 5))
+                let pinnedAt: Date? = sqlite3_column_type(folderStmt, 6) == SQLITE_NULL
+                    ? nil
+                    : Date(timeIntervalSince1970: sqlite3_column_double(folderStmt, 6))
+                let desc = sqlite3_column_text(folderStmt, 7).map { String(cString: $0) }
+                let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(folderStmt, 8))
+                let updatedAt = Date(timeIntervalSince1970: sqlite3_column_double(folderStmt, 9))
+
+                let folder = ChatFolder(
+                    id: id, name: name, icon: icon, color: color,
+                    origin: origin, sortIndex: sortIndex, pinnedAt: pinnedAt,
+                    desc: desc, createdAt: createdAt, updatedAt: updatedAt
+                )
+                await ChatStore.shared.applyRemoteFolder(folder)
+                folderCount += 1
+            }
+        }
+        sqlite3_finalize(folderStmt)
+        logger.info("Merged \(folderCount) folders from backup")
+
+        // --- Compact Markers ---
+        var markerCount = 0
+        var markerStmt: OpaquePointer?
+        if sqlite3_prepare_v2(backupDB,
+            "SELECT id, session_id, summary, first_kept_sort_order, compacted_count, created_at, ui_boundary_sort_order, boundary_message_id, first_kept_message_id, last_compacted_message_id, version FROM compact_markers",
+            -1, &markerStmt, nil) == SQLITE_OK {
+            while sqlite3_step(markerStmt) == SQLITE_ROW {
+                let id = String(cString: sqlite3_column_text(markerStmt, 0))
+                let sessionId = String(cString: sqlite3_column_text(markerStmt, 1))
+                let summary = String(cString: sqlite3_column_text(markerStmt, 2))
+                let firstKeptSortOrder = Int(sqlite3_column_int(markerStmt, 3))
+                let compactedCount = Int(sqlite3_column_int(markerStmt, 4))
+                let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(markerStmt, 5))
+                let uiBoundarySortOrder: Int? = sqlite3_column_type(markerStmt, 6) == SQLITE_NULL
+                    ? nil
+                    : Int(sqlite3_column_int(markerStmt, 6))
+                let boundaryMessageId = sqlite3_column_text(markerStmt, 7).map { String(cString: $0) }
+                let firstKeptMessageId = sqlite3_column_text(markerStmt, 8).map { String(cString: $0) }
+                let lastCompactedMessageId = sqlite3_column_text(markerStmt, 9).map { String(cString: $0) }
+                let version = Int(sqlite3_column_int(markerStmt, 10))
+
+                let marker = CompactMarker(
+                    id: id, sessionId: sessionId, summary: summary,
+                    firstKeptSortOrder: firstKeptSortOrder, compactedCount: compactedCount,
+                    createdAt: createdAt, uiBoundarySortOrder: uiBoundarySortOrder,
+                    boundaryMessageId: boundaryMessageId,
+                    firstKeptMessageId: firstKeptMessageId,
+                    lastCompactedMessageId: lastCompactedMessageId,
+                    version: version
+                )
+                await ChatStore.shared.mergeRemoteCompactMarker(marker)
+                markerCount += 1
+            }
+        }
+        sqlite3_finalize(markerStmt)
+        logger.info("Merged \(markerCount) compact markers from backup")
+    }
+
+    /// Opens the backup skills.db and merges skills into the live SkillStore
+    /// using importSkillFromSync (which has its own LWW guard).
+    private func mergeSkillsDatabase(from backupDBURL: URL, tempDir: URL) async throws {
+        var backupDB: OpaquePointer?
+        guard sqlite3_open_v2(backupDBURL.path, &backupDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let backupDB else {
+            logger.error("Failed to open backup skills.db at \(backupDBURL.path)")
+            return
+        }
+        defer { sqlite3_close(backupDB) }
+
+        struct BackupSkill {
+            let id: String
+            let content: String
+            let importSourceStr: String
+            let isEnabled: Bool
+            let installedAt: Date
+            let updatedAt: Date
+        }
+
+        var skills: [BackupSkill] = []
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(backupDB,
+            "SELECT id, import_source, is_enabled, installed_at, updated_at FROM skills",
+            -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let id = String(cString: sqlite3_column_text(stmt, 0))
+                let importSourceStr = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "file"
+                let isEnabled = sqlite3_column_int(stmt, 2) != 0
+                let installedAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3))
+                let updatedAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
+
+                // Read SKILL.md content from the backup's skills directory
+                let skillFile = tempDir
+                    .appendingPathComponent("lib/MinisChat/skills/\(id)/SKILL.md")
+                let content = (try? String(contentsOf: skillFile, encoding: .utf8)) ?? ""
+                guard !content.isEmpty else {
+                    logger.warning("Skill \(id) has no SKILL.md in backup — skipping")
+                    continue
+                }
+                skills.append(BackupSkill(
+                    id: id, content: content,
+                    importSourceStr: importSourceStr,
+                    isEnabled: isEnabled,
+                    installedAt: installedAt,
+                    updatedAt: updatedAt
+                ))
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        for skill in skills {
+            let source = SkillImportSource.fromDB(skill.importSourceStr)
+            await MainActor.run {
+                _ = SkillStore.shared.importSkillFromSync(
+                    skillId: skill.id,
+                    content: skill.content,
+                    source: source,
+                    isEnabled: skill.isEnabled,
+                    installedAt: skill.installedAt,
+                    updatedAt: skill.updatedAt
+                )
+            }
+        }
+        logger.info("Merged \(skills.count) skills from backup")
+    }
+
+    // MARK: - File Asset Deduplication
+
+    /// Copies file assets from the temp restore directory to their live
+    /// locations, skipping files that already exist locally and are newer
+    /// or the same age (deduplication by modification time).
+    private func copyFileAssets(from tempDir: URL) throws {
+        let fm = FileManager.default
+
+        // docs/ → Documents directory
+        let docsTemp = tempDir.appendingPathComponent("docs")
+        if fm.fileExists(atPath: docsTemp.path) {
+            try copyFilesWithDedup(from: docsTemp, to: documentsDirectory)
+        }
+
+        // lib/MinisChat/minis/ → Library/MinisChat/minis/ (file assets)
+        let minisTemp = tempDir.appendingPathComponent("lib/MinisChat/minis")
+        let minisLive = libraryMinisChatDirectory.appendingPathComponent("minis")
+        if fm.fileExists(atPath: minisTemp.path) {
+            try copyFilesWithDedup(from: minisTemp, to: minisLive)
+        }
+    }
+
+    /// Recursively copies files from source to destination, skipping any
+    /// file that already exists at the destination and is newer or the
+    /// same age. Overwrites only when the source file is strictly newer.
+    private func copyFilesWithDedup(from source: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let basePath = source.path + "/"
+        var copied = 0, skipped = 0
+
+        for case let fileURL as URL in enumerator {
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: fileURL.path, isDirectory: &isDir)
+            if isDir.boolValue { continue }
+
+            let relativePath = fileURL.path.replacingOccurrences(of: basePath, with: "")
+            let destURL = destination.appendingPathComponent(relativePath)
+
+            // Create parent directories
             let parentDir = destURL.deletingLastPathComponent()
             if !fm.fileExists(atPath: parentDir.path) {
                 try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
             }
 
-            // Write file (overwrite if exists)
+            // Dedup: skip if local exists and is >= backup mtime
+            if fm.fileExists(atPath: destURL.path) {
+                let localMod = try? fm.attributesOfItem(atPath: destURL.path)[.modificationDate] as? Date
+                let backupMod = try? fm.attributesOfItem(atPath: fileURL.path)[.modificationDate] as? Date
+                if let localDate = localMod, let backupDate = backupMod, localDate >= backupDate {
+                    skipped += 1
+                    continue
+                }
+                // Backup is newer — remove old file before copy
+                try? fm.removeItem(at: destURL)
+            }
+
+            try fm.copyItem(at: fileURL, to: destURL)
+            copied += 1
+        }
+        logger.info("File dedup: copied \(copied), skipped \(skipped) (local newer/same)")
+    }
+
+    /// Old-format backup extraction (backward compatibility). Extracts
+    /// files directly to the documents directory, overwriting existing.
+    private func extractBackupOldFormat(_ entries: [SkillStore.ZipEntry]) throws {
+        let fm = FileManager.default
+        let docsDir = documentsDirectory
+
+        for entry in entries {
+            let destURL = docsDir.appendingPathComponent(entry.name)
+            let parentDir = destURL.deletingLastPathComponent()
+            if !fm.fileExists(atPath: parentDir.path) {
+                try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            }
             try entry.data.write(to: destURL)
         }
-
-        logger.info("Extraction complete: \(entries.filter { !$0.isDirectory }.count) files restored")
+        logger.info("Old-format extraction complete: \(entries.count) files restored")
     }
 
     /// Refreshes backupCount and totalBackupSize from Google Drive.
