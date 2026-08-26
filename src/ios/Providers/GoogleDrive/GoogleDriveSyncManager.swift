@@ -99,25 +99,24 @@ final class GoogleDriveSyncManager: ObservableObject {
             syncError = nil
         }
 
-        // Run the entire backup on a detached task so file I/O and ZIP
-        // building don't block the MainActor. Previous code ran on the
-        // MainActor (because SwiftUI's Task inherits MainActor context),
-        // causing the UI to freeze during backup.
-        do {
-            try await Task.detached(priority: .userInitiated) {
+        // Use fire-and-forget Task to avoid blocking MainActor.
+        // The .value call on Task.detached was causing deadlocks because it
+        // synchronously waits on the current actor, blocking the UI thread.
+        Task {
+            do {
                 try await self.backupInternal()
-            }.value
-        } catch {
-            logger.error("Backup failed: \(error.localizedDescription)")
+            } catch {
+                logger.error("Backup failed: \(error.localizedDescription)")
+                await MainActor.run {
+                    isBackingUp = false
+                    syncError = error.localizedDescription
+                }
+                return
+            }
+            // Reset on success path
             await MainActor.run {
                 isBackingUp = false
-                syncError = error.localizedDescription
             }
-            return
-        }
-        // Reset on success path
-        await MainActor.run {
-            isBackingUp = false
         }
     }
 

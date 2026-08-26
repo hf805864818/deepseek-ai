@@ -107,7 +107,8 @@ enum GoogleDriveAPI {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 120   // 2 min per network request
         config.timeoutIntervalForResource = 600  // 10 min total for large uploads
-        config.waitsForConnectivity = true       // wait for network if unavailable
+        // 移除 waitsForConnectivity：避免网络中断时无限等待导致备份卡死
+        // config.waitsForConnectivity = true
         return URLSession(configuration: config)
     }()
 
