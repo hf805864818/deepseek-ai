@@ -743,7 +743,7 @@ extension AIChatViewModel {
         let rawMessagesForSum = rawMessages
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            var input: Int64 = 0, output: Int64 = 0, cacheRead: Int64 = 0, cacheWrite: Int64 = 0
+            var input = 0, output = 0, cacheRead = 0, cacheWrite = 0
             for raw in rawMessagesForSum where raw.role == .assistant {
                 if let u = raw.tokenUsage {
                     input += u.inputTokens

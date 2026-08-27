@@ -173,12 +173,17 @@ final class MessageListLayout: UICollectionViewLayout {
     /// heights have changed. When empty and itemCount == lastItemCount and
     /// width == lastPreparedWidth, prepare() is a no-op. Rebuilding only from
     /// the first changed index onward avoids the O(n) full rebuild on every
-    /// streaming height update.
+    /// streaming height update. `_forceFullRebuild` is set when caches are
+    /// cleared/remapped and the entire layout must be recomputed from scratch.
     private var invalidatedItemIndices: Set<Int> = []
+    private var _forceFullRebuild: Bool = true
     private var needsFullRebuild: Bool {
-        get { !invalidatedItemIndices.isEmpty }
+        get { _forceFullRebuild || !invalidatedItemIndices.isEmpty }
         set {
-            if !newValue {
+            if newValue {
+                _forceFullRebuild = true
+            } else {
+                _forceFullRebuild = false
                 invalidatedItemIndices.removeAll()
             }
         }
@@ -284,10 +289,12 @@ final class MessageListLayout: UICollectionViewLayout {
         }
 
         // [T-perf-layout-incremental-rebuild] When only specific items changed
-        // height (no new items, width unchanged), rebuild only from the first
-        // changed index onward. This turns streaming height corrections from
-        // O(n) to O(n - minIdx) where minIdx is typically the streaming cell.
-        if !invalidatedItemIndices.isEmpty
+        // height (no new items, width unchanged, no force-full-rebuild), rebuild
+        // only from the first changed index onward. This turns streaming height
+        // corrections from O(n) to O(n - minIdx) where minIdx is typically the
+        // streaming cell.
+        if !_forceFullRebuild
+            && !invalidatedItemIndices.isEmpty
             && itemCount == lastItemCount
             && abs(width - lastPreparedWidth) < 0.5
             && !itemAttributes.isEmpty {
