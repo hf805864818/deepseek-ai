@@ -670,13 +670,14 @@ extension AIChatViewModel {
         // are safe off-main because no UI code reads these concurrently during
         // loadSession (messages hasn't been assigned to self yet).
         let phase2bStart = CFAbsoluteTimeGetCurrent()
+        let baseFontSize = await FontSettings.shared.scaledMessage(16.5)
         Task.detached(priority: .userInitiated) {
             for msg in loadedUIMessages where msg.role == .assistant {
                 for block in msg.blocks where block.kind == .text && !block.content.isEmpty {
                     autoreleasepool {
                         let content = block.cachedMarkdown ?? MarkdownContent(prepareMarkdownForRender(block.content))
                         block.cachedMarkdown = content
-                        block.cachedAttributedString = renderMarkdownBlocks(content.blocks)
+                        block.cachedAttributedString = renderMarkdownBlocksOffMain(content.blocks, baseFontSize: baseFontSize)
                     }
                 }
             }

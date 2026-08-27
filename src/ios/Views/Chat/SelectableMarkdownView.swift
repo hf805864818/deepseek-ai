@@ -337,6 +337,14 @@ func renderMarkdownBlocks(_ blocks: [BlockNode]) -> NSAttributedString {
     return renderer.render(blocks: blocks)
 }
 
+/// Non-MainActor variant of renderMarkdownBlocks that takes the base font size
+/// as a parameter so it can be called from background threads. The caller is
+/// responsible for obtaining the font size from the main actor first.
+func renderMarkdownBlocksOffMain(_ blocks: [BlockNode], baseFontSize: CGFloat) -> NSAttributedString {
+    let renderer = MarkdownNSRenderer(baseFontSize: baseFontSize)
+    return renderer.render(blocks: blocks)
+}
+
 // MARK: - MarkdownNSRenderer
 
 /// Converts `[BlockNode]` → `NSMutableAttributedString` for display in a UITextView.

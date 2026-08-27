@@ -3200,7 +3200,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Invalidated whenever agentHistory.count changes or cachedLatestMarker changes.
     /// Avoids repeating the O(n×m) dropOrphanedToolParts scan on every inference
     /// call within the same turn (Plan-First + Self-Verify + retries = 3–8 calls).
-    private var _cachedEffectiveHistory: (result: [AgentMessage], historyCount: Int, markerId: String?)?
+    var _cachedEffectiveHistory: (result: [AgentMessage], historyCount: Int, markerId: String?)?
     /// The session's persisted model id (from ChatStore.getSession). Cached at
     /// loadSession time so resolveCurrentEntry can fall back to it without an
     /// async hop to the actor. Empty string means "not yet loaded" — treat as
