@@ -408,15 +408,26 @@ extension AIChatViewModel {
         //   firstKeptMessageId → boundaryMessageId → firstKeptSortOrder
         let compactMarker = remoteDeviceId == nil ? await ChatStore.shared.latestCompactMarker(sessionId: sessionId) : nil
         self.cachedLatestMarker = compactMarker
+        _cachedEffectiveHistory = nil  // [T-perf-effective-history-cache] Marker loaded → invalidate cache
         if let marker = compactMarker {
             logger.info("[Compact] ━━━ Phase 2.5: restore (Phase B id-first) ━━━")
             logger.info("[Compact] marker: id=\(marker.id.prefix(8)) fkmId=\(marker.firstKeptMessageId?.prefix(8) ?? "nil") bmId=\(marker.boundaryMessageId?.prefix(8) ?? "nil") lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") fkSO=\(marker.firstKeptSortOrder) compactedCount=\(marker.compactedCount) summary=\(marker.summary.count)chars createdAt=\(marker.createdAt)")
             logger.info("[Compact] DB: totalRaw=\(rawMessages.count) range=\(rawMessages.first?.sortOrder ?? -1)...\(rawMessages.last?.sortOrder ?? -1)")
             logger.info("[Compact] Memory: history=\(loadedHistory.count) uiMessages=\(loadedUIMessages.count)")
+            // [T-perf-compact-id-dict] Build a single [id: RawMessage] lookup so
+            // every id-based resolution during Phase 2.5 is O(1) instead of O(n).
+            // Without this, v2 markers, compactAll markers, and boundary-marker
+            // resolutions each do their own `rawMessages.first(where: { $0.id == id })`
+            // linear scan — up to 6 O(n) passes in the worst case.
+            var rawById: [String: RawMessage] = [:]
+            rawById.reserveCapacity(rawMessages.count)
+            for raw in rawMessages {
+                rawById[raw.id] = raw
+            }
             // Diag: locate marker.lcmId in rawMessages so we can see the exact
             // sortOrder that needs to match a UI msg.sourceSortOrder later.
             if let lcmId = marker.lastCompactedMessageId,
-               let lcmRaw = rawMessages.first(where: { $0.id == lcmId }) {
+               let lcmRaw = rawById[lcmId] {
                 let uiHit = loadedUIMessages.firstIndex(where: { $0.sourceSortOrder == lcmRaw.sortOrder })
                 logger.info("[Compact] marker.lcmId → raw.sortOrder=\(lcmRaw.sortOrder) role=\(lcmRaw.role) → UIIdx=\(uiHit.map(String.init) ?? "MISS")")
             } else {
@@ -439,7 +450,7 @@ extension AIChatViewModel {
                 && marker.lastCompactedMessageId != nil
             var boundaryMsgId: String? = marker.firstKeptMessageId ?? marker.boundaryMessageId
             var boundaryResolutionPath: String = "none"
-            if let mid = boundaryMsgId, rawMessages.contains(where: { $0.id == mid }) {
+            if let mid = boundaryMsgId, rawById[mid] != nil {
                 boundaryResolutionPath = (marker.firstKeptMessageId == mid) ? "firstKeptMessageId" : "boundaryMessageId"
             } else if isCompactAllShape {
                 // Leave boundaryMsgId nil so the compactAll branch (which
@@ -482,7 +493,7 @@ extension AIChatViewModel {
                 // sortOrder, lastSourceSortOrder is the LAST. The marker's
                 // anchor can sit anywhere inside that range and still belongs
                 // to that UI message.
-                let lcmRaw = marker.lastCompactedMessageId.flatMap { id in rawMessages.first(where: { $0.id == id }) }
+                let lcmRaw = marker.lastCompactedMessageId.flatMap { rawById[$0] }
                 if let lcmId = marker.lastCompactedMessageId, let lcmRaw,
                    let lcmUIIdx = Self.uiIndexForAnchorRaw(lcmRaw, in: loadedUIMessages) {
                     insertIdx = lcmUIIdx + 1
@@ -524,7 +535,7 @@ extension AIChatViewModel {
             } else if boundaryMsgId == nil && marker.firstKeptMessageId == nil && marker.boundaryMessageId == nil {
                 // compactAll marker — use lastCompactedMessageId for cutoff.
                 if let lcmId = marker.lastCompactedMessageId,
-                   let lcmRaw = rawMessages.first(where: { $0.id == lcmId }),
+                   let lcmRaw = rawById[lcmId],
                    let lcmUIIdx = loadedUIMessages.firstIndex(where: { $0.sourceSortOrder == lcmRaw.sortOrder }) {
                     insertIdx = lcmUIIdx + 1
                     boundaryResolutionPath = "compactAll(lastCompactedMessageId)"
@@ -538,7 +549,7 @@ extension AIChatViewModel {
                     // — the underlying messages were re-indexed by a v1→v2 sync
                     // migration, leaving the marker's lcmId orphaned.
                     let lcmIdStr = marker.lastCompactedMessageId?.prefix(8) ?? "nil"
-                    let rawHit = marker.lastCompactedMessageId.flatMap { id in rawMessages.first(where: { $0.id == id }) }
+                    let rawHit = marker.lastCompactedMessageId.flatMap { rawById[$0] }
                     let stage: String
                     if marker.lastCompactedMessageId == nil {
                         stage = "marker.lcmId is nil"
@@ -593,7 +604,7 @@ extension AIChatViewModel {
                     }
                 }
             } else if let mid = boundaryMsgId,
-               let bmRaw = rawMessages.first(where: { $0.id == mid }),
+               let bmRaw = rawById[mid],
                let bmUIIdx = loadedUIMessages.firstIndex(where: { $0.sourceSortOrder == bmRaw.sortOrder }) {
                 insertIdx = bmUIIdx  // divider BEFORE boundary (boundary message is first active)
             } else {
@@ -622,6 +633,7 @@ extension AIChatViewModel {
         // Defer assigning messages until after Phase 3 (tool snapshots) so the
         // UI never sees messages without their corresponding snapshot data.
         agentHistory = loadedHistory
+        _cachedEffectiveHistory = nil  // [T-perf-effective-history-cache] Clear cache on full history reload
 
         // [T-ios-unread-dot-reappears] Opening the session means the user has
         // now seen every completed assistant turn in it, so align the unread
@@ -649,13 +661,27 @@ extension AIChatViewModel {
         // This ensures the first sizeThatFits call returns the correct height,
         // eliminating the estimated→actual contentSize oscillation that causes
         // scroll jitter when cells first enter the viewport.
-        for msg in loadedUIMessages where msg.role == .assistant {
-            for block in msg.blocks where block.kind == .text && !block.content.isEmpty {
-                cacheAttributedString(for: block)
+        //
+        // [T-perf-attrstr-bg] Move the O(n×m) markdown parse + TextKit render
+        // off the main thread. On DeepMode long sessions this could be 50–150ms
+        // of main-thread work; moving it to a background task lets the UI
+        // render with estimated heights first, then the cached attr strings
+        // fill in before cells scroll into view. The writes to block properties
+        // are safe off-main because no UI code reads these concurrently during
+        // loadSession (messages hasn't been assigned to self yet).
+        let phase2bStart = CFAbsoluteTimeGetCurrent()
+        Task.detached(priority: .userInitiated) {
+            for msg in loadedUIMessages where msg.role == .assistant {
+                for block in msg.blocks where block.kind == .text && !block.content.isEmpty {
+                    autoreleasepool {
+                        let content = block.cachedMarkdown ?? MarkdownContent(prepareMarkdownForRender(block.content))
+                        block.cachedMarkdown = content
+                        block.cachedAttributedString = renderMarkdownBlocks(content.blocks)
+                    }
+                }
             }
         }
-
-        let phase2bElapsed = (CFAbsoluteTimeGetCurrent() - buildStart) * 1000 - phase2aElapsed - phase25Elapsed - phase2sigElapsed
+        let phase2bElapsed = (CFAbsoluteTimeGetCurrent() - phase2bStart) * 1000
         let buildElapsed = (CFAbsoluteTimeGetCurrent() - buildStart) * 1000
         let restoredEstimate = estimateContextTokens()
         logger.info("[SessionLoad] \(sessionId) — Phase 2 build messages: \(String(format: "%.1f", buildElapsed))ms (\(loadedUIMessages.count) UI messages, \(loadedHistory.count) history entries, estimated ~\(restoredEstimate) context tokens)")
@@ -663,17 +689,40 @@ extension AIChatViewModel {
 
         // Phase 3: Extract tool snapshots
         let snapshotStart = CFAbsoluteTimeGetCurrent()
+        // [T-perf-snapshot-toolname-dict] Build a single [toolUseId: toolName]
+        // lookup dictionary in O(n×m) so each tool_result snapshot resolves its
+        // tool name in O(1) instead of calling findToolName() which re-scans all
+        // rawMessages every time. DeepMode sessions with many tool calls saw
+        // O(t×n) time here (t = tool results, n = total messages).
+        // Also pre-extract file_write content so recoverFileWriteContent() —
+        // which was another O(n×m) per call — becomes a dictionary lookup.
+        var toolNameById: [String: String] = [:]
+        var fileWriteContentById: [String: String] = [:]
+        for raw in rawMessages {
+            for part in raw.parts {
+                if case .toolUse(let tu) = part {
+                    toolNameById[tu.toolUseId] = tu.name
+                    if tu.name == "file_write" {
+                        if let data = tu.input.data(using: .utf8),
+                           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let content = dict["content"] as? String {
+                            fileWriteContentById[tu.toolUseId] = content
+                        }
+                    }
+                }
+            }
+        }
         var loadedSnapshots: [ToolSnapshotItem] = []
         for raw in rawMessages {
             for part in raw.parts {
                 if case .toolResult(let tr) = part, let snap = tr.snapshot {
-                    let toolName = Self.findToolName(for: tr.toolUseId, in: rawMessages)
+                    let toolName = toolNameById[tr.toolUseId] ?? "tool"
                     // For file_write: ensure snapshot contains file content, not just tool result
                     let finalSnap: ToolSnapshot
                     if toolName == "file_write",
                        let text = snap.text, text.hasPrefix("Wrote to ") || text.hasPrefix("Appended to ") {
-                        // Old-format snapshot — recover file content from ToolUse input or disk
-                        let fileContent = Self.recoverFileWriteContent(for: tr.toolUseId, in: rawMessages)
+                        // Old-format snapshot — recover file content from pre-built dictionary
+                        let fileContent = fileWriteContentById[tr.toolUseId]
                         if let fileContent, !fileContent.isEmpty {
                             let lines = fileContent.components(separatedBy: "\n")
                             let preview = lines.prefix(200).joined(separator: "\n")
@@ -1437,7 +1486,28 @@ extension AIChatViewModel {
     }
 
     func effectiveAgentHistory() -> [AgentMessage] {
+        // [T-perf-effective-history-cache] Cache the dropOrphanedToolParts result
+        // so repeated calls within the same agent-history state are O(1) instead
+        // of O(n×m). DeepMode auto-continue can trigger 3–8 inference calls per
+        // turn (Plan-First + Self-Verify + retries), each calling this function
+        // before every request — that was 3–8× the same O(n×m) work per turn.
+        // Invalidation key: agentHistory.count (append-only during a turn) +
+        // cachedLatestMarker?.id (compaction changes the marker). If both match
+        // the last-computed state, the cleaned result is identical.
+        let currentCount = agentHistory.count
+        let currentMarkerId = cachedLatestMarker?.id
+        if let cached = _cachedEffectiveHistory,
+           cached.historyCount == currentCount,
+           cached.markerId == currentMarkerId {
+            logger.info("[Compact] effectiveAgentHistory: cache hit \(cached.result.count) msg(s) from agentHistory.count=\(currentCount) markerId=\(currentMarkerId?.prefix(8) ?? "nil")")
+            return cached.result
+        }
         let result = Self.dropOrphanedToolParts(effectiveAgentHistoryUncounted(), logger: logger)
+        _cachedEffectiveHistory = (
+            result: result,
+            historyCount: currentCount,
+            markerId: currentMarkerId
+        )
         // One-line breadcrumb on every inference call so a "summary-only"
         // regression is visible in logs without scraping agent traces.
         logger.info("[Compact] effectiveAgentHistory: returning \(result.count) msg(s) from agentHistory.count=\(self.agentHistory.count) markerId=\(self.cachedLatestMarker?.id.prefix(8) ?? "nil")")

@@ -446,6 +446,7 @@ extension AIChatViewModel {
         // Refresh cached marker to the next-most-recent one (or nil).
         let next = await ChatStore.shared.latestCompactMarker(sessionId: sessionId)
         self.cachedLatestMarker = next
+        self._cachedEffectiveHistory = nil  // [T-perf-effective-history-cache] Marker changed → invalidate cache
 
         // Rebuild UI message list from DB to reflect the new (or absent)
         // marker. loadSession() re-runs Phase 2.5 restore against the
@@ -797,6 +798,7 @@ extension AIChatViewModel {
 
         // Phase B: update cache so effectiveAgentHistory() starts using the new summary immediately.
         self.cachedLatestMarker = marker
+        self._cachedEffectiveHistory = nil  // [T-perf-effective-history-cache] New marker → invalidate cache
 
         // Phase B: do NOT mutate agentHistory. It stays full; summary is synthesized
         // at inference time via effectiveAgentHistory().
