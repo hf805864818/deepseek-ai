@@ -2587,6 +2587,13 @@ extension CollectionViewMessageListV3 {
                 streamGeneration &+= 1
 
                 let cvWidth = viewController?.collectionView.bounds.width ?? 390
+                // [T-perf-applysnapshot-incremental-seed] Only compute expensive
+                // TextKit/UILabel estimates for NEW items or items that lost their
+                // prior estimate. Existing items remapped by updateCacheForSnapshot
+                // keep their precalc/estimated height; re-seeding would overwrite a
+                // more accurate precalc with a cheaper estimate and trigger redundant
+                // layout invalidation.
+                let oldSet = Set(previousSnapshotIds)
                 for (i, item) in newItems.enumerated() {
                     // [T-ios-scroll-decel-height-drift] Register the stable
                     // content key for this index so a later self-size writes the
@@ -2644,6 +2651,13 @@ extension CollectionViewMessageListV3 {
                     }
 
                     guard layout.cachedHeight(at: i) == nil else { continue }
+
+                    // [T-perf-applysnapshot-incremental-seed] Skip expensive re-seed
+                    // for existing items that already have a remapped precalc height.
+                    // New items and items without precalc still get seeded below.
+                    if !oldSet.isEmpty, oldSet.contains(item), layout.precalcHeight(at: i) != nil {
+                        continue
+                    }
 
                     // Re-entry seed: if we have a real measured height for this
                     // exact content key at this width, use it as precalc — the

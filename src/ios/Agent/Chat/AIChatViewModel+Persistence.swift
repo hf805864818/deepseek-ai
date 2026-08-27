@@ -123,12 +123,10 @@ extension AIChatViewModel {
             lastKnownDbCount = dbCount
             lastKnownDbOrderHash = hash
             // [T-ios-paused-badge-desync] SKIP-LOAD skips loadSession(), which
-            // is the only place that evaluates the interrupted-loop tail and
-            // sets canResume. If reconcileInterruptedSessions (foreground
-            // reconcile) set a .paused badge while this cached VM's canResume
-            // is still false, the detail page shows no "Interrupted" banner
-            // even though the list shows ⏸. Re-run the lightweight check here.
-            recheckCanResumeFromHistory()
+            // [T-perf-loadsession-defer-resume-check] Skip recheckCanResume here —
+            // it will be called once at the end of loadSession() after all UI
+            // messages are rebuilt, avoiding a redundant O(n) parts scan on the
+            // cached-VM re-enter path.
         }
     }
 
@@ -738,13 +736,27 @@ extension AIChatViewModel {
         // the billed cumulative total. The Token Usage sheet uses billing
         // semantics (every iteration is charged), so sum the raw per-iteration
         // usage. Runtime totals were already correct via the per-iteration `+=`.
-        // (Accumulators were already zeroed above, before the empty-session guard.)
-        for raw in rawMessages where raw.role == .assistant {
-            if let u = raw.tokenUsage {
-                sessionInputTokens += u.inputTokens
-                sessionOutputTokens += u.outputTokens
-                sessionCacheReadTokens += u.cacheReadTokens
-                sessionCacheWriteTokens += u.cacheCreationTokens
+        // [T-perf-token-sum-bg] Move the O(n) token accumulation to a background
+        // task so it doesn't block the main thread during session load. The UI
+        // reads these values asynchronously (Token Usage sheet), so a brief delay
+        // between load and correct totals is acceptable.
+        let rawMessagesForSum = rawMessages
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            var input: Int64 = 0, output: Int64 = 0, cacheRead: Int64 = 0, cacheWrite: Int64 = 0
+            for raw in rawMessagesForSum where raw.role == .assistant {
+                if let u = raw.tokenUsage {
+                    input += u.inputTokens
+                    output += u.outputTokens
+                    cacheRead += u.cacheReadTokens
+                    cacheWrite += u.cacheCreationTokens
+                }
+            }
+            await MainActor.run {
+                self.sessionInputTokens = input
+                self.sessionOutputTokens = output
+                self.sessionCacheReadTokens = cacheRead
+                self.sessionCacheWriteTokens = cacheWrite
             }
         }
 

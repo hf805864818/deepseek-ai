@@ -421,10 +421,13 @@ extension AIChatViewModel {
         // them — O(n) string building + I/O on the main thread. Now only the
         // total is computed; diagnostics are gated behind a debug flag.
         //
-        // Only call effectiveAgentHistory() on the full-computation path —
-        // this is the path that runs after compaction/offload changed the
-        // history, so we need the accurate slice.
-        let slice = effectiveAgentHistory()
+        // [T-perf-estimate-skip-effective] Skip effectiveAgentHistory() on the
+        // cold-cache path — it calls dropOrphanedToolParts() which is O(n*m).
+        // Token estimation does not need the exact effective slice; using the
+        // raw agentHistory slightly over-estimates (safe — only triggers
+        // compaction earlier) but avoids the heavy orphan scan on the main
+        // thread during send/resume.
+        let slice = agentHistory
         var totalChars = 0
         var imageTokens = 0
         for msg in slice {

@@ -32,14 +32,14 @@ final class MessageListLayout: UICollectionViewLayout {
         // Don't overwrite if we already have a real measured height.
         guard heightCache[index] == nil else { return }
         estimatedHeights[index] = height
-        needsFullRebuild = true  // [T-perf-layout-incremental-prepare]
+        invalidatedItemIndices.insert(index)  // [T-perf-layout-incremental-prepare]
     }
 
     func setPrecalcHeight(_ height: CGFloat, at index: Int) {
         // Don't overwrite if we already have a real measured height.
         guard heightCache[index] == nil else { return }
         precalcHeights[index] = height
-        needsFullRebuild = true  // [T-perf-layout-incremental-prepare]
+        invalidatedItemIndices.insert(index)  // [T-perf-layout-incremental-prepare]
     }
 
     /// When true, ALL self-sizing invalidation is deferred (heights stored in
@@ -169,13 +169,20 @@ final class MessageListLayout: UICollectionViewLayout {
     /// unchanged and no heights were invalidated, we can skip the full rebuild.
     private var lastPreparedWidth: CGFloat = 0
 
-    /// [T-perf-layout-incremental-prepare] Dirty flag set when any heightCache
-    /// entry changes (via setCachedHeight/invalidateHeight/invalidationContext)
-    /// or when caches are cleared (session switch, width purge). Cleared after
-    /// a successful prepare(). When false and itemCount == lastItemCount and
-    /// width == lastPreparedWidth, prepare() is a no-op — eliminating the O(n)
-    /// rebuild that fired on every invalidateLayout() even when nothing changed.
-    private var needsFullRebuild: Bool = true
+    /// [T-perf-layout-incremental-prepare] Tracks specific item indices whose
+    /// heights have changed. When empty and itemCount == lastItemCount and
+    /// width == lastPreparedWidth, prepare() is a no-op. Rebuilding only from
+    /// the first changed index onward avoids the O(n) full rebuild on every
+    /// streaming height update.
+    private var invalidatedItemIndices: Set<Int> = []
+    private var needsFullRebuild: Bool {
+        get { !invalidatedItemIndices.isEmpty }
+        set {
+            if !newValue {
+                invalidatedItemIndices.removeAll()
+            }
+        }
+    }
 
     // MARK: - Core Layout
 
@@ -272,6 +279,63 @@ final class MessageListLayout: UICollectionViewLayout {
             #endif
             if elapsed >= 5 {
                 AppLogger(category: "ScrollStall").debug("[prepare] #\(Self.prepareCallCount) APPEND \(String(format: "%.1f", elapsed))ms +\(itemCount - lastItemCount) items total=\(itemCount)")
+            }
+            return
+        }
+
+        // [T-perf-layout-incremental-rebuild] When only specific items changed
+        // height (no new items, width unchanged), rebuild only from the first
+        // changed index onward. This turns streaming height corrections from
+        // O(n) to O(n - minIdx) where minIdx is typically the streaming cell.
+        if !invalidatedItemIndices.isEmpty
+            && itemCount == lastItemCount
+            && abs(width - lastPreparedWidth) < 0.5
+            && !itemAttributes.isEmpty {
+            let minIdx = invalidatedItemIndices.min()!
+            var y: CGFloat = 0
+            if minIdx > 0 {
+                let prev = itemAttributes[minIdx - 1]
+                y = prev.frame.maxY
+                let nextIsFooter = (contentKeyByIndex[minIdx]?.hasPrefix("f:") ?? false)
+                    && (footerHugByIndex[minIdx] ?? true)
+                    && !isStreamingCell(minIdx)
+                if !nextIsFooter, prev.frame.height > 0 { y += itemSpacing }
+            }
+            for i in minIdx..<itemCount {
+                let attrs = itemAttributes[i]
+                let h: CGFloat
+                if let cached = heightCache[i] {
+                    h = cached
+                } else if let precalc = precalcHeights[i] {
+                    h = precalc
+                } else if let est = estimatedHeights[i] {
+                    h = est
+                } else {
+                    h = estimatedItemHeight
+                }
+                attrs.frame = CGRect(x: 0, y: y, width: width, height: h)
+                y += h
+                let isLast = (i + 1 == itemCount)
+                let nextIsFooter = !isLast
+                    && (contentKeyByIndex[i + 1]?.hasPrefix("f:") ?? false)
+                    && (footerHugByIndex[i + 1] ?? true)
+                    && !isStreamingCell(i + 1)
+                if !isLast, !nextIsFooter, h > 0 { y += itemSpacing }
+            }
+            totalHeight = y
+            lastItemCount = itemCount
+            lastPreparedWidth = width
+            invalidatedItemIndices.removeAll()
+            Self.prepareCallCount &+= 1
+            let elapsed = (CACurrentMediaTime() - t0) * 1000
+            #if DEBUG
+            ScrollMetricsRecorder.shared.record(
+                kind: "prepare", a: Double(itemCount), b: totalHeight,
+                offset: Double(collectionView?.contentOffset.y ?? 0),
+                note: String(format: "%.1fms incremental", elapsed))
+            #endif
+            if elapsed >= 5 {
+                AppLogger(category: "ScrollStall").debug("[prepare] #\(Self.prepareCallCount) INCREMENTAL \(String(format: "%.1f", elapsed))ms from=\(minIdx) items=\(itemCount)")
             }
             return
         }
@@ -603,7 +667,7 @@ final class MessageListLayout: UICollectionViewLayout {
 
         // Cache the new height. prepare() will use this to compute correct totalHeight.
         heightCache[index] = newHeight
-        needsFullRebuild = true  // [T-perf-layout-incremental-prepare]
+        invalidatedItemIndices.insert(index)  // [T-perf-layout-incremental-prepare]
 
         // [SettleJitter] Evidence log (H2): a correction passing through DURING
         // deceleration gets NO contentOffsetAdjustment (the !isDecelerating

@@ -7483,7 +7483,19 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         guard !deferredStreamingTextUpdates.isEmpty else { return }
         let pendingUpdates = deferredStreamingTextUpdates
         deferredStreamingTextUpdates.removeAll()
-        for pending in pendingUpdates {
+
+        // [T-perf-flush-batch-merge] Merge pending updates by (messageId, blockId)
+        // so a long suspend window that accumulated hundreds of token deltas
+        // collapses to one apply per block. The O(updates) loop becomes O(blocks),
+        // eliminating the main-thread stall when flushing a large backlog.
+        var mergedByKey: [String: DeferredStreamingTextUpdate] = [:]
+        for update in pendingUpdates {
+            let key = update.messageId.uuidString + "|" + update.blockId.uuidString
+            mergedByKey[key] = update
+        }
+        let merged = Array(mergedByKey.values)
+
+        for pending in merged {
             guard let message = messages.first(where: { $0.id == pending.messageId }),
                   let block = message.blocks.first(where: { $0.id == pending.blockId }) else { continue }
             applyStreamingTextBlockContent(
