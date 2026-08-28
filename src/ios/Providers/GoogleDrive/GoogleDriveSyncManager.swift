@@ -473,7 +473,12 @@ final class GoogleDriveSyncManager: ObservableObject {
     ///
     /// Old-format backups (without docs/ or lib/ prefixes) fall back to
     /// the original extract-and-overwrite behavior for backward compatibility.
-    private func mergeBackup(_ zipData: Data) async throws {
+    ///
+    /// This is provider-agnostic — it only depends on the ZIP layout, not on
+    /// where the backup came from. Exposed (non-private) so other sync
+    /// providers (e.g. `LocalSyncManager`) can reuse the exact same restore
+    /// logic and stay byte-compatible with Google Drive backups.
+    func mergeBackup(_ zipData: Data) async throws {
         let entries: [SkillStore.ZipEntry]
         do {
             entries = try SkillStore.readZipEntries(data: zipData)

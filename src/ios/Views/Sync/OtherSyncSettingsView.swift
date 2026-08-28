@@ -3,15 +3,28 @@ import SwiftUI
 // MARK: - Other Sync Settings View
 
 /// Lists all available cloud sync platforms. Each platform has an icon,
-/// name, and connection status. Currently only Google Drive is implemented;
+/// name, and connection status. Local Sync and Google Drive are implemented;
 /// OneDrive and WebDAV are placeholders for future support.
 @available(iOS 17.0, *)
 struct OtherSyncSettingsView: View {
 
     @ObservedObject private var oauthManager = GoogleDriveOAuthManager.shared
+    @ObservedObject private var localSyncManager = LocalSyncManager.shared
 
     var body: some View {
         List {
+            // MARK: Local Sync
+
+            NavigationLink(destination: LocalSyncView()) {
+                platformRow(
+                    icon: "tray.and.arrow.down.fill",
+                    color: .green,
+                    name: String(localized: "Local Sync", comment: "Local sync platform name"),
+                    status: localSyncManager.hasDestination ? .connected : .disconnected
+                )
+            }
+            .buttonStyle(.plain)
+
             // MARK: Google Drive
 
             NavigationLink(destination: GoogleDriveSyncView()) {

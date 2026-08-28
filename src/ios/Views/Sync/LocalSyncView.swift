@@ -1,41 +1,85 @@
 import SwiftUI
-import SafariServices
+import UIKit
+import UniformTypeIdentifiers
 
-// MARK: - Google Drive Sync View
+// MARK: - Folder Picker
 
-/// Settings view for Google Drive sync: account, backup/restore,
-/// auto-sync toggle, and backup history list.
+/// Wraps `UIDocumentPickerViewController` to let the user pick a directory
+/// in the Files app. The resulting URL is security-scoped; persistent
+/// access is kept by storing a security-scoped bookmark
+/// (see `LocalSyncManager.saveDestination`).
+private struct FolderPicker: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
+    var onPick: (URL) -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
+        picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let parent: FolderPicker
+        init(_ parent: FolderPicker) { self.parent = parent }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            parent.isPresented = false
+            if let url = urls.first {
+                parent.onPick(url)
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.isPresented = false
+        }
+    }
+}
+
+// MARK: - Local Sync View
+
+/// Settings view for local directory sync: destination folder selection,
+/// backup/restore, auto-sync toggle, and backup history list.
+///
+/// The backup flow uses fire-and-forget (like `GoogleDriveSyncView`), so
+/// the backup list is refreshed by observing `isBackingUp` falling back to
+/// false — NOT by calling `loadBackups()` immediately after `backup()`
+/// (which would run before the write completes and show a stale list).
 @available(iOS 17.0, *)
-struct GoogleDriveSyncView: View {
+struct LocalSyncView: View {
 
-    @ObservedObject private var oauthManager = GoogleDriveOAuthManager.shared
-    @ObservedObject private var syncManager = GoogleDriveSyncManager.shared
+    @ObservedObject private var syncManager = LocalSyncManager.shared
 
     // MARK: - View State
 
-    @State private var backups: [GoogleDriveFile] = []
+    @State private var backups: [LocalBackup] = []
     @State private var isLoadingBackups = false
+    @State private var showFolderPicker = false
     @State private var errorMessage: String?
     @State private var showError = false
     @State private var showRestoreConfirm = false
-    @State private var restoreFileId: String?
-    @State private var restoreFileName: String?
+    @State private var restoreBackup: LocalBackup?
 
     // MARK: - Body
 
     var body: some View {
         List {
-            accountSection
-            if oauthManager.isAuthenticated {
+            destinationSection
+            if syncManager.hasDestination {
                 syncSection
                 autoSyncSection
                 backupsSection
             }
         }
-        .navigationTitle(String(localized: "Google Drive", comment: "Navigation title for Google Drive sync settings"))
+        .navigationTitle(String(localized: "Local Sync", comment: "Navigation title for local sync settings"))
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if oauthManager.isAuthenticated {
+            if syncManager.hasDestination {
                 loadBackups()
             }
         }
@@ -47,21 +91,20 @@ struct GoogleDriveSyncView: View {
         .alert(String(localized: "Restore Backup?", comment: "Restore confirmation alert title"), isPresented: $showRestoreConfirm) {
             Button(String(localized: "Cancel", comment: "Restore confirmation cancel button"), role: .cancel) {}
             Button(String(localized: "Restore", comment: "Restore confirmation confirm button")) {
-                if let fileId = restoreFileId {
-                    performRestore(from: fileId)
-                } else {
-                    performRestoreLatest()
+                if let backup = restoreBackup {
+                    performRestore(from: backup)
                 }
             }
         } message: {
-            if let name = restoreFileName {
+            if let backup = restoreBackup {
                 Text(String.localizedStringWithFormat(
                     String(localized: "This will overwrite files in the app's documents directory with the contents of \"%@\". This cannot be undone.",
                            comment: "Restore confirmation message with file name"),
-                    name
+                    backup.name
                 ))
             }
         }
+        // Surface sync errors surfaced by the manager.
         .onChange(of: syncManager.syncError) { _, error in
             if let error = error {
                 errorMessage = error
@@ -69,67 +112,74 @@ struct GoogleDriveSyncView: View {
             }
         }
         // Refresh the backup list when a backup completes (isBackingUp
-        // falls true → false). backup() is fire-and-forget, so the list
-        // must be reloaded here rather than right after backup() returns.
+        // falls true → false). This avoids the stale-list bug that an
+        // immediate `loadBackups()` after the fire-and-forget `backup()`
+        // would cause.
         .onChange(of: syncManager.isBackingUp) { wasBackingUp, isBackingUp in
             if wasBackingUp && !isBackingUp {
                 loadBackups()
             }
         }
+        .sheet(isPresented: $showFolderPicker) {
+            FolderPicker(isPresented: $showFolderPicker) { url in
+                syncManager.saveDestination(url)
+                loadBackups()
+            }
+        }
     }
 
-    // MARK: - Account Section
+    // MARK: - Destination Section
 
-    private var accountSection: some View {
+    private var destinationSection: some View {
         Section {
-            if oauthManager.isAuthenticated {
+            if syncManager.hasDestination {
                 HStack {
-                    settingsIcon("person.crop.circle.fill", color: .blue)
+                    settingsIcon("folder.fill", color: .green)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(String(localized: "Signed In", comment: "Google Drive signed in status"))
+                        Text(String(localized: "Folder Selected", comment: "Local sync destination selected status"))
                             .font(.subheadline)
-                        if let email = oauthManager.userEmail {
-                            Text(email)
+                        if let name = syncManager.destinationName {
+                            Text(name)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
                     Spacer()
                     Button {
-                        oauthManager.logout()
-                        backups = []
+                        showFolderPicker = true
                     } label: {
-                        Text(String(localized: "Sign Out", comment: "Google Drive sign out button"))
+                        Text(String(localized: "Change", comment: "Local sync change folder button"))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(.red)
                 }
+                Button(role: .destructive) {
+                    syncManager.clearDestination()
+                    backups = []
+                } label: {
+                    Text(String(localized: "Clear Folder", comment: "Local sync clear folder button"))
+                }
+                .buttonStyle(.plain)
             } else {
                 Button {
-                    performLogin()
+                    showFolderPicker = true
                 } label: {
                     HStack {
-                        settingsIcon("person.badge.plus", color: .blue)
-                        if oauthManager.isAuthenticating {
-                            Text(String(localized: "Signing In...", comment: "Google Drive signing in status"))
-                            Spacer()
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Text(String(localized: "Sign in with Google", comment: "Google Drive sign in button"))
-                                .foregroundStyle(Color.primary)
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                        settingsIcon("folder.badge.plus", color: .green)
+                        Text(String(localized: "Choose Folder", comment: "Local sync choose folder button"))
+                            .foregroundStyle(Color.primary)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(oauthManager.isAuthenticating)
             }
         } header: {
-            Text(String(localized: "Account", comment: "Google Drive account section header"))
+            Text(String(localized: "Destination", comment: "Local sync destination section header"))
+        } footer: {
+            Text(String(localized: "Pick a folder in the Files app. Backups are saved there as ZIP files and persist even if the app is uninstalled.",
+                         comment: "Local sync destination footer"))
         }
     }
 
@@ -177,7 +227,7 @@ struct GoogleDriveSyncView: View {
             .disabled(syncManager.isBackingUp || syncManager.isRestoring)
 
             Button {
-                confirmRestoreLatest()
+                performRestoreLatest()
             } label: {
                 HStack {
                     settingsIcon("arrow.down.circle.fill", color: .green)
@@ -195,7 +245,7 @@ struct GoogleDriveSyncView: View {
             .buttonStyle(.plain)
             .disabled(syncManager.isBackingUp || syncManager.isRestoring)
         } header: {
-            Text(String(localized: "Sync", comment: "Google Drive sync section header"))
+            Text(String(localized: "Sync", comment: "Local sync section header"))
         }
     }
 
@@ -222,8 +272,8 @@ struct GoogleDriveSyncView: View {
         } header: {
             Text(String(localized: "Auto Sync", comment: "Auto sync section header"))
         } footer: {
-            Text(String(localized: "Automatically backs up your data to Google Drive every 4 hours when the app is running.",
-                         comment: "Auto sync description footer"))
+            Text(String(localized: "Automatically backs up your data to the selected folder every 4 hours when the app is running.",
+                         comment: "Local auto sync description footer"))
         }
     }
 
@@ -247,10 +297,9 @@ struct GoogleDriveSyncView: View {
                     .foregroundStyle(.secondary)
                     .font(.callout)
             } else {
-                ForEach(backups, id: \.id) { backup in
+                ForEach(backups) { backup in
                     Button {
-                        restoreFileId = backup.id
-                        restoreFileName = backup.name
+                        restoreBackup = backup
                         showRestoreConfirm = true
                     } label: {
                         HStack {
@@ -260,16 +309,12 @@ struct GoogleDriveSyncView: View {
                                     .font(.caption)
                                     .lineLimit(1)
                                 HStack(spacing: 8) {
-                                    if let date = backup.modifiedTime {
-                                        Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                    if let size = backup.size {
-                                        Text(formatSize(size))
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                    }
+                                    Text(backup.modifiedDate, format: .dateTime.month(.abbreviated).day().hour().minute())
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                    Text(formatSize(backup.size))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
                                 }
                             }
                             Spacer()
@@ -282,7 +327,7 @@ struct GoogleDriveSyncView: View {
                     .disabled(syncManager.isBackingUp || syncManager.isRestoring)
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) {
-                            performDelete(fileId: backup.id)
+                            performDelete(backup)
                         } label: {
                             Label(String(localized: "Delete", comment: "Delete backup swipe action"), systemImage: "trash")
                         }
@@ -296,24 +341,10 @@ struct GoogleDriveSyncView: View {
 
     // MARK: - Actions
 
-    private func performLogin() {
-        Task {
-            do {
-                try await oauthManager.login()
-                await loadBackups()
-            } catch {
-                errorMessage = error.localizedDescription
-                showError = true
-            }
-        }
-    }
-
     private func performBackup() {
         Task {
-            // backup() is fire-and-forget (to avoid blocking MainActor), so
-            // it returns before the upload completes. Refreshing the list
-            // here would show a stale list — the actual refresh happens via
-            // the onChange(of: isBackingUp) modifier when the flag falls.
+            // Fire-and-forget backup; the list is refreshed via the
+            // onChange(of: isBackingUp) modifier above.
             await syncManager.backup()
         }
     }
@@ -329,19 +360,10 @@ struct GoogleDriveSyncView: View {
         }
     }
 
-    /// Shows the restore confirmation alert for "Restore from Latest".
-    /// Reuses the per-file restore alert by leaving `restoreFileId` nil;
-    /// the alert's Restore button falls back to `performRestoreLatest()`.
-    private func confirmRestoreLatest() {
-        restoreFileId = nil
-        restoreFileName = String(localized: "the latest backup", comment: "Restore latest confirmation name")
-        showRestoreConfirm = true
-    }
-
-    private func performRestore(from fileId: String) {
+    private func performRestore(from backup: LocalBackup) {
         Task {
             do {
-                try await syncManager.restoreFrom(fileId: fileId)
+                try await syncManager.restoreFrom(url: backup.url)
             } catch {
                 errorMessage = error.localizedDescription
                 showError = true
@@ -349,10 +371,10 @@ struct GoogleDriveSyncView: View {
         }
     }
 
-    private func performDelete(fileId: String) {
+    private func performDelete(_ backup: LocalBackup) {
         Task {
             do {
-                try await syncManager.deleteBackup(fileId: fileId)
+                try await syncManager.deleteBackup(at: backup.url)
                 await loadBackups()
             } catch {
                 errorMessage = error.localizedDescription
@@ -369,7 +391,8 @@ struct GoogleDriveSyncView: View {
             do {
                 backups = try await syncManager.listBackups()
             } catch {
-                // Silently ignore — the list will just be empty
+                // Silently ignore — the list will just be empty.
+                backups = []
             }
             isLoadingBackups = false
         }

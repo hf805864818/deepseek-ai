@@ -474,6 +474,8 @@
 		GD0000000B /* GoogleDriveAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000002 /* GoogleDriveAPI.swift */; };
 		GD0000000C /* GoogleDriveSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000003 /* GoogleDriveSyncManager.swift */; };
 		GD0000000D /* GoogleDriveSyncView.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000004 /* GoogleDriveSyncView.swift */; };
+		LS0000000C /* LocalSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = LS00000003 /* LocalSyncManager.swift */; };
+		LS0000000D /* LocalSyncView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LS00000004 /* LocalSyncView.swift */; };
 		GD0000000E /* OtherSyncSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000005 /* OtherSyncSettingsView.swift */; };
 		EXA000001 /* xAIModelsAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = EXA000011 /* xAIModelsAPI.swift */; };
 		EXA000002 /* XAITokenStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = EXA000012 /* XAITokenStorage.swift */; };
@@ -1118,6 +1120,8 @@
 		GD00000002 /* GoogleDriveAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveAPI.swift; sourceTree = "<group>"; };
 		GD00000003 /* GoogleDriveSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveSyncManager.swift; sourceTree = "<group>"; };
 		GD00000004 /* GoogleDriveSyncView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleDriveSyncView.swift; sourceTree = "<group>"; };
+		LS00000003 /* LocalSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSyncManager.swift; sourceTree = "<group>"; };
+		LS00000004 /* LocalSyncView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSyncView.swift; sourceTree = "<group>"; };
 		GD00000005 /* OtherSyncSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OtherSyncSettingsView.swift; sourceTree = "<group>"; };
 		EXA000011 /* xAIModelsAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = xAIModelsAPI.swift; sourceTree = "<group>"; };
 		EXA000012 /* XAITokenStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XAITokenStorage.swift; sourceTree = "<group>"; };
@@ -1427,6 +1431,7 @@
 				E7A000030 /* OpenRouter */,
 				EXA000030 /* xAI */,
 				GD00000010 /* GoogleDrive */,
+				LS00000010 /* LocalSync */,
 				42A3821DABA8773E8A5BA57E /* Voice */,
 			);
 			path = Providers;
@@ -1567,6 +1572,14 @@
 				GD00000011 /* OAuth */,
 			);
 			path = GoogleDrive;
+			sourceTree = "<group>";
+		};
+		LS00000010 /* LocalSync */ = {
+			isa = PBXGroup;
+			children = (
+				LS00000003 /* LocalSyncManager.swift */,
+			);
+			path = LocalSync;
 			sourceTree = "<group>";
 		};
 		GD00000011 /* OAuth */ = {
@@ -1900,6 +1913,7 @@
 				EAB000080 /* CloudSyncSettingsV2View.swift */,
 				GD00000004 /* GoogleDriveSyncView.swift */,
 				GD00000005 /* OtherSyncSettingsView.swift */,
+				LS00000004 /* LocalSyncView.swift */,
 			);
 			path = Sync;
 			sourceTree = "<group>";
@@ -2720,6 +2734,8 @@
 				GD0000000C /* GoogleDriveSyncManager.swift in Sources */,
 				GD0000000D /* GoogleDriveSyncView.swift in Sources */,
 				GD0000000E /* OtherSyncSettingsView.swift in Sources */,
+				LS0000000C /* LocalSyncManager.swift in Sources */,
+				LS0000000D /* LocalSyncView.swift in Sources */,
 				E5W000032 /* WebAppPathResolver.swift in Sources */,
 				E5W000033 /* WebAppWebViewController.swift in Sources */,
 				E5W000035 /* WebAppHtmlMetadata.swift in Sources */,
