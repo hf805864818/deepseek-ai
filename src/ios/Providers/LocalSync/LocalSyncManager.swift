@@ -112,7 +112,7 @@ final class LocalSyncManager: ObservableObject {
         do {
             let url = try URL(
                 resolvingBookmarkData: data,
-                options: [.withSecurityScope],
+                options: [],
                 relativeTo: nil,
                 bookmarkDataIsStale: &stale
             )
