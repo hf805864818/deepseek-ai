@@ -561,6 +561,7 @@ struct LocalSyncView: View {
 /// packaging, saving) with a spinner, and the final result with a
 /// checkmark (success) or cross (failure). Auto-dismisses after a
 /// short delay — see `handleBackupPhaseChange` in `LocalSyncView`.
+@available(iOS 17.0, *)
 private struct BackupCapsuleView: View {
     let message: String
     let icon: LocalSyncView.CapsuleIcon
