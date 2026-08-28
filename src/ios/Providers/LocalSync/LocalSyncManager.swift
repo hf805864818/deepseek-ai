@@ -112,7 +112,7 @@ final class LocalSyncManager: ObservableObject {
         do {
             let url = try URL(
                 resolvingBookmarkData: data,
-                options: [],
+                options: [.withSecurityScope],
                 relativeTo: nil,
                 bookmarkDataIsStale: &stale
             )
@@ -145,6 +145,19 @@ final class LocalSyncManager: ObservableObject {
     /// Stores a security-scoped bookmark for the user-picked directory.
     /// Called from the document picker callback.
     func saveDestination(_ url: URL) {
+        // The URL from UIDocumentPickerViewController is security-scoped.
+        // We must start accessing it before creating a bookmark, otherwise
+        // the bookmark will not capture the security scope and later
+        // startAccessingSecurityScopedResource() will fail.
+        guard url.startAccessingSecurityScopedResource() else {
+            logger.error("Failed to start accessing security-scoped resource for \(url.lastPathComponent)")
+            Task { @MainActor in
+                syncError = "无法访问所选文件夹，请重新选择。"
+            }
+            return
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+
         do {
             let data = try url.bookmarkData(
                 options: [],
