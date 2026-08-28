@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -95,7 +96,7 @@ object LocalSyncManager {
         refreshStats()
     }
 
-    private fun prefs() = EncryptedPrefsFactory.getPrefs(appContext, PREFS_NAME)
+    private fun prefs() = EncryptedPrefsFactory.safeCreate(appContext, PREFS_NAME)
 
     private fun loadSettings() {
         val p = prefs()

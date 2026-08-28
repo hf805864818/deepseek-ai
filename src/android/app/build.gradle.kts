@@ -205,6 +205,9 @@ dependencies {
     // DataStore
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
+    // DocumentFile — SAF tree-URI access for LocalSyncManager
+    implementation("androidx.documentfile:documentfile:1.0.1")
+
     // Security (EncryptedSharedPreferences)
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
