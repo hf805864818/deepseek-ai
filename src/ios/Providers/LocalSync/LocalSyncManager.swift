@@ -4,6 +4,20 @@ import os.log
 
 private let logger = AppLogger(category: "LocalSync")
 
+// MARK: - Backup Phase
+
+/// Progress phases for the capsule toast shown during backup.
+/// The View observes `LocalSyncManager.backupPhase` and displays a
+/// matching message + spinner/checkmark in a capsule overlay.
+enum BackupPhase: Equatable {
+    case idle
+    case collecting
+    case packaging
+    case saving
+    case done
+    case error
+}
+
 // MARK: - Local Backup
 
 /// A single backup file living in the user-selected local directory.
@@ -61,6 +75,10 @@ final class LocalSyncManager: ObservableObject {
     @MainActor @Published private(set) var backupCount = 0
     @MainActor @Published private(set) var totalBackupSize: Int64 = 0
     @MainActor @Published private(set) var destinationName: String?
+    /// Current backup progress phase, observed by the View to show a
+    /// capsule toast. Reset to `.idle` by the View after the toast
+    /// for `.done` / `.error` auto-dismisses.
+    @MainActor @Published private(set) var backupPhase: BackupPhase = .idle
 
     // MARK: - AppStorage (persistent settings)
 
@@ -159,6 +177,12 @@ final class LocalSyncManager: ObservableObject {
         logger.info("Cleared destination bookmark")
     }
 
+    /// Resets `backupPhase` back to `.idle`. Called by the View after
+    /// the capsule toast for `.done` or `.error` has been shown.
+    @MainActor func resetPhase() {
+        backupPhase = .idle
+    }
+
     // MARK: - Backup
 
     /// Builds a ZIP archive of the app's data and writes it to the
@@ -185,6 +209,7 @@ final class LocalSyncManager: ObservableObject {
         await MainActor.run {
             isBackingUp = true
             syncError = nil
+            backupPhase = .collecting
         }
 
         // Use fire-and-forget Task to avoid blocking MainActor.
@@ -196,11 +221,14 @@ final class LocalSyncManager: ObservableObject {
                 await MainActor.run {
                     isBackingUp = false
                     syncError = error.localizedDescription
+                    backupPhase = .error
                 }
                 return
             }
             await MainActor.run {
                 isBackingUp = false
+                // backupPhase is .done (set by backupInternal).
+                // The View resets it after the capsule auto-dismisses.
             }
         }
     }
@@ -211,6 +239,7 @@ final class LocalSyncManager: ObservableObject {
         // 1. Collect files from documents directory AND Library/MinisChat.
         //    This mirrors GoogleDriveSyncManager exactly so the backup is
         //    byte-compatible and restores identically.
+        await MainActor.run { backupPhase = .collecting }
         let docsDir = documentsDirectory
         let libDir = libraryMinisChatDirectory
         var files = collectFiles(in: docsDir, prefix: "docs/")
@@ -229,6 +258,7 @@ final class LocalSyncManager: ObservableObject {
         logger.info("Step 2: building ZIP archive (\(files.count) files, \(totalRawSize) bytes raw)...")
 
         // 2. Create ZIP archive.
+        await MainActor.run { backupPhase = .packaging }
         let zipData = SkillStore.buildZipArchive(files: files)
         logger.info("Step 2: ZIP built: \(zipData.count) bytes")
 
@@ -236,13 +266,15 @@ final class LocalSyncManager: ObservableObject {
         let fileName = "\(backupPrefix)\(timestamp).zip"
 
         // 3. Write backup file to the user-selected folder (security-scoped).
+        await MainActor.run { backupPhase = .saving }
         try await withFolderAccess { url in
             let destURL = url.appendingPathComponent(fileName)
             try zipData.write(to: destURL, options: .atomic)
             logger.info("Step 3: wrote backup to \(destURL.path)")
         }
 
-        // 4. Update sync state.
+        // 4. Done — set phase so the capsule shows success.
+        await MainActor.run { backupPhase = .done }
         lastSyncTimestamp = Date().timeIntervalSince1970
         await MainActor.run { syncError = nil }
         logger.info("=== Local backup complete: \(fileName) ===")

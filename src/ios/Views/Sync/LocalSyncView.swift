@@ -64,14 +64,29 @@ struct LocalSyncView: View {
     @State private var showError = false
     @State private var showRestoreConfirm = false
     @State private var restoreBackup: LocalBackup?
+    /// Set to `true` when the user taps "Backup Now" without a
+    /// destination folder. After folder selection the flag triggers
+    /// an automatic backup; if the picker is cancelled the flag is
+    /// reset via `.onChange(of: showFolderPicker)`.
+    @State private var pendingBackupAfterSelection = false
+
+    // MARK: - Capsule Toast State
+
+    @State private var capsuleMessage: String?
+    @State private var capsuleIcon: CapsuleIcon = .spinner
+    @State private var showCapsule = false
+
+    enum CapsuleIcon {
+        case spinner, success, failure
+    }
 
     // MARK: - Body
 
     var body: some View {
         List {
             destinationSection
+            syncSection
             if syncManager.hasDestination {
-                syncSection
                 autoSyncSection
                 backupsSection
             }
@@ -124,6 +139,32 @@ struct LocalSyncView: View {
             FolderPicker(isPresented: $showFolderPicker) { url in
                 syncManager.saveDestination(url)
                 loadBackups()
+                if pendingBackupAfterSelection {
+                    pendingBackupAfterSelection = false
+                    performBackup()
+                }
+            }
+        }
+        // Reset the pending-backup flag when the folder picker is
+        // dismissed without a selection (user cancelled). If a folder
+        // WAS picked, the onPick callback already reset it before this
+        // fires, making this a no-op.
+        .onChange(of: showFolderPicker) { _, isShown in
+            if !isShown && pendingBackupAfterSelection {
+                pendingBackupAfterSelection = false
+            }
+        }
+        // Observe backup phase changes to show / update / dismiss the
+        // capsule toast.
+        .onChange(of: syncManager.backupPhase) { _, phase in
+            handleBackupPhaseChange(phase)
+        }
+        // Capsule toast overlay, pinned to the top of the List.
+        .overlay(alignment: .top) {
+            if showCapsule, let message = capsuleMessage {
+                BackupCapsuleView(message: message, icon: capsuleIcon)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
     }
@@ -187,26 +228,33 @@ struct LocalSyncView: View {
 
     private var syncSection: some View {
         Section {
-            if let date = syncManager.lastSyncDate {
+            // Stats only shown when a destination folder is selected.
+            if syncManager.hasDestination {
+                if let date = syncManager.lastSyncDate {
+                    HStack {
+                        Text(String(localized: "Last Synced", comment: "Last sync time label"))
+                        Spacer()
+                        Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 HStack {
-                    Text(String(localized: "Last Synced", comment: "Last sync time label"))
+                    Text(String(localized: "Backups", comment: "Backup count label"))
                     Spacer()
-                    Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
+                    Text("\(syncManager.backupCount)")
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text(String(localized: "Total Size", comment: "Total backup size label"))
+                    Spacer()
+                    Text(formatSize(syncManager.totalBackupSize))
                         .foregroundStyle(.secondary)
                 }
             }
-            HStack {
-                Text(String(localized: "Backups", comment: "Backup count label"))
-                Spacer()
-                Text("\(syncManager.backupCount)")
-                    .foregroundStyle(.secondary)
-            }
-            HStack {
-                Text(String(localized: "Total Size", comment: "Total backup size label"))
-                Spacer()
-                Text(formatSize(syncManager.totalBackupSize))
-                    .foregroundStyle(.secondary)
-            }
+
+            // "Backup Now" — always visible. When no destination is set,
+            // tapping this button opens the folder picker first, then
+            // automatically starts the backup once a folder is chosen.
             Button {
                 performBackup()
             } label: {
@@ -214,38 +262,56 @@ struct LocalSyncView: View {
                     settingsIcon("arrow.up.circle.fill", color: .blue)
                     if syncManager.isBackingUp {
                         Text(String(localized: "Backing Up...", comment: "Backup in progress status"))
-                        Spacer()
-                        ProgressView()
-                            .controlSize(.small)
+                            .foregroundStyle(Color.primary)
                     } else {
                         Text(String(localized: "Backup Now", comment: "Backup now button"))
                             .foregroundStyle(Color.primary)
+                        Spacer()
+                        if !syncManager.hasDestination {
+                            Text(String(localized: "Choose Folder", comment: "Hint shown when no destination is set"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if syncManager.isBackingUp {
+                        Spacer()
+                        ProgressView()
+                            .controlSize(.small)
                     }
                 }
             }
             .buttonStyle(.plain)
             .disabled(syncManager.isBackingUp || syncManager.isRestoring)
 
-            Button {
-                performRestoreLatest()
-            } label: {
-                HStack {
-                    settingsIcon("arrow.down.circle.fill", color: .green)
-                    if syncManager.isRestoring {
-                        Text(String(localized: "Restoring...", comment: "Restore in progress status"))
-                        Spacer()
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Text(String(localized: "Restore from Latest", comment: "Restore from latest backup button"))
-                            .foregroundStyle(Color.primary)
+            // Restore is only meaningful with a destination.
+            if syncManager.hasDestination {
+                Button {
+                    performRestoreLatest()
+                } label: {
+                    HStack {
+                        settingsIcon("arrow.down.circle.fill", color: .green)
+                        if syncManager.isRestoring {
+                            Text(String(localized: "Restoring...", comment: "Restore in progress status"))
+                                .foregroundStyle(Color.primary)
+                            Spacer()
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text(String(localized: "Restore from Latest", comment: "Restore from latest backup button"))
+                                .foregroundStyle(Color.primary)
+                        }
                     }
                 }
+                .buttonStyle(.plain)
+                .disabled(syncManager.isBackingUp || syncManager.isRestoring)
             }
-            .buttonStyle(.plain)
-            .disabled(syncManager.isBackingUp || syncManager.isRestoring)
         } header: {
             Text(String(localized: "Sync", comment: "Local sync section header"))
+        } footer: {
+            if !syncManager.hasDestination {
+                Text(String(localized: "Tap \"Backup Now\" to choose a folder and export your data.",
+                             comment: "Local sync footer when no destination is set"))
+            }
         }
     }
 
@@ -342,10 +408,65 @@ struct LocalSyncView: View {
     // MARK: - Actions
 
     private func performBackup() {
-        Task {
-            // Fire-and-forget backup; the list is refreshed via the
-            // onChange(of: isBackingUp) modifier above.
-            await syncManager.backup()
+        if !syncManager.hasDestination {
+            // No destination yet — set a flag so that after the user
+            // picks a folder, a backup is automatically triggered.
+            pendingBackupAfterSelection = true
+            showFolderPicker = true
+        } else {
+            Task {
+                // Fire-and-forget backup; the list is refreshed via the
+                // onChange(of: isBackingUp) modifier above.
+                await syncManager.backup()
+            }
+        }
+    }
+
+    // MARK: - Capsule Toast Handler
+
+    /// Updates the capsule toast in response to `backupPhase` changes.
+    /// Each phase maps to a message + icon; `.done` and `.error`
+    /// auto-dismiss after a short delay.
+    private func handleBackupPhaseChange(_ phase: BackupPhase) {
+        switch phase {
+        case .idle:
+            withAnimation(.easeInOut(duration: 0.3)) { showCapsule = false }
+
+        case .collecting:
+            capsuleIcon = .spinner
+            capsuleMessage = String(localized: "Collecting data…", comment: "Capsule: collecting data phase")
+            withAnimation(.easeInOut(duration: 0.3)) { showCapsule = true }
+
+        case .packaging:
+            capsuleIcon = .spinner
+            capsuleMessage = String(localized: "Packaging data…", comment: "Capsule: packaging data phase")
+
+        case .saving:
+            capsuleIcon = .spinner
+            capsuleMessage = String(localized: "Saving backup…", comment: "Capsule: saving backup phase")
+
+        case .done:
+            capsuleIcon = .success
+            capsuleMessage = String(localized: "Backup complete!", comment: "Capsule: backup done")
+            // Auto-dismiss after 2 seconds, then reset the phase.
+            Task {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                await MainActor.run {
+                    withAnimation(.easeInOut(duration: 0.3)) { showCapsule = false }
+                    syncManager.resetPhase()
+                }
+            }
+
+        case .error:
+            capsuleIcon = .failure
+            capsuleMessage = String(localized: "Backup failed", comment: "Capsule: backup error")
+            Task {
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                await MainActor.run {
+                    withAnimation(.easeInOut(duration: 0.3)) { showCapsule = false }
+                    syncManager.resetPhase()
+                }
+            }
         }
     }
 
@@ -430,5 +551,46 @@ struct LocalSyncView: View {
                 bytes
             )
         }
+    }
+}
+
+// MARK: - Backup Capsule View
+
+/// A small capsule-shaped toast that overlays the top of the Local Sync
+/// page, showing the current backup progress phase (collecting,
+/// packaging, saving) with a spinner, and the final result with a
+/// checkmark (success) or cross (failure). Auto-dismisses after a
+/// short delay — see `handleBackupPhaseChange` in `LocalSyncView`.
+private struct BackupCapsuleView: View {
+    let message: String
+    let icon: LocalSyncView.CapsuleIcon
+
+    var body: some View {
+        HStack(spacing: 10) {
+            switch icon {
+            case .spinner:
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(.white)
+            case .success:
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            case .failure:
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+            }
+
+            Text(message)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            Capsule()
+                .fill(.black.opacity(0.78))
+                .shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 4)
+        )
+        .padding(.horizontal, 24)
     }
 }
