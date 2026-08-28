@@ -867,4 +867,35 @@
     <!-- Other Sync -->
     <string name="other_sync">其他同步</string>
     <string name="other_sync_subtitle">Google Drive 等</string>
+
+    <!-- Local Sync -->
+    <string name="local_sync_title">本地同步</string>
+    <string name="local_sync_subtitle">匯出備份到本地儲存</string>
+    <string name="local_sync_destination">目標資料夾</string>
+    <string name="local_sync_folder_selected">已選擇資料夾</string>
+    <string name="local_sync_tap_to_change">點擊更換資料夾</string>
+    <string name="local_sync_clear_folder">清除資料夾</string>
+    <string name="local_sync_choose_folder">選擇資料夾</string>
+    <string name="local_sync_choose_folder_desc">在檔案管理器中選擇一個資料夾。備份將以 ZIP 檔案儲存。</string>
+    <string name="local_sync_sync">同步</string>
+    <string name="local_sync_no_folder_hint">點擊「立即備份」選擇資料夾並匯出資料。</string>
+    <string name="local_sync_last_sync">上次同步</string>
+    <string name="local_sync_backups">備份數量</string>
+    <string name="local_sync_backups_subtitle">%1$d 個備份（%2$s）</string>
+    <string name="local_sync_backup_now">立即備份</string>
+    <string name="local_sync_restore_latest">從最新備份還原</string>
+    <string name="local_sync_auto_sync">自動同步</string>
+    <string name="local_sync_auto_sync_desc">每 4 小時自動備份一次</string>
+    <string name="local_sync_no_backups">尚無備份。點擊「立即備份」建立一個。</string>
+    <string name="local_sync_more_options">更多選項</string>
+    <string name="local_sync_restore">還原</string>
+    <string name="local_sync_restore_backup">還原備份？</string>
+    <string name="local_sync_restore_confirm">從 %1$s 還原？這將覆蓋當前應用資料。</string>
+    <string name="local_sync_delete_backup">刪除備份</string>
+    <string name="local_sync_delete_confirm">刪除 %1$s？此操作不可撤銷。</string>
+    <string name="local_sync_collecting">正在取得同步資料…</string>
+    <string name="local_sync_packaging">正在打包資料…</string>
+    <string name="local_sync_saving">正在儲存備份…</string>
+    <string name="local_sync_backup_complete">備份完成！</string>
+    <string name="local_sync_backup_failed">備份失敗</string>
 </resources>

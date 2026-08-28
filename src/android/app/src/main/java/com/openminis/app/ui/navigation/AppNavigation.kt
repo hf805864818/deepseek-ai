@@ -65,6 +65,7 @@ import com.openminis.app.ui.settings.SharedFolderDetailScreen
 import com.openminis.app.ui.settings.SharedFoldersScreen
 import com.openminis.app.ui.settings.SkillsManagementScreen
 import com.openminis.app.ui.settings.GoogleDriveSyncScreen
+import com.openminis.app.ui.settings.LocalSyncScreen
 import com.openminis.app.ui.settings.OtherSyncScreen
 import com.openminis.app.data.repository.EnvVarRepository
 import com.openminis.app.data.repository.MemoryRepository
@@ -168,6 +169,7 @@ object Routes {
     const val ABOUT = "about"
     const val OTHER_SYNC = "other_sync"
     const val GOOGLE_DRIVE_SYNC = "google_drive_sync"
+    const val LOCAL_SYNC = "local_sync"
     const val ONBOARDING_MODELS = "onboarding_models"
     /** T219-2: Mount external folders settings + detail. */
     const val MOUNTED_FOLDERS = "mounted_folders"
@@ -1204,11 +1206,18 @@ fun AppNavigation(
             OtherSyncScreen(
                 onBack = { navController.safePopBackStack() },
                 onGoogleDriveClick = { navController.safeNavigate(Routes.GOOGLE_DRIVE_SYNC) },
+                onLocalSyncClick = { navController.safeNavigate(Routes.LOCAL_SYNC) },
             )
         }
 
         composable(Routes.GOOGLE_DRIVE_SYNC) {
             GoogleDriveSyncScreen(
+                onBack = { navController.safePopBackStack() },
+            )
+        }
+
+        composable(Routes.LOCAL_SYNC) {
+            LocalSyncScreen(
                 onBack = { navController.safePopBackStack() },
             )
         }

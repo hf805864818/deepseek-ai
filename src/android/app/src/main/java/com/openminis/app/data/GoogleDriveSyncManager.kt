@@ -333,7 +333,7 @@ object GoogleDriveSyncManager {
      * This multi-source format allows the restore path to distinguish
      * databases from file assets and apply LWW merging per category.
      */
-    private fun createBackupZip(filesDir: File, dbDir: File): ByteArray {
+    internal fun createBackupZip(filesDir: File, dbDir: File): ByteArray {
         val baos = ByteArrayOutputStream()
         ZipOutputStream(baos).use { zos ->
             // 1. File assets from filesDir
@@ -400,7 +400,7 @@ object GoogleDriveSyncManager {
      * Old-format backups (without files/ or db/ prefixes) fall back to the
      * original extract-and-overwrite behavior for backward compatibility.
      */
-    private fun mergeBackup(zipData: ByteArray) {
+    internal fun mergeBackup(zipData: ByteArray) {
         // Read all entries from the ZIP
         val entries = mutableListOf<ZipEntryData>()
         ZipInputStream(zipData.inputStream()).use { zis ->

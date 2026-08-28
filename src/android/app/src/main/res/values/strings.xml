@@ -1717,4 +1717,35 @@
     <string name="sync_other">Other</string>
     <string name="coming_soon">Coming Soon</string>
     <string name="other_sync_subtitle">Google Drive and more</string>
+
+    <!-- Local Sync -->
+    <string name="local_sync_title">Local Sync</string>
+    <string name="local_sync_subtitle">Export backups to local storage</string>
+    <string name="local_sync_destination">Destination</string>
+    <string name="local_sync_folder_selected">Folder Selected</string>
+    <string name="local_sync_tap_to_change">Tap to change folder</string>
+    <string name="local_sync_clear_folder">Clear Folder</string>
+    <string name="local_sync_choose_folder">Choose Folder</string>
+    <string name="local_sync_choose_folder_desc">Pick a folder in your file manager. Backups are saved as ZIP files.</string>
+    <string name="local_sync_sync">Sync</string>
+    <string name="local_sync_no_folder_hint">Tap \"Backup Now\" to choose a folder and export your data.</string>
+    <string name="local_sync_last_sync">Last sync</string>
+    <string name="local_sync_backups">Backups</string>
+    <string name="local_sync_backups_subtitle">%1$d backups (%2$s)</string>
+    <string name="local_sync_backup_now">Backup Now</string>
+    <string name="local_sync_restore_latest">Restore Latest</string>
+    <string name="local_sync_auto_sync">Auto Sync</string>
+    <string name="local_sync_auto_sync_desc">Automatically back up every 4 hours</string>
+    <string name="local_sync_no_backups">No backups yet. Tap \"Backup Now\" to create one.</string>
+    <string name="local_sync_more_options">More options</string>
+    <string name="local_sync_restore">Restore</string>
+    <string name="local_sync_restore_backup">Restore Backup?</string>
+    <string name="local_sync_restore_confirm">Restore from %1$s? This will overwrite current app data.</string>
+    <string name="local_sync_delete_backup">Delete Backup</string>
+    <string name="local_sync_delete_confirm">Delete %1$s? This cannot be undone.</string>
+    <string name="local_sync_collecting">Collecting data…</string>
+    <string name="local_sync_packaging">Packaging data…</string>
+    <string name="local_sync_saving">Saving backup…</string>
+    <string name="local_sync_backup_complete">Backup complete!</string>
+    <string name="local_sync_backup_failed">Backup failed</string>
 </resources>

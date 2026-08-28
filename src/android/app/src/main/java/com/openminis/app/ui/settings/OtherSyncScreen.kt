@@ -22,6 +22,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.CloudOff
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -64,7 +65,7 @@ import com.openminis.app.auth.GoogleDriveOAuthManager
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit) {
+fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit, onLocalSyncClick: () -> Unit = {}) {
     val context = LocalContext.current
     val oauthManager = remember { GoogleDriveOAuthManager.forSync(context.applicationContext) }
     var googleDriveConnected by remember { mutableStateOf(oauthManager.isAuthenticated()) }
@@ -105,6 +106,14 @@ fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit) {
         ) {
             // ── Cloud Sync platforms ──
             OtherSyncSection(title = stringResource(R.string.cloud_sync)) {
+                // Local Sync (above Google Drive)
+                OtherSyncItem(
+                    icon = Icons.Outlined.Folder,
+                    iconColor = Color(0xFF34C759),
+                    title = stringResource(R.string.local_sync_title),
+                    subtitle = stringResource(R.string.local_sync_subtitle),
+                    onClick = onLocalSyncClick,
+                )
                 OtherSyncItem(
                     icon = Icons.Outlined.Cloud,
                     iconColor = Color(0xFF4285F4),
