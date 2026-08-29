@@ -15,7 +15,7 @@ struct EnvProfile: Identifiable, Codable, Hashable {
     var icon: String?       // SF Symbol name, e.g. "briefcase", "person"
     var color: String?      // theme color token (optional)
     var isDefault: Bool     // whether this is the default profile for new sessions
-    let createdAt: Date
+    var createdAt: Date
     var updatedAt: Date
 
     init(
@@ -46,7 +46,7 @@ struct EnvProfileVar: Identifiable, Codable, Hashable {
     let profileId: String
     var key: String
     var note: String
-    let createdAt: Date
+    var createdAt: Date
     var updatedAt: Date
 
     init(

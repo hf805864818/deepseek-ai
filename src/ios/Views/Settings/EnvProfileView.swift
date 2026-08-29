@@ -159,7 +159,7 @@ struct EnvProfileVarsView: View {
     @State private var searchText = ""
     @State private var showingAddSheet = false
     @State private var editingEntry: EnvProfileVar?
-    @State private var revealedKeys: Set<String> = [:]
+    @State private var revealedKeys: Set<String> = []
     @State private var copiedId: String?
 
     private var filteredEntries: [EnvProfileVar] {
