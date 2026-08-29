@@ -6743,50 +6743,7 @@ struct SessionEditSheet: View {
                             }
                         }
                     } label: {
-                        HStack {
-                            if let profile = profileStore.profiles.first(where: { $0.id == selectedProfileId }) {
-                                ZStack {
-                                    Circle()
-                                        .fill(Color.accentColor.opacity(0.15))
-                                        .frame(width: 28, height: 28)
-                                    Image(systemName: profile.icon ?? "square.stack.3d.up")
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(.accent)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 6) {
-                                        Text(profile.name)
-                                            .font(.body)
-                                        if profile.isDefault {
-                                            Text("Default")
-                                                .font(.caption2)
-                                                .padding(.horizontal, 5)
-                                                .padding(.vertical, 1)
-                                                .background(Color.accentColor.opacity(0.15))
-                                                .foregroundStyle(.accent)
-                                                .clipShape(Capsule())
-                                        }
-                                    }
-                                }
-                            } else {
-                                ZStack {
-                                    Circle()
-                                        .fill(Color.secondary.opacity(0.15))
-                                        .frame(width: 28, height: 28)
-                                    Image(systemName: "globe")
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text("None (Global only)")
-                                    .font(.body)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .contentShape(Rectangle())
+                        profileMenuLabel
                     }
                     .buttonStyle(.plain)
                 }
@@ -6831,6 +6788,69 @@ struct SessionEditSheet: View {
                 selectedProfileId = session.envProfileId
             }
         }
+    }
+
+    @ViewBuilder
+    private var profileMenuLabel: some View {
+        HStack {
+            if let profile = profileStore.profiles.first(where: { $0.id == selectedProfileId }) {
+                profileIconView(profile)
+                profileNameView(profile)
+            } else {
+                noProfileView
+            }
+            Spacer()
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private func profileIconView(_ profile: EnvProfile) -> some View {
+        ZStack {
+            Circle()
+                .fill(Color.accentColor.opacity(0.15))
+                .frame(width: 28, height: 28)
+            Image(systemName: profile.icon ?? "square.stack.3d.up")
+                .font(.system(size: 13))
+                .foregroundStyle(.accent)
+        }
+    }
+
+    @ViewBuilder
+    private func profileNameView(_ profile: EnvProfile) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(profile.name)
+                    .font(.body)
+                if profile.isDefault {
+                    Text("Default")
+                        .font(.caption2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.15))
+                        .foregroundStyle(.accent)
+                        .clipShape(Capsule())
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var noProfileView: some View {
+        ZStack {
+            Circle()
+                .fill(Color.secondary.opacity(0.15))
+                .frame(width: 28, height: 28)
+            Image(systemName: "globe")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+        }
+        Text("None (Global only)")
+            .font(.body)
+            .foregroundStyle(.secondary)
     }
 
     private func regenerate() {

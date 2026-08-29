@@ -360,7 +360,15 @@ class ISHTerminalViewModel: ObservableObject {
         // When opened from a session, resolve the session's env profile; otherwise
         // fall back to global user-defined vars only.
         stepStart = CFAbsoluteTimeGetCurrent()
-        let sessionEnvProfileId = sessionId.flatMap { ChatStore.shared.getSession($0)?.envProfileId }
+        var sessionEnvProfileId: String? = nil
+        if let sid = sessionId {
+            let profileSemaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                sessionEnvProfileId = await ChatStore.shared.getSession(sid)?.envProfileId
+                profileSemaphore.signal()
+            }
+            profileSemaphore.wait()
+        }
         let customEnv = EnvProfileStore.shared.resolvedEnv(forProfile: sessionEnvProfileId)
         if !customEnv.isEmpty {
             ISHKernel.shared.customEnvironment = customEnv

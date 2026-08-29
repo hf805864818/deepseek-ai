@@ -109,6 +109,40 @@ struct ChatSession: Identifiable, Codable, Hashable {
         hasher.combine(updatedAt)
     }
 
+    // MARK: - Memberwise init (explicit because custom Codable suppresses synthesis)
+
+    init(
+        id: String,
+        title: String? = nil,
+        category: String? = nil,
+        modelId: String,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        lastMessage: String? = nil,
+        source: String? = nil,
+        lastSyncedAt: Date? = nil,
+        remoteDeviceId: String? = nil,
+        remoteDeviceName: String? = nil,
+        pinnedAt: Date? = nil,
+        folderId: String? = nil,
+        envProfileId: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.category = category
+        self.modelId = modelId
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.lastMessage = lastMessage
+        self.source = source
+        self.lastSyncedAt = lastSyncedAt
+        self.remoteDeviceId = remoteDeviceId
+        self.remoteDeviceName = remoteDeviceName
+        self.pinnedAt = pinnedAt
+        self.folderId = folderId
+        self.envProfileId = envProfileId
+    }
+
     // MARK: - Codable (custom for backward compatibility)
 
     private enum SessionCodingKeys: String, CodingKey {

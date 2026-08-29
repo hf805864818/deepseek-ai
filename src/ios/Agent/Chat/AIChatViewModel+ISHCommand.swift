@@ -32,7 +32,7 @@ extension AIChatViewModel {
         let bashism = BashismDetector.detect(command)
         var bashReminder: String? = nil
         if bashism.needsBash {
-            let outcome = await OnDemandBash.shared.ensureBash(executor: ishExecutor(sessionId: sid))
+            let outcome = await OnDemandBash.shared.ensureBash(executor: await ishExecutor(sessionId: sid))
             switch outcome {
             case .available:
                 if bashism.mustSwitchInterpreter {
@@ -57,13 +57,13 @@ extension AIChatViewModel {
     /// Returns the env profile ID for the given session, or nil if the session
     /// has no profile or cannot be found. Uses ChatStore's direct DB lookup
     /// (primary key, O(1)) — safe to call on the command execution path.
-    private func envProfileId(for sessionId: String) -> String? {
-        ChatStore.shared.getSession(sessionId)?.envProfileId
+    private func envProfileId(for sessionId: String) async -> String? {
+        await ChatStore.shared.getSession(sessionId)?.envProfileId
     }
 
     /// Executor adapter handing OnDemandBash a way to run guest commands.
-    private func ishExecutor(sessionId sid: String) -> OnDemandBash.Executor {
-        let profileId = envProfileId(for: sid)
+    private func ishExecutor(sessionId sid: String) async -> OnDemandBash.Executor {
+        let profileId = await envProfileId(for: sid)
         return OnDemandBash.Executor(run: { command, timeout in
             let r = try? await ISHExecutionCoordinator.shared.execute(
                 sessionId: sid,
@@ -110,7 +110,7 @@ extension AIChatViewModel {
             || result.exitCode == (Self.bashMissingSentinel << 8) {
             await OnDemandBash.shared.markDisappeared()
             if allowReinstall {
-                let outcome = await OnDemandBash.shared.ensureBash(executor: ishExecutor(sessionId: sid))
+                let outcome = await OnDemandBash.shared.ensureBash(executor: await ishExecutor(sessionId: sid))
                 if case .available = outcome {
                     return try await runViaBash(script, sessionId: sid, timeout: timeout,
                                                 lineCallback: lineCallback, allowReinstall: false)
@@ -156,9 +156,10 @@ extension AIChatViewModel {
         // stays nil so the entry records an abort, not a fake exit status.
         let result: ISHCommandResult
         do {
+            let profileId = await envProfileId(for: sid)
             result = try await ISHExecutionCoordinator.shared.execute(
                 sessionId: sid,
-                envProfileId: envProfileId(for: sid),
+                envProfileId: profileId,
                 command: command,
                 timeout: effectiveTimeout,
                 // ISHShellExecutor dispatches every line on the main queue

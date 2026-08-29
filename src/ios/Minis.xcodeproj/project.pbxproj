@@ -327,6 +327,8 @@
 		E5P000004 /* DeepLinkRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5P000014 /* DeepLinkRouter.swift */; };
 		E5PRIV01 /* EnvVarPrivacyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PRIV11 /* EnvVarPrivacyStore.swift */; };
 		E5PRIV02 /* EnvVarRedactor.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PRIV12 /* EnvVarRedactor.swift */; };
+		E5EP0001 /* EnvProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5EP0011 /* EnvProfileStore.swift */; };
+		E5EP0002 /* EnvProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5EP0012 /* EnvProfileView.swift */; };
 		E5PV00001 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E5PV00002 /* PrivacyInfo.xcprivacy */; };
 		E5Q000001 /* BPETokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5Q000011 /* BPETokenizer.swift */; };
 		E5Q000002 /* cl100k_base.tiktoken in Resources */ = {isa = PBXBuildFile; fileRef = E5Q000012 /* cl100k_base.tiktoken */; };
@@ -983,6 +985,8 @@
 		E5P000014 /* DeepLinkRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkRouter.swift; sourceTree = "<group>"; };
 		E5PRIV11 /* EnvVarPrivacyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvVarPrivacyStore.swift; sourceTree = "<group>"; };
 		E5PRIV12 /* EnvVarRedactor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvVarRedactor.swift; sourceTree = "<group>"; };
+		E5EP0011 /* EnvProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvProfileStore.swift; sourceTree = "<group>"; };
+		E5EP0012 /* EnvProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvProfileView.swift; sourceTree = "<group>"; };
 		E5PV00002 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		E5Q000011 /* BPETokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BPETokenizer.swift; sourceTree = "<group>"; };
 		E5Q000012 /* cl100k_base.tiktoken */ = {isa = PBXFileReference; lastKnownFileType = text; path = cl100k_base.tiktoken; sourceTree = "<group>"; };
@@ -1711,6 +1715,7 @@
 				E5S000011 /* DeviceIdentity.swift */,
 				F1S00010 /* Environment */,
 				E5P000011 /* EnvVarStore.swift */,
+				E5EP0011 /* EnvProfileStore.swift */,
 				E5PRIV11 /* EnvVarPrivacyStore.swift */,
 				E5PRIV12 /* EnvVarRedactor.swift */,
 				E5Q000014 /* FontSettings.swift */,
@@ -2159,6 +2164,7 @@
 				E5S000014 /* CloudSyncSettingsView.swift */,
 				E5G000013 /* EnhancedBackgroundSettingsView.swift */,
 				E5P000012 /* EnvironmentVariablesView.swift */,
+				E5EP0012 /* EnvProfileView.swift */,
 				E5J000012 /* LogManagementView.swift */,
 				E5J000013 /* ConfigAuditView.swift */,
 				E5N0000142F3B941A00049557 /* MemoryManagementView.swift */,
@@ -2936,9 +2942,11 @@
 				E5N0000052F3B941A00049557 /* SessionMemoryView.swift in Sources */,
 				E5N0000062F3B941A00049557 /* AlarmListView.swift in Sources */,
 				E5P000001 /* EnvVarStore.swift in Sources */,
+				E5EP0001 /* EnvProfileStore.swift in Sources */,
 				E5PRIV01 /* EnvVarPrivacyStore.swift in Sources */,
 				E5PRIV02 /* EnvVarRedactor.swift in Sources */,
 				E5P000002 /* EnvironmentVariablesView.swift in Sources */,
+				E5EP0002 /* EnvProfileView.swift in Sources */,
 				E5P000003 /* DeepLinkCoordinator.swift in Sources */,
 				E5P000004 /* DeepLinkRouter.swift in Sources */,
 				E5CFG0001 /* ConfigAuditEntry.swift in Sources */,
