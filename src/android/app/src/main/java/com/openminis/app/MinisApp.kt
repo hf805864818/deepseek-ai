@@ -138,6 +138,8 @@ class MinisApp : Application(), ImageLoaderFactory {
         private set
     lateinit var envVarRepository: EnvVarRepository
         private set
+    lateinit var envProfileRepository: com.openminis.app.data.repository.EnvProfileRepository
+        private set
     lateinit var skillRepository: SkillRepository
         private set
     lateinit var mcpRepository: MCPRepository
@@ -388,6 +390,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         chatRepository = ChatRepository(database.chatDao())
         providerRepository = ProviderRepository(this)
         envVarRepository = EnvVarRepository(this)
+        envProfileRepository = com.openminis.app.data.repository.EnvProfileRepository(this)
         // [T-android-safemode-lateinit-crash-147] SkillRepository parses
         // third-party content (skills imported from external hubs), which
         // makes it the realistic source of a throw in this block. Its own
@@ -442,6 +445,8 @@ class MinisApp : Application(), ImageLoaderFactory {
         RootfsManager.getInstance(this)
         ExecutionCoordinator.init(this)
         ExecutionCoordinator.envVarRepository = envVarRepository
+        ExecutionCoordinator.envProfileRepository = envProfileRepository
+        ExecutionCoordinator.chatDao = database.chatDao()
 
         // Privacy Mode store + redactor wiring. Mirrors iOS
         // EnvVarPrivacyStore.init / EnvVarRedactor static handoff.

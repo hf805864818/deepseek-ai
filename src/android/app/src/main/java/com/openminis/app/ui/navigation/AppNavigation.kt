@@ -1014,8 +1014,16 @@ fun AppNavigation(
 
         composable(Routes.ENV_VARS) {
             if (envVarRepository != null) {
+                // T-env-profiles: obtain the application-scoped
+                // EnvProfileRepository singleton from MinisApp (same pattern
+                // used for mountedFoldersStore above) so the env screen and
+                // the sandbox ExecutionCoordinator share one instance.
+                val envProfileRepository = remember {
+                    (context.applicationContext as com.openminis.app.MinisApp).envProfileRepository
+                }
                 EnvironmentVariablesScreen(
                     envVarRepository = envVarRepository,
+                    envProfileRepository = envProfileRepository,
                     onBack = { navController.safePopBackStack() },
                 )
             }

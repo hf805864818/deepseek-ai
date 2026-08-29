@@ -24,6 +24,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -39,6 +41,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
+import com.openminis.app.data.repository.EnvProfileRepository
 import com.openminis.app.data.repository.EnvVarRepository
 import com.openminis.app.deeplink.DeepLinkCoordinator
 
@@ -53,12 +56,23 @@ import com.openminis.app.deeplink.DeepLinkCoordinator
 @Composable
 fun EnvironmentVariablesScreen(
     envVarRepository: EnvVarRepository,
+    envProfileRepository: EnvProfileRepository,
     onBack: () -> Unit,
 ) {
     val entries by envVarRepository.entries.collectAsState()
+    val profiles by envProfileRepository.profiles.collectAsState()
+    // T-env-profiles-tab: 0 = Global (existing env-var list), 1 = Profiles
+    // (config集 list). The top-bar + action switches behavior per tab.
+    var selectedTab by remember { mutableStateOf(0) }
     var showAddSheet by remember { mutableStateOf(false) }
     var editEntryId by remember { mutableStateOf<String?>(null) }
     var deleteEntryId by remember { mutableStateOf<String?>(null) }
+    // Profile-list state mirroring the global var flow above: add sheet,
+    // long-press delete target, and the tapped detail overlay (tracked by id
+    // so the live profile is rederived from the `profiles` flow).
+    var showAddProfileSheet by remember { mutableStateOf(false) }
+    var deleteProfile by remember { mutableStateOf<EnvProfileRepository.EnvProfile?>(null) }
+    var selectedProfileId by remember { mutableStateOf<String?>(null) }
     // iOS parity (AIChatView.swift L1410-1411): when a deep link arrives
     // with `create_key`, the env screen should open with a prefilled Add
     // sheet so the user only has to paste the value.
@@ -69,6 +83,9 @@ fun EnvironmentVariablesScreen(
     LaunchedEffect(Unit) {
         DeepLinkCoordinator.consumePendingEnvVarCreate()?.let {
             prefill = it
+            // Deep link always targets a global variable, so land on the
+            // Global tab even if the user last viewed Profiles.
+            selectedTab = 0
             showAddSheet = true
         }
     }
@@ -79,13 +96,31 @@ fun EnvironmentVariablesScreen(
         title = stringResource(R.string.env_var_title),
         onBack = onBack,
         // T75-part1 moved Add off a FAB onto the top-bar action slot;
-        // kept here for visual continuity.
+        // kept here for visual continuity. The + now branches on the
+        // active tab: Global → add a variable, Profiles → add a profile.
         actions = {
-            IconButton(onClick = { showAddSheet = true }) {
+            IconButton(onClick = {
+                if (selectedTab == 0) showAddSheet = true else showAddProfileSheet = true
+            }) {
                 Icon(Icons.Default.Add, contentDescription = stringResource(R.string.env_var_add))
             }
         },
     ) {
+        TabRow(selectedTabIndex = selectedTab) {
+            Tab(
+                selected = selectedTab == 0,
+                onClick = { selectedTab = 0 },
+                text = { Text(stringResource(R.string.env_tab_global)) },
+            )
+            Tab(
+                selected = selectedTab == 1,
+                onClick = { selectedTab = 1 },
+                text = { Text(stringResource(R.string.env_tab_profiles)) },
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+
+        if (selectedTab == 0) {
         SettingsSection(
             header = stringResource(R.string.env_var_privacy_header),
             footer = stringResource(R.string.env_var_privacy_footer),
@@ -185,6 +220,17 @@ fun EnvironmentVariablesScreen(
                 }
             }
         }
+        } else {
+            // Profiles tab — embed the same list rendering the standalone
+            // EnvProfileScreen uses (EnvProfileListSection), so tap/long-press
+            // behavior is identical. Tap opens the var detail overlay; long
+            // press prompts delete.
+            EnvProfileListSection(
+                profiles = profiles,
+                onProfileClick = { selectedProfileId = it.id },
+                onProfileLongClick = { deleteProfile = it },
+            )
+        }
 
         Spacer(Modifier.height(24.dp))
     }
@@ -226,6 +272,55 @@ fun EnvironmentVariablesScreen(
                     Text(stringResource(R.string.common_cancel))
                 }
             },
+        )
+    }
+
+    // Profile add sheet (Profiles tab + action). Editing a profile's own
+    // metadata (name / icon / set-as-default) is done from the
+    // EnvProfileVarsScreen detail overlay below, so this list only opens the
+    // sheet in create mode.
+    if (showAddProfileSheet) {
+        EnvProfileFormSheet(
+            editProfile = null,
+            repository = envProfileRepository,
+            onDismiss = { showAddProfileSheet = false },
+        )
+    }
+
+    // Profile long-press delete confirmation.
+    if (deleteProfile != null) {
+        AlertDialog(
+            onDismissRequest = { deleteProfile = null },
+            title = { Text("Delete ${deleteProfile?.name ?: "profile"}?") },
+            text = { Text(stringResource(R.string.env_profile_delete_confirm_text)) },
+            confirmButton = {
+                MinisTextButton(onClick = {
+                    deleteProfile?.let { envProfileRepository.deleteProfile(it.id) }
+                    deleteProfile = null
+                }) {
+                    Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                MinisTextButton(onClick = { deleteProfile = null }) {
+                    Text(stringResource(R.string.common_cancel))
+                }
+            },
+        )
+    }
+
+    // Profile variable detail overlay. Rendered last so it paints over the
+    // tab UI; clearing the selection simply stops drawing it and returns to
+    // the Profiles tab with the list still composed underneath. The profile
+    // is rederived from the live `profiles` flow so a rename done inside the
+    // detail surfaces here too, and deleting the profile closes the overlay.
+    selectedProfileId?.let { id ->
+        profiles.firstOrNull { it.id == id }
+    }?.let { profile ->
+        EnvProfileVarsScreen(
+            profile = profile,
+            repository = envProfileRepository,
+            onBack = { selectedProfileId = null },
         )
     }
 }

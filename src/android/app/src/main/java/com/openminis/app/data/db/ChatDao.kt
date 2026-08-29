@@ -86,6 +86,9 @@ interface ChatDao {
     @Query("UPDATE sessions SET model_binding = :binding, model_id = :modelId, updated_at = :updatedAt WHERE id = :id")
     suspend fun updateSessionBinding(id: String, binding: String, modelId: String, updatedAt: Long = System.currentTimeMillis())
 
+    @Query("UPDATE sessions SET env_profile_id = :envProfileId WHERE id = :id")
+    suspend fun updateSessionEnvProfileId(id: String, envProfileId: String?)
+
     @Query("DELETE FROM sessions WHERE id = :id")
     suspend fun deleteSession(id: String)
 

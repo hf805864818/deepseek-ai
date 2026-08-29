@@ -53,4 +53,5 @@ data class ChatSessionEntity(
      * in its old section.
      */
     @ColumnInfo(name = "folder_id") val folderId: String? = null,
+    @ColumnInfo(name = "env_profile_id") val envProfileId: String? = null,
 )

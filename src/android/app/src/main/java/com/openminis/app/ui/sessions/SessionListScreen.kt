@@ -410,6 +410,15 @@ fun SessionListScreen(
     onScheduledTasksClick: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    // [T-android-env-profile-session-binding] Env-profile repository pulled
+    // from MinisApp (property injection) so the SessionEditSheet can offer a
+    // profile picker and the onSave path can persist the binding. Null only in
+    // safe-mode (subsystems not initialized), in which case the picker simply
+    // renders "None (Global only)".
+    val envProfileRepository = remember {
+        (context.applicationContext as? com.openminis.app.MinisApp)
+            ?.takeIf { it.subsystemsReady() }?.envProfileRepository
+    }
     // T46: hoist VM ownership to the NavBackStackEntry's ViewModelStore so
     // [searchQuery] / [isSearchActive] survive navigation. The previous
     // `remember {}` scoping tied the VM to the composable's lifetime — pushing
@@ -1273,8 +1282,14 @@ fun SessionListScreen(
             isRegenerating = session.id in regeneratingIds,
             onRegenerate = { viewModel.regenerateTitle(session.id) },
             onDismiss = { editSession = null },
-            onSave = { title, category ->
+            envProfileRepository = envProfileRepository,
+            onSave = { title, category, envProfileId ->
                 viewModel.updateTitleAndCategory(session.id, title, category)
+                // [T-android-env-profile-session-binding] Persist the
+                // selected profile binding alongside title/category. Done as
+                // a separate write (chatDao.updateSessionEnvProfileId) so the
+                // title/category update path stays untouched.
+                viewModel.updateSessionEnvProfile(session.id, envProfileId)
                 editSession = null
             },
         )
@@ -2847,7 +2862,7 @@ private val allCategories = listOf(
 internal fun SessionEditSheet(
     session: ChatSessionEntity,
     onDismiss: () -> Unit,
-    onSave: (title: String, category: String?) -> Unit,
+    onSave: (title: String, category: String?, envProfileId: String?) -> Unit,
     // [T-android-sessionedit-regenerate-button] Regenerate-Title support,
     // matching iOS SessionEditSheet. `liveSession` is the DB-backed row that
     // updates when regeneration writes a new title/category; `isRegenerating`
@@ -2857,9 +2872,27 @@ internal fun SessionEditSheet(
     liveSession: ChatSessionEntity = session,
     isRegenerating: Boolean = false,
     onRegenerate: () -> Unit = {},
+    // [T-android-env-profile-session-binding] Env-profile picker. When null
+    // (e.g. caller did not wire it up), the picker section is omitted so the
+    // sheet behaves exactly as before. The current binding seeds
+    // `selectedProfileId`; saving propagates the choice through onSave.
+    envProfileRepository: com.openminis.app.data.repository.EnvProfileRepository? = null,
 ) {
     var title by remember { mutableStateOf(session.title ?: "") }
     var selectedCategory by remember { mutableStateOf(session.category) }
+    var selectedProfileId by remember { mutableStateOf(session.envProfileId) }
+    var profileMenuExpanded by remember { mutableStateOf(false) }
+    // Collect profiles reactively so a profile created/renamed in another
+    // sheet while this one is open flows in immediately. Keyed on the repo so
+    // the resolved flow instance is stable across recompositions (Compose
+    // rules-of-composition: collectAsState must run against a stable source).
+    // Falls back to a remembered empty flow when the repo is unavailable
+    // (safe-mode), in which case the picker renders only "None".
+    val profileFlow = remember(envProfileRepository) {
+        envProfileRepository?.profiles
+            ?: kotlinx.coroutines.flow.MutableStateFlow(emptyList())
+    }
+    val profiles by profileFlow.collectAsState()
 
     // [T-android-sessionedit-regenerate-button] When a regeneration run writes a
     // new title/category to the DB, `liveSession` updates — mirror those values
@@ -2895,7 +2928,7 @@ internal fun SessionEditSheet(
                 )
                 Spacer(Modifier.weight(1f))
                 MinisTextButton(
-                    onClick = { onSave(title.ifBlank { "New Chat" }, selectedCategory) },
+                    onClick = { onSave(title.ifBlank { "New Chat" }, selectedCategory, selectedProfileId) },
                 ) { Text("Save") }
             }
 
@@ -2962,6 +2995,69 @@ internal fun SessionEditSheet(
             }
 
             Spacer(Modifier.height(20.dp))
+
+            // [T-android-env-profile-session-binding] Environment Profile
+            // picker. Only rendered when a repository is wired in; otherwise
+            // the sheet is identical to its pre-binding form. "None" resolves
+            // to global-only env vars (no profile overlay). The default
+            // profile is flagged so the user can tell at a glance which one
+            // auto-applies to new sessions.
+            if (envProfileRepository != null) {
+                Text(
+                    "Environment Profile",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+                Box {
+                    OutlinedButton(
+                        onClick = { profileMenuExpanded = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        val selectedName = profiles.firstOrNull { it.id == selectedProfileId }?.name
+                        Text(
+                            if (selectedProfileId == null || selectedName == null) "None (Global only)"
+                            else selectedName,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Icon(
+                            Icons.Default.KeyboardArrowDown,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = profileMenuExpanded,
+                        onDismissRequest = { profileMenuExpanded = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("None (Global only)") },
+                            onClick = {
+                                selectedProfileId = null
+                                profileMenuExpanded = false
+                            },
+                        )
+                        profiles.forEach { profile ->
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(profile.name)
+                                        if (profile.isDefault) {
+                                            Spacer(Modifier.width(8.dp))
+                                            Badge { Text("Default") }
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    selectedProfileId = profile.id
+                                    profileMenuExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(20.dp))
+            }
 
             // [T-android-sessionedit-regenerate-button] Regenerate Title —
             // matches iOS SessionEditSheet's dedicated section below Category.

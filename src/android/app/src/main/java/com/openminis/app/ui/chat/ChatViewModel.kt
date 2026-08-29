@@ -362,6 +362,35 @@ class ChatViewModel(
 
     private val mediaStore = com.openminis.app.data.storage.MediaStore(context)
 
+    // [T-android-env-profile-session-binding] Property-injected from MinisApp
+    // to avoid widening the factory signature threaded through ChatScreen.
+    // buildSystemPrompt uses them to disclose the active profile + available
+    // env-var names to the model; ensureSession stamps the default profile on
+    // new sessions. Null in safe-mode (subsystems not initialized) — the
+    // prompt fragment is then simply omitted.
+    private val envProfileRepository: com.openminis.app.data.repository.EnvProfileRepository? =
+        (context.applicationContext as? com.openminis.app.MinisApp)
+            ?.takeIf { it.subsystemsReady() }?.envProfileRepository
+    private val envVarRepository: com.openminis.app.data.repository.EnvVarRepository? =
+        (context.applicationContext as? com.openminis.app.MinisApp)
+            ?.takeIf { it.subsystemsReady() }?.envVarRepository
+
+    /**
+     * Cached env_profile_id for the active session. Hydrated in [loadSession] /
+     * [ensureSession] and refreshed by [updateSessionEnvProfile]; read by the
+     * NON-suspend [buildSystemPrompt] so the prompt can disclose the active
+     * profile without a DB round-trip on every turn. buildSystemPrompt runs
+     * synchronously inside the non-suspend send/retry entry points, so it
+     * cannot itself await chatDao.getSession — the cache is the bridge.
+     *
+     * May be briefly stale if the binding is changed from the session LIST
+     * while this chat is open in another screen; reopening the chat re-
+     * hydrates it. Editing the binding via the in-chat title pill goes through
+     * [updateSessionEnvProfile], which refreshes the cache immediately.
+     */
+    internal var cachedEnvProfileId: String? = null
+        private set
+
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
 
@@ -3309,6 +3338,33 @@ class ChatViewModel(
         }
     }
 
+    // [T-android-env-profile-session-binding] Persist a profile binding chosen
+    // from the in-chat title-pill edit sheet. Refreshes the cache eagerly so
+    // the very next buildSystemPrompt (same turn, if applicable) reflects the
+    // change without waiting for the async DB write or a session reload.
+    fun updateSessionEnvProfile(envProfileId: String?) {
+        val sid = realSessionId.ifEmpty { return }
+        cachedEnvProfileId = envProfileId
+        viewModelScope.launch {
+            runCatching { chatRepository.dao.updateSessionEnvProfileId(sid, envProfileId) }
+        }
+    }
+
+    /**
+     * [T-android-env-profile-session-binding] Stamp the default env profile
+     * onto a brand-new session (created just now in [ensureSession]). The new
+     * row's env_profile_id is NULL, so this only fills in the default when one
+     * exists — it never overwrites a user choice. Refreshes the cache so the
+     * first-turn system prompt can disclose the profile.
+     */
+    private suspend fun applyDefaultEnvProfileIfNeeded() {
+        val repo = envProfileRepository ?: return
+        val default = repo.defaultProfile ?: return
+        val sid = realSessionId.ifEmpty { return }
+        runCatching { chatRepository.dao.updateSessionEnvProfileId(sid, default.id) }
+        cachedEnvProfileId = default.id
+    }
+
     /** Ensure the session exists in the database. Called before first message. */
     private suspend fun ensureSession(): String {
         if (realSessionId.isNotEmpty()) return realSessionId
@@ -3323,6 +3379,12 @@ class ChatViewModel(
             memoryEnabled = _memoryEnabled.value,
         )
         realSessionId = session.id
+        // [T-android-env-profile-session-binding] Stamp the default env profile
+        // onto the newly-persisted session (the main "New Chat" path). Done
+        // here rather than in SessionListViewModel because this is where the
+        // deferred draft→DB promotion actually inserts the row. Best-effort:
+        // no default profile → no-op, env_profile_id stays NULL.
+        applyDefaultEnvProfileIfNeeded()
         // "New Chat in Group": file the just-promoted draft into its folder.
         // Unconditional (vs iOS setFolderIfUnfiled) — the session is seconds
         // old and nothing else can have filed it yet.
@@ -3507,6 +3569,10 @@ class ChatViewModel(
             _sessionTitle.value = session.title ?: "New Chat"
             _sessionCategory.value = session.category
             _memoryEnabled.value = session.memoryEnabled != 0
+            // [T-android-env-profile-session-binding] Seed the cached binding
+            // so buildSystemPrompt (non-suspend) can disclose it without a
+            // DB round-trip. Re-hydrated here on every (re)load.
+            cachedEnvProfileId = session.envProfileId
             // T239: hydrate persisted thinking-mode override. null = unset
             // (use OFF as the legacy default); non-null = explicit user
             // choice persisted across cold-start. runCatching guards against
@@ -9163,6 +9229,44 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // enabled-MCP disclosure, injected right after the skills fragment.
         mcpRepository?.reloadFromDisk()
         val mcpFragment = mcpRepository?.mcpPromptFragment(activeSessionId)
+        // [T-android-env-profile-session-binding] Disclose the active env
+        // profile to the model: the profile NAME and the NAMES of every env
+        // variable available to shell_execute this turn (global vars merged
+        // with the profile's vars — profile overrides global, but the key
+        // SET is the union). VALUES are deliberately NOT included: the prompt
+        // already forbids echoing/printing env-var values, and listing them
+        // here would only widen the leak surface. The model learns which
+        // names it can reference as $VAR, nothing more. Placed after the MCP
+        // fragment and before the memory fragments, matching the iOS order
+        // (profile context sits with the other "what's available" disclosures
+        // rather than with the recall/identity sections).
+        val envProfileFragment: String? = run {
+            val repo = envProfileRepository ?: return@run null
+            val profileId = cachedEnvProfileId ?: return@run null
+            val profile = repo.profile(profileId) ?: return@run null
+            // Union of global + profile var names (ExecutionCoordinator
+            // injects the resolved global+profile map into the shell, so the
+            // model can reference any of these by name).
+            val globalKeys = envVarRepository?.entries?.value?.map { it.key } ?: emptyList()
+            val profileKeys = repo.vars(profileId).map { it.key }
+            val allKeys = ((globalKeys + profileKeys).toSet())
+                .filter { it.isNotEmpty() }
+                .sorted()
+            if (allKeys.isEmpty()) return@run null
+            buildString {
+                append("Active environment profile: ")
+                append(profile.name)
+                if (profile.isDefault) append(" (default)")
+                append('\n')
+                append("- The following environment variables are available to shell_execute in this session (NAMES ONLY — values are secrets, never print them): ")
+                append(allKeys.joinToString(", "))
+                append('\n')
+                append("- Reference each by name inside scripts (e.g. ")
+                append('$')
+                append(allKeys.first())
+                append("). NEVER echo, print, cat, or otherwise output any variable's value. (See the Environment variables rules above for the full security policy.)")
+            }
+        }
         // [T-memory-toggle-gates-injection-and-tools-android] Skip loading
         // GLOBAL.md + recent daily logs entirely when the user has turned
         // memory off for this session. Cheaper (no disk read) and — more
@@ -9183,6 +9287,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             if (mcpFragment != null) {
                 append("\n\n")
                 append(mcpFragment)
+            }
+            if (envProfileFragment != null) {
+                append("\n\n")
+                append(envProfileFragment)
             }
             if (globalMemoryFragment != null) {
                 append("\n\n")

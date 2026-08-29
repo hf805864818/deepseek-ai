@@ -35,6 +35,8 @@ object ExecutionCoordinator {
 
     private lateinit var appContext: Context
     var envVarRepository: EnvVarRepository? = null
+    var envProfileRepository: com.openminis.app.data.repository.EnvProfileRepository? = null
+    var chatDao: com.openminis.app.data.db.ChatDao? = null
 
     /** Thread-safe per-session shell registry. */
     private val shells = ConcurrentHashMap<String, PersistentShell>()
@@ -98,7 +100,16 @@ object ExecutionCoordinator {
             // (T124a). Pass the previously-injected key set so applyEnvironment
             // can `unset` anything the user has since removed from settings;
             // otherwise the long-lived shell would keep stale values.
-            val envVars = envVarRepository?.allAsDict() ?: emptyMap()
+            //
+            // Env profile support: resolve the session's envProfileId and
+            // merge profile vars over global vars. Falls back to global-only
+            // when no profile is bound or the profile repo is not available.
+            val envProfileId = chatDao?.getSession(sessionId)?.envProfileId
+            val envVars = if (envProfileId != null && envProfileRepository != null && envVarRepository != null) {
+                envProfileRepository!!.resolvedEnv(profileId = envProfileId, globalRepository = envVarRepository!!)
+            } else {
+                envVarRepository?.allAsDict() ?: emptyMap()
+            }
             val previousKeys = lastInjectedKeys[sessionId] ?: emptySet()
             if (envVars.isNotEmpty() || previousKeys.isNotEmpty()) {
                 shell.applyEnvironment(envVars, previousKeys = previousKeys)

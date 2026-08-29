@@ -122,6 +122,15 @@ class SessionListViewModel(
         }
     }
 
+    // [T-android-env-profile-session-binding] Property-injected from MinisApp
+    // (the instruction's "属性注入" option) to avoid widening the factory
+    // signature threaded through SessionListScreen. Null only in safe-mode.
+    // Used to apply the default profile to newly-created sessions and to back
+    // the SessionEditSheet picker (the sheet itself reads profiles directly).
+    private val envProfileRepository: com.openminis.app.data.repository.EnvProfileRepository? =
+        (context.applicationContext as? com.openminis.app.MinisApp)
+            ?.takeIf { it.subsystemsReady() }?.envProfileRepository
+
     private val _allSessions = MutableStateFlow<List<ChatSessionEntity>>(emptyList())
 
     /**
@@ -746,6 +755,30 @@ class SessionListViewModel(
         }
     }
 
+    // [T-android-env-profile-session-binding] Persist the profile binding
+    // chosen in SessionEditSheet. Mirrors updateTitleAndCategory: a fire-and-
+    // forget viewModelScope.launch that writes chatDao.updateSessionEnvProfileId
+    // directly (a dedicated UPDATE that touches only env_profile_id).
+    fun updateSessionEnvProfile(id: String, envProfileId: String?) {
+        viewModelScope.launch {
+            runCatching { chatRepository.dao.updateSessionEnvProfileId(id, envProfileId) }
+        }
+    }
+
+    /**
+     * [T-android-env-profile-session-binding] Apply the default env profile to
+     * a freshly-created session. Called from the session-creation paths in
+     * this VM (duplicateSession). The brand-new row has env_profile_id=NULL,
+     * so this never overwrites a user choice — it only fills in the default
+     * when one exists. The main "New Chat" path creates its DB row in
+     * ChatViewModel.ensureSession, which applies the same default there.
+     */
+    private suspend fun applyDefaultEnvProfileIfNeeded(sessionId: String) {
+        val repo = envProfileRepository ?: return
+        val default = repo.defaultProfile ?: return
+        runCatching { chatRepository.dao.updateSessionEnvProfileId(sessionId, default.id) }
+    }
+
     fun regenerateTitle(id: String) {
         viewModelScope.launch(Dispatchers.IO) {
             withContext(Dispatchers.Main) {
@@ -1071,6 +1104,9 @@ class SessionListViewModel(
                 modelId = session.modelId,
                 title = "${session.title ?: "Chat"} (Copy)",
             )
+            // [T-android-env-profile-session-binding] Stamp the default env
+            // profile onto the new (copy) session, matching new-session policy.
+            applyDefaultEnvProfileIfNeeded(newSession.id)
             for (msg in messages) {
                 chatRepository.appendMessage(
                     sessionId = newSession.id,

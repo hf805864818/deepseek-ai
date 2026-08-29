@@ -4209,12 +4209,20 @@ fun ChatScreen(
             // list (same composable, exposed `internal`) so title + category
             // edits from the in-chat pill are visually + behaviourally
             // identical to the home-screen long-press flow.
+            // [T-android-env-profile-session-binding] Same repo wiring as the
+            // session list so the in-chat edit sheet can also bind a profile.
+            val envProfileRepository = remember {
+                (context.applicationContext as? com.openminis.app.MinisApp)
+                    ?.takeIf { it.subsystemsReady() }?.envProfileRepository
+            }
             editingSession?.let { session ->
                 com.openminis.app.ui.sessions.SessionEditSheet(
                     session = session,
                     onDismiss = { editingSession = null },
-                    onSave = { newTitle, newCategory ->
+                    envProfileRepository = envProfileRepository,
+                    onSave = { newTitle, newCategory, envProfileId ->
                         viewModel.updateTitleAndCategory(newTitle, newCategory)
+                        viewModel.updateSessionEnvProfile(envProfileId)
                         editingSession = null
                     },
                 )
