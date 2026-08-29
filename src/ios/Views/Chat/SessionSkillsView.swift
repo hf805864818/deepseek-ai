@@ -85,6 +85,42 @@ struct SessionSkillsView: View {
         }
     }
 
+    /// [T-deep-mode] 深度技能组：`.bundled` 来源且 id 以 `deep-` 开头。
+    private var deepSkills: [Skill] {
+        filteredSkills.filter { $0.importSource == .bundled && $0.id.hasPrefix("deep-") }
+    }
+
+    /// [T-deep-mode] 非深度技能（用户自定义 / 导入的技能）。
+    private var userSkills: [Skill] {
+        filteredSkills.filter { !($0.importSource == .bundled && $0.id.hasPrefix("deep-")) }
+    }
+
+    /// [T-deep-mode] 复用的技能行视图，深度技能组与用户技能组共用。
+    @ViewBuilder
+    private func skillRow(_ skill: Skill) -> some View {
+        NavigationLink {
+            SessionSkillDetailView(skill: skill)
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(skill.name).font(.body)
+                    if !skill.description.isEmpty {
+                        Text(skill.description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { isEnabled(skill) },
+                    set: { setOverride(skill, $0) }
+                ))
+                .labelsHidden()
+            }
+        }
+    }
+
     var body: some View {
         // Reference the version counter so SwiftUI refreshes on override changes.
         let _ = store.sessionOverrideVersion
@@ -104,29 +140,25 @@ struct SessionSkillsView: View {
                             .font(.subheadline)
                     }
                 } else {
-                    Section(footer: Text("Toggles override the skill's default for this session only.")) {
-                        ForEach(filteredSkills) { skill in
-                            NavigationLink {
-                                SessionSkillDetailView(skill: skill)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(skill.name).font(.body)
-                                        if !skill.description.isEmpty {
-                                            Text(skill.description)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(2)
-                                        }
-                                    }
-                                    Spacer()
-                                    Toggle("", isOn: Binding(
-                                        get: { isEnabled(skill) },
-                                        set: { setOverride(skill, $0) }
-                                    ))
-                                    .labelsHidden()
-                                }
+                    if !deepSkills.isEmpty {
+                        Section {
+                            ForEach(deepSkills) { skill in
+                                skillRow(skill)
                             }
+                        } header: {
+                            Text("深度龙虾Ai")
+                        } footer: {
+                            Text("Toggles override the skill's default for this session only.")
+                        }
+                    }
+
+                    if !userSkills.isEmpty {
+                        Section {
+                            ForEach(userSkills) { skill in
+                                skillRow(skill)
+                            }
+                        } header: {
+                            Text("我的技能")
                         }
                     }
                 }

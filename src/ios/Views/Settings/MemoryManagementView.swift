@@ -10,6 +10,7 @@ import SwiftUI
 struct MemoryManagementView: View {
     @State private var memoryFiles: [MemoryFileItem] = []
     @State private var forceSyncToast: String?
+    @State private var showClearAllConfirmation = false
     @AppStorage("cloudSync.v2.enabled") private var iCloudSyncEnabled: Bool = false
     /// [T-memory-global-toggle-settings-ui-ios] Global default for whether
     /// a NEW session starts with memory enabled. Default true preserves
@@ -60,20 +61,33 @@ struct MemoryManagementView: View {
         .navigationTitle("Memory")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            if #available(iOS 17.0, *), iCloudSyncEnabled {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    if #available(iOS 17.0, *), iCloudSyncEnabled {
                         Button {
                             Task { await forceSyncMemory() }
                         } label: {
                             Label(String(localized: "Force iCloud Sync"),
                                   systemImage: "arrow.triangle.2.circlepath.icloud")
                         }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
                     }
+                    Button(role: .destructive) {
+                        showClearAllConfirmation = true
+                    } label: {
+                        Label("Clear All Memory", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
                 }
             }
+        }
+        .alert("Clear All Memory", isPresented: $showClearAllConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("Clear All", role: .destructive) {
+                clearAllMemory()
+            }
+        } message: {
+            Text("This will delete ALL daily memory logs and structured memory. GLOBAL.md will NOT be deleted. This action cannot be undone.")
         }
         .overlay(alignment: .top) {
             if let msg = forceSyncToast {
@@ -103,6 +117,51 @@ struct MemoryManagementView: View {
         await ForceSyncHelper.bidirectionalSync(
             recordTypes: ["MemoryGlobalV2", "MemoryDailyV2"])
         forceSyncToast = String(localized: "Synced \(count) memory files")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            forceSyncToast = nil
+        }
+    }
+
+    private func clearAllMemory() {
+        let fm = FileManager.default
+        let memDir = AIChatViewModel.minisMemoryPersistentDir
+
+        // 1. Delete all daily .md memory files (keep GLOBAL.md)
+        if let files = try? fm.contentsOfDirectory(at: memDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            let dailyFiles = files.filter {
+                $0.pathExtension == "md" && $0.lastPathComponent != "GLOBAL.md"
+            }
+            for url in dailyFiles {
+                try? fm.removeItem(at: url)
+            }
+        }
+
+        // 2. Clear structured memory (write empty array)
+        let structuredURL = memDir.appendingPathComponent("memory-structured.json")
+        if fm.fileExists(atPath: structuredURL.path) {
+            do {
+                let emptyData = try JSONEncoder().encode([MemoryEntry]())
+                try emptyData.write(to: structuredURL, options: .atomic)
+            } catch {
+                // If we can't write empty array, try deleting the file entirely
+                try? fm.removeItem(at: structuredURL)
+            }
+        }
+
+        // 3. Clear cross-session context (deep mode only)
+        let crossSessionURL = memDir.appendingPathComponent("deep-cross-session.json")
+        if fm.fileExists(atPath: crossSessionURL.path) {
+            try? fm.removeItem(at: crossSessionURL)
+        }
+
+        // 4. Refresh UI
+        loadFiles()
+
+        // 5. Notify observers
+        NotificationCenter.default.post(name: .memoryFilesDidChange, object: nil)
+
+        // 6. Toast feedback
+        forceSyncToast = "All memory cleared"
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             forceSyncToast = nil
         }
