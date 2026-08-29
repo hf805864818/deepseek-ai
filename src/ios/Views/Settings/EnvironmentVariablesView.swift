@@ -3,10 +3,12 @@ import UIKit
 
 struct EnvironmentVariablesView: View {
     @StateObject private var store = EnvVarStore.shared
+    @StateObject private var profileStore = EnvProfileStore.shared
     @StateObject private var privacy = EnvVarPrivacyStore.shared
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var searchText = ""
     @State private var showingAddSheet = false
+    @State private var showingAddProfileSheet = false
     @State private var editingEntry: EnvVarEntry?
     @State private var revealedKeys: Set<String> = []
     @State private var copiedId: String?
@@ -14,6 +16,12 @@ struct EnvironmentVariablesView: View {
     @State private var prefillValue = ""
     @State private var prefillNote = ""
     @State private var overwriteConfirm: OverwriteRequest?
+    @State private var selectedTab: EnvVarTab = .global
+
+    private enum EnvVarTab: String, CaseIterable {
+        case global = "Global"
+        case profiles = "Profiles"
+    }
 
     private struct OverwriteRequest: Identifiable {
         let id = UUID()
@@ -32,32 +40,22 @@ struct EnvironmentVariablesView: View {
     var body: some View {
         List {
             Section {
-                Toggle("Privacy Mode", isOn: $privacy.enabled)
-            } footer: {
-                Text("When enabled, any environment variable value that appears in shell-execute output is replaced with a masked form (e.g. `sk-1********ajhks`) before reaching the model. Values shorter than 8 characters become all `*`. The user-visible output in chat is unchanged.")
+                Picker("Category", selection: $selectedTab) {
+                    ForEach(EnvVarTab.allCases, id: \.self) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
             }
 
-            if store.entries.isEmpty {
-                Section {
-                    VStack(spacing: 8) {
-                        Image(systemName: "terminal")
-                            .font(.largeTitle)
-                            .foregroundStyle(.secondary)
-                        Text("No Environment Variables")
-                            .font(.headline)
-                        Text("Add variables like API keys or tokens that will be available in the shell environment.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 20)
-                }
+            if selectedTab == .global {
+                globalSection
             } else {
-                ForEach(filteredEntries) { entry in
-                    envVarRow(entry)
-                }
-                .onDelete(perform: deleteEntries)
+                // Profiles tab content is in a separate list (pushed view)
+                // so we embed the profile list inline here.
+                profileListSection
             }
         }
         .listStyle(.insetGrouped)
@@ -67,7 +65,11 @@ struct EnvironmentVariablesView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    showingAddSheet = true
+                    if selectedTab == .global {
+                        showingAddSheet = true
+                    } else {
+                        showingAddProfileSheet = true
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -81,6 +83,11 @@ struct EnvironmentVariablesView: View {
                 prefillKey = ""
                 prefillValue = ""
                 prefillNote = ""
+            }
+        }
+        .sheet(isPresented: $showingAddProfileSheet) {
+            EnvProfileFormSheet(mode: .add) { name, icon, isDefault in
+                profileStore.addProfile(name: name, icon: icon, isDefault: isDefault)
             }
         }
         .onAppear {
@@ -134,6 +141,116 @@ struct EnvironmentVariablesView: View {
                     store.delete(id: entry.id)
                 }
             )
+        }
+    }
+
+    // MARK: - Global Section
+
+    @ViewBuilder
+    private var globalSection: some View {
+        Section {
+            Toggle("Privacy Mode", isOn: $privacy.enabled)
+        } footer: {
+            Text("When enabled, any environment variable value that appears in shell-execute output is replaced with a masked form (e.g. `sk-1********ajhks`) before reaching the model. Values shorter than 8 characters become all `*`. The user-visible output in chat is unchanged.")
+        }
+
+        if filteredEntries.isEmpty {
+            Section {
+                VStack(spacing: 8) {
+                    Image(systemName: "terminal")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                    Text("No Global Variables")
+                        .font(.headline)
+                    Text("Global env vars are available in every session. Use profiles to override them per-session.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+            }
+        } else {
+            Section {
+                ForEach(filteredEntries) { entry in
+                    envVarRow(entry)
+                }
+                .onDelete(perform: deleteEntries)
+            } header: {
+                Text("Global Variables")
+            }
+        }
+    }
+
+    // MARK: - Profiles Section
+
+    @ViewBuilder
+    private var profileListSection: some View {
+        if profileStore.profiles.isEmpty {
+            Section {
+                VStack(spacing: 8) {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                    Text("No Profiles")
+                        .font(.headline)
+                    Text("Create profiles to group env vars by account or project. Assign a profile to a session to use its values.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+            }
+        } else {
+            Section {
+                ForEach(profileStore.profiles) { profile in
+                    profileNavRow(profile)
+                }
+            } header: {
+                Text("Profiles")
+            } footer: {
+                Text("Each profile can override global env vars. Assign a profile to a session to use its values.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func profileNavRow(_ profile: EnvProfile) -> some View {
+        let count = profileStore.vars(for: profile.id).count
+        NavigationLink {
+            EnvProfileVarsView(profile: profile)
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(Color.accentColor.opacity(0.15))
+                        .frame(width: 36, height: 36)
+                    Image(systemName: profile.icon ?? "square.stack.3d.up")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.accent)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(profile.name)
+                            .font(.body)
+                            .fontWeight(.medium)
+                        if profile.isDefault {
+                            Text("Default")
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Color.accentColor.opacity(0.15))
+                                .foregroundStyle(.accent)
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Text("\(count) variable\(count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 

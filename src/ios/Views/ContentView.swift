@@ -1457,11 +1457,12 @@ struct ContentView: View {
             .presentationDetents([.medium])
         }
         .sheet(item: $sessionToEdit) { session in
-            SessionEditSheet(session: session) { newTitle, newCategory in
+            SessionEditSheet(session: session) { newTitle, newCategory, newEnvProfileId in
                 // [T-ios-state-publish-offmain-crash] @MainActor so the @State
                 // write after the actor-hop await stays on the main thread.
                 Task { @MainActor in
                     await ChatStore.shared.updateSessionTitle(session.id, title: newTitle, category: newCategory)
+                    await ChatStore.shared.updateSessionEnvProfileId(session.id, envProfileId: newEnvProfileId)
                     refreshSessionList()
                 }
                 sessionToEdit = nil
@@ -6650,12 +6651,14 @@ private struct SuspendedRing: View {
 
 struct SessionEditSheet: View {
     let session: ChatSession
-    let onSave: (String, String?) -> Void
+    let onSave: (String, String?, String?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var editTitle: String = ""
     @State private var editCategory: String = ""
     @State private var isRegenerating = false
+    @StateObject private var profileStore = EnvProfileStore.shared
+    @State private var selectedProfileId: String?
 
     private static let categories: [(key: String, label: String, icon: String, color: Color)] = [
         ("code",         "Code",         "terminal.fill",               .orange),
@@ -6709,6 +6712,85 @@ struct SessionEditSheet: View {
                     .padding(.vertical, 8)
                 }
 
+                Section("Environment Profile") {
+                    Menu {
+                        Button {
+                            selectedProfileId = nil
+                        } label: {
+                            HStack {
+                                if selectedProfileId == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                                Text("None (Global only)")
+                            }
+                        }
+                        ForEach(profileStore.profiles) { profile in
+                            Button {
+                                selectedProfileId = profile.id
+                            } label: {
+                                HStack {
+                                    if selectedProfileId == profile.id {
+                                        Image(systemName: "checkmark")
+                                    }
+                                    Image(systemName: profile.icon ?? "square.stack.3d.up")
+                                    Text(profile.name)
+                                    if profile.isDefault {
+                                        Text("Default")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            if let profile = profileStore.profiles.first(where: { $0.id == selectedProfileId }) {
+                                ZStack {
+                                    Circle()
+                                        .fill(Color.accentColor.opacity(0.15))
+                                        .frame(width: 28, height: 28)
+                                    Image(systemName: profile.icon ?? "square.stack.3d.up")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.accent)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text(profile.name)
+                                            .font(.body)
+                                        if profile.isDefault {
+                                            Text("Default")
+                                                .font(.caption2)
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(Color.accentColor.opacity(0.15))
+                                                .foregroundStyle(.accent)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                }
+                            } else {
+                                ZStack {
+                                    Circle()
+                                        .fill(Color.secondary.opacity(0.15))
+                                        .frame(width: 28, height: 28)
+                                    Image(systemName: "globe")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text("None (Global only)")
+                                    .font(.body)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 Section {
                     Button {
                         regenerate()
@@ -6737,7 +6819,7 @@ struct SessionEditSheet: View {
                     Button("Save") {
                         let title = editTitle.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !title.isEmpty else { return }
-                        onSave(title, editCategory.isEmpty ? nil : editCategory)
+                        onSave(title, editCategory.isEmpty ? nil : editCategory, selectedProfileId)
                     }
                     .bold()
                     .disabled(editTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -6746,6 +6828,7 @@ struct SessionEditSheet: View {
             .onAppear {
                 editTitle = session.title ?? ""
                 editCategory = session.category ?? ""
+                selectedProfileId = session.envProfileId
             }
         }
     }

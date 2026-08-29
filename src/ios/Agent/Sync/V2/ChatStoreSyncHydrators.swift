@@ -128,6 +128,18 @@ enum ChatStoreSyncHydrators {
             deletionApplier: { id in await applyEnvVarItemDeletion(id: id) }
         )
         h.register(
+            recordType: "EnvProfile",
+            builder: { id in await buildEnvProfile(id: id) },
+            merger: { record in await mergeEnvProfile(record: record) },
+            deletionApplier: { id in await applyEnvProfileDeletion(id: id) }
+        )
+        h.register(
+            recordType: "EnvProfileVar",
+            builder: { id in await buildEnvProfileVar(id: id) },
+            merger: { record in await mergeEnvProfileVar(record: record) },
+            deletionApplier: { id in await applyEnvProfileVarDeletion(id: id) }
+        )
+        h.register(
             recordType: "SyncDeviceV2",
             builder: { id in await buildDevice(id: id) },
             merger: { record in await mergeDevice(record: record) }
@@ -193,12 +205,15 @@ enum ChatStoreSyncHydrators {
         // doesn't know the field exists — only the former may clear local.
         let folderFieldPresent = record.fields["folderId"] != nil
         let folderId = optionalStringField(record, "folderId")
+        let envProfileFieldPresent = record.fields["envProfileId"] != nil
+        let envProfileId = optionalStringField(record, "envProfileId")
 
         var session = ChatSession(
             id: id, title: title, category: category, modelId: modelId,
             createdAt: createdAt, updatedAt: updatedAt
         )
         session.pinnedAt = pinnedAt
+        session.envProfileId = envProfileId
         // v2 doesn't currently track per-device origin in PortableRecord;
         // pass an empty string as a sentinel ("unknown remote device").
         await ChatStore.shared.mergeRemoteSession(
@@ -207,7 +222,9 @@ enum ChatStoreSyncHydrators {
             modelBinding: modelBinding,
             remotePinnedAtRaw: pinnedAt,
             remoteFolderId: folderId,
-            remoteHasFolderField: folderFieldPresent
+            remoteHasFolderField: folderFieldPresent,
+            remoteEnvProfileId: envProfileId,
+            remoteHasEnvProfileField: envProfileFieldPresent
         )
     }
 
@@ -882,6 +899,146 @@ enum ChatStoreSyncHydrators {
             EnvVarStore.shared.applyRemoteDeletion(id: id)
         }
         logger.info("[SyncCore] applied EnvVarItem deletion id=\(id.prefix(8))")
+    }
+
+    // MARK: - EnvProfile
+
+    /// Build a per-profile record. The `id` is the EnvProfile UUID,
+    /// also used as the CK recordName.
+    private static func buildEnvProfile(id: String) async -> PortableRecord? {
+        let profile = await MainActor.run { EnvProfileStore.shared.profile(id: id) }
+        guard let profile else {
+            // Local profile gone — drop the stale upsert dirty row.
+            // The op=delete path is separate (deletionApplier on the
+            // receiver side, op=delete on the dirty row on the sender side).
+            return nil
+        }
+        let synced = SyncedEnvProfile.from(profile)
+        return SyncableTypeRegistry.shared.metadata(for: "EnvProfile")?.buildPortable(synced)
+    }
+
+    /// Apply an inbound EnvProfile record. Adds-or-replaces the profile
+    /// via EnvProfileStore.applyRemoteProfile. LWW resolution by updatedAt
+    /// ordering from the cloud stream.
+    private static func mergeEnvProfile(record: PortableRecord) async {
+        guard let id = stringField(record, "profileId") else {
+            logger.warning("[SyncCore] mergeEnvProfile: missing profileId field")
+            return
+        }
+        guard let name = stringField(record, "name") else {
+            logger.warning("[SyncCore] mergeEnvProfile: missing name for id=\(id.prefix(8))")
+            return
+        }
+        let icon = stringField(record, "icon")
+        let color = stringField(record, "color")
+        let isDefault = intField(record, "isDefault") ?? 0
+        let createdAt = dateField(record, "createdAt") ?? Date()
+        let updatedAt = dateField(record, "updatedAt") ?? record.updatedAt
+        // Recently-deleted guard: same pattern as mergeEnvVarItem —
+        // applyRemoteProfile unconditionally re-inserts an unknown id,
+        // so a just-deleted profile re-fetched before the cloud delete
+        // lands would resurrect without this check.
+        if await ChatStore.shared.isRecentlyDeletedRecord(type: "EnvProfile", id: id, remoteUpdatedAt: updatedAt) {
+            logger.info("[SyncCore] mergeEnvProfile SKIP (recently deleted locally): id=\(id.prefix(8))")
+            return
+        }
+        // In-flight local edit guard: while this id has a pending local
+        // upsert, skip the inbound apply; the post-push fetch reconciles
+        // normally. Same rationale as mergeEnvVarItem.
+        let pendingDirty = await ChatStore.shared.loadDirtyRecords()
+        if pendingDirty.contains(where: { $0.recordType == "EnvProfile" && $0.recordId == id && $0.operation != "delete" }) {
+            logger.info("[SyncCore] mergeEnvProfile SKIP (local upsert pending): id=\(id.prefix(8))")
+            return
+        }
+        await MainActor.run {
+            EnvProfileStore.shared.applyRemoteProfile(
+                id: id, name: name, icon: icon, color: color,
+                isDefault: isDefault != 0, createdAt: createdAt, updatedAt: updatedAt
+            )
+        }
+        logger.info("[SyncCore] applied EnvProfile id=\(id.prefix(8)) name=\(name)")
+    }
+
+    /// Apply an inbound op=delete tombstone for an EnvProfile.
+    /// Removes the profile and all its vars by id.
+    private static func applyEnvProfileDeletion(id: String) async {
+        await MainActor.run {
+            EnvProfileStore.shared.applyRemoteProfileDeletion(id: id)
+        }
+        logger.info("[SyncCore] applied EnvProfile deletion id=\(id.prefix(8))")
+    }
+
+    // MARK: - EnvProfileVar (per-profile-variable)
+
+    /// Build a per-profile-variable record. The `id` is the EnvProfileVar
+    /// UUID, also used as the CK recordName. Values are pulled from
+    /// Keychain at build time and base64-encoded into the record so a
+    /// peer that hasn't yet received the matching iCloud Keychain sync
+    /// entry still gets the value.
+    private static func buildEnvProfileVar(id: String) async -> PortableRecord? {
+        let v = await MainActor.run { EnvProfileStore.shared.varItem(id: id) }
+        guard let v else {
+            // Local var gone — drop the stale upsert dirty row.
+            // The op=delete path is separate.
+            return nil
+        }
+        let synced = SyncedEnvProfileVar.from(v)
+        return SyncableTypeRegistry.shared.metadata(for: "EnvProfileVar")?.buildPortable(synced)
+    }
+
+    /// Apply an inbound per-profile-variable record. Adds-or-replaces
+    /// the var via EnvProfileStore.applyRemoteProfileVar. LWW resolution
+    /// by updatedAt ordering from the cloud stream.
+    private static func mergeEnvProfileVar(record: PortableRecord) async {
+        guard let id = stringField(record, "varId") else {
+            logger.warning("[SyncCore] mergeEnvProfileVar: missing varId field")
+            return
+        }
+        guard let profileId = stringField(record, "profileId") else {
+            logger.warning("[SyncCore] mergeEnvProfileVar: missing profileId for id=\(id.prefix(8))")
+            return
+        }
+        guard let key = stringField(record, "key") else {
+            logger.warning("[SyncCore] mergeEnvProfileVar: missing key for id=\(id.prefix(8))")
+            return
+        }
+        let valueB64 = stringField(record, "valueB64") ?? ""
+        let note = stringField(record, "note") ?? ""
+        let createdAt = dateField(record, "createdAt") ?? Date()
+        let updatedAt = dateField(record, "updatedAt") ?? record.updatedAt
+        // Recently-deleted guard — same pattern as EnvVarItem.
+        if await ChatStore.shared.isRecentlyDeletedRecord(type: "EnvProfileVar", id: id, remoteUpdatedAt: updatedAt) {
+            logger.info("[SyncCore] mergeEnvProfileVar SKIP (recently deleted locally): id=\(id.prefix(8))")
+            return
+        }
+        // In-flight local edit guard — same pattern as EnvVarItem.
+        let pendingDirty = await ChatStore.shared.loadDirtyRecords()
+        if pendingDirty.contains(where: { $0.recordType == "EnvProfileVar" && $0.recordId == id && $0.operation != "delete" }) {
+            logger.info("[SyncCore] mergeEnvProfileVar SKIP (local upsert pending): id=\(id.prefix(8))")
+            return
+        }
+        let value: String = {
+            guard !valueB64.isEmpty,
+                  let data = Data(base64Encoded: valueB64),
+                  let s = String(data: data, encoding: .utf8) else { return "" }
+            return s
+        }()
+        await MainActor.run {
+            EnvProfileStore.shared.applyRemoteProfileVar(
+                id: id, profileId: profileId, key: key, value: value,
+                note: note, createdAt: createdAt, updatedAt: updatedAt
+            )
+        }
+        logger.info("[SyncCore] applied EnvProfileVar id=\(id.prefix(8)) key=\(key)")
+    }
+
+    /// Apply an inbound op=delete tombstone for an EnvProfileVar.
+    /// Removes the var by id and deletes its Keychain entry.
+    private static func applyEnvProfileVarDeletion(id: String) async {
+        await MainActor.run {
+            EnvProfileStore.shared.applyRemoteProfileVarDeletion(id: id)
+        }
+        logger.info("[SyncCore] applied EnvProfileVar deletion id=\(id.prefix(8))")
     }
 
     // MARK: - SyncDevice

@@ -22,6 +22,7 @@ struct SyncedSession: Syncable {
     var modelBinding: String?
     var pinnedAt: Date?
     var folderId: String?
+    var envProfileId: String?
 
     static let syncMetadata: SyncTypeMetadata<SyncedSession> = {
         typealias F = FieldDescriptor<SyncedSession>
@@ -43,6 +44,7 @@ struct SyncedSession: Syncable {
                 // bump): old devices ignore the unknown CKRecord field on read
                 // and omit it on write, both of which decode as nil here.
                 F.optionalString("folderId", \SyncedSession.folderId),
+                F.optionalString("envProfileId", \SyncedSession.envProfileId),
             ],
             conflictPolicy: .lastWriteWinsByField(\SyncedSession.updatedAt),
             version: 1
@@ -60,7 +62,8 @@ struct SyncedSession: Syncable {
             memoryEnabled: memoryEnabled ? 1 : 0,
             modelBinding: modelBinding,
             pinnedAt: s.pinnedAt,
-            folderId: s.folderId
+            folderId: s.folderId,
+            envProfileId: s.envProfileId
         )
     }
 }
@@ -657,6 +660,106 @@ struct SyncedEnvVar: Syncable {
     }()
 }
 
+// MARK: - SyncedEnvProfile
+//
+// One CK record per environment variable profile. Profiles are
+// per-account global scope; last-write-wins by updatedAt. Profile
+// variables (SyncedEnvProfileVar) are child records scoped by profileId.
+struct SyncedEnvProfile: Syncable {
+    var id: String          // EnvProfile.id (UUID) — also CK recordName
+    var name: String
+    var icon: String?
+    var color: String?
+    var isDefault: Int      // 0/1
+    var createdAt: Date
+    var updatedAt: Date
+
+    static let syncMetadata: SyncTypeMetadata<SyncedEnvProfile> = {
+        typealias F = FieldDescriptor<SyncedEnvProfile>
+        return SyncTypeMetadata<SyncedEnvProfile>(
+            recordType: "EnvProfile",
+            idKeyPath: \SyncedEnvProfile.id,
+            scope: .global,
+            fields: [
+                F.string("profileId",     \SyncedEnvProfile.id),
+                F.string("name",          \SyncedEnvProfile.name),
+                F.optionalString("icon",  \SyncedEnvProfile.icon),
+                F.optionalString("color", \SyncedEnvProfile.color),
+                F.int("isDefault",        \SyncedEnvProfile.isDefault),
+                F.date("createdAt",       \SyncedEnvProfile.createdAt),
+                F.date("updatedAt",       \SyncedEnvProfile.updatedAt),
+            ],
+            conflictPolicy: .lastWriteWinsByField(\SyncedEnvProfile.updatedAt),
+            version: 1
+        )
+    }()
+
+    static func from(_ p: EnvProfile) -> SyncedEnvProfile {
+        SyncedEnvProfile(
+            id: p.id,
+            name: p.name,
+            icon: p.icon,
+            color: p.color,
+            isDefault: p.isDefault ? 1 : 0,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt
+        )
+    }
+}
+
+// MARK: - SyncedEnvProfileVar (per-profile-variable record)
+//
+// One CK record per environment variable within a profile. Follows the
+// same per-record LWW pattern as SyncedEnvVar but scoped to a profile.
+//
+// `valueB64`: base64(utf8(value)) — same trust model as SyncedEnvVar.
+// Values travel in the record (not solely via iCloud Keychain) so a
+// brand-new entry shows up on a peer with its value immediately. The
+// receiver decodes and writes the value into Keychain itself.
+struct SyncedEnvProfileVar: Syncable {
+    var id: String          // EnvProfileVar.id (UUID) — also CK recordName
+    var profileId: String   // owning EnvProfile.id
+    var key: String
+    var valueB64: String    // base64(value); empty for "no value yet"
+    var note: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    static let syncMetadata: SyncTypeMetadata<SyncedEnvProfileVar> = {
+        typealias F = FieldDescriptor<SyncedEnvProfileVar>
+        return SyncTypeMetadata<SyncedEnvProfileVar>(
+            recordType: "EnvProfileVar",
+            idKeyPath: \SyncedEnvProfileVar.id,
+            scope: .perParent(parentType: "EnvProfile", \SyncedEnvProfileVar.profileId),
+            fields: [
+                F.string("varId",       \SyncedEnvProfileVar.id),
+                F.string("profileId",   \SyncedEnvProfileVar.profileId),
+                F.string("key",         \SyncedEnvProfileVar.key),
+                F.string("valueB64",    \SyncedEnvProfileVar.valueB64),
+                F.string("note",        \SyncedEnvProfileVar.note),
+                F.date("createdAt",     \SyncedEnvProfileVar.createdAt),
+                F.date("updatedAt",     \SyncedEnvProfileVar.updatedAt),
+            ],
+            conflictPolicy: .lastWriteWinsByField(\SyncedEnvProfileVar.updatedAt),
+            version: 1
+        )
+    }()
+
+    static func from(_ v: EnvProfileVar) -> SyncedEnvProfileVar {
+        let value = EnvProfileStore.loadValueSync(profileId: v.profileId, key: v.key) ?? ""
+        let valueB64 = Data(value.utf8).base64EncodedString()
+        return SyncedEnvProfileVar(
+            id: v.id,
+            profileId: v.profileId,
+            key: v.key,
+            valueB64: valueB64,
+            note: v.note,
+            createdAt: v.createdAt,
+            updatedAt: v.updatedAt
+        )
+    }
+}
+
 // MARK: - SyncedDevice
 
 struct SyncedDevice: Syncable {
@@ -883,6 +986,8 @@ enum SyncedTypesBootstrap {
         r.register(SyncedProviderThinkingRuleV3.self)
         r.register(SyncedEnvVars.self)   // legacy whole-file, inbound only
         r.register(SyncedEnvVar.self)    // per-variable, current schema
+        r.register(SyncedEnvProfile.self)
+        r.register(SyncedEnvProfileVar.self)
         r.register(SyncedDevice.self)
         r.register(SyncedSoul.self)
         r.register(SyncedMemoryGlobal.self)

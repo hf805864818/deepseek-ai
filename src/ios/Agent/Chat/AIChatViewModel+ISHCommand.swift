@@ -54,12 +54,24 @@ extension AIChatViewModel {
                                          lineCallback: lineCallback)
     }
 
+    /// Returns the env profile ID for the given session, or nil if the session
+    /// has no profile or cannot be found. Uses ChatStore's direct DB lookup
+    /// (primary key, O(1)) — safe to call on the command execution path.
+    private func envProfileId(for sessionId: String) -> String? {
+        ChatStore.shared.getSession(sessionId)?.envProfileId
+    }
+
     /// Executor adapter handing OnDemandBash a way to run guest commands.
     private func ishExecutor(sessionId sid: String) -> OnDemandBash.Executor {
-        OnDemandBash.Executor(run: { command, timeout in
+        let profileId = envProfileId(for: sid)
+        return OnDemandBash.Executor(run: { command, timeout in
             let r = try? await ISHExecutionCoordinator.shared.execute(
-                sessionId: sid, command: command, timeout: timeout,
-                lineCallback: { _ in }, pidCallback: { _ in })
+                sessionId: sid,
+                envProfileId: profileId,
+                command: command,
+                timeout: timeout,
+                lineCallback: { _ in },
+                pidCallback: { _ in })
             return r?.exitCode ?? -1
         })
     }
@@ -146,6 +158,7 @@ extension AIChatViewModel {
         do {
             result = try await ISHExecutionCoordinator.shared.execute(
                 sessionId: sid,
+                envProfileId: envProfileId(for: sid),
                 command: command,
                 timeout: effectiveTimeout,
                 // ISHShellExecutor dispatches every line on the main queue

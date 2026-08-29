@@ -92,6 +92,7 @@ actor ISHExecutionCoordinator {
     /// [T-concurrent-tools 2026-05-25]
     func execute(
         sessionId: String,
+        envProfileId: String?,
         command: String,
         timeout: TimeInterval?,
         lineCallback: @escaping (String) -> Void,
@@ -125,6 +126,7 @@ actor ISHExecutionCoordinator {
 
         return try await runCommand(
             sessionId: sessionId,
+            envProfileId: envProfileId,
             myId: myId,
             fsContext: fsContext,
             command: command,
@@ -265,6 +267,7 @@ actor ISHExecutionCoordinator {
     /// Bridge ISHShellExecutor's callback API to async/await.
     private func runCommand(
         sessionId: String,
+        envProfileId: String?,
         myId: UUID,
         fsContext: UInt64,
         command: String,
@@ -274,8 +277,9 @@ actor ISHExecutionCoordinator {
     ) async throws -> ISHCommandResult {
         let effectiveTimeout = timeout ?? 300 // 5 minute default
 
-        // Load user-defined env vars (nonisolated, reads from disk + Keychain)
-        let customEnv = EnvVarStore.shared.allAsDict()
+        // Load resolved env vars from the given profile (nonisolated, safe to call from this actor).
+        // When envProfileId is nil, falls back to global env vars only.
+        let customEnv = EnvProfileStore.shared.resolvedEnv(forProfile: envProfileId)
 
         // Feed the command as a script via stdin pipe to /bin/sh.
         // This avoids shell quoting issues with multi-line or special-char commands.

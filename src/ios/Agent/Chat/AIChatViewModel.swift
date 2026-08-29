@@ -2716,6 +2716,43 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
     }
 
+    // MARK: - Environment profile prompt snippet
+
+    /// Builds a system-prompt fragment describing the active environment
+    /// profile and the names of all available environment variables (global +
+    /// profile-merged).  Returns `nil` when the session has no profile or the
+    /// profile cannot be resolved.
+    ///
+    /// Values are intentionally NOT revealed — only variable names are listed.
+    private func envProfileSystemPromptSnippet() async -> String? {
+        guard let sid = sessionId,
+              let session = await ChatStore.shared.getSession(sid),
+              let profileId = session.envProfileId,
+              let profile = EnvProfileStore.shared.profile(id: profileId) else {
+            return nil
+        }
+
+        // Collect all resolved env var names: global vars plus profile vars
+        // (profile values override global vars with the same key, but for
+        // name-listing we just need the union of keys).
+        let globalKeys = Set(EnvVarStore.shared.entries.map(\.key))
+        let profileKeys = Set(EnvProfileStore.shared.vars(for: profileId).map(\.key))
+        let allKeys = globalKeys.union(profileKeys).sorted()
+
+        var lines: [String] = []
+        lines.append("## Environment Profile: \(profile.name)")
+        lines.append("")
+        lines.append("The current environment profile \"\(profile.name)\" is active. The following environment variables are available (profile values override global values with the same name):")
+        lines.append("")
+        for key in allKeys {
+            lines.append("- \(key)")
+        }
+        lines.append("")
+        lines.append("You can use these environment variables in shell commands and code. Do NOT reveal or print the values of environment variables to the user.")
+
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Deep mode scope context (Phase 3)
 
     /// Build the scope context for rule matching from recent messages.
@@ -5736,6 +5773,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             userSystemPrompt += "\n\n" + mcpFragment
         }
 
+        // Inject environment profile info (active profile + available env var names).
+        if let envProfileFragment = await envProfileSystemPromptSnippet() {
+            userSystemPrompt += "\n\n" + envProfileFragment
+        }
+
         // [T-memory-toggle-gates-injection-and-tools-ios] Memory injection
         // (GLOBAL.md + recent daily logs) is gated by the per-session
         // memoryEnabled toggle. SOUL.md (identity / persona) is rendered
@@ -6224,6 +6266,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 if let sid = sessionId,
                    let mcpFragment = MCPStore.shared.systemPromptSnippet(for: sid) {
                     userSystemPrompt += "\n\n" + mcpFragment
+                }
+                // Inject environment profile info (active profile + available env var names).
+                if let envProfileFragment = await envProfileSystemPromptSnippet() {
+                    userSystemPrompt += "\n\n" + envProfileFragment
                 }
                 // [T-memory-toggle-gates-injection-and-tools-ios] Mirror
                 // the gate from the first injection site — fallback to a

@@ -759,9 +759,10 @@ struct AIChatView: View {
             .equatable()
         )
         .sheet(item: $titlePillEditSession) { session in
-            SessionEditSheet(session: session) { newTitle, newCategory in
+            SessionEditSheet(session: session) { newTitle, newCategory, newEnvProfileId in
                 Task {
                     await ChatStore.shared.updateSessionTitle(session.id, title: newTitle, category: newCategory)
+                    await ChatStore.shared.updateSessionEnvProfileId(session.id, envProfileId: newEnvProfileId)
                     refreshTitlePillSession()
                 }
                 titlePillEditSession = nil

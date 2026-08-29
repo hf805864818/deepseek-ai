@@ -356,13 +356,16 @@ class ISHTerminalViewModel: ObservableObject {
             logger.info("[StartShell] mountForSession: \(String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - stepStart) * 1000))ms")
         }
 
-        // Inject user-defined environment variables
+        // Inject resolved environment variables (global + session's env profile, if any).
+        // When opened from a session, resolve the session's env profile; otherwise
+        // fall back to global user-defined vars only.
         stepStart = CFAbsoluteTimeGetCurrent()
-        let customEnv = EnvVarStore.shared.allAsDict()
+        let sessionEnvProfileId = sessionId.flatMap { ChatStore.shared.getSession($0)?.envProfileId }
+        let customEnv = EnvProfileStore.shared.resolvedEnv(forProfile: sessionEnvProfileId)
         if !customEnv.isEmpty {
             ISHKernel.shared.customEnvironment = customEnv
         }
-        logger.info("[StartShell] envVars: \(String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - stepStart) * 1000))ms (\(customEnv.count) vars)")
+        logger.info("[StartShell] envVars: \(String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - stepStart) * 1000))ms (\(customEnv.count) vars, profile=\(sessionEnvProfileId ?? "nil"))")
 
         // Start shell
         stepStart = CFAbsoluteTimeGetCurrent()

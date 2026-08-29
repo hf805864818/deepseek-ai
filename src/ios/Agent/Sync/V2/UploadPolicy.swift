@@ -49,7 +49,8 @@ enum UploadPolicy {
                         "ProviderInstanceV3", "ProviderModelEntryV3", "ProviderModelGroupV3",
                         "ProviderThinkingRuleV3"]
             case .envVars:
-                return ["EnvVar", "EnvVarV2"]
+                return ["EnvVar", "EnvVarV2", "EnvVarItem",
+                        "EnvProfile", "EnvProfileVar"]
             case .memory:
                 return ["MemoryGlobalV2", "MemoryDailyV2"]
             }

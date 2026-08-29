@@ -53,6 +53,7 @@ struct ChatSession: Identifiable, Codable, Hashable {
     var remoteDeviceName: String? // human-readable name of the remote device
     var pinnedAt: Date?       // non-nil if session is pinned; timestamp of when it was pinned
     var folderId: String?     // non-nil if filed into a folder; NULL = ungrouped
+    var envProfileId: String? // non-nil if session uses a specific env var profile; NULL = global only
 
     /// Whether this session is from a remote device (read-only).
     var isRemote: Bool { remoteDeviceId != nil }
@@ -106,6 +107,50 @@ struct ChatSession: Identifiable, Codable, Hashable {
         // Mirror ==: cheap, identity + updatedAt. Avoids hashing long strings.
         hasher.combine(id)
         hasher.combine(updatedAt)
+    }
+
+    // MARK: - Codable (custom for backward compatibility)
+
+    private enum SessionCodingKeys: String, CodingKey {
+        case id, title, category, modelId, createdAt, updatedAt
+        case lastMessage, source, lastSyncedAt, remoteDeviceId
+        case remoteDeviceName, pinnedAt, folderId, envProfileId
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: SessionCodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        category = try c.decodeIfPresent(String.self, forKey: .category)
+        modelId = try c.decode(String.self, forKey: .modelId)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        lastMessage = try c.decodeIfPresent(String.self, forKey: .lastMessage)
+        source = try c.decodeIfPresent(String.self, forKey: .source)
+        lastSyncedAt = try c.decodeIfPresent(Date.self, forKey: .lastSyncedAt)
+        remoteDeviceId = try c.decodeIfPresent(String.self, forKey: .remoteDeviceId)
+        remoteDeviceName = try c.decodeIfPresent(String.self, forKey: .remoteDeviceName)
+        pinnedAt = try c.decodeIfPresent(Date.self, forKey: .pinnedAt)
+        folderId = try c.decodeIfPresent(String.self, forKey: .folderId)
+        envProfileId = try c.decodeIfPresent(String.self, forKey: .envProfileId) // new field, nil for legacy
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: SessionCodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encodeIfPresent(title, forKey: .title)
+        try c.encodeIfPresent(category, forKey: .category)
+        try c.encode(modelId, forKey: .modelId)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encodeIfPresent(lastMessage, forKey: .lastMessage)
+        try c.encodeIfPresent(source, forKey: .source)
+        try c.encodeIfPresent(lastSyncedAt, forKey: .lastSyncedAt)
+        try c.encodeIfPresent(remoteDeviceId, forKey: .remoteDeviceId)
+        try c.encodeIfPresent(remoteDeviceName, forKey: .remoteDeviceName)
+        try c.encodeIfPresent(pinnedAt, forKey: .pinnedAt)
+        try c.encodeIfPresent(folderId, forKey: .folderId)
+        try c.encodeIfPresent(envProfileId, forKey: .envProfileId)
     }
 }
 
@@ -643,6 +688,9 @@ actor ChatStore {
         // (push only after priority=0 drains in each batch).
         addColumnIfMissing(table: "sync_dirty_records", column: "priority", definition: "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing(table: "sync_dirty_records", column: "created_at", definition: "REAL NOT NULL DEFAULT 0")
+        // Env var profile binding: NULL = use global defaults only; a non-nil
+        // ID means the session is scoped to that profile's variable set.
+        addColumnIfMissing(table: "sessions", column: "env_profile_id", definition: "TEXT")
 
         // One-shot cleanup: drop legacy v1 dirty rows that have a v2
         // counterpart. Under the V2 engine these have no consumer (the
@@ -988,7 +1036,8 @@ actor ChatStore {
             modelId: modelId,
             createdAt: now,
             updatedAt: now,
-            source: source
+            source: source,
+            envProfileId: nil
         )
 
         // [T-memory-enabled-new-session-bug] Explicitly write memory_enabled
@@ -1253,7 +1302,8 @@ actor ChatStore {
                    -- Appended LAST on purpose: the decode below reads columns
                    -- by index, so a new column goes at the end to leave every
                    -- existing index untouched.
-                   s.folder_id
+                   s.folder_id,
+                   s.env_profile_id
             FROM sessions s ORDER BY s.updated_at DESC
             """
             // Note: `remote_tombstoned_at` column still exists on the
@@ -1326,13 +1376,14 @@ actor ChatStore {
                 let pinnedAt: Date? = sqlite3_column_type(stmt, 11) != SQLITE_NULL
                     ? Date(timeIntervalSince1970: sqlite3_column_double(stmt, 11)) : nil
                 let folderId = Self.colTextOpt(stmt, 14)
+                let envProfileId = Self.colTextOpt(stmt, 15)
 
                 sessions.append(ChatSession(
                     id: id, title: title, category: category, modelId: modelId,
                     createdAt: createdAt, updatedAt: updatedAt, lastMessage: lastMessage,
                     source: source, lastSyncedAt: lastSyncedAt,
                     remoteDeviceId: remoteDeviceId, pinnedAt: pinnedAt,
-                    folderId: folderId
+                    folderId: folderId, envProfileId: envProfileId
                 ))
             }
         }
@@ -1548,7 +1599,8 @@ actor ChatStore {
             SELECT DISTINCT s.id, s.title, s.model_id, s.created_at, s.updated_at, s.category,
                    (SELECT m2.parts_json FROM messages m2
                     WHERE m2.session_id = s.id AND m2.parts_json LIKE ?
-                    ORDER BY m2.sort_order DESC LIMIT 1)
+                    ORDER BY m2.sort_order DESC LIMIT 1),
+                   s.env_profile_id
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.id
             WHERE s.title LIKE ? OR m.parts_json LIKE ?
@@ -1572,13 +1624,15 @@ actor ChatStore {
                 let updatedAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
                 let category = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
                 let matchedPartsJSON = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
+                let envProfileId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
 
                 let titleMatched = title?.lowercased().contains(lowerQuery) == true
                 let snippet = matchedPartsJSON.flatMap { extractTextFromPartsJSON($0) }
 
                 let session = ChatSession(
                     id: id, title: title, category: category, modelId: modelId,
-                    createdAt: createdAt, updatedAt: updatedAt, lastMessage: snippet
+                    createdAt: createdAt, updatedAt: updatedAt, lastMessage: snippet,
+                    envProfileId: envProfileId
                 )
                 results.append(SearchResult(session: session, matchSnippet: snippet, titleMatched: titleMatched))
             }
@@ -1920,7 +1974,7 @@ actor ChatStore {
     }
 
     func getSession(_ id: String) -> ChatSession? {
-        let sql = "SELECT id, title, model_id, created_at, updated_at, category, source, pinned_at, folder_id FROM sessions WHERE id = ?"
+        let sql = "SELECT id, title, model_id, created_at, updated_at, category, source, pinned_at, folder_id, env_profile_id FROM sessions WHERE id = ?"
         var stmt: OpaquePointer?
         var session: ChatSession?
 
@@ -1936,11 +1990,12 @@ actor ChatStore {
                 let pinnedAt: Date? = sqlite3_column_type(stmt, 7) != SQLITE_NULL
                     ? Date(timeIntervalSince1970: sqlite3_column_double(stmt, 7)) : nil
                 let folderId = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
+                let envProfileId = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
 
                 session = ChatSession(
                     id: id, title: title, category: category, modelId: modelId,
                     createdAt: createdAt, updatedAt: updatedAt, source: source,
-                    pinnedAt: pinnedAt, folderId: folderId
+                    pinnedAt: pinnedAt, folderId: folderId, envProfileId: envProfileId
                 )
             }
         }
@@ -1955,6 +2010,18 @@ actor ChatStore {
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
             sqlite3_bind_text(stmt, 1, (modelId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (id as NSString).utf8String, -1, nil)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+    }
+
+    func updateSessionEnvProfileId(_ id: String, envProfileId: String?) {
+        invalidateSessionListCache()
+        let sql = "UPDATE sessions SET env_profile_id = ? WHERE id = ?"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindOptionalText(stmt, index: 1, value: envProfileId)
             sqlite3_bind_text(stmt, 2, (id as NSString).utf8String, -1, nil)
             sqlite3_step(stmt)
         }
@@ -6058,13 +6125,14 @@ extension ChatStore {
     ///   local folder assignment must be preserved, whereas a new-build peer
     ///   sending an explicit nil means "ungrouped on that device" and, when
     ///   remote is newer, that wins (folder_id rides the session's LWW).
-    func mergeRemoteSession(_ session: ChatSession, fromDeviceId: String, memoryEnabled: Bool = true, modelBinding: String? = nil, remotePinnedAtRaw: Date? = nil, remoteFolderId: String? = nil, remoteHasFolderField: Bool = false) {
+    func mergeRemoteSession(_ session: ChatSession, fromDeviceId: String, memoryEnabled: Bool = true, modelBinding: String? = nil, remotePinnedAtRaw: Date? = nil, remoteFolderId: String? = nil, remoteHasFolderField: Bool = false, remoteEnvProfileId: String? = nil, remoteHasEnvProfileField: Bool = false) {
         invalidateSessionListCache()
         // Check if local session exists and its updated_at + pinned_at
         var localUpdatedAt: Double?
         var localPinnedAt: Double?
         var localFolderId: String?
-        let checkSql = "SELECT updated_at, pinned_at, folder_id FROM sessions WHERE id = ?"
+        var localEnvProfileId: String?
+        let checkSql = "SELECT updated_at, pinned_at, folder_id, env_profile_id FROM sessions WHERE id = ?"
         var checkStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, checkSql, -1, &checkStmt, nil) == SQLITE_OK {
             sqlite3_bind_text(checkStmt, 1, (session.id as NSString).utf8String, -1, nil)
@@ -6074,6 +6142,7 @@ extension ChatStore {
                     localPinnedAt = sqlite3_column_double(checkStmt, 1)
                 }
                 localFolderId = sqlite3_column_text(checkStmt, 2).map { String(cString: $0) }
+                localEnvProfileId = sqlite3_column_text(checkStmt, 3).map { String(cString: $0) }
             }
         }
         sqlite3_finalize(checkStmt)
@@ -6118,9 +6187,17 @@ extension ChatStore {
                 // folder_id is written ONLY when the peer's record carried
                 // the field — an old build's record omitting it must not wipe
                 // a local folder assignment (same tolerance pinnedAt got).
-                let sql = remoteHasFolderField
-                    ? "UPDATE sessions SET title = ?, category = ?, updated_at = ?, memory_enabled = ?, model_binding = ?, pinned_at = ?, folder_id = ? WHERE id = ?"
-                    : "UPDATE sessions SET title = ?, category = ?, updated_at = ?, memory_enabled = ?, model_binding = ?, pinned_at = ? WHERE id = ?"
+                // env_profile_id follows the same rule.
+                let sql: String
+                if remoteHasFolderField && remoteHasEnvProfileField {
+                    sql = "UPDATE sessions SET title = ?, category = ?, updated_at = ?, memory_enabled = ?, model_binding = ?, pinned_at = ?, folder_id = ?, env_profile_id = ? WHERE id = ?"
+                } else if remoteHasFolderField {
+                    sql = "UPDATE sessions SET title = ?, category = ?, updated_at = ?, memory_enabled = ?, model_binding = ?, pinned_at = ?, folder_id = ? WHERE id = ?"
+                } else if remoteHasEnvProfileField {
+                    sql = "UPDATE sessions SET title = ?, category = ?, updated_at = ?, memory_enabled = ?, model_binding = ?, pinned_at = ?, env_profile_id = ? WHERE id = ?"
+                } else {
+                    sql = "UPDATE sessions SET title = ?, category = ?, updated_at = ?, memory_enabled = ?, model_binding = ?, pinned_at = ? WHERE id = ?"
+                }
                 var stmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
                     bindOptionalText(stmt, index: 1, value: session.title)
@@ -6133,12 +6210,16 @@ extension ChatStore {
                     } else {
                         sqlite3_bind_null(stmt, 6)
                     }
+                    var nextIndex: Int32 = 7
                     if remoteHasFolderField {
-                        bindOptionalText(stmt, index: 7, value: remoteFolderId)
-                        sqlite3_bind_text(stmt, 8, (session.id as NSString).utf8String, -1, nil)
-                    } else {
-                        sqlite3_bind_text(stmt, 7, (session.id as NSString).utf8String, -1, nil)
+                        bindOptionalText(stmt, index: nextIndex, value: remoteFolderId)
+                        nextIndex += 1
                     }
+                    if remoteHasEnvProfileField {
+                        bindOptionalText(stmt, index: nextIndex, value: remoteEnvProfileId)
+                        nextIndex += 1
+                    }
+                    sqlite3_bind_text(stmt, nextIndex, (session.id as NSString).utf8String, -1, nil)
                     sqlite3_step(stmt)
                 }
                 sqlite3_finalize(stmt)
@@ -6184,6 +6265,22 @@ extension ChatStore {
                     iCloudLogger.info("[iCloud] mergeRemoteSession folder sub-merge: id=\(session.id.prefix(8)) -> folder \(remoteFid.prefix(8))")
                     NotificationCenter.default.post(name: .sessionDidUpdate, object: session.id)
                 }
+                // env_profile_id uses the same conservative sub-merge rule
+                // as folder_id: adopt remote only when local has no opinion
+                // (local NULL), since changing env profile doesn't bump
+                // updated_at. See folder sub-merge comment above for rationale.
+                if remoteHasEnvProfileField, localEnvProfileId == nil, let remoteEid = remoteEnvProfileId {
+                    let eSql = "UPDATE sessions SET env_profile_id = ? WHERE id = ? AND env_profile_id IS NULL"
+                    var eStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, eSql, -1, &eStmt, nil) == SQLITE_OK {
+                        sqlite3_bind_text(eStmt, 1, (remoteEid as NSString).utf8String, -1, nil)
+                        sqlite3_bind_text(eStmt, 2, (session.id as NSString).utf8String, -1, nil)
+                        sqlite3_step(eStmt)
+                    }
+                    sqlite3_finalize(eStmt)
+                    iCloudLogger.info("[iCloud] mergeRemoteSession envProfile sub-merge: id=\(session.id.prefix(8)) -> profile \(remoteEid.prefix(8))")
+                    NotificationCenter.default.post(name: .sessionDidUpdate, object: session.id)
+                }
                 // Even if we skip the main update, still merge pin state if remote has pin info
                 // and the resolved pin differs from local
                 if remotePinnedAtRaw != nil, resolvedPinnedAt != localPinnedAt {
@@ -6214,7 +6311,7 @@ extension ChatStore {
             }
             // Local doesn't have this session — insert
             iCloudLogger.info("[iCloud] mergeRemoteSession INSERT: id=\(session.id) title=\(session.title ?? "nil") from=\(fromDeviceId)")
-            let sql = "INSERT INTO sessions (id, title, category, model_id, created_at, updated_at, remote_origin_device_id, memory_enabled, model_binding, pinned_at, folder_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            let sql = "INSERT INTO sessions (id, title, category, model_id, created_at, updated_at, remote_origin_device_id, memory_enabled, model_binding, pinned_at, folder_id, env_profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(stmt, 1, (session.id as NSString).utf8String, -1, nil)
@@ -6235,6 +6332,12 @@ extension ChatStore {
                 // the list renders it as ungrouped until FolderV2 arrives
                 // (fetchRecentV2 ordering gives no cross-type guarantees).
                 bindOptionalText(stmt, index: 11, value: remoteHasFolderField ? remoteFolderId : nil)
+                // env_profile_id: same tolerance as folder_id — old devices
+                // that don't carry the field must not pre-emptively NULL out
+                // a value (though on INSERT there's no local to preserve, we
+                // still gate on field presence for consistency and to match
+                // the UPDATE branch's semantic).
+                bindOptionalText(stmt, index: 12, value: remoteHasEnvProfileField ? remoteEnvProfileId : nil)
                 sqlite3_step(stmt)
             }
             sqlite3_finalize(stmt)
@@ -6551,7 +6654,8 @@ extension ChatStore {
                     category: sqlite3_column_text(stmt, 2).map { String(cString: $0) },
                     modelId: String(cString: sqlite3_column_text(stmt, 3)),
                     createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)),
-                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
+                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5)),
+                    envProfileId: nil
                 ))
             }
         }

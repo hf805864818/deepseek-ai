@@ -1033,6 +1033,11 @@ extension AIChatViewModel {
         let session = await ChatStore.shared.createSession(modelId: model.id, source: sessionSource)
         sessionId = session.id
         Self.activeSessionId = session.id
+
+        // Apply default env profile to new sessions, if one is set.
+        if let defaultProfile = EnvProfileStore.shared.defaultProfile {
+            await ChatStore.shared.updateSessionEnvProfileId(session.id, envProfileId: defaultProfile.id)
+        }
         // [T-memory-enabled-new-session-bug] Sync the @Published memoryEnabled
         // to the value createSession just persisted from the global default.
         // A draft VM initializes memoryEnabled = true and never runs

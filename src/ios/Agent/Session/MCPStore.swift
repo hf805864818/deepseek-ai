@@ -674,6 +674,7 @@ final class MCPStore: ObservableObject {
         let quoted = "'" + server.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let result = try await ISHExecutionCoordinator.shared.execute(
             sessionId: "mcp-settings",
+            envProfileId: nil,
             command: "minis-mcp-cli refresh \(quoted)",
             timeout: 120,
             lineCallback: { _ in },
