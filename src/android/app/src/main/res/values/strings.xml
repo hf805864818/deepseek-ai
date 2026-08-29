@@ -731,6 +731,9 @@
     <string name="env_profile_delete_confirm_text">This will permanently remove the profile and all of its variables.</string>
     <string name="env_profile_form_add_title">New Profile</string>
     <string name="env_profile_form_edit_title">Edit Profile</string>
+    <string name="env_profile_session_label">Environment Profile</string>
+    <string name="env_profile_none">None (Global only)</string>
+    <string name="env_profile_delete_confirm_title">Delete %1$s?</string>
     <string name="log_title">Logs</string>
     <string name="log_share_all">Share All</string>
     <string name="log_section_logging">Logging</string>

@@ -3004,7 +3004,7 @@ internal fun SessionEditSheet(
             // auto-applies to new sessions.
             if (envProfileRepository != null) {
                 Text(
-                    "Environment Profile",
+                    stringResource(R.string.env_profile_session_label),
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.padding(bottom = 8.dp),
                 )
@@ -3015,7 +3015,7 @@ internal fun SessionEditSheet(
                     ) {
                         val selectedName = profiles.firstOrNull { it.id == selectedProfileId }?.name
                         Text(
-                            if (selectedProfileId == null || selectedName == null) "None (Global only)"
+                            if (selectedProfileId == null || selectedName == null) stringResource(R.string.env_profile_none)
                             else selectedName,
                         )
                         Spacer(Modifier.weight(1f))
@@ -3030,7 +3030,7 @@ internal fun SessionEditSheet(
                         onDismissRequest = { profileMenuExpanded = false },
                     ) {
                         DropdownMenuItem(
-                            text = { Text("None (Global only)") },
+                            text = { Text(stringResource(R.string.env_profile_none)) },
                             onClick = {
                                 selectedProfileId = null
                                 profileMenuExpanded = false
@@ -3043,7 +3043,7 @@ internal fun SessionEditSheet(
                                         Text(profile.name)
                                         if (profile.isDefault) {
                                             Spacer(Modifier.width(8.dp))
-                                            Badge { Text("Default") }
+                                            Badge { Text(stringResource(R.string.common_default)) }
                                         }
                                     }
                                 },

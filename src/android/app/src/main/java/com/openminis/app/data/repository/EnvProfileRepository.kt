@@ -74,7 +74,7 @@ class EnvProfileRepository(private val context: Context) {
 
     fun profile(id: String): EnvProfile? = _profiles.value.firstOrNull { it.id == id }
 
-    fun vars(for profileId: String): List<EnvProfileVar> =
+    fun vars(`for` profileId: String): List<EnvProfileVar> =
         _vars.value.filter { it.profileId == profileId }.sortedBy { it.key }
 
     fun value(profileId: String, key: String): String? =

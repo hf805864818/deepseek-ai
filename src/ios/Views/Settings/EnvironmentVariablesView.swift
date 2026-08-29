@@ -42,7 +42,7 @@ struct EnvironmentVariablesView: View {
             Section {
                 Picker("Category", selection: $selectedTab) {
                     ForEach(EnvVarTab.allCases, id: \.self) { tab in
-                        Text(tab.rawValue).tag(tab)
+                        Text(LocalizedStringKey(tab.rawValue)).tag(tab)
                     }
                 }
                 .pickerStyle(.segmented)
