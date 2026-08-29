@@ -3253,8 +3253,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// async hop to the actor. Empty string means "not yet loaded" — treat as
     /// no fallback.
     var cachedSessionModelId: String = ""
+    /// [T-perf-tools-cache] Cached result of makeAgentTools().
+    /// Tool definitions depend on deepModeEnabled + memoryEnabled + vision
+    /// capability — all slow-changing. Invalidated implicitly: the next call
+    /// sees a different key and rebuilds.
+    var _cachedAgentTools: (
+        deepModeEnabled: Bool,
+        memoryEnabled: Bool,
+        nativeVision: Bool,
+        visionGroupConfigured: Bool,
+        tools: [AgentToolDefinition]
+    )?
     /// The ModelEntry used in the current/last agent loop, for rebuilding the provider.
     var keepAliveEntry: ModelEntry?
+    /// [T-perf-history-bg-warmup] Background task pre-computing effectiveAgentHistory()
+    /// so the first call in runAgentLoop hits the cache instead of blocking the main
+    /// thread. Started at send() time, runs in parallel with attachment processing.
+    var _historyWarmupTask: Task<Void, Never>?
     /// Pending thought signatures loaded from persisted session, keyed by tool call ID.
     /// Applied to GeminiAgentProvider when the agent loop starts.
     var pendingThoughtSignatures: [String: ToolCallMetadata] = [:]
@@ -3597,6 +3612,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         currentTask = Task { [weak self] in
             guard let self else { return }
+
+            // [T-perf-history-bg-warmup] Kick off the O(n×m) history scan on a
+            // background thread NOW, so it runs in parallel with the attachment
+            // processing below. By the time runAgentLoop needs effectiveAgentHistory(),
+            // the cache should already be warm — zero main-thread blocking.
+            self.warmupEffectiveHistoryInBackground()
 
             // Lazily create session before persisting anything
             await self.ensureSession()
@@ -6216,6 +6237,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             fallbackReasons.removeAll()
             // Phase B: route through effectiveAgentHistory() so compact summary is
             // synthesized at inference time instead of baked into agentHistory.
+            // [T-perf-history-bg-warmup] Wait for the background warmup to finish
+            // before calling effectiveAgentHistory(). If warmup already finished
+            // this returns immediately; if not, we yield the main actor so the UI
+            // stays responsive while the O(n×m) scan completes.
+            if let warmup = _historyWarmupTask {
+                await warmup.value
+                _historyWarmupTask = nil
+            }
             let contextHistory = effectiveAgentHistory()
             let stream = try await streamWithGroupFallback(
                 provider: provider,

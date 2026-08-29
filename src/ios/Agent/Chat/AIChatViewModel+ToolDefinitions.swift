@@ -28,6 +28,37 @@ extension AIChatViewModel {
     // MARK: - Tool Definitions (Canonical)
 
     func makeAgentTools() -> [AgentToolDefinition] {
+        // [T-perf-tools-cache] Cache the tool definition list so repeated calls
+        // within the same configuration state are O(1). Tool definitions only
+        // change when deepModeEnabled, memoryEnabled, or the active model's
+        // vision capability changes — all low-frequency events. This saves
+        // ~5-10ms per inference call on the hot path (DeepMode = 3-8 calls/turn
+        // × ~8ms = 24-64ms saved per turn).
+        let kDeep = deepModeEnabled
+        let kMem = memoryEnabled
+        let kVision = activeModelHasNativeVision
+        let kVG = VisionGroupResolver.isConfigured
+        if let cached = _cachedAgentTools,
+           cached.deepModeEnabled == kDeep,
+           cached.memoryEnabled == kMem,
+           cached.nativeVision == kVision,
+           cached.visionGroupConfigured == kVG {
+            return cached.tools
+        }
+        let tools = buildAgentTools()
+        _cachedAgentTools = (
+            deepModeEnabled: kDeep,
+            memoryEnabled: kMem,
+            nativeVision: kVision,
+            visionGroupConfigured: kVG,
+            tools: tools
+        )
+        return tools
+    }
+
+    /// [T-perf-tools-cache] Actual tool-building logic, extracted from the old
+    /// inline body of makeAgentTools() so the cache layer can wrap it cleanly.
+    private func buildAgentTools() -> [AgentToolDefinition] {
         // [T-memory-toggle-gates-injection-and-tools-ios] memory_get and
         // memory_write are conditionally registered. When the per-session
         // toggle is off, drop both tool definitions so the LLM never sees

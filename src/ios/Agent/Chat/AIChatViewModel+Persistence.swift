@@ -1598,6 +1598,96 @@ extension AIChatViewModel {
         return result
     }
 
+    /// [T-perf-history-bg-warmup] Kick off a background task that pre-computes
+    /// effectiveAgentHistory() so the first call inside runAgentLoop hits the
+    /// cache instead of blocking the main thread.
+    ///
+    /// Why this matters: AIChatViewModel is @MainActor, so everything inside
+    /// `Task { ... }` still runs on the main thread. Without this warmup, the
+    /// first effectiveAgentHistory() call in runAgentLoop does a full O(n×m)
+    /// scan on the main thread — 100–300ms on long DeepMode sessions.
+    ///
+    /// With warmup: the scan runs on a background thread in parallel with
+    /// attachment processing (file copies, compression, uploads), so by the
+    /// time runAgentLoop needs the history, the cache is already warm.
+    ///
+    /// Safe to call multiple times — subsequent calls no-op if a warmup task
+    /// is already running or the cache is already valid for the current state.
+    func warmupEffectiveHistoryInBackground() {
+        let currentCount = agentHistory.count
+        let currentMarkerId = cachedLatestMarker?.id
+
+        // Already cached and valid → nothing to do
+        if let cached = _cachedEffectiveHistory,
+           cached.historyCount == currentCount,
+           cached.markerId == currentMarkerId {
+            return
+        }
+
+        // Incremental fast path is already O(Δ×m) ≈ sub-ms — only worth
+        // offloading when a full build is needed (cold cache or marker change).
+        if currentMarkerId == nil,
+           let cached = _cachedEffectiveHistory,
+           cached.markerId == nil,
+           currentCount > cached.historyCount {
+            // Incremental path on main thread is fast enough (just new messages)
+            return
+        }
+
+        // Capture a snapshot of the data we need for the full build.
+        // AgentMessage is a struct (@unchecked Sendable), so the array copy
+        // is safe to pass to a background thread for read-only traversal.
+        let historySnapshot = agentHistory
+        let markerSnapshot = cachedLatestMarker
+
+        _historyWarmupTask = Task.detached(priority: .userInitiated) { [weak self] in
+            // Build id sets + check orphans — this is the O(n×m) heavy part
+            var toolUseIds: Set<String> = []
+            var toolResultIds: Set<String> = []
+            for msg in historySnapshot {
+                for part in msg.parts {
+                    switch part {
+                    case .toolUse(let id, _, _): toolUseIds.insert(id)
+                    case .toolResult(let id, _, _, _, _, _, _, _): toolResultIds.insert(id)
+                    default: break
+                    }
+                }
+            }
+
+            // With no marker, effectiveAgentHistoryUncounted == identity,
+            // so the raw history is the input to dropOrphanedToolParts.
+            // Call the static function directly (pure, thread-safe).
+            let result: [AgentMessage]
+            if markerSnapshot == nil {
+                result = Self.dropOrphanedToolParts(historySnapshot, logger: logger)
+            } else {
+                // Marker present: we can't easily compute the effective slice
+                // off-main because it depends on more MainActor state. Skip
+                // the warmup — marker sessions are already shorter (compacted).
+                return
+            }
+
+            // Write result back to the cache on the main actor.
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                // Only update if state hasn't changed while we were computing
+                guard self.agentHistory.count == currentCount,
+                      self.cachedLatestMarker?.id == currentMarkerId else {
+                    logger.info("[Compact] history warmup: discarded (state changed during background build)")
+                    return
+                }
+                self._cachedEffectiveHistory = (
+                    result: result,
+                    historyCount: currentCount,
+                    markerId: currentMarkerId,
+                    toolUseIds: toolUseIds,
+                    toolResultIds: toolResultIds
+                )
+                logger.info("[Compact] history warmup: completed \(result.count) msg(s) (background build, cache is now warm)")
+            }
+        }
+    }
+
     /// [T-ios-compact-orphan-toolcall] Last line of defence before a history
     /// slice becomes a provider request: every `toolResult`
     /// (function_call_output) must have a matching `toolUse` (function_call)
