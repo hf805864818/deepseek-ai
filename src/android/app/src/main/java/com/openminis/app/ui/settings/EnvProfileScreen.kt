@@ -46,12 +46,15 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -193,15 +196,44 @@ fun EnvProfileScreen(
                     .padding(padding),
             ) {
                 itemsIndexed(profiles) { index, profile ->
-                    EnvProfileRow(
-                        profile = profile,
-                        onClick = { selectedProfileId = profile.id },
-                        onLongClick = {
-                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                            deleteProfile = profile
+                    val dismissState = rememberSwipeToDismissBoxState(
+                        confirmValueChange = { value ->
+                            if (value == SwipeToDismissBoxValue.EndToStart) {
+                                deleteProfile = profile
+                                true
+                            } else {
+                                false
+                            }
                         },
-                        showDivider = index < profiles.size - 1,
                     )
+                    SwipeToDismissBox(
+                        state = dismissState,
+                        backgroundContent = {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(MaterialTheme.colorScheme.error)
+                                    .padding(horizontal = 20.dp),
+                                contentAlignment = Alignment.CenterEnd,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onError,
+                                )
+                            }
+                        },
+                    ) {
+                        EnvProfileRow(
+                            profile = profile,
+                            onClick = { selectedProfileId = profile.id },
+                            onLongClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                deleteProfile = profile
+                            },
+                            showDivider = index < profiles.size - 1,
+                        )
+                    }
                 }
             }
         }
@@ -417,6 +449,7 @@ fun EnvProfileListSection(
     profiles: List<EnvProfileRepository.EnvProfile>,
     onProfileClick: (EnvProfileRepository.EnvProfile) -> Unit,
     onProfileLongClick: (EnvProfileRepository.EnvProfile) -> Unit,
+    onProfileDelete: (EnvProfileRepository.EnvProfile) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     SettingsSection(
@@ -445,12 +478,41 @@ fun EnvProfileListSection(
             }
         } else {
             profiles.forEachIndexed { index, profile ->
-                EnvProfileRow(
-                    profile = profile,
-                    onClick = { onProfileClick(profile) },
-                    onLongClick = { onProfileLongClick(profile) },
-                    showDivider = index < profiles.size - 1,
+                val dismissState = rememberSwipeToDismissBoxState(
+                    confirmValueChange = { value ->
+                        if (value == SwipeToDismissBoxValue.EndToStart) {
+                            onProfileDelete(profile)
+                            true
+                        } else {
+                            false
+                        }
+                    },
                 )
+                SwipeToDismissBox(
+                    state = dismissState,
+                    backgroundContent = {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.error)
+                                .padding(horizontal = 20.dp),
+                            contentAlignment = Alignment.CenterEnd,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onError,
+                            )
+                        }
+                    },
+                ) {
+                    EnvProfileRow(
+                        profile = profile,
+                        onClick = { onProfileClick(profile) },
+                        onLongClick = { onProfileLongClick(profile) },
+                        showDivider = index < profiles.size - 1,
+                    )
+                }
             }
         }
     }

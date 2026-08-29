@@ -17,6 +17,7 @@ struct EnvironmentVariablesView: View {
     @State private var prefillNote = ""
     @State private var overwriteConfirm: OverwriteRequest?
     @State private var selectedTab: EnvVarTab = .global
+    @State private var profileToDelete: EnvProfile?
 
     private enum EnvVarTab: String, CaseIterable {
         case global = "Global"
@@ -89,6 +90,24 @@ struct EnvironmentVariablesView: View {
             EnvProfileFormSheet(mode: .add) { name, icon, isDefault in
                 profileStore.addProfile(name: name, icon: icon, isDefault: isDefault)
             }
+        }
+        .alert(
+            String(localized: "Delete profile?"),
+            isPresented: Binding(
+                get: { profileToDelete != nil },
+                set: { if !$0 { profileToDelete = nil } }
+            ),
+            presenting: profileToDelete
+        ) { profile in
+            Button(String(localized: "Delete"), role: .destructive) {
+                profileStore.deleteProfile(id: profile.id)
+                profileToDelete = nil
+            }
+            Button(String(localized: "Cancel"), role: .cancel) {
+                profileToDelete = nil
+            }
+        } message: { profile in
+            Text(String(localized: "All env vars in \"\(profile.name)\" will be deleted. This cannot be undone."))
         }
         .onAppear {
             if let pending = deepLink.pendingEnvVarCreate {
@@ -206,6 +225,11 @@ struct EnvironmentVariablesView: View {
             Section {
                 ForEach(profileStore.profiles) { profile in
                     profileNavRow(profile)
+                }
+                .onDelete { offsets in
+                    if let index = offsets.first {
+                        profileToDelete = profileStore.profiles[index]
+                    }
                 }
             } header: {
                 Text("Profiles")

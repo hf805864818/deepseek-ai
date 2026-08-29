@@ -229,6 +229,7 @@ fun EnvironmentVariablesScreen(
                 profiles = profiles,
                 onProfileClick = { selectedProfileId = it.id },
                 onProfileLongClick = { deleteProfile = it },
+                onProfileDelete = { deleteProfile = it },
             )
         }
 
