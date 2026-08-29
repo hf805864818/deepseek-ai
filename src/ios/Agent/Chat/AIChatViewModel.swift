@@ -3237,7 +3237,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Invalidated whenever agentHistory.count changes or cachedLatestMarker changes.
     /// Avoids repeating the O(n×m) dropOrphanedToolParts scan on every inference
     /// call within the same turn (Plan-First + Self-Verify + retries = 3–8 calls).
-    var _cachedEffectiveHistory: (result: [AgentMessage], historyCount: Int, markerId: String?)?
+    ///
+    /// [T-perf-effective-history-incremental] toolUseIds / toolResultIds track the
+    /// cumulative id sets so the NEXT call can do an O(Δ×m) incremental build
+    /// instead of an O(n×m) full rebuild when only new messages were appended.
+    var _cachedEffectiveHistory: (
+        result: [AgentMessage],
+        historyCount: Int,
+        markerId: String?,
+        toolUseIds: Set<String>,
+        toolResultIds: Set<String>
+    )?
     /// The session's persisted model id (from ChatStore.getSession). Cached at
     /// loadSession time so resolveCurrentEntry can fall back to it without an
     /// async hop to the actor. Empty string means "not yet loaded" — treat as
@@ -3439,50 +3449,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
         }
 
-        // Check if context is near capacity
+        // [T-perf-send-optimistic-ui] Skip the synchronous context check on the
+        // main thread — it could trigger O(n×m) history scans and cause a visible
+        // stall when tapping Send. Instead we:
+        //   1. Update the UI immediately (message inserted, scroll to bottom)
+        //   2. Check context in the background Task before running the agent
+        //   3. If context needs attention, cancel and present the prompt
+        // This way the Send button feels instant in the common case (context ok).
+        let shouldCheckContext = !skipCompactCheck
         if skipCompactCheck {
             skipCompactCheck = false
-        } else {
-            switch checkContextBeforeSend() {
-            case .ok:
-                break
-            case .needsCompact:
-                if sessionSource == "shortcut" || autoCompactEnabled {
-                    // Shortcut sessions can't show UI prompts; auto-compact
-                    // opt-in [T-chat-auto-compact-opt-in] rides the same
-                    // no-prompt path — compact and send without asking.
-                    logger.info("[Context] Near capacity — auto-compacting (\(sessionSource == "shortcut" ? "shortcut session" : "autoCompactEnabled"))")
-                    pendingSendText = sendText
-                    pendingSendAttachments = pendingAttachments
-                    inputText = ""
-                    attachments = []
-                    compactAndSend()
-                    return
-                }
-                pendingSendText = sendText
-                pendingSendAttachments = pendingAttachments
-                inputText = ""
-                attachments = []
-                showCompactBeforeSendPrompt = true
-                logger.info("[Context] Near capacity — prompting user to compact before send")
-                return
-            case .exhausted:
-                if sessionSource == "shortcut" {
-                    // Shortcut sessions can't show UI — set inline error
-                    logger.info("[Context] Exhausted — shortcut session cannot continue")
-                    let errMsg = ChatMessage(role: .assistant, content: "", blocks: [])
-                    errMsg.error = String(localized: "Context full. Start a new session to continue.")
-                    messages.append(errMsg)
-                    return
-                }
-                pendingSendText = sendText
-                pendingSendAttachments = pendingAttachments
-                inputText = ""
-                attachments = []
-                showContextExhaustedPrompt = true
-                logger.info("[Context] Exhausted — prompting user to start new session or clear chat")
-                return
-            }
         }
 
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -3628,6 +3604,26 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // Defensive: ensure tracker reflects the real session ID after draft→real migration.
             if let sid = self.sessionId, self.isProcessing {
                 SessionActivityTracker.shared.setActive(sid, source: "vm=\(self.vmInstanceId) send/ensureSession draft→real")
+            }
+
+            // [T-perf-send-optimistic-ui] Check context AFTER the UI has already
+            // been updated (message inserted, composer cleared). In the common
+            // case (context ok) this adds zero latency to the Send tap. In the
+            // rare case (near capacity / exhausted) we cancel the in-flight
+            // task and fall back to the prompt flow — the user sees a brief
+            // "sending → queued" transition instead of a frozen Send button.
+            if shouldCheckContext {
+                let contextResult = self.checkContextBeforeSend()
+                if contextResult != .ok {
+                    await MainActor.run {
+                        self.handleSendContextFailure(
+                            result: contextResult,
+                            sendText: sendText,
+                            attachments: pendingAttachments
+                        )
+                    }
+                    return
+                }
             }
 
             // Copy attachment files to session uploads dir and build metadata

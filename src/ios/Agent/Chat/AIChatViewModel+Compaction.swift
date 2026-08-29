@@ -41,6 +41,87 @@ extension AIChatViewModel {
         checkContextBeforeSend() != .ok
     }
 
+    /// [T-perf-send-optimistic-ui] Handle context-check failure when the send
+    /// path already inserted the user message and started the Task. Converts
+    /// the last user message to queued state and shows the appropriate prompt.
+    /// Called from MainActor context.
+    func handleSendContextFailure(result: ContextPolicy.CheckResult, sendText: String, attachments: [AttachmentMeta]) {
+        // Find the last user message (the one we just inserted)
+        guard let lastUserMsg = messages.last(where: { $0.role == .user && !$0.isQueued }) else {
+            logger.warning("[Context] handleSendContextFailure: no last user message found, falling back to legacy flow")
+            pendingSendText = sendText
+            pendingSendAttachments = attachments
+            switch result {
+            case .needsCompact:
+                showCompactBeforeSendPrompt = true
+            case .exhausted:
+                showContextExhaustedPrompt = true
+            case .ok:
+                break
+            }
+            isProcessing = false
+            return
+        }
+
+        // Convert to queued state so the UI stays consistent
+        let queuedPrompt = QueuedPrompt(text: sendText, attachments: attachments)
+        promptQueue.append(queuedPrompt)
+        lastUserMsg.isQueued = true
+        lastUserMsg.queuedPromptId = queuedPrompt.id
+        lastUserMsg.inputAttachments = attachments
+
+        pendingSendText = sendText
+        pendingSendAttachments = attachments
+        isProcessing = false
+
+        switch result {
+        case .ok:
+            // Shouldn't happen, but handle gracefully
+            break
+        case .needsCompact:
+            if sessionSource == "shortcut" || autoCompactEnabled {
+                logger.info("[Context] Near capacity — auto-compacting (optimistic UI path)")
+                showCompactBeforeSendPrompt = false
+                // Re-run compactAndSend logic but skip re-inserting the message
+                // since we already converted it to queued above.
+                let activeMessages = messages.filter {
+                    $0.role != .compactDivider && $0.role != .systemInfo && !$0.isCompactedHistory && !$0.isQueued
+                }
+                guard activeMessages.count > 1, let lastActive = activeMessages.last else {
+                    // Not enough to compact — send directly
+                    promptQueue.removeAll { $0.id == queuedPrompt.id }
+                    lastUserMsg.isQueued = false
+                    lastUserMsg.queuedPromptId = nil
+                    skipCompactCheck = true
+                    isProcessing = true
+                    Task { await self.drainQueuedPrompts() }
+                    return
+                }
+                compactTask = Task {
+                    await self.compactBefore(lastActive.id)
+                    guard !Task.isCancelled else { return }
+                    self.schedulePostCompactDrain()
+                }
+            } else {
+                showCompactBeforeSendPrompt = true
+                logger.info("[Context] Near capacity — prompting user to compact (optimistic UI path)")
+            }
+        case .exhausted:
+            if sessionSource == "shortcut" {
+                logger.info("[Context] Exhausted — shortcut session cannot continue (optimistic UI path)")
+                let errMsg = ChatMessage(role: .assistant, content: "", blocks: [])
+                errMsg.error = String(localized: "Context full. Start a new session to continue.")
+                messages.append(errMsg)
+                // Remove the queued user message since we can't send it
+                promptQueue.removeAll { $0.id == queuedPrompt.id }
+                messages.removeAll { $0.queuedPromptId == queuedPrompt.id }
+            } else {
+                showContextExhaustedPrompt = true
+                logger.info("[Context] Exhausted — prompting user (optimistic UI path)")
+            }
+        }
+    }
+
     /// Compact then send the pending message.
     func compactAndSend() {
         showCompactBeforeSendPrompt = false
