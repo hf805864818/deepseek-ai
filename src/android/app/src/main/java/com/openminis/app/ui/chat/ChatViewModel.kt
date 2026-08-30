@@ -890,6 +890,7 @@ class ChatViewModel(
                 providerRepository, context,
             ),
             memoryEnabled = _memoryEnabled.value,
+            deepModeEnabled = _deepModeEnabled.value,
         )
 
     /**
@@ -1145,6 +1146,10 @@ class ChatViewModel(
     /** Verify failures in current workflow — for client load computation. */
     @Volatile
     private var verifyFailures: Int = 0
+
+    /** Whether the next text-only turn is expected to contain a root cause rule. */
+    @Volatile
+    private var expectingRootCauseRule: Boolean = false
 
     /**
      * [T-deep-mode-cognitive-p2-c10] When the model emits
@@ -1662,6 +1667,8 @@ class ChatViewModel(
         _deepModeEnabled.value = newValue
         // System prompt depends on deep mode state
         invalidateSystemPromptCache()
+        // v6.1: invalidate static fragment cache on toggle
+        invalidateDeepModeStaticCache()
         // Save to global prefs (per-session DB persistence to be added later
         // with a schema migration; for now the global default is the source of truth).
         com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, newValue)
@@ -1699,6 +1706,7 @@ class ChatViewModel(
             totalToolCallsInLoop = 0
             verifyFailures = 0
             _needMoreContextState.value = null
+            expectingRootCauseRule = false
             // C14 cross-session: clear active project pointer
             com.openminis.app.agent.CrossSessionContextStore.clearActiveProject(context)
         }
@@ -5771,6 +5779,7 @@ class ChatViewModel(
         lastModelLoadSignal = null
         _cognitiveLoadState.value = com.openminis.app.agent.CognitiveLoadState.empty
         _needMoreContextState.value = null
+        expectingRootCauseRule = false
 
         // [T-deep-mode-clarify-gate] Clarification gate: if deep mode is on and
         // the request has high-confidence ambiguity, pause for clarification
@@ -8203,11 +8212,38 @@ class ChatViewModel(
                             verifyFailures++
                             AppLogger.info(
                                 TAG_STREAM,
-                                "VerifyGate: failed → re-entering execution " +
-                                    "(roundsLeft=$verifyRoundsLeft, " +
+                                "VerifyGate: failed → " +
+                                    (if (_deepModeLevel.value >= com.openminis.app.agent.DeepModeLevel.AGGRESSIVE) "root cause analysis"
+                                     else "re-entering execution") +
+                                    " (roundsLeft=$verifyRoundsLeft, " +
                                     "reason=${verifySentinel.reason ?: "none"})",
                             )
                             verifyPhase = VerifyPhase.IDLE
+
+                            // [T-deep-mode-cognitive-p2-c13] C13: In AGGRESSIVE
+                            // mode, run a root cause analysis round before
+                            // re-entering execution. The model analyzes why
+                            // things went wrong and produces a reusable rule.
+                            if (_deepModeLevel.value >= com.openminis.app.agent.DeepModeLevel.AGGRESSIVE) {
+                                val analysisPrompt = com.openminis.app.agent.RootCauseAnalyzer.buildAnalysisPrompt(
+                                    verifySentinel.reason
+                                )
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = analysisPrompt,
+                                        contentParts = listOf(
+                                            AgentContentPart.Text(analysisPrompt)
+                                        ),
+                                    )
+                                )
+                                expectingRootCauseRule = true
+                                // Continue for the root cause analysis turn.
+                                // After this turn, we'll check for the root
+                                // cause rule and then go back to execution.
+                                continue
+                            }
+
                             // Top up GoalRunner budget for the fix round
                             if (goalRunnerRoundsLeft <= 0) {
                                 goalRunnerRoundsLeft = 1
@@ -8263,6 +8299,53 @@ class ChatViewModel(
                         TAG_STREAM,
                         "C14: workflow summary saved (${summary.length} chars)",
                     )
+                }
+
+                // [T-deep-mode-cognitive-p2-c13] C13: After root cause analysis
+                // turn, extract the rule from the model's reply, save it, then
+                // auto-enter execution to fix the problem.
+                if (expectingRootCauseRule && accumulatedText.isNotBlank()) {
+                    expectingRootCauseRule = false
+                    val rule = com.openminis.app.agent.RootCauseAnalyzer.extractRule(
+                        accumulatedText
+                    )
+                    if (rule != null) {
+                        com.openminis.app.agent.RootCauseAnalyzer.saveRule(context, rule)
+                        invalidateSystemPromptCache()
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "C13: root cause rule saved (${rule.length} chars)",
+                        )
+                    } else {
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "C13: no root cause rule found in reply (fail-safe)",
+                        )
+                    }
+                    // Re-enter execution mode to fix the issues
+                    if (goalRunnerRoundsLeft <= 0) {
+                        goalRunnerRoundsLeft = 1
+                    }
+                    val fixReminder = buildString {
+                        append(
+                            "<system-reminder>Root cause analysis complete. " +
+                                "Now go fix the problems you identified. " +
+                                "This is the execution phase — call tools to " +
+                                "make fixes, then end with <<GOAL_STATE>> done " +
+                                "when you're ready for another verification round."
+                        )
+                        append("</system-reminder>")
+                    }
+                    agentHistory.add(
+                        LLMMessage(
+                            role = LLMMessage.Role.USER,
+                            content = fixReminder,
+                            contentParts = listOf(
+                                AgentContentPart.Text(fixReminder)
+                            ),
+                        )
+                    )
+                    continue
                 }
 
                 loopExitedNormally = true
@@ -8836,6 +8919,9 @@ class ChatViewModel(
             "browser_use" -> executeBrowserUseTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
+            com.openminis.app.agent.SequentialThinkingTool.TOOL_NAME -> executeSequentialThinkingTool(
+                argsJson
+            )
             else -> ToolExecutionResult("Unknown tool: $name", false)
         }
     }
@@ -9317,6 +9403,57 @@ class ChatViewModel(
             keywords = keywords,
         )
         return ToolExecutionResult(result.output, result.success, toolTitle = result.toolTitle)
+    }
+
+    // [T-deep-mode-cognitive-p2-c11] C11: Sequential thinking tool executor.
+    // The tool takes a problem description and returns a structured reasoning
+    // framework template for the model to fill in. Fast — no I/O, just string
+    // generation. Gated by deep mode (tool only registered when on), but we
+    // add a defensive check here too.
+    private fun executeSequentialThinkingTool(argsJson: String): ToolExecutionResult {
+        if (!_deepModeEnabled.value) {
+            return ToolExecutionResult(
+                "Error: sequential_thinking tool is only available in deep mode.",
+                false,
+                toolTitle = "Sequential Thinking",
+            )
+        }
+
+        val args = try { org.json.JSONObject(argsJson) } catch (_: Exception) {
+            return ToolExecutionResult("Error: Invalid arguments", false)
+        }
+
+        val problem = args.optString("problem", "").trim()
+        val maxSteps = args.optInt("max_steps", com.openminis.app.agent.SequentialThinkingTool.DEFAULT_STEPS)
+        val toolTitle = args.optString("tool_title", "Sequential Thinking")
+
+        // Validate
+        com.openminis.app.agent.SequentialThinkingTool.validateInput(problem, maxSteps)
+            ?.let { error ->
+                return ToolExecutionResult(error, false, toolTitle = toolTitle)
+            }
+
+        // Determine current phase context for the framework
+        val phase = when {
+            verifyPhase == VerifyPhase.VERIFYING -> "verifying"
+            retrospectiveHasRun -> "retrospective"
+            else -> "executing"
+        }
+
+        val result = com.openminis.app.agent.SequentialThinkingTool.generateFramework(
+            problem = problem,
+            maxSteps = maxSteps,
+            workflowPhase = phase,
+            workflowStep = 0,
+            cognitiveLoadLevel = _cognitiveLoadState.value.level,
+            isMultiPath = false,
+        )
+
+        return ToolExecutionResult(
+            result.framework,
+            true,
+            toolTitle = toolTitle,
+        )
     }
 
     // ─── UI Helpers ──────────────────────────────────────────────────────
@@ -9969,38 +10106,30 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             // Only injected when deep mode is ON and a DeepModeStore is available.
             // Rules are scoped to the current context (file paths + keywords from
             // the user's latest message) to keep the prompt focused.
+            //
+            // v6.1 optimization:
+            //   1. extractScopeContext() pulls file paths + keywords from recent
+            //      history so scoped rules (Android/Kotlin, Python, shell)
+            //      actually match — before v6.1 they were always empty.
+            //   2. getDeepModeStaticFragment() caches the static portion
+            //      (header + PlanGate + GoalRunner + VerifyGate + cognitive rules)
+            //      so we don't rebuild those strings on every prompt.
             if (_deepModeEnabled.value && deepModeStore != null) {
-                val scopeCtx = com.openminis.app.agent.DeepModeScopeContext(
-                    level = _deepModeLevel.value,
-                    // alwaysApply rules always match; keyword/glob scoping will
-                    // be populated once we extract file paths from tool results.
-                )
+                // [v6.1] Extract scope context from recent conversation
+                val scopeCtx = extractScopeContext()
                 val rules = deepModeStore.rulesFragment(scopeCtx)
                 if (rules.isNotEmpty()) {
                     append("\n\n")
-                    append("## 深度龙虾Ai (Deep Agent Mode) — ACTIVE\n")
-                    append("You are in **Deep Agent Mode** — a higher-autonomy, higher-rigor operating mode.\n")
-                    append("Follow the behavior rules below in addition to all other instructions above.\n\n")
                     append(rules)
                     append("\n\n")
-                    append(com.openminis.app.agent.PlanGate.systemPromptFragment)
-                    append("\n\n")
-                    append(com.openminis.app.agent.GoalRunner.systemPromptFragment)
-                    append("\n\n")
-                    append(com.openminis.app.agent.VerifyGate.systemPromptFragment)
-                    append("\n\n")
-                    // C9 cognitive load sentinel (standard+)
-                    if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
-                        append(com.openminis.app.agent.CognitiveLoadMonitor.systemPromptFragment)
-                        append("\n\n")
-                    }
-                    // C14 cross-session context
+                    // [v6.1] Use cached static fragment
+                    append(getDeepModeStaticFragment(_deepModeLevel.value))
+                    // C14 cross-session context (dynamic, per-session)
                     com.openminis.app.agent.CrossSessionContextStore.contextFragment(context)
                         ?.let { fragment ->
-                            append(fragment)
                             append("\n\n")
+                            append(fragment)
                         }
-                    append(deepModeCognitiveRulesFragment())
                 }
             }
             // Runtime context goes last so the prefix above stays byte-stable
@@ -10073,6 +10202,125 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
 """
             )
         }
+    }
+
+    // MARK: - v6.1 Deep Mode Optimizations
+
+    /**
+     * [T-deep-mode-v61-scope-context] Extract scope context from recent
+     * conversation history for better scoped-rule matching.
+     *
+     * Before v6.1, the scope context only carried the DeepModeLevel — scoped
+     * rules (Android/Kotlin, Python, shell safety, …) never matched because
+     * filePaths and userKeywords were always empty. This function extracts:
+     *   - File paths from recent file_* tool arguments and shell commands
+     *   - Keywords from the last user message
+     *
+     * The result feeds into DeepModeStore.matchingRules() so only rules
+     * relevant to the current task are injected — keeping the system prompt
+     * leaner and the model's behavior more targeted.
+     */
+    private fun extractScopeContext(): com.openminis.app.agent.DeepModeScopeContext {
+        val filePaths = mutableSetOf<String>()
+        val keywords = mutableSetOf<String>()
+
+        // Extract file paths from recent agent history (tool calls)
+        for (msg in agentHistory.takeLast(20)) {
+            for (part in msg.contentParts) {
+                if (part is AgentContentPart.ToolUse) {
+                    val args = part.input ?: continue
+                    // file_read / file_write / file_edit — path argument
+                    if (part.name in setOf("file_read", "file_write", "file_edit")) {
+                        try {
+                            val path = org.json.JSONObject(args).optString("path", "")
+                            if (path.isNotBlank()) filePaths.add(path)
+                        } catch (_: Exception) { }
+                    }
+                    // shell_execute — extract file references from command
+                    if (part.name == "shell_execute") {
+                        try {
+                            val cmd = org.json.JSONObject(args).optString("command", "")
+                            // Extract common file patterns from command
+                            val filePattern = Regex("""[\w./\-]+\.(kt|kts|java|py|sh|bash|zsh|js|ts|tsx|jsx|css|html|xml|json|md|yaml|yml|go|rs|c|cpp|h|swift|rb|php)""", RegexOption.IGNORE_CASE)
+                            filePattern.findAll(cmd).forEach { match ->
+                                filePaths.add(match.value)
+                            }
+                        } catch (_: Exception) { }
+                    }
+                }
+            }
+        }
+
+        // Extract keywords from the last user message
+        val lastUserMsg = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER }?.content ?: ""
+        if (lastUserMsg.isNotBlank()) {
+            val keywordCandidates = listOf(
+                "android" to listOf("android", "kotlin", "jetpack", "compose", "apk", "viewmodel", "activity", "fragment"),
+                "python" to listOf("python", "pip", "django", "flask", "pandas", "numpy", "script"),
+                "shell" to listOf("shell", "bash", "script", "terminal", "command line", "linux", "cli"),
+                "web" to listOf("web", "browser", "html", "css", "javascript", "frontend", "website"),
+                "ios" to listOf("ios", "swift", "uikit", "swiftui", "xcode"),
+            )
+            val lowerMsg = lastUserMsg.lowercase()
+            for ((keyword, variants) in keywordCandidates) {
+                if (variants.any { lowerMsg.contains(it) }) {
+                    keywords.add(keyword)
+                }
+            }
+        }
+
+        return com.openminis.app.agent.DeepModeScopeContext(
+            filePaths = filePaths.toList(),
+            userKeywords = keywords.toList(),
+            level = _deepModeLevel.value,
+        )
+    }
+
+    /**
+     * [T-deep-mode-v61-static-fragment-cache] Pre-computed static portion of
+     * the deep mode fragment. The static header + PlanGate + GoalRunner +
+     * VerifyGate + cognitive rules don't change per-message — only the
+     * scoped rules and cross-session context do. Caching the static part
+     * saves string-building work on every prompt rebuild.
+     */
+    private var cachedDeepModeStaticFragment: String? = null
+    private var cachedDeepModeStaticLevel: com.openminis.app.agent.DeepModeLevel? = null
+
+    private fun getDeepModeStaticFragment(level: com.openminis.app.agent.DeepModeLevel): String {
+        cachedDeepModeStaticFragment?.let { cached ->
+            if (cachedDeepModeStaticLevel == level) return cached
+        }
+
+        val fragment = buildString {
+            append("## 深度龙虾Ai (Deep Agent Mode) — ACTIVE\n")
+            append("You are in **Deep Agent Mode** — a higher-autonomy, higher-rigor operating mode.\n")
+            append("Follow the behavior rules below in addition to all other instructions above.\n\n")
+            append(com.openminis.app.agent.PlanGate.systemPromptFragment)
+            append("\n\n")
+            append(com.openminis.app.agent.GoalRunner.systemPromptFragment)
+            append("\n\n")
+            append(com.openminis.app.agent.VerifyGate.systemPromptFragment)
+            append("\n\n")
+            // C9 cognitive load sentinel (standard+)
+            if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
+                append(com.openminis.app.agent.CognitiveLoadMonitor.systemPromptFragment)
+                append("\n\n")
+            }
+            append(deepModeCognitiveRulesFragment())
+        }
+
+        cachedDeepModeStaticFragment = fragment
+        cachedDeepModeStaticLevel = level
+        return fragment
+    }
+
+    /**
+     * Invalidate the deep mode static fragment cache. Called when the level
+     * changes or deep mode is toggled.
+     */
+    private fun invalidateDeepModeStaticCache() {
+        cachedDeepModeStaticFragment = null
+        cachedDeepModeStaticLevel = null
     }
 
     // ─── Legacy tool execution methods (kept for compatibility) ───────────

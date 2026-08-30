@@ -2492,6 +2492,37 @@ fun ChatScreen(
                                                 )
                                             }
                                         }
+                                        // [T-deep-mode-ui-badge] Deep mode intensity indicator
+                                        val deepModeLevel by viewModel.deepModeLevel.collectAsState()
+                                        if (deepModeLevel != com.openminis.app.agent.DeepModeLevel.LITE) {
+                                            val deepBadgeColor = when (deepModeLevel) {
+                                                com.openminis.app.agent.DeepModeLevel.AGGRESSIVE -> Color(0xFFFF9500)
+                                                com.openminis.app.agent.DeepModeLevel.STANDARD -> Color(0xFF34C759)
+                                                else -> Color(0xFF8E8E93)
+                                            }
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(4.dp))
+                                                    .background(deepBadgeColor.copy(alpha = 0.15f))
+                                                    .padding(horizontal = 4.dp, vertical = 1.dp),
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.AutoAwesome,
+                                                    contentDescription = null,
+                                                    tint = deepBadgeColor,
+                                                    modifier = Modifier.size(9.dp),
+                                                )
+                                                Text(
+                                                    text = deepModeLevel.displayName,
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Medium,
+                                                    color = deepBadgeColor,
+                                                    style = noFontPad,
+                                                )
+                                            }
+                                        }
                                         Text(
                                             text = if (providerName.isNotEmpty() && modelName.isNotEmpty()) {
                                                 "$providerName · $modelName"
@@ -4238,6 +4269,12 @@ fun ChatScreen(
                     .padding(horizontal = 12.dp)
                     .padding(top = 2.dp, bottom = 8.dp),
             ) {
+                // [T-deep-mode-ui-plangate] Plan confirmation bar (deep mode)
+                PlanGateConfirmationBar(viewModel = viewModel)
+
+                // [T-deep-mode-ui-clarifygate] Clarification gate bar (deep mode)
+                ClarifyGateBar(viewModel = viewModel)
+
                 // T13 banner moved INSIDE the LazyColumn so it renders at the
                 // visual end of the message list (mirrors iOS — see the
                 // banner item before items() in the LazyColumn block above).

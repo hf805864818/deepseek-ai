@@ -27,6 +27,9 @@ object AgentTools {
         // attempt those calls. Mirrors the iOS gate at
         // AIChatViewModel.makeAgentTools(memoryEnabled:).
         memoryEnabled: Boolean = true,
+        // [T-deep-mode-cognitive-p2-c11] C11: Sequential thinking tool.
+        // Only registered when deep mode is on — deep-mode-exclusive feature.
+        deepModeEnabled: Boolean = false,
     ): List<AgentToolDefinition> = buildList {
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
@@ -39,6 +42,9 @@ object AgentTools {
         if (memoryEnabled) {
             add(memoryWriteDefinition())
             add(memoryGetDefinition())
+        }
+        if (deepModeEnabled) {
+            add(sequentialThinkingDefinition())
         }
     }
 
@@ -135,5 +141,24 @@ object AgentTools {
         ),
         required = listOf("tool_title"),
         propertyOrdering = listOf("tool_title", "scope", "keywords"),
+    )
+
+    // [T-deep-mode-cognitive-p2-c11] C11: Sequential thinking tool.
+    // Aligned with iOS SequentialThinkingTool.toolDefinition().
+    private fun sequentialThinkingDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = com.openminis.app.agent.SequentialThinkingTool.TOOL_NAME,
+        description = "Break down a complex problem into structured reasoning steps. " +
+            "Use this when you need to think through a problem methodically before or during execution. " +
+            "Each step follows: hypothesis → verification → conclusion → convergence assessment. " +
+            "The tool returns a framework template you fill in. " +
+            "Do NOT use for simple tasks — only when the problem genuinely requires multi-step deduction. " +
+            "Only available in deep mode.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Analyze authentication flow', 'Plan database migration strategy'). Use the same language as the user."),
+            "problem" to AgentToolParam("string", "The problem or question that needs structured reasoning. Be specific — include context, constraints, and what you're trying to determine."),
+            "max_steps" to AgentToolParam("integer", "Maximum reasoning steps (default: 5, range: 2-15). Each step is one hypothesis-check-conclusion cycle. Use more for complex architecture decisions, fewer for straightforward questions. The tool may reduce this if cognitive load is high."),
+        ),
+        required = listOf("tool_title", "problem"),
+        propertyOrdering = listOf("tool_title", "problem", "max_steps"),
     )
 }
