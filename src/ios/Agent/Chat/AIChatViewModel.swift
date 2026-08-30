@@ -1419,6 +1419,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // for the total-switch contract).
         _cachedDeepModeFragment = nil
         _cachedDeepModeFragmentKey = nil
+        _cachedRulesModTime = -1  // [T-perf-deepmode-modtime-ttl]
+        _cachedRulesModTimeTS = 0
         // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load state to
         // empty so no warning banner survives the off switch.
         cognitiveLoadState = .empty
@@ -2782,6 +2784,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// clear it in `deepModeDidDisableCleanup()` so no state survives a toggle-off.
     var _cachedDeepModeFragment: String?
     var _cachedDeepModeFragmentKey: String?
+    /// [T-perf-deepmode-modtime-ttl] TTL-cached rules file mod time. The old code
+    /// called DeepModeStore.rulesFileModTime() (a file system stat) on every
+    /// single deepModeFragment access — including cache hits — adding I/O latency
+    /// to the main thread. We now cache the result for 2 seconds, so the 3–8
+    /// inference calls within a turn only stat the file once.
+    var _cachedRulesModTime: Double = -1
+    var _cachedRulesModTimeTS: CFAbsoluteTime = 0
 
     private func buildDeepModeScopeContext() -> DeepModeScopeContext {
         // [T-perf-scope-cache] Return cached result when the last user message
@@ -2901,6 +2910,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// since the last scan. Reset to 0 on resume (partial re-scan needed).
     var orphanScanCursor = 0
 
+    /// [T-perf-orphan-incremental] Cumulative set of toolResult IDs from the
+    /// clean prefix (0..<orphanScanCursor). The old code re-scanned the entire
+    /// clean prefix for toolResult IDs on every send — twice (Phase 1 + Phase 2).
+    /// This set lets us skip both prefix scans: we just merge it into the
+    /// working set in O(1). Reset alongside orphanScanCursor.
+    var orphanScanPrefixToolResultIds = Set<String>()
+
     private var deepModeFragment: String {
         // [T-deep-mode-perf-fragment-cache] Cache hit fast-path. The fragment
         // is a pure function of: deep-mode level, memory flag, the scope context
@@ -2910,7 +2926,21 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // rule glob NSPredicate builds + multi-KB concat.
         let scopeCtx = buildDeepModeScopeContext()
         let level = deepModeLevel
-        let cacheKey = "\(level.rawValue)|\(memoryEnabled)|\(scopeCtx.userInputLowercased)|\(scopeCtx.mentionedFilePaths.joined())|\(DeepModeStore.rulesFileModTime() ?? -1)"
+        // [T-perf-deepmode-modtime-ttl] Only stat the rules file once every 2s.
+        // The old code called rulesFileModTime() on every access — a file system
+        // stat that blocked the main thread even on cache hits. Within a turn
+        // (3–8 inference calls) the file can't change, so this is safe.
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - _cachedRulesModTimeTS > 2.0 {
+            _cachedRulesModTime = DeepModeStore.rulesFileModTime() ?? -1
+            _cachedRulesModTimeTS = now
+        }
+        // [T-perf-deepmode-cachekey-hash] Use a hash of the user input instead
+        // of the full text. The old key embedded the entire user message, which
+        // made key comparison O(n) on every access. A hash is O(1) and captures
+        // the same validity signal: different messages → different hash → miss.
+        let inputHash = scopeCtx.userInputLowercased.hashValue
+        let cacheKey = "\(level.rawValue)|\(memoryEnabled)|\(inputHash)|\(scopeCtx.mentionedFilePaths.joined())|\(_cachedRulesModTime)"
         if let cached = _cachedDeepModeFragment, _cachedDeepModeFragmentKey == cacheKey {
             return cached
         }
@@ -3241,10 +3271,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-perf-effective-history-incremental] toolUseIds / toolResultIds track the
     /// cumulative id sets so the NEXT call can do an O(Δ×m) incremental build
     /// instead of an O(n×m) full rebuild when only new messages were appended.
+    ///
+    /// [T-perf-marker-incremental] anchorIdx stores the resolved anchor index
+    /// for marker sessions. When markerId and anchorIdx are unchanged and history
+    /// only grew, the preAnchor + summary injection are stable — only the
+    /// postAnchor tail needs appending. This extends the incremental path to
+    /// compacted sessions (DeepMode long conversations).
     var _cachedEffectiveHistory: (
         result: [AgentMessage],
         historyCount: Int,
         markerId: String?,
+        anchorIdx: Int?,  // nil for non-marker sessions
         toolUseIds: Set<String>,
         toolResultIds: Set<String>
     )?
@@ -3532,8 +3569,15 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             if remainingUserCount == 0 {
                 agentHistory.removeAll()
                 orphanScanCursor = 0
+                orphanScanPrefixToolResultIds.removeAll() // [T-perf-orphan-incremental]
             } else if keepUpTo + 1 < agentHistory.count {
                 agentHistory.removeSubrange((keepUpTo + 1)...)
+                // [T-perf-orphan-incremental] History was truncated — the
+                // cumulative prefix set may contain IDs that are no longer in
+                // agentHistory. Reset both the cursor and the set so the next
+                // send does a full re-scan (safe, and edit is infrequent).
+                orphanScanCursor = 0
+                orphanScanPrefixToolResultIds.removeAll()
             }
             // Trim persisted messages.
             // Phase B: agentHistory is no longer mutated by compact, so agentHistory.count
@@ -5767,6 +5811,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 activeGroupId = gid
             }
         }
+
+        // [T-perf-keyboard-yield] Give the main run loop one frame before the
+        // heavy synchronous prompt assembly + orphan scan begins. When the user
+        // taps send, performSend() dismisses the keyboard (inputFocused=false),
+        // then this Task starts. Without this yield the keyboard dismissal
+        // animation freezes mid-way — "底部空了" — because the main thread is
+        // immediately locked by the prompt build. The yield lets Core Animation
+        // advance 1–2 frames so the keyboard slides away smoothly before we
+        // start blocking. Zero cost on retry/resume (keyboard already down).
+        await Task.yield()
+
         let tools = makeAgentTools()
 
         var userSystemPrompt = baseSystemPrompt
@@ -5927,10 +5982,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         var allToolUseIds = Set<String>()
         var allToolResultIds = Set<String>()
 
-        // Phase 1: scan only the dirty suffix for IDs, and the full history
-        // for orphaned results that may have been stranded by a prior cancel.
-        // For tool_results we must scan the full history because a prior
-        // incomplete turn may have left a result whose tool_use is earlier.
+        // Phase 1: scan only the dirty suffix for IDs, and use the cumulative
+        // prefix set for toolResult IDs from the clean prefix.
+        // [T-perf-orphan-incremental] The old code re-scanned the entire clean
+        // prefix (0..<scanFrom) for toolResult IDs on every send. This was the
+        // primary O(n×m) bottleneck — hundreds of messages × parts each, twice
+        // per send. We now maintain orphanScanPrefixToolResultIds as a cumulative
+        // set, so this merge is O(1) instead of O(n×m).
         for msg in scanFrom..<agentHistory.count {
             let partList = agentHistory[msg].parts
             for part in partList {
@@ -5942,17 +6000,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 }
             }
         }
-        // Also scan the clean prefix to catch any tool_results whose
-        // matching tool_use was added in the same batch (rare edge case).
-        if scanFrom > 0 {
-            for i in 0..<scanFrom {
-                for part in agentHistory[i].parts {
-                    if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                        allToolResultIds.insert(id)
-                    }
-                }
-            }
-        }
+        // Merge the cumulative prefix toolResult IDs — replaces the old
+        // full-prefix scan. Covers the same "tool_result whose tool_use was
+        // added in the same batch" edge case the old scan handled.
+        allToolResultIds.formUnion(orphanScanPrefixToolResultIds)
 
         // 1. Remove orphaned tool_results (tool_result without matching tool_use).
         //    These cause API 400: "unexpected tool_use_id found in tool_result blocks".
@@ -5987,18 +6038,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         // 2. Inject placeholder tool_results for orphaned tool_uses (tool_use without matching tool_result).
         // Rebuild allToolResultIds after removals above — only in the scanned range.
-        allToolResultIds.removeAll()
+        // [T-perf-orphan-incremental] Phase 2 previously re-scanned the entire
+        // clean prefix (0..<scanFrom) for toolResult IDs a SECOND time. We now
+        // reuse the cumulative prefix set — O(1) instead of O(n×m) again.
+        allToolResultIds = orphanScanPrefixToolResultIds
         for i in scanFrom..<agentHistory.count {
             let msg = agentHistory[i]
             for part in msg.parts {
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                    allToolResultIds.insert(id)
-                }
-            }
-        }
-        // Include results from the clean prefix too.
-        for i in 0..<scanFrom {
-            for part in agentHistory[i].parts {
                 if case .toolResult(let id, _, _, _, _, _, _, _) = part {
                     allToolResultIds.insert(id)
                 }
@@ -6041,7 +6087,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // On resume we scan from 0 (dirty suffix), then advance to count so
         // the next normal runAgentLoop starts from here.
         orphanScanCursor = agentHistory.count
-        logger.info("⏱️ [runAgentLoop] setup complete elapsed=\(String(format: "%.1f", orphanScanMs))ms (prompt+orphanScan) scanFrom=\(scanFrom) cursor=\(orphanScanCursor)")
+        // [T-perf-orphan-incremental] Accumulate toolResult IDs from the range
+        // we just verified into the cumulative prefix set. This range is now
+        // part of the "clean prefix" for the next send — its toolResult IDs
+        // will be served from the set in O(1) instead of re-scanned in O(n×m).
+        // On resume (scanFrom == 0) the set is rebuilt from the full history.
+        if isResume {
+            orphanScanPrefixToolResultIds.removeAll()
+        }
+        for i in scanFrom..<agentHistory.count {
+            for part in agentHistory[i].parts {
+                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
+                    orphanScanPrefixToolResultIds.insert(id)
+                }
+            }
+        }
+        logger.info("⏱️ [runAgentLoop] setup complete elapsed=\(String(format: "%.1f", orphanScanMs))ms (prompt+orphanScan) scanFrom=\(scanFrom) cursor=\(orphanScanCursor) prefixToolResultIds=\(orphanScanPrefixToolResultIds.count)")
         await Task.yield()
 
         // Counted instead of `while true` so we have a hard backstop against

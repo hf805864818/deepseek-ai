@@ -1510,13 +1510,19 @@ extension AIChatViewModel {
         }
 
         // ── [T-perf-effective-history-incremental] Incremental fast path ──
-        // When: no compaction marker (effectiveAgentHistoryUncounted == identity),
-        //       marker unchanged, history only grew (append-only), and previous
-        //       build had no orphans (so cached.result matches raw history prefix).
+        // When: marker unchanged, history only grew (append-only), and previous
+        // build had no orphans (so cached.result matches raw history prefix).
         // Cost: O(Δ×m) instead of O(n×m) — 10–50× faster on long DeepMode sessions.
-        if currentMarkerId == nil,
-           let cached = _cachedEffectiveHistory,
-           cached.markerId == nil,
+        //
+        // [T-perf-marker-incremental] This incremental path now ALSO covers marker
+        // (compacted) sessions. When markerId is unchanged and anchorIdx is stable,
+        // the preAnchor slice + summary injection are identical to the cached copy
+        // — only the postAnchor tail grew. We append the new tail messages and
+        // orphan-check them against the cumulative id sets. This eliminates the
+        // 100–300ms full-build that previously fired on EVERY send in DeepMode
+        // long conversations (which are almost always compacted).
+        if let cached = _cachedEffectiveHistory,
+           cached.markerId == currentMarkerId,
            currentCount > cached.historyCount {
             let deltaStart = cached.historyCount
             let newMessages = Array(agentHistory[deltaStart...])
@@ -1548,17 +1554,23 @@ extension AIChatViewModel {
             }
 
             if orphanedResults.isEmpty && orphanedUses.isEmpty {
-                // No orphans → simple append is safe (previous result == raw prefix)
+                // No orphans → simple append is safe.
+                // For non-marker sessions: cached.result == raw prefix (identity).
+                // For marker sessions: preAnchor + summary-injection are stable
+                // when markerId is unchanged; the new messages are all in the
+                // postAnchor tail, which maps 1:1 to the cached result's tail.
                 var result = cached.result
                 result.append(contentsOf: newMessages)
                 _cachedEffectiveHistory = (
                     result: result,
                     historyCount: currentCount,
-                    markerId: nil,
+                    markerId: currentMarkerId,
+                    anchorIdx: cached.anchorIdx,
                     toolUseIds: toolUseIds,
                     toolResultIds: toolResultIds
                 )
-                logger.info("[Compact] effectiveAgentHistory: incremental build +\(newMessages.count) msg(s), total=\(result.count) (Δ only, no full scan)")
+                let path = currentMarkerId == nil ? "no-marker" : "marker"
+                logger.info("[Compact] effectiveAgentHistory: incremental build (\(path)) +\(newMessages.count) msg(s), total=\(result.count) (Δ only, no full scan)")
                 return result
             } else {
                 logger.info("[Compact] effectiveAgentHistory: incremental skipped (orphans found), falling back to full build")
@@ -1569,32 +1581,43 @@ extension AIChatViewModel {
         let rawHistory = effectiveAgentHistoryUncounted()
         let result = Self.dropOrphanedToolParts(rawHistory, logger: logger)
 
-        // Collect id sets for future incremental builds (only useful when no marker,
-        // since with a marker the result layout differs from raw agentHistory).
+        // [T-perf-marker-incremental] Collect id sets from the RESULT (after
+        // orphan removal) for ALL sessions — including marker sessions. The
+        // old code only collected for non-marker sessions, which meant marker
+        // sessions could never use the incremental path.
         var newToolUseIds: Set<String> = []
         var newToolResultIds: Set<String> = []
-        if currentMarkerId == nil {
-            for msg in rawHistory {
-                for part in msg.parts {
-                    switch part {
-                    case .toolUse(let id, _, _): newToolUseIds.insert(id)
-                    case .toolResult(let id, _, _, _, _, _, _, _): newToolResultIds.insert(id)
-                    default: break
-                    }
+        for msg in result {
+            for part in msg.parts {
+                switch part {
+                case .toolUse(let id, _, _): newToolUseIds.insert(id)
+                case .toolResult(let id, _, _, _, _, _, _, _): newToolResultIds.insert(id)
+                default: break
                 }
             }
+        }
+
+        // [T-perf-marker-incremental] Resolve anchorIdx for marker sessions so
+        // the next call can verify it hasn't shifted. This is a simple O(n)
+        // property scan — much cheaper than the O(n×m) dropOrphanedToolParts
+        // we just avoided. Only needed when a marker is present.
+        var resolvedAnchorIdx: Int? = nil
+        if let marker = cachedLatestMarker, marker.version >= 2,
+           let anchorId = marker.lastCompactedMessageId {
+            resolvedAnchorIdx = agentHistory.lastIndex(where: { $0.dbMessageId == anchorId })
         }
 
         _cachedEffectiveHistory = (
             result: result,
             historyCount: currentCount,
             markerId: currentMarkerId,
+            anchorIdx: resolvedAnchorIdx,
             toolUseIds: newToolUseIds,
             toolResultIds: newToolResultIds
         )
         // One-line breadcrumb on every inference call so a "summary-only"
         // regression is visible in logs without scraping agent traces.
-        logger.info("[Compact] effectiveAgentHistory: full build \(result.count) msg(s) from agentHistory.count=\(self.agentHistory.count) markerId=\(self.cachedLatestMarker?.id.prefix(8) ?? "nil")")
+        logger.info("[Compact] effectiveAgentHistory: full build \(result.count) msg(s) from agentHistory.count=\(self.agentHistory.count) markerId=\(self.cachedLatestMarker?.id.prefix(8) ?? "nil") anchorIdx=\(resolvedAnchorIdx ?? -1)")
         return result
     }
 
@@ -1626,9 +1649,10 @@ extension AIChatViewModel {
 
         // Incremental fast path is already O(Δ×m) ≈ sub-ms — only worth
         // offloading when a full build is needed (cold cache or marker change).
-        if currentMarkerId == nil,
-           let cached = _cachedEffectiveHistory,
-           cached.markerId == nil,
+        // [T-perf-marker-incremental] The incremental path now covers marker
+        // sessions too, so we skip warmup for those as well.
+        if let cached = _cachedEffectiveHistory,
+           cached.markerId == currentMarkerId,
            currentCount > cached.historyCount {
             // Incremental path on main thread is fast enough (just new messages)
             return
@@ -1670,8 +1694,18 @@ extension AIChatViewModel {
             // Write result back to the cache on the main actor.
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                // Only update if state hasn't changed while we were computing
-                guard self.agentHistory.count == currentCount,
+                // [T-perf-warmup-race-fix] Only update if state is compatible.
+                // The old guard used `== currentCount` which rejected the result
+                // whenever agentHistory grew between warmup launch and completion
+                // (N → N+1 after agentHistory.append(userMessage)). This happened
+                // on virtually every send, making the warmup a pure waste.
+                //
+                // Fix: accept the result when count >= currentCount AND marker
+                // hasn't changed. The incremental path will handle the delta
+                // (new messages since currentCount) on the next effectiveAgentHistory()
+                // call — which is exactly what the warmup was trying to prevent
+                // (a cold-cache full build on the main thread).
+                guard self.agentHistory.count >= currentCount,
                       self.cachedLatestMarker?.id == currentMarkerId else {
                     logger.info("[Compact] history warmup: discarded (state changed during background build)")
                     return
@@ -1680,6 +1714,7 @@ extension AIChatViewModel {
                     result: result,
                     historyCount: currentCount,
                     markerId: currentMarkerId,
+                    anchorIdx: nil,  // resolved lazily on next full build if needed
                     toolUseIds: toolUseIds,
                     toolResultIds: toolResultIds
                 )

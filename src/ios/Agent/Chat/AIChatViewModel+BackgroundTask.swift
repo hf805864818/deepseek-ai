@@ -667,6 +667,7 @@ extension AIChatViewModel {
         cachedLatestMarker = nil
         toolLoopDetector.reset()
         orphanScanCursor = 0
+        orphanScanPrefixToolResultIds.removeAll() // [T-perf-orphan-incremental]
 
         // [T-ios-crash-clearchat-send] Reset workflow state machine so a
         // leftover non-idle phase (e.g. .awaitingApproval, .verifying) from
