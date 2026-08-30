@@ -15,6 +15,7 @@ import com.openminis.app.browser.BrowserActionInput
 import com.openminis.app.browser.BrowserTabPool
 import com.openminis.app.data.db.MessageEntity
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lightbulb
@@ -1673,12 +1674,9 @@ class ChatViewModel(
         // with a schema migration; for now the global default is the source of truth).
         com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, newValue)
         viewModelScope.launch {
-            val sid = ensureSession()
-            // Best-effort: try to persist to session row if the DAO supports it.
-            // Falls back gracefully if the column doesn't exist yet.
-            try {
-                chatRepository.dao.updateDeepModeEnabled(sid, if (newValue) 1 else 0)
-            } catch (_: Exception) { }
+            ensureSession()
+            // Per-session DB persistence to be added later with a schema migration;
+            // for now the global default is the source of truth.
         }
         appendSystemInfo(
             text = if (newValue) {
@@ -1730,7 +1728,7 @@ class ChatViewModel(
             .firstOrNull { it.isNotEmpty() && !it.startsWith("```") }
             ?: plan.take(100)
         com.openminis.app.agent.CrossSessionContextStore.setActiveProject(
-            context, firstLine, sessionId = _sessionId.value
+            context, firstLine, sessionId = sessionId
         )
         invalidateSystemPromptCache() // context fragment changed
 
@@ -1753,7 +1751,7 @@ class ChatViewModel(
                 )
             )
             // Re-enter the agent loop — start a fresh run
-            val provider = activeProvider() ?: return@launch
+            val provider = currentProvider ?: return@launch
             val systemPrompt = buildSystemPrompt()
             val fallbackProviders = buildFallbackProviders(provider)
             val activeFallbackStrategy = run {
@@ -1770,7 +1768,7 @@ class ChatViewModel(
                     fallbackStrategy = activeFallbackStrategy,
                 )
             } catch (e: Exception) {
-                AppLogger.error(TAG_STREAM, "PlanGate resume agent loop error: ${e.message}", e)
+                AppLogger.error(TAG_STREAM, "PlanGate resume agent loop error: ${e.message}")
             }
         }
     }
@@ -8296,7 +8294,7 @@ class ChatViewModel(
                     isRetrospectiveRunning = false
                     val summary = accumulatedText.trim().take(200)
                     com.openminis.app.agent.CrossSessionContextStore.appendWorkflowSummary(
-                        context, summary, sessionId = _sessionId.value,
+                        context, summary, sessionId = sessionId,
                     )
                     invalidateSystemPromptCache()
                     AppLogger.info(
