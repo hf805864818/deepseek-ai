@@ -1129,6 +1129,31 @@ class ChatViewModel(
         _systemPromptCacheValid = false
     }
 
+    // MARK: - C9 Cognitive Load Monitor
+    internal val _cognitiveLoadState =
+        MutableStateFlow(com.openminis.app.agent.CognitiveLoadState.empty)
+    val cognitiveLoadState: StateFlow<com.openminis.app.agent.CognitiveLoadState> =
+        _cognitiveLoadState.asStateFlow()
+
+    @Volatile
+    private var lastModelLoadSignal: com.openminis.app.agent.CognitiveLoadSignal? = null
+
+    /** Total tool calls in current agent loop — for client load computation. */
+    @Volatile
+    private var totalToolCallsInLoop: Int = 0
+
+    /** Verify failures in current workflow — for client load computation. */
+    @Volatile
+    private var verifyFailures: Int = 0
+
+    /**
+     * [T-deep-mode-cognitive-p2-c10] When the model emits
+     * <<GOAL_STATE>> need_more_context, auto-continuation stops and this
+     * state holds the reason. UI can render a "needs input" prompt.
+     */
+    internal val _needMoreContextState = MutableStateFlow<String?>(null)
+    val needMoreContextState: StateFlow<String?> = _needMoreContextState.asStateFlow()
+
     /**
      * [T-android-enhanced-cache] Enhanced Cache (1-hour Anthropic cache TTL)
      * toggle. Per-VM memory state, NOT persisted — mirrors iOS
@@ -1668,6 +1693,14 @@ class ChatViewModel(
             goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
             retrospectiveHasRun = false
             isRetrospectiveRunning = false
+            // C9 cognitive load cleanup
+            _cognitiveLoadState.value = com.openminis.app.agent.CognitiveLoadState.empty
+            lastModelLoadSignal = null
+            totalToolCallsInLoop = 0
+            verifyFailures = 0
+            _needMoreContextState.value = null
+            // C14 cross-session: clear active project pointer
+            com.openminis.app.agent.CrossSessionContextStore.clearActiveProject(context)
         }
     }
 
@@ -1680,6 +1713,18 @@ class ChatViewModel(
         val plan = pendingPlanText ?: return
         pendingPlanText = null
         AppLogger.info(TAG_STREAM, "PlanGate: user approved plan (${plan.length} chars)")
+
+        // [T-deep-mode-cognitive-p2-c14] C14: Save active project context
+        // when a plan is confirmed, so future sessions know what the user
+        // was last working on.
+        val firstLine = plan.lines()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("```") }
+            ?: plan.take(100)
+        com.openminis.app.agent.CrossSessionContextStore.setActiveProject(
+            context, firstLine, sessionId = _sessionId.value
+        )
+        invalidateSystemPromptCache() // context fragment changed
 
         // Resume the agent loop with an "execute the plan" system reminder
         viewModelScope.launch(Dispatchers.IO) {
@@ -5720,6 +5765,12 @@ class ChatViewModel(
         // Reset C7 retrospective on fresh user message
         retrospectiveHasRun = false
         isRetrospectiveRunning = false
+        // Reset C9 cognitive load on fresh user message
+        totalToolCallsInLoop = 0
+        verifyFailures = 0
+        lastModelLoadSignal = null
+        _cognitiveLoadState.value = com.openminis.app.agent.CognitiveLoadState.empty
+        _needMoreContextState.value = null
 
         // [T-deep-mode-clarify-gate] Clarification gate: if deep mode is on and
         // the request has high-confidence ambiguity, pause for clarification
@@ -8032,6 +8083,7 @@ class ChatViewModel(
                                 "GoalRunner: need_more_context → stopping " +
                                     "(reason=${goalSentinel.reason ?: "none"})",
                             )
+                            _needMoreContextState.value = goalSentinel.reason ?: "需要更多信息"
                             withContext(Dispatchers.Main) {
                                 appendSystemInfo(
                                     text = "深度龙虾Ai 需要更多信息：${
@@ -8148,6 +8200,7 @@ class ChatViewModel(
                         }
                         com.openminis.app.agent.VerifyGate.ParseResult.FAILED -> {
                             verifyRoundsLeft--
+                            verifyFailures++
                             AppLogger.info(
                                 TAG_STREAM,
                                 "VerifyGate: failed → re-entering execution " +
@@ -8194,6 +8247,22 @@ class ChatViewModel(
                         "VerifyGate: no sentinel in verify turn → treating as passed (fail-safe)",
                     )
                     verifyPhase = VerifyPhase.IDLE
+                }
+
+                // [T-deep-mode-cognitive-p2-c14] C14: Save workflow summary
+                // after the retrospective turn completes. The retrospective
+                // text (from the model's reply) becomes the summary.
+                if (isRetrospectiveRunning && accumulatedText.isNotBlank()) {
+                    isRetrospectiveRunning = false
+                    val summary = accumulatedText.trim().take(200)
+                    com.openminis.app.agent.CrossSessionContextStore.appendWorkflowSummary(
+                        context, summary, sessionId = _sessionId.value,
+                    )
+                    invalidateSystemPromptCache()
+                    AppLogger.info(
+                        TAG_STREAM,
+                        "C14: workflow summary saved (${summary.length} chars)",
+                    )
                 }
 
                 loopExitedNormally = true
@@ -8547,6 +8616,43 @@ class ChatViewModel(
             // Auto-title after first exchange (mirrors iOS generateSessionTitleIfNeeded)
             if (turn == 0) {
                 generateSessionTitleIfNeeded()
+            }
+
+            // [T-deep-mode-cognitive-p2-c9] Update cognitive load after each
+            // tool-calling turn. Combines model's self-assessed sentinel
+            // (from accumulatedText) with client-computed metrics.
+            if (_deepModeEnabled.value) {
+                totalToolCallsInLoop += toolCalls.size
+                // Parse COGNITIVE_LOAD sentinel from the assistant text
+                val modelSignal = accumulatedText.takeIf { it.isNotBlank() }
+                    ?.let { com.openminis.app.agent.CognitiveLoadMonitor.parseSentinel(it) }
+                if (modelSignal != null) {
+                    lastModelLoadSignal = modelSignal
+                    // Strip sentinel from visible text
+                    com.openminis.app.agent.CognitiveLoadMonitor.textWithoutSentinel(
+                        accumulatedText
+                    )?.let { cleanText ->
+                        accumulatedText = cleanText
+                        withContext(Dispatchers.Main) {
+                            updateAssistantMessage(
+                                assistantId, accumulatedText, false, allToolBlocks,
+                            )
+                        }
+                    }
+                }
+
+                val goalRoundsUsed = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS - goalRunnerRoundsLeft
+                val clientLoad = com.openminis.app.agent.CognitiveLoadMonitor.computeClientLoad(
+                    toolCallCount = totalToolCallsInLoop,
+                    verifyFailures = verifyFailures,
+                    goalRunnerRoundsUsed = goalRoundsUsed,
+                )
+                val mergedState = com.openminis.app.agent.CognitiveLoadMonitor.merge(
+                    modelAssessed = modelSignal?.level,
+                    clientComputed = clientLoad,
+                    note = modelSignal?.note,
+                )
+                _cognitiveLoadState.value = mergedState
             }
 
             // [T-android-queued-message-interrupt-on-toolclose] iOS d14174d3
@@ -9883,6 +9989,17 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     append("\n\n")
                     append(com.openminis.app.agent.VerifyGate.systemPromptFragment)
                     append("\n\n")
+                    // C9 cognitive load sentinel (standard+)
+                    if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
+                        append(com.openminis.app.agent.CognitiveLoadMonitor.systemPromptFragment)
+                        append("\n\n")
+                    }
+                    // C14 cross-session context
+                    com.openminis.app.agent.CrossSessionContextStore.contextFragment(context)
+                        ?.let { fragment ->
+                            append(fragment)
+                            append("\n\n")
+                        }
                     append(deepModeCognitiveRulesFragment())
                 }
             }
