@@ -1107,6 +1107,12 @@ class ChatViewModel(
     @Volatile
     private var pendingVerifySentinel: com.openminis.app.agent.VerifyGate.ParsedSentinel? = null
 
+    // MARK: - C7 Post-task Retrospective
+    @Volatile
+    private var retrospectiveHasRun = false
+    @Volatile
+    private var isRetrospectiveRunning = false
+
     internal val _thinkingLevel = MutableStateFlow(ThinkingLevel.OFF)
     val thinkingLevel: StateFlow<ThinkingLevel> = _thinkingLevel.asStateFlow()
 
@@ -1645,6 +1651,8 @@ class ChatViewModel(
             verifyPhase = VerifyPhase.IDLE
             verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
             goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
+            retrospectiveHasRun = false
+            isRetrospectiveRunning = false
         }
     }
 
@@ -5694,6 +5702,9 @@ class ChatViewModel(
         // Reset PlanGate on fresh user message
         _planGateState.value = com.openminis.app.agent.PlanGate.State.IDLE
         pendingPlanText = null
+        // Reset C7 retrospective on fresh user message
+        retrospectiveHasRun = false
+        isRetrospectiveRunning = false
 
         // [T-deep-mode-clarify-gate] Clarification gate: if deep mode is on and
         // the request has high-confidence ambiguity, pause for clarification
@@ -8074,11 +8085,48 @@ class ChatViewModel(
                 if (verifyPhase == VerifyPhase.VERIFYING && verifySentinel != null) {
                     when (verifySentinel.result) {
                         com.openminis.app.agent.VerifyGate.ParseResult.PASSED -> {
+                            verifyPhase = VerifyPhase.IDLE
+                            // [T-deep-mode-cognitive-p1-c7] Post-task retrospective.
+                            // After verification passes, run one final turn where
+                            // the model reviews what happened.
+                            if (!retrospectiveHasRun) {
+                                retrospectiveHasRun = true
+                                isRetrospectiveRunning = true
+                                AppLogger.info(
+                                    TAG_STREAM,
+                                    "C7 Retrospective: starting post-task review",
+                                )
+                                val retroPrompt = buildString {
+                                    append(
+                                        "<system-reminder>深度模式任务后复盘（C7）：本次任务已完成，" +
+                                            "请快速复盘以下四个维度：\n"
+                                    )
+                                    append("1. 意图理解准确吗？（用户要什么 vs 你做了什么）\n")
+                                    append("2. 难度评估准吗？（预估难度 vs 实际难度）\n")
+                                    append("3. 工具选择最优吗？（有无更优工具/路径）\n")
+                                    append("4. 边界声明到位吗？（做了什么 / 没做什么 / 为什么）\n")
+                                    append(
+                                        "请简洁回答，提炼一条可复用的经验教训。" +
+                                            "如果你的复盘包含值得长期记住的经验，" +
+                                            "请使用 memory_write 工具保存。" +
+                                            "</system-reminder>"
+                                    )
+                                }
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = retroPrompt,
+                                        contentParts = listOf(
+                                            AgentContentPart.Text(retroPrompt)
+                                        ),
+                                    )
+                                )
+                                continue
+                            }
                             AppLogger.info(
                                 TAG_STREAM,
                                 "VerifyGate: passed → finishing workflow",
                             )
-                            verifyPhase = VerifyPhase.IDLE
                             // Fall through to normal break
                         }
                         com.openminis.app.agent.VerifyGate.ParseResult.FAILED -> {
@@ -9809,6 +9857,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     append(com.openminis.app.agent.GoalRunner.systemPromptFragment)
                     append("\n\n")
                     append(com.openminis.app.agent.VerifyGate.systemPromptFragment)
+                    append("\n\n")
+                    append(deepModeCognitiveRulesFragment())
                 }
             }
             // Runtime context goes last so the prefix above stays byte-stable
@@ -9818,6 +9868,64 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             append("- Current date: ").append(dateStr).append(" (").append(tzId).append(")\n")
             append("- Device language: ").append(lang).append("\n")
             append("- minis-model-use models available: ").append(modelUseCount)
+        }
+    }
+
+    /**
+     * [T-deep-mode-cognitive-p1] P1 cognitive rules fragment for deep mode.
+     * Contains C6 (heartbeat self-check) and C8 (proactive web research) rules.
+     * These are prompt-level rules that guide the model's behavior during
+     * deep-mode execution.
+     */
+    private fun deepModeCognitiveRulesFragment(): String {
+        val level = _deepModeLevel.value
+        return buildString {
+            append("## 认知能力 (Cognitive Capabilities)\n\n")
+
+            // C6: 心跳自检 — always included in deep mode
+            append(
+                """
+C6 — HEARTBEAT SELF-CHECK: Every 3-5 tool calls, pause briefly and ask yourself:
+  • Am I making real progress toward the goal?
+  • Am I repeating the same action or pattern?
+  • Is there a simpler approach I'm missing?
+  • Should I pivot or ask the user for guidance?
+If you detect you're stuck in a loop or not making progress, stop and rethink.
+Use <<GOAL_STATE>> need_more_context if you need user input to get unstuck.
+
+"""
+            )
+
+            // C8: 联网查询进攻 — included at STANDARD and above
+            if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
+                append(
+                    """
+C8 — PROACTIVE WEB RESEARCH: When you need information that:
+  • Is time-sensitive (news, prices, status, versions, dates)
+  • May have changed since your training data
+  • Requires specific facts you're uncertain about
+  • Involves documentation, APIs, or technical specifications
+DO NOT guess or rely on your training knowledge. Instead:
+  1. Use web_search to find the information
+  2. Use WebFetch to read relevant pages in detail
+  3. Cite your sources (URLs) in your answer
+Better to search once than to hallucinate wrong information.
+
+"""
+                )
+            }
+
+            // C5: 失败三次换方法 — built on GoalRunner, add the rule here
+            append(
+                """
+C5 — FAIL-THREE-TIMES RULE: If the same tool or approach fails 3 times in a row:
+  1. STOP using that approach immediately
+  2. Think of at least one alternative method
+  3. Try the alternative approach
+  4. If you can't think of a good alternative, emit <<GOAL_STATE>> need_more_context: <what you tried and what you need>
+Do NOT keep banging your head against the same wall. Creativity over brute force.
+"""
+            )
         }
     }
 
