@@ -1116,6 +1116,19 @@ class ChatViewModel(
     internal val _thinkingLevel = MutableStateFlow(ThinkingLevel.OFF)
     val thinkingLevel: StateFlow<ThinkingLevel> = _thinkingLevel.asStateFlow()
 
+    // [T-android-perf-system-prompt-cache] Cached system prompt.
+    // Invalidated when any dependency changes (deep mode, memory, thinking level, etc.).
+    // Reduces CPU work on every send, especially noticeable with deep mode on.
+    @Volatile
+    private var _cachedSystemPrompt: String? = null
+    @Volatile
+    private var _systemPromptCacheValid = false
+
+    /** Invalidate the system prompt cache. Call whenever a dependency changes. */
+    private fun invalidateSystemPromptCache() {
+        _systemPromptCacheValid = false
+    }
+
     /**
      * [T-android-enhanced-cache] Enhanced Cache (1-hour Anthropic cache TTL)
      * toggle. Per-VM memory state, NOT persisted — mirrors iOS
@@ -1622,6 +1635,8 @@ class ChatViewModel(
     private fun toggleDeepMode() {
         val newValue = !_deepModeEnabled.value
         _deepModeEnabled.value = newValue
+        // System prompt depends on deep mode state
+        invalidateSystemPromptCache()
         // Save to global prefs (per-session DB persistence to be added later
         // with a schema migration; for now the global default is the source of truth).
         com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, newValue)
@@ -5897,20 +5912,22 @@ class ChatViewModel(
                 }
             }
 
-            // Build system prompt
-            // Anthropic OAuth requires the Claude Code prefix in the system prompt
-            val baseSystemPrompt = buildSystemPrompt()
-            val systemPrompt = if ((provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true) {
-                val prefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
-                if (baseSystemPrompt?.startsWith(prefix) == true) baseSystemPrompt
-                else "$prefix\n\n${baseSystemPrompt ?: ""}"
-            } else baseSystemPrompt
-
             // Start agent loop with fallback. _isStreaming was set synchronously at top.
             streamLaunched = true
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "send streamJob ENTER sid=$activeSessionId")
                 try {
+                    // [T-android-perf-system-prompt-bg] Build system prompt on
+                    // background thread — it's only used by runAgentLoop and
+                    // can be expensive (deep mode rules, memory sections, etc.).
+                    // Moving it off the main thread reduces send-button lag.
+                    val baseSystemPrompt = buildSystemPrompt()
+                    val systemPrompt = if ((provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true) {
+                        val prefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
+                        if (baseSystemPrompt?.startsWith(prefix) == true) baseSystemPrompt
+                        else "$prefix\n\n${baseSystemPrompt ?: ""}"
+                    } else baseSystemPrompt
+
                     // Acquire concurrency slot (suspends if at max)
                     SessionConcurrencyManager.acquireSlot(activeSessionId)
                     AppLogger.debug(TAG_STREAM, "send streamJob slot acquired")
@@ -9588,6 +9605,14 @@ class ChatViewModel(
     }
 
     private fun buildSystemPrompt(): String? {
+        // [T-android-perf-system-prompt-cache] Return cached value if valid.
+        // The cache is invalidated whenever any dependency (deep mode, memory,
+        // thinking level, etc.) changes. This avoids rebuilding the entire
+        // prompt string on every send — a significant win with deep mode on.
+        if (_systemPromptCacheValid) {
+            return _cachedSystemPrompt
+        }
+
         // Cache-friendly layout: keep `base` byte-stable by stripping out anything
         // that varies per request, then append a "Runtime context" suffix at the
         // very end with all the dynamic bits (date, timezone, locale, configured
@@ -9812,7 +9837,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         val globalMemoryFragment = if (memoryOn) memoryRepository?.loadGlobalMemoryFragment() else null
         val dailyMemoryFragment = if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment() else null
 
-        return buildString {
+        val result = buildString {
             append(base)
             if (skillFragment != null) {
                 append("\n\n")
@@ -9869,6 +9894,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             append("- Device language: ").append(lang).append("\n")
             append("- minis-model-use models available: ").append(modelUseCount)
         }
+        // [T-android-perf-system-prompt-cache] Store in cache before returning.
+        _cachedSystemPrompt = result
+        _systemPromptCacheValid = true
+        return result
     }
 
     /**
