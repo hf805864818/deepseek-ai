@@ -582,6 +582,7 @@ class MainActivity : ComponentActivity() {
                     skillRepository = app.skillRepository,
                     mcpRepository = app.mcpRepository,
                     memoryRepository = app.memoryRepository,
+                    deepModeStore = app.deepModeStore,
                     navController = navController,
                     initialDeepLink = launchDeepLink,
                 )

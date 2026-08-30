@@ -394,6 +394,7 @@ fun ChatScreen(
     memoryRepository: MemoryRepository? = null,
     skillRepository: com.openminis.app.data.repository.SkillRepository? = null,
     mcpRepository: com.openminis.app.data.repository.MCPRepository? = null,
+    deepModeStore: com.openminis.app.agent.DeepModeStore? = null,
     onBack: () -> Unit,
     /** [T-new-chat-menu-entry] "New Chat" from the chat "..." menu: caller
      *  navigates to a fresh draft chat (same funnel as the session list's
@@ -435,6 +436,7 @@ fun ChatScreen(
             memoryRepository = memoryRepository,
             skillRepository = skillRepository,
             mcpRepository = mcpRepository,
+            deepModeStore = deepModeStore,
         ),
     )
     // [T-android-larky-longsession-followup] Consume the tail-windowed

@@ -146,6 +146,8 @@ class MinisApp : Application(), ImageLoaderFactory {
         private set
     lateinit var memoryRepository: MemoryRepository
         private set
+    lateinit var deepModeStore: com.openminis.app.agent.DeepModeStore
+        private set
     lateinit var webAppShortcutRepository: WebAppShortcutRepository
         private set
     lateinit var backgroundSettingsRepository: BackgroundSettingsRepository
@@ -400,6 +402,8 @@ class MinisApp : Application(), ImageLoaderFactory {
         skillRepository = SkillRepository(this)
         mcpRepository = MCPRepository(this)
         memoryRepository = MemoryRepository(java.io.File(filesDir, "minis-global/memory"))
+        deepModeStore = com.openminis.app.agent.DeepModeStore(java.io.File(filesDir, "minis-global/memory"))
+        deepModeStore.ensureExists()
         webAppShortcutRepository = WebAppShortcutRepository(database.webAppShortcutDao())
 
         // T-android-safemode-lateinit-crash: every repository the UI layer
