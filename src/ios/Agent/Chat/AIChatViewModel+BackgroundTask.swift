@@ -637,12 +637,94 @@ extension AIChatViewModel {
     }
 
     func clearChat() {
+        // [T-ios-crash-clearchat-send] Cancel any in-flight task FIRST so the
+        // running agent loop doesn't continue mutating messages / agentHistory
+        // after we've emptied them. Previously, clearChat() removed all data
+        // but left currentTask running; if the task then tried to append to
+        // messages[msgIdx] or agentHistory[i], it would crash with an index
+        // out-of-range trap. The user symptom: "clear chat → send → immediate
+        // crash" because the old task was still running when the new send
+        // started, or the new runAgentLoop hit stale cached state.
+        currentTask?.cancel()
+        currentTask = nil
+        compactTask?.cancel()
+        compactTask = nil
+        _historyWarmupTask?.cancel()
+        _historyWarmupTask = nil
+        userDidCancel = false
+        isProcessing = false
+        canResume = false
+        committedBlockCount = 0
+        prevCommittedBlockCount = 0
+        autoRetryAttempt = 0
+        autoRetryCountdown = 0
+
+        // Reset all transient UI / streaming state
         messages.removeAll()
         agentHistory.removeAll()
         toolSnapshots.removeAll()
         errorMessage = nil
         cachedLatestMarker = nil
         toolLoopDetector.reset()
+        orphanScanCursor = 0
+
+        // [T-ios-crash-clearchat-send] Reset workflow state machine so a
+        // leftover non-idle phase (e.g. .awaitingApproval, .verifying) from
+        // the previous conversation can't confuse the next send's runAgentLoop
+        // entry path. resetWorkflow() handles phase/steps/verify budget/
+        // sentinels/saved state in one place.
+        planGateState = .idle
+        resetWorkflow()
+        goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+        pendingGoalSentinel = nil
+        clarifyState = .idle
+        skipClarifyCheck = false
+        workflowFinishTask?.cancel()
+        workflowFinishTask = nil
+
+        // [T-deep-mode] Reset deep-mode UI state so no banners / badges from
+        // the previous conversation survive into the fresh one.
+        cognitiveLoadState = .empty
+        lastModelLoadSignal = nil
+        needMoreContextState = nil
+        retrospectiveHasRun = false
+        isRetrospectiveRunning = false
+        didInjectEmptyToolReminderThisRun = false
+        didInjectUncertaintyCheckThisRun = false
+
+        // [T-deep-mode-perf-fragment-cache] Invalidate all deep-mode / scope
+        // caches. They carry signatures from the previous conversation's
+        // messages and file paths; reusing them after clearChat would give
+        // the new conversation stale rules and could also cause key-mismatch
+        // crashes if the cache holds references to now-deallocated strings.
+        _cachedDeepModeFragment = nil
+        _cachedDeepModeFragmentKey = nil
+        _cachedScopeContext = nil
+        _cachedScopeLastUserMessage = ""
+
+        // [T-perf-effective-history-cache] Invalidate the effective-history
+        // cache. It holds a copy of agentHistory entries + tool-use ID sets
+        // keyed by historyCount + markerId. After clearChat, historyCount
+        // drops to 0 so the cache naturally misses on the next read — but
+        // we explicitly clear it to free the memory and eliminate any
+        // chance of a stale key collision.
+        _cachedEffectiveHistory = nil
+
+        // [T-ios-crash-clearchat-send] Clear pending thought signatures from
+        // the previous session. These are session-specific and meaningless
+        // after a clear; leaving them could cause a mismatch on the next
+        // Gemini provider restore if the count doesn't match the new history.
+        pendingThoughtSignatures.removeAll()
+
+        // Subagent sessions belong to the old conversation
+        for subagent in activeSubagents {
+            subagent.cancel()
+        }
+        activeSubagents.removeAll()
+
+        // Reset per-turn flags
+        hasClearedTTSForCurrentTurn = false
+        heartbeatToolCallCount = 0
 
         if let sessionId {
             Task { await ISHExecutionCoordinator.shared.sessionDidTerminate(sessionId: sessionId) }

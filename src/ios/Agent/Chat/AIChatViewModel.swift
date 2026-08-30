@@ -5916,7 +5916,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // cursor to agentHistory.count. On resume (partial re-scan), we
         // reset the cursor to 0 because an interrupted turn may have left
         // earlier messages in an unknown state.
-        let scanFrom = isResume ? 0 : max(0, orphanScanCursor)
+        // [T-ios-crash-clearchat-send] Defensive clamp: if orphanScanCursor
+        // somehow ended up > agentHistory.count (e.g. clearChat() didn't
+        // reset it in an older build), clamp it to a valid range instead
+        // of letting it produce an empty scan that leaves all tool IDs
+        // undetected. This is a safety net — clearChat() now properly
+        // resets the cursor, so this should never trigger in practice.
+        let rawScanFrom = isResume ? 0 : orphanScanCursor
+        let scanFrom = min(max(0, rawScanFrom), max(0, agentHistory.count - 1))
         var allToolUseIds = Set<String>()
         var allToolResultIds = Set<String>()
 
