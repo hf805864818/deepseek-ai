@@ -112,7 +112,7 @@ description: "Shell script safety conventions"
 ---
 Shell safety conventions (apply when writing shell scripts):
 - Start scripts with set -euo pipefail for strict error handling.
-- Quote variable expansions: "$var" not $var.
+- Quote variable expansions: "${'$'}var" not ${'$'}var.
 - Use printf instead of echo for predictable output.
 - Check return codes; don't assume commands succeed silently.
 """

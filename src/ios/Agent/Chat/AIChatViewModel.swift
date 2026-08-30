@@ -977,7 +977,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-deep-mode-workflow] Pending one-shot task that fades the completed
     /// tracker out after a short all-green "完成过渡". Cancelled on master-switch
     /// teardown so a disabled deep mode never lets a stray delay mutate state.
-    private var workflowFinishTask: Task<Void, Never>?
+    var workflowFinishTask: Task<Void, Never>?
 
     /// [T-deep-mode-goal-runner] Remaining auto-continuation budget for Layer C.
     /// Decremented once per auto-round, reset to `GoalRunner.maxAutoRounds` on a
@@ -1027,7 +1027,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-deep-mode-cognitive-p2-c9] The model's self-assessed load signal
     /// from the last turn's sentinel. Kept separately so the UI can show
     /// both the model's and the client's assessment.
-    private var lastModelLoadSignal: CognitiveLoadSignal?
+    var lastModelLoadSignal: CognitiveLoadSignal?
 
     // MARK: - P2 Cognitive: C10 Dynamic Autonomy Exit
 
@@ -2764,8 +2764,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     // The scope context depends on the last user message + recent 10 messages'
     // file path mentions. Between send() and runAgentLoop entry, messages don't
     // change, so the cache hits and skips the regex traversal.
-    private var _cachedScopeContext: DeepModeScopeContext?
-    private var _cachedScopeLastUserMessage: String = ""
+    var _cachedScopeContext: DeepModeScopeContext?
+    var _cachedScopeLastUserMessage: String = ""
 
     /// [T-deep-mode-perf-fragment-cache] Cache for the computed
     /// `deepModeFragment` string (the large multi-KB deep-agent behavior
@@ -2780,8 +2780,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// which is only invoked under `if deepModeEnabled`. When the switch is off
     /// the fragment is never read and the cache is never touched; we additionally
     /// clear it in `deepModeDidDisableCleanup()` so no state survives a toggle-off.
-    private var _cachedDeepModeFragment: String?
-    private var _cachedDeepModeFragmentKey: String?
+    var _cachedDeepModeFragment: String?
+    var _cachedDeepModeFragmentKey: String?
 
     private func buildDeepModeScopeContext() -> DeepModeScopeContext {
         // [T-perf-scope-cache] Return cached result when the last user message
@@ -3000,7 +3000,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// cleared when a new workflow starts (beginExecution). Total-switch safe:
     /// the retrospective only runs inside `if deepModeEnabled`, and this flag is
     /// in-memory only — never persisted.
-    private var retrospectiveHasRun = false
+    var retrospectiveHasRun = false
 
     /// [T-deep-mode-cognitive-p1] C7 fix: Flag that is true while the
     /// retrospective's runAgentLoop() is executing. Checked by
@@ -3009,7 +3009,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// coincidentally contains a <<GOAL_STATE>> sentinel). Total-switch
     /// safe: only set inside maybeRunRetrospective(), which is guarded by
     /// `guard deepModeEnabled`.
-    private var isRetrospectiveRunning = false
+    var isRetrospectiveRunning = false
 
     // [T-phase5] Subagent orchestration: active subagent sessions.
     // `task_dispatch` creates a SubagentSession and appends it here.
