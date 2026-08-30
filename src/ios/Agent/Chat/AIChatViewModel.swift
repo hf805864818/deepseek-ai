@@ -3303,7 +3303,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     var committedBlockCount: Int = 0
     /// The committedBlockCount before the current/last iteration started.
     /// Used by handleUserCancelledCleanup to roll back the last iteration.
-    private var prevCommittedBlockCount: Int = 0
+    var prevCommittedBlockCount: Int = 0
     /// Set by cancel() so the task's error handler knows this was a user stop.
     /// Internal-access so concurrent tool extensions can read it. [T-concurrent-tools]
     var userDidCancel = false

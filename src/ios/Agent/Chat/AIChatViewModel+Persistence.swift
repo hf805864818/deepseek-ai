@@ -1715,7 +1715,7 @@ extension AIChatViewModel {
     ///
     /// Messages emptied by the drop are removed, since a parts-less message is
     /// itself invalid on several providers.
-    static func dropOrphanedToolParts(_ history: [AgentMessage], logger: AppLogger) -> [AgentMessage] {
+    nonisolated static func dropOrphanedToolParts(_ history: [AgentMessage], logger: AppLogger) -> [AgentMessage] {
         var toolUseIds: Set<String> = []
         var toolResultIds: Set<String> = []
         for msg in history {

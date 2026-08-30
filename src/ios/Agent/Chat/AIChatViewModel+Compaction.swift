@@ -45,7 +45,7 @@ extension AIChatViewModel {
     /// path already inserted the user message and started the Task. Converts
     /// the last user message to queued state and shows the appropriate prompt.
     /// Called from MainActor context.
-    func handleSendContextFailure(result: ContextPolicy.CheckResult, sendText: String, attachments: [AttachmentMeta]) {
+    func handleSendContextFailure(result: ContextPolicy.CheckResult, sendText: String, attachments: [InputAttachment]) {
         // Find the last user message (the one we just inserted)
         guard let lastUserMsg = messages.last(where: { $0.role == .user && !$0.isQueued }) else {
             logger.warning("[Context] handleSendContextFailure: no last user message found, falling back to legacy flow")

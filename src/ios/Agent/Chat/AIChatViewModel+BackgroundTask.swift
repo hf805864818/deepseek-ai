@@ -724,7 +724,8 @@ extension AIChatViewModel {
 
         // Reset per-turn flags
         hasClearedTTSForCurrentTurn = false
-        heartbeatToolCallCount = 0
+        // Note: heartbeatToolCallCount is a local var in runAgentLoop,
+        // not a class property — it auto-resets on the next send.
 
         if let sessionId {
             Task { await ISHExecutionCoordinator.shared.sessionDidTerminate(sessionId: sessionId) }

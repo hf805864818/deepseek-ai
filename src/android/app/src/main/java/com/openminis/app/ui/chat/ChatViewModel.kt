@@ -1667,8 +1667,8 @@ class ChatViewModel(
         _deepModeEnabled.value = newValue
         // System prompt depends on deep mode state
         invalidateSystemPromptCache()
-        // v6.1: invalidate static fragment cache on toggle
-        invalidateDeepModeStaticCache()
+        // v6.1: invalidate all deep mode caches on toggle
+        invalidateDeepModeCaches()
         // Save to global prefs (per-session DB persistence to be added later
         // with a schema migration; for now the global default is the source of truth).
         com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, newValue)
@@ -4739,6 +4739,10 @@ class ChatViewModel(
         _error.value = null
         _cachedLatestMarker = null
         invalidateEstimateCache()  // [T-perf-estimate-cache-android]
+        // v6.1: invalidate all deep mode caches — they carry signatures from
+        // the previous conversation's messages and file paths; reusing them
+        // after clearChat would give the new conversation stale rules.
+        invalidateDeepModeCaches()
         toolLoopDetector.reset()
         _canResume.value = false
         _attachments.value = emptyList()
@@ -10111,25 +10115,13 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             //   1. extractScopeContext() pulls file paths + keywords from recent
             //      history so scoped rules (Android/Kotlin, Python, shell)
             //      actually match — before v6.1 they were always empty.
-            //   2. getDeepModeStaticFragment() caches the static portion
-            //      (header + PlanGate + GoalRunner + VerifyGate + cognitive rules)
-            //      so we don't rebuild those strings on every prompt.
-            if (_deepModeEnabled.value && deepModeStore != null) {
-                // [v6.1] Extract scope context from recent conversation
-                val scopeCtx = extractScopeContext()
-                val rules = deepModeStore.rulesFragment(scopeCtx)
-                if (rules.isNotEmpty()) {
-                    append("\n\n")
-                    append(rules)
-                    append("\n\n")
-                    // [v6.1] Use cached static fragment
-                    append(getDeepModeStaticFragment(_deepModeLevel.value))
-                    // C14 cross-session context (dynamic, per-session)
-                    com.openminis.app.agent.CrossSessionContextStore.contextFragment(context)
-                        ?.let { fragment ->
-                            append("\n\n")
-                            append(fragment)
-                        }
+            //   2. getDeepModeFragment() caches the FULL fragment (scoped rules
+            //      + static portion + cross-session context) keyed on level +
+            //      memory + scope signature + rules mod-time, so all within-turn
+            //      prompt rebuilds hit O(1) cache.
+            getDeepModeFragment()?.let { fragment ->
+                if (fragment.isNotEmpty()) {
+                    append(fragment)
                 }
             }
             // Runtime context goes last so the prefix above stays byte-stable
@@ -10207,6 +10199,17 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
     // MARK: - v6.1 Deep Mode Optimizations
 
     /**
+     * [T-perf-scope-cache-android] Cache for extractScopeContext() result.
+     * The scope context depends on the last user message + recent messages'
+     * file path mentions. Between send() and runAgentLoop entry, messages
+     * don't change, so the cache hits and skips the regex traversal.
+     *
+     * Mirrors iOS `_cachedScopeContext` / `_cachedScopeLastUserMessage`.
+     */
+    private var _cachedScopeContext: com.openminis.app.agent.DeepModeScopeContext? = null
+    private var _cachedScopeLastUserMessage: String = ""
+
+    /**
      * [T-deep-mode-v61-scope-context] Extract scope context from recent
      * conversation history for better scoped-rule matching.
      *
@@ -10219,8 +10222,21 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
      * The result feeds into DeepModeStore.matchingRules() so only rules
      * relevant to the current task are injected — keeping the system prompt
      * leaner and the model's behavior more targeted.
+     *
+     * v6.1 perf: returns cached result when the last user message hasn't
+     * changed (same send flow → same scope context → no recomputation).
      */
     private fun extractScopeContext(): com.openminis.app.agent.DeepModeScopeContext {
+        // [T-perf-scope-cache-android] Return cached result when the last
+        // user message hasn't changed — scope is stable within the same
+        // send/runAgentLoop flow and recomputing is wasted work.
+        val lastUserMessage = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER }?.content ?: ""
+        _cachedScopeContext?.let { cached ->
+            if (lastUserMessage == _cachedScopeLastUserMessage) {
+                return cached
+            }
+        }
+
         val filePaths = mutableSetOf<String>()
         val keywords = mutableSetOf<String>()
 
@@ -10228,18 +10244,18 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
         for (msg in agentHistory.takeLast(20)) {
             for (part in msg.contentParts) {
                 if (part is AgentContentPart.ToolUse) {
-                    val args = part.input ?: continue
+                    val args = part.input
                     // file_read / file_write / file_edit — path argument
                     if (part.name in setOf("file_read", "file_write", "file_edit")) {
                         try {
-                            val path = org.json.JSONObject(args).optString("path", "")
+                            val path = args.optString("path", "")
                             if (path.isNotBlank()) filePaths.add(path)
                         } catch (_: Exception) { }
                     }
                     // shell_execute — extract file references from command
                     if (part.name == "shell_execute") {
                         try {
-                            val cmd = org.json.JSONObject(args).optString("command", "")
+                            val cmd = args.optString("command", "")
                             // Extract common file patterns from command
                             val filePattern = Regex("""[\w./\-]+\.(kt|kts|java|py|sh|bash|zsh|js|ts|tsx|jsx|css|html|xml|json|md|yaml|yml|go|rs|c|cpp|h|swift|rb|php)""", RegexOption.IGNORE_CASE)
                             filePattern.findAll(cmd).forEach { match ->
@@ -10251,9 +10267,8 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
             }
         }
 
-        // Extract keywords from the last user message
-        val lastUserMsg = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER }?.content ?: ""
-        if (lastUserMsg.isNotBlank()) {
+        // Extract keywords from the last user message (reuse lastUserMessage from cache check above)
+        if (lastUserMessage.isNotBlank()) {
             val keywordCandidates = listOf(
                 "android" to listOf("android", "kotlin", "jetpack", "compose", "apk", "viewmodel", "activity", "fragment"),
                 "python" to listOf("python", "pip", "django", "flask", "pandas", "numpy", "script"),
@@ -10261,7 +10276,7 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
                 "web" to listOf("web", "browser", "html", "css", "javascript", "frontend", "website"),
                 "ios" to listOf("ios", "swift", "uikit", "swiftui", "xcode"),
             )
-            val lowerMsg = lastUserMsg.lowercase()
+            val lowerMsg = lastUserMessage.lowercase()
             for ((keyword, variants) in keywordCandidates) {
                 if (variants.any { lowerMsg.contains(it) }) {
                     keywords.add(keyword)
@@ -10269,11 +10284,15 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
             }
         }
 
-        return com.openminis.app.agent.DeepModeScopeContext(
+        val ctx = com.openminis.app.agent.DeepModeScopeContext(
             filePaths = filePaths.toList(),
             userKeywords = keywords.toList(),
             level = _deepModeLevel.value,
         )
+        // [T-perf-scope-cache-android] Store in cache before returning.
+        _cachedScopeContext = ctx
+        _cachedScopeLastUserMessage = lastUserMessage
+        return ctx
     }
 
     /**
@@ -10315,12 +10334,97 @@ Do NOT keep banging your head against the same wall. Creativity over brute force
     }
 
     /**
-     * Invalidate the deep mode static fragment cache. Called when the level
-     * changes or deep mode is toggled.
+     * [T-deep-mode-perf-fragment-cache-android] Full deep-mode fragment cache
+     * keyed on its true inputs: level + memory flag + scope signature +
+     * rules file mod-time. All within-turn recomputations become O(1) hits.
+     *
+     * Mirrors iOS `_cachedDeepModeFragment` / `_cachedDeepModeFragmentKey`.
+     * The static-part cache (above) is still useful as a building block —
+     * the full cache uses it internally to avoid rebuilding the static
+     * portion even on a full-cache miss when the level is unchanged.
      */
-    private fun invalidateDeepModeStaticCache() {
+    private var _cachedDeepModeFragment: String? = null
+    private var _cachedDeepModeFragmentKey: String? = null
+
+    /**
+     * Build the complete deep mode fragment (scoped rules + static portion
+     * + cross-session context) with full caching. Mirrors iOS
+     * `deepModeFragment` computed property.
+     *
+     * Cache key: `level|memoryEnabled|scopeUserKeywords|scopeFilePaths|rulesModTime`
+     * Returns null if deep mode is disabled or DeepModeStore is unavailable.
+     */
+    private fun getDeepModeFragment(): String? {
+        if (!_deepModeEnabled.value || deepModeStore == null) return null
+
+        val scopeCtx = extractScopeContext()
+        val level = _deepModeLevel.value
+        val memoryOn = _memoryEnabled.value
+        val rulesModTime = deepModeStore.rulesFileModTime() ?: -1L
+
+        // Build cache key — same inputs → same fragment
+        val cacheKey = buildString {
+            append(level.name)
+            append('|')
+            append(memoryOn)
+            append('|')
+            append(scopeCtx.userKeywords.joinToString(","))
+            append('|')
+            append(scopeCtx.filePaths.joinToString(","))
+            append('|')
+            append(rulesModTime)
+        }
+
+        // Fast path: cache hit
+        _cachedDeepModeFragment?.let { cached ->
+            if (_cachedDeepModeFragmentKey == cacheKey) {
+                return cached
+            }
+        }
+
+        // Slow path: build the fragment
+        val rulesFragment = deepModeStore.rulesFragment(scopeCtx)
+        if (rulesFragment.isEmpty()) {
+            // No rules matched — still cache this (as empty) so we don't
+            // re-run the glob matching on every prompt rebuild.
+            _cachedDeepModeFragment = ""
+            _cachedDeepModeFragmentKey = cacheKey
+            return ""
+        }
+
+        val fragment = buildString {
+            append("\n\n")
+            append(rulesFragment)
+            append("\n\n")
+            append(getDeepModeStaticFragment(level))
+            // C14 cross-session context (dynamic, per-session)
+            com.openminis.app.agent.CrossSessionContextStore.contextFragment(context)
+                ?.let { ctxFragment ->
+                    append("\n\n")
+                    append(ctxFragment)
+                }
+        }
+
+        _cachedDeepModeFragment = fragment
+        _cachedDeepModeFragmentKey = cacheKey
+        return fragment
+    }
+
+    /**
+     * Invalidate all deep mode caches (scope context + static fragment +
+     * full fragment). Called when deep mode is toggled, level changes,
+     * chat is cleared, or rules are edited.
+     */
+    private fun invalidateDeepModeCaches() {
+        // Static portion cache
         cachedDeepModeStaticFragment = null
         cachedDeepModeStaticLevel = null
+        // Full fragment cache
+        _cachedDeepModeFragment = null
+        _cachedDeepModeFragmentKey = null
+        // Scope context cache
+        _cachedScopeContext = null
+        _cachedScopeLastUserMessage = ""
     }
 
     // ─── Legacy tool execution methods (kept for compatibility) ───────────
