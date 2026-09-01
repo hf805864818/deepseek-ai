@@ -7168,7 +7168,7 @@ extension ChatStore {
         guard !ids.isEmpty else { return [:] }
         // SQLite parameter limit is 999 by default; our batch max is 100.
         // Build IN clause with placeholders.
-        let placeholders = ids.map { "?" }.joined(separator: ",")
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
         let sql = """
             SELECT id, session_id, role, parts_json, created_at, token_usage,
                    reasoning_content, stream_interrupt_count, sort_order,
