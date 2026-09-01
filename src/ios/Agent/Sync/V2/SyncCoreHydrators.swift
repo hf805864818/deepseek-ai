@@ -36,9 +36,19 @@ final class SyncCoreHydrators {
     /// registered, SyncCore falls back to a hard delete via direct SQL.
     typealias DeletionApplier = (_ id: String) async -> Void
 
+    /// [T-icloud-thermal-batch-build] Batch builder: given an array of ids
+    /// for the same recordType, return a map of id → PortableRecord.
+    /// Implementations should use a single SQL query (WHERE id IN (...))
+    /// instead of N separate queries. Ids missing from the result map are
+    /// treated as "local row gone" by the caller (same semantics as
+    /// buildPortable returning nil). Reduces O(n) DB round-trips to O(1)
+    /// per batch — the primary CPU bottleneck during iCloud sync.
+    typealias BatchBuilder = (_ ids: [String]) async -> [String: PortableRecord]
+
     private var builders: [String: Builder] = [:]
     private var mergers: [String: Merger] = [:]
     private var deleters: [String: DeletionApplier] = [:]
+    private var batchBuilders: [String: BatchBuilder] = [:]
 
     func register(
         recordType: String,
@@ -51,12 +61,44 @@ final class SyncCoreHydrators {
         if let d = deletionApplier { deleters[recordType] = d }
     }
 
+    /// [T-icloud-thermal-batch-build] Register a batch builder for a
+    /// recordType. When set, SyncCore.sendNow() groups dirty rows by type
+    /// and calls this instead of per-record buildPortable(). Falls back to
+    /// the single-record Builder for types without a batch builder.
+    func registerBatchBuilder(recordType: String, batchBuilder: @escaping BatchBuilder) {
+        batchBuilders[recordType] = batchBuilder
+    }
+
+    /// True when this recordType has a batch builder registered.
+    func hasBatchBuilder(recordType: String) -> Bool {
+        batchBuilders[recordType] != nil
+    }
+
     func buildPortable(recordType: String, id: String) async -> PortableRecord? {
         guard let b = builders[recordType] else {
             // No builder yet — type is registered for read-only consumption.
             return nil
         }
         return await b(id)
+    }
+
+    /// [T-icloud-thermal-batch-build] Batch-build PortableRecords for a set
+    /// of ids of the same recordType. Uses the registered BatchBuilder
+    /// (single SQL query) when available; otherwise falls back to calling
+    /// buildPortable() per id. Returns a map of [id: PortableRecord]; ids
+    /// not in the map have no local row (same semantics as nil return).
+    func buildPortableBatch(recordType: String, ids: [String]) async -> [String: PortableRecord] {
+        if let bb = batchBuilders[recordType] {
+            return await bb(ids)
+        }
+        // Fallback: per-record build (same behavior as before this optimization)
+        var result: [String: PortableRecord] = [:]
+        for id in ids {
+            if let p = await buildPortable(recordType: recordType, id: id) {
+                result[id] = p
+            }
+        }
+        return result
     }
 
     /// True when this recordType has a builder closure registered. Used by

@@ -5415,11 +5415,21 @@ extension ChatStore {
         // the user is actively using the app (foreground, not on the sync
         // sheet), we back way off so typing / scrolling stays smooth. When
         // background or on the sync sheet, we run at the base pace.
-        let baseWindowSize = 50
+        //
+        // [T-icloud-thermal-backlog-adaptive] Smaller windows + lower drain
+        // threshold to keep the dirty queue at a steady low level. Old values
+        // (50 sessions / 2000 threshold / 10s poll) caused the queue to spike
+        // to thousands of rows after each staging pass, which kept the send
+        // loop busy for long stretches and prevented the device from entering
+        // low-power states. New values (10 sessions / 300 threshold / 5s poll)
+        // create a "trickle" effect: stage 10 sessions → drain to <300 → stage
+        // 10 more. The queue never exceeds ~500 rows, so the send loop has
+        // just enough work without flooding the system.
+        let baseWindowSize = 10
         let backlogPriority = 1
-        let baseDrainPollInterval: UInt64 = 10_000_000_000  // 10s
-        let baseDrainThreshold = 2_000
-        let baseInterWindowSleep: UInt64 = 1_000_000_000  // 1s
+        let baseDrainPollInterval: UInt64 = 5_000_000_000  // 5s
+        let baseDrainThreshold = 300  // ~3× the max batch size (100)
+        let baseInterWindowSleep: UInt64 = 2_000_000_000  // 2s
         let drainDeadlineSeconds: TimeInterval = 60 * 60  // 60min
         var totalStaged = 0
         var passes = 0
@@ -5463,17 +5473,19 @@ extension ChatStore {
                 interWindowSleep = baseInterWindowSleep
             } else if thermal == .serious {
                 // Foreground + hot → very slow pace
-                windowSize = baseWindowSize / 4  // 12-13 sessions per batch
-                drainPollInterval = baseDrainPollInterval * 4  // 40s between checks
-                drainThreshold = baseDrainThreshold / 2  // 1000
-                interWindowSleep = baseInterWindowSleep * 4  // 4s rest
+                // [T-icloud-thermal-backlog-adaptive] Updated for new base values
+                windowSize = max(baseWindowSize / 4, 2)  // 2-3 sessions per batch
+                drainPollInterval = baseDrainPollInterval * 4  // 20s between checks
+                drainThreshold = baseDrainThreshold / 2  // 150
+                interWindowSleep = baseInterWindowSleep * 4  // 8s rest
             } else {
                 // Foreground, normal temp → moderate pace
                 // (user is typing/browsing — keep sync unobtrusive)
-                windowSize = baseWindowSize / 2  // 25 sessions per batch
-                drainPollInterval = baseDrainPollInterval * 2  // 20s between checks
-                drainThreshold = baseDrainThreshold  // same threshold
-                interWindowSleep = baseInterWindowSleep * 2  // 2s rest
+                // [T-icloud-thermal-backlog-adaptive] Updated for new base values
+                windowSize = baseWindowSize / 2  // 5 sessions per batch
+                drainPollInterval = baseDrainPollInterval * 2  // 10s between checks
+                drainThreshold = baseDrainThreshold  // same threshold (300)
+                interWindowSleep = baseInterWindowSleep * 2  // 4s rest
             }
 
             let cursor = UserDefaults.standard.double(forKey: cursorKey)
@@ -7145,6 +7157,60 @@ extension ChatStore {
         }
         sqlite3_finalize(stmt)
         return message
+    }
+
+    /// [T-icloud-thermal-batch-build] Batch-load messages + their updatedAt
+    /// in a single SQL query. Replaces N calls to loadSingleMessage + N calls
+    /// to messageUpdatedAt (2N DB round-trips) with 1 query. Used by the
+    /// MessageV2 batch builder registered in ChatStoreSyncHydrators.
+    /// Returns a dictionary keyed by message id.
+    func loadMessagesBatch(ids: [String]) -> [String: (msg: RawMessage, updatedAt: Date)] {
+        guard !ids.isEmpty else { return [:] }
+        // SQLite parameter limit is 999 by default; our batch max is 100.
+        // Build IN clause with placeholders.
+        let placeholders = ids.map { "?" }.joined(separator: ",")
+        let sql = """
+            SELECT id, session_id, role, parts_json, created_at, token_usage,
+                   reasoning_content, stream_interrupt_count, sort_order,
+                   COALESCE(updated_at, created_at)
+            FROM messages WHERE id IN (\(placeholders))
+        """
+        var stmt: OpaquePointer?
+        var result: [String: (msg: RawMessage, updatedAt: Date)] = [:]
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            for (i, id) in ids.enumerated() {
+                sqlite3_bind_text(stmt, Int32(i + 1), (id as NSString).utf8String, -1, nil)
+            }
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let msgId = String(cString: sqlite3_column_text(stmt, 0))
+                let sessionId = String(cString: sqlite3_column_text(stmt, 1))
+                let roleStr = String(cString: sqlite3_column_text(stmt, 2))
+                let partsJson = String(cString: sqlite3_column_text(stmt, 3))
+                let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
+                let tokenUsageStr = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
+                let reasoningContent = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
+                let streamInterruptCount = Int(sqlite3_column_int(stmt, 7))
+                let sortOrder = Int(sqlite3_column_int64(stmt, 8))
+                let updatedAtTs = sqlite3_column_double(stmt, 9)
+
+                let role = MessageRole(rawValue: roleStr) ?? .user
+                let parts = (try? JSONDecoder().decode([ContentPart].self, from: Data(partsJson.utf8))) ?? []
+                let tokenUsage = tokenUsageStr.flatMap { str in
+                    try? JSONDecoder().decode(StoredTokenUsage.self, from: Data(str.utf8))
+                }
+
+                var raw = RawMessage(
+                    id: msgId, sessionId: sessionId, role: role, parts: parts,
+                    createdAt: createdAt, tokenUsage: tokenUsage,
+                    reasoningContent: reasoningContent,
+                    streamInterruptCount: streamInterruptCount
+                )
+                raw.sortOrder = sortOrder
+                result[msgId] = (msg: raw, updatedAt: Date(timeIntervalSince1970: updatedAtTs))
+            }
+        }
+        sqlite3_finalize(stmt)
+        return result
     }
 
     // MARK: - Size Estimation for Sync Categories

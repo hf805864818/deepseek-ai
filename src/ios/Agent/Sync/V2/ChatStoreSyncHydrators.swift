@@ -32,6 +32,16 @@ enum ChatStoreSyncHydrators {
             merger: { record in await mergeMessage(record: record) },
             deletionApplier: { id in await deleteMessage(id: id) }
         )
+        // [T-icloud-thermal-batch-build] Register a batch builder for
+        // MessageV2 — the most numerous record type in iCloud sync. Each
+        // historical session can have hundreds of messages, so a 100-row
+        // dirty batch typically contains 80-95 messages. The old path did
+        // 2 SQL queries per message (loadSingleMessage + messageUpdatedAt);
+        // the batch path does 1 query total. This is the single biggest
+        // CPU reduction in the iCloud thermal optimization.
+        h.registerBatchBuilder(recordType: "MessageV2") { ids in
+            await buildMessagesBatch(ids: ids)
+        }
 
         h.register(
             recordType: "CompactMarkerV2",
@@ -289,6 +299,27 @@ enum ChatStoreSyncHydrators {
             .buildPortable(synced)
     }
 
+    /// [T-icloud-thermal-batch-build] Batch-build MessageV2 PortableRecords
+    /// using a single SQL query. Loads all messages + their updatedAt values
+    /// in one pass, then constructs SyncedMessage → PortableRecord for each.
+    /// Equivalent to calling buildMessage(id:) N times but with 1 DB query
+    /// instead of 2N. Messages not found in SQLite are simply omitted from
+    /// the result (same semantics as buildMessage returning nil).
+    private static func buildMessagesBatch(ids: [String]) async -> [String: PortableRecord] {
+        guard !ids.isEmpty else { return [:] }
+        let loaded = await ChatStore.shared.loadMessagesBatch(ids: ids)
+        let metadata = SyncableTypeRegistry.shared.metadata(for: "MessageV2")
+        guard let metadata else { return [:] }
+        var result: [String: PortableRecord] = [:]
+        for (msgId, (msg, updatedAt)) in loaded {
+            let synced = SyncedMessage.from(msg, updatedAt: updatedAt)
+            if let portable = metadata.buildPortable(synced) {
+                result[msgId] = portable
+            }
+        }
+        return result
+    }
+
     private static func mergeMessage(record: PortableRecord) async {
         guard let id = stringField(record, "messageId"),
               let sessionId = stringField(record, "sessionId"),
@@ -398,6 +429,51 @@ enum ChatStoreSyncHydrators {
 
     // MARK: - SessionFile
 
+    /// [T-icloud-thermal-modtime-cache] TTL-cached file stat results to avoid
+    /// repeated `FileManager.attributesOfItem` calls during sync. Each stat
+    /// is a kernel-level filesystem operation that wakes the flash controller
+    /// and prevents the device from entering low-power states. In a sync
+    /// cycle, the same files may be stat'd multiple times (retry, conflict
+    /// resolution, batch rebuild). This cache serves the result from memory
+    /// after the first stat, with a 30-second TTL.
+    /// Keyed by file path. Invalidated on local file writes (see invalidateFileStatCache).
+    private static var fileStatCache: [String: (size: Int, modDate: Date)] = [:]
+    private static var fileStatCacheTimestamp: CFAbsoluteTime = 0
+    private static let fileStatCacheTTL: CFAbsoluteTime = 30  // seconds
+
+    /// Invalidate a single entry (call after writing/modifying a file locally).
+    static func invalidateFileStatCache(path: String) {
+        fileStatCache.removeValue(forKey: path)
+    }
+
+    /// Clear the entire cache (call after a sync cycle completes).
+    static func clearFileStatCache() {
+        fileStatCache.removeAll()
+        fileStatCacheTimestamp = CFAbsoluteTimeGetCurrent()
+    }
+
+    /// Cached file stat: returns (size, modDate) for a path, hitting the
+    /// cache when possible. Returns nil if the file doesn't exist.
+    private static func cachedFileStat(path: String) -> (size: Int, modDate: Date)? {
+        let now = CFAbsoluteTimeGetCurrent()
+        // TTL expired → clear and start fresh
+        if now - fileStatCacheTimestamp > fileStatCacheTTL {
+            fileStatCache.removeAll()
+            fileStatCacheTimestamp = now
+        }
+        if let cached = fileStatCache[path] {
+            return cached
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return nil
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? Int) ?? 0
+        let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
+        fileStatCache[path] = (size: size, modDate: modDate)
+        return (size: size, modDate: modDate)
+    }
+
     /// SessionFile recordId is "sessionId:relativePath" (compositeKey).
     private static func buildSessionFile(id: String) async -> PortableRecord? {
         let parts = id.split(separator: ":", maxSplits: 1)
@@ -406,10 +482,14 @@ enum ChatStoreSyncHydrators {
         let relativePath = String(parts[1])
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
         let fileURL = library.appendingPathComponent("MinisChat/minis/\(sessionId)/\(relativePath)")
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
-        let fileSize = (attrs?[.size] as? Int) ?? 0
-        let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
+        // [T-icloud-thermal-modtime-cache] Use cached stat instead of
+        // calling FileManager.attributesOfItem on every buildSessionFile
+        // invocation. During a sync cycle the same file may be built
+        // multiple times (retry, conflict resolution); the cache avoids
+        // repeated kernel-level stat calls that prevent low-power state.
+        guard let stat = cachedFileStat(path: fileURL.path) else { return nil }
+        let fileSize = stat.size
+        let modDate = stat.modDate
         // Skip oversized files (single source of truth: UploadPolicy.maxFileSizeBytes).
         let maxSize = UploadPolicy.maxFileSizeBytes
         if fileSize > maxSize {
@@ -485,6 +565,10 @@ enum ChatStoreSyncHydrators {
             try fm.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if fm.fileExists(atPath: destURL.path) { try? fm.removeItem(at: destURL) }
             try fm.copyItem(at: asset.fileURL, to: destURL)
+            // [T-icloud-thermal-modtime-cache] Invalidate the stat cache
+            // for this file — we just wrote it, so the cached size/mtime
+            // is now stale.
+            invalidateFileStatCache(path: destURL.path)
             // [T-ios-log-noise-reduction] INFO→DEBUG: per-file apply trace,
             // high-volume during batch sync; not actionable in production.
             logger.debug("[SyncCore] applied SessionFileV2: \(sessionId.prefix(8))/\(relativePath) size=\(asset.size)")

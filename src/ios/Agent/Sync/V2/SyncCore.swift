@@ -549,7 +549,16 @@ final class SyncCore {
         var batchRecords: [PortableRecord] = []
         var batchDeletes: [SyncRecordID] = []
 
-        for row in dirty {
+        // [T-icloud-thermal-batch-build] Group dirty rows by recordType so
+        // we can use batch builders (single SQL query per type) instead of
+        // N separate per-record queries. This is the primary CPU optimization
+        // for iCloud sync — 100 messages × 2 queries each = 200 DB round-trips
+        // collapses to 2 batch queries. Types without a batch builder fall
+        // back to per-record buildPortable() transparently.
+        // Step 1: partition dirty rows by recordType (non-delete only).
+        var groupedIds: [String: [String]] = [:]  // recordType → [recordId]
+        var groupedRowIndices: [String: [(rowIdx: Int, recordId: String)]] = [:]
+        for (idx, row) in dirty.enumerated() {
             guard let metadata = registry.metadata(for: row.recordType) else {
                 continue
             }
@@ -562,28 +571,33 @@ final class SyncCore {
                 }
                 continue
             }
-            // Build via the type's owner — SyncCore doesn't know how to
-            // hydrate a SyncedX from local SQLite (that's per-type
-            // ChatStore work). We delegate to a hydrator registered per
-            // recordType (see `SyncCoreHydrators`).
-            if let portable = await SyncCoreHydrators.shared.buildPortable(
-                recordType: row.recordType, id: row.recordId
-            ) {
-                batchRecords.append(portable)
-            }
-            // If buildPortable returned nil there are two distinct cases:
-            //   (a) no builder is registered for this recordType — KEEP
-            //       the dirty row so a future patch with a registered
-            //       builder can pick it up. Clearing it here would lose
-            //       data silently (audit C3).
-            //   (b) builder is registered but returned nil — local row
-            //       is gone, clear the dirty so we don't loop trying to
-            //       rebuild a missing record.
-            else if !SyncCoreHydrators.shared.hasBuilder(recordType: row.recordType) {
-                logger.warning("[SyncSchema] noBuilderForType: \(row.recordType):\(row.recordId.prefix(8)) — keeping dirty for future builder")
-            } else {
-                logger.info("[SyncCore] dropping stale dirty: \(row.recordType):\(row.recordId.prefix(8)) (no local row)")
-                await ChatStore.shared.clearDirtyRecord(recordName: "\(row.recordType):\(row.recordId)")
+            groupedIds[row.recordType, default: []].append(row.recordId)
+            groupedRowIndices[row.recordType, default: []].append((rowIdx: idx, recordId: row.recordId))
+        }
+
+        // Step 2: for each recordType, batch-build all PortableRecords in
+        // one call. Falls back to per-record build for types without a
+        // batch builder.
+        for (recordType, ids) in groupedIds {
+            let builtMap = await SyncCoreHydrators.shared.buildPortableBatch(
+                recordType: recordType, ids: ids
+            )
+            // Append in the original dirty-row order so the batch
+            // preserves parent-before-child ordering.
+            for (_, recordId) in groupedRowIndices[recordType] ?? [] {
+                if let portable = builtMap[recordId] {
+                    batchRecords.append(portable)
+                } else {
+                    // buildPortable returned nil — same logic as before:
+                    //   (a) no builder registered → KEEP dirty
+                    //   (b) builder registered but nil → local row gone, clear
+                    if !SyncCoreHydrators.shared.hasBuilder(recordType: recordType) {
+                        logger.warning("[SyncSchema] noBuilderForType: \(recordType):\(recordId.prefix(8)) — keeping dirty for future builder")
+                    } else {
+                        logger.info("[SyncCore] dropping stale dirty: \(recordType):\(recordId.prefix(8)) (no local row)")
+                        await ChatStore.shared.clearDirtyRecord(recordName: "\(recordType):\(recordId)")
+                    }
+                }
             }
         }
 
@@ -702,6 +716,9 @@ final class SyncCore {
                 logger.info("[SyncCore] sendNow done, dirty.total=\(after.total) remaining — chaining another send (delay=\(currentSendDelay)s, throttle=\(throttleLabel))")
                 scheduleSend(delay: currentSendDelay)
             }
+            // [T-icloud-thermal-modtime-cache] Clear the file stat cache
+            // after each send cycle. The next cycle will re-stat as needed.
+            ChatStoreSyncHydrators.clearFileStatCache()
         }
     }
 
