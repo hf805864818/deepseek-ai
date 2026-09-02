@@ -3925,6 +3925,28 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             defer { concurrency.releaseSlot(sessionId: sid) }
 
             do {
+                // [T-perf-keyboard-yield-phase2] Wait for the keyboard dismissal
+                // animation to complete before kicking off heavy main-thread
+                // work (prompt assembly + orphan scan + effective history build).
+                //
+                // performSend() dismisses the keyboard (inputFocused=false +
+                // resignFirstResponder) right before calling vm.send(). The
+                // standard iOS keyboard slide-down animation takes ~250ms.
+                // A single Task.yield() (16ms / 1 frame) is not enough for
+                // DeepMode long sessions where runAgentLoop setup blocks the
+                // main thread for 100–400ms — the animation freezes mid-way
+                // ("底部空了", input bar left floating).
+                //
+                // Attachment processing above runs concurrently, so the
+                // effective wait is often shorter than 250ms (file I/O
+                // overlaps with the keyboard animation). This sleep only
+                // pads the remaining time to ensure the animation finishes
+                // before we saturate the main thread.
+                //
+                // Zero impact on retry/resume/auto-continue: those paths call
+                // runAgentLoop() directly and do not go through send().
+                try await Task.sleep(nanoseconds: 250_000_000)
+
                 try await self.runAgentLoop()
             } catch is CancellationError {
                 logger.info("Agent loop cancelled")
