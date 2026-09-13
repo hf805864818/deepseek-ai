@@ -115,6 +115,25 @@ jobs:
         run: ./deps/build_ffmpeg.sh
         working-directory: ${{ github.workspace }}
 
+      - name: Install Go toolchain (for rclone)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-rclone-ios-${{ runner.os }}-${{ hashFiles('deps/rclone-mobile/**', 'deps/rclone-mobile/go.sum') }}
+          restore-keys: |
+            go-rclone-ios-${{ runner.os }}-
+
+      - name: Build rclone iOS (Rclone.xcframework)
+        run: ./deps/build_rclone_ios.sh
+        working-directory: ${{ github.workspace }}
+
       - name: Build iSH
         run: ./deps/build_ish.sh
         working-directory: ${{ github.workspace }}
@@ -273,6 +292,35 @@ jobs:
 
       - name: Build PRoot
         run: ./deps/build_proot.sh
+        working-directory: ${{ github.workspace }}
+
+      - name: Install Go toolchain (for rclone Android)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-rclone-android-${{ runner.os }}-${{ hashFiles('deps/rclone-mobile/**') }}
+          restore-keys: |
+            go-rclone-android-${{ runner.os }}-
+
+      - name: Build rclone Android (rclone.aar)
+        run: |
+          # 定位 NDK (android-actions/setup-android 装的 NDK 路径)
+          NDK_DIR="$(ls -d "$HOME/Android/Sdk/ndk"/* 2>/dev/null | head -1)"
+          [ -z "$NDK_DIR" ] && NDK_DIR="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | head -1)"
+          if [ -z "$NDK_DIR" ]; then
+            echo "NDK not found, skipping rclone Android build (rclone.aar will be missing)"
+            exit 0
+          fi
+          export ANDROID_NDK_HOME="$NDK_DIR"
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          ./deps/build_rclone_android.sh
         working-directory: ${{ github.workspace }}
 
       - name: Prepare Android sandbox
