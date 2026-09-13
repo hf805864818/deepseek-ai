@@ -311,16 +311,28 @@ jobs:
 
       - name: Build rclone Android (rclone.aar)
         run: |
-          # 定位 NDK (android-actions/setup-android 装的 NDK 路径)
-          NDK_DIR="$(ls -d "$HOME/Android/Sdk/ndk"/* 2>/dev/null | head -1)"
-          [ -z "$NDK_DIR" ] && NDK_DIR="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | head -1)"
+          # 1. 安装 gomobile (Android 端 rclone 构建依赖)
+          go install golang.org/x/mobile/cmd/gomobile@latest || {
+            echo "::warning::gomobile install failed, skipping rclone Android"
+            exit 0
+          }
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init 2>&1 || echo "::warning::gomobile init failed, continuing"
+          # 2. 定位 NDK
+          NDK_DIR=""
+          for base in "$HOME/Android/Sdk" /usr/local/lib/android/sdk "${ANDROID_HOME}"; do
+            [ -d "$base/ndk" ] && NDK_DIR="$(ls -d "$base"/ndk/* 2>/dev/null | head -1)" && break
+          done
           if [ -z "$NDK_DIR" ]; then
             echo "NDK not found, skipping rclone Android build (rclone.aar will be missing)"
             exit 0
           fi
           export ANDROID_NDK_HOME="$NDK_DIR"
           export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
-          ./deps/build_rclone_android.sh
+          ./deps/build_rclone_android.sh || {
+            echo "::warning::rclone Android build failed, APK will lack rclone support"
+            exit 0
+          }
         working-directory: ${{ github.workspace }}
 
       - name: Prepare Android sandbox
