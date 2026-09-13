@@ -89,34 +89,6 @@
 		B02B7ADBAB47BDB33F664A21 /* VoiceProvider+Vendors.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BB45FC87D39AE9AB4495BE9 /* VoiceProvider+Vendors.swift */; };
 		BB1000100F700000000000AA /* ContextPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1000110F700000000000AA /* ContextPolicy.swift */; };
 		BB1000120F700000000000AA /* ContextPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1000110F700000000000AA /* ContextPolicy.swift */; };
-		BKP000101 /* BackupFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000201 /* BackupFormat.swift */; };
-		BKP000102 /* BackupBlobStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000202 /* BackupBlobStore.swift */; };
-		BKP000103 /* BackupJSONLWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000203 /* BackupJSONLWriter.swift */; };
-		BKP000104 /* BackupFileTreeExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000204 /* BackupFileTreeExporter.swift */; };
-		BKP000105 /* BackupExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000205 /* BackupExporter.swift */; };
-		BKP000106 /* BackupPackageReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000206 /* BackupPackageReader.swift */; };
-		BKP000107 /* DebugRPCBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000207 /* DebugRPCBackup.swift */; };
-		BKP000109 /* BackupImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000209 /* BackupImporter.swift */; };
-		BKP000110 /* BackupZipExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000210 /* BackupZipExtractor.swift */; };
-		BKP000111 /* BackupImporter+Categories.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000211 /* BackupImporter+Categories.swift */; };
-		BKP000112 /* BackupSecrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000212 /* BackupSecrets.swift */; };
-		BKP000113 /* BackupCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000213 /* BackupCrypto.swift */; };
-		BKP000114 /* BackupDelivery.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000214 /* BackupDelivery.swift */; };
-		BKP000115 /* BackupSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000215 /* BackupSettingsView.swift */; };
-		BKP000116 /* BackupRestoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000216 /* BackupRestoreView.swift */; };
-		BKP000117 /* BackupOpenRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000217 /* BackupOpenRouter.swift */; };
-		BKP000118 /* BackupSecretsImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000218 /* BackupSecretsImporter.swift */; };
-		BKP000119 /* BackupRestoreJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000219 /* BackupRestoreJournal.swift */; };
-		BKP000130 /* BackupDestinations.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000230 /* BackupDestinations.swift */; };
-		BKP000131 /* BackupActivityLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000231 /* BackupActivityLock.swift */; };
-		BKP000132 /* BackupExportJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000232 /* BackupExportJournal.swift */; };
-		BKP000133 /* BackupRescueIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000233 /* BackupRescueIndex.swift */; };
-		BKP000134 /* BackupAndRestoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000234 /* BackupAndRestoreView.swift */; };
-		BKP000140 /* BackupKeepAlive.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000240 /* BackupKeepAlive.swift */; };
-		BKP000141 /* BackupProgressReporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000241 /* BackupProgressReporter.swift */; };
-		BKP000142 /* BackupZipWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000242 /* BackupZipWriter.swift */; };
-		BKP000143 /* BackupTransferStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000243 /* BackupTransferStatus.swift */; };
-		BKP000144 /* BackupSkippedFilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BKP000244 /* BackupSkippedFilesView.swift */; };
 		C0B1AF9A75C90C3C178A8804 /* VoiceTextSanitizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7656F4130247E4002A3AC0C /* VoiceTextSanitizer.swift */; };
 		E51000001 /* MinisApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = E51000011 /* MinisApp.swift */; };
 		E51000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E51000012 /* ContentView.swift */; };
@@ -536,18 +508,6 @@
 		FDD896F80E0A14A7B60B12EF /* VoiceLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E23EA0E199D6D50EBC76F2 /* VoiceLog.swift */; };
 		LOC00001 /* AppLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = LOC00002 /* AppLocalization.swift */; };
 		RCL000010 /* Rclone.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = RCL000020 /* Rclone.xcframework */; };
-		RCL000110 /* RcloneBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000210 /* RcloneBridge.swift */; };
-		RCL000111 /* RcloneRemoteStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000211 /* RcloneRemoteStore.swift */; };
-		RCL000112 /* RcloneChunkedUpload.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000212 /* RcloneChunkedUpload.swift */; };
-		RCL000113 /* RcloneBackendCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000213 /* RcloneBackendCatalog.swift */; };
-		RCL000114 /* RcloneAddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000214 /* RcloneAddServerView.swift */; };
-		RCL000115 /* BackupDestinationPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000215 /* BackupDestinationPicker.swift */; };
-		RCL000116 /* BackupDestinationDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000216 /* BackupDestinationDetailView.swift */; };
-		RCL000117 /* BackupHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000217 /* BackupHistory.swift */; };
-		RCL000118 /* BackupRunController.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000218 /* BackupRunController.swift */; };
-		RCL000119 /* BackupHistoryDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000219 /* BackupHistoryDetailView.swift */; };
-		RCL000120 /* BackupCategoryIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000220 /* BackupCategoryIcon.swift */; };
-		RCL000121 /* BackupHUD.swift in Sources */ = {isa = PBXBuildFile; fileRef = RCL000221 /* BackupHUD.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -2779,6 +2739,19 @@
 				E5DEEP002 /* PlanGate.swift in Sources */,
 				E5DEEP003 /* GoalRunner.swift in Sources */,
 				E5DEEP004 /* WorkflowState.swift in Sources */,
+				E5DEEP005 /* WorkfE51000041 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AC0000202 /* ProviderCustomizationGenerated.swift in Sources */,
+				E54000AC1 /* DebugSkillGenerated.swift in Sources */,
+				E5FP00100 /* AppGroupChangeWatcher.swift in Sources */,
+				AA0838A02F3B941A00049557 /* AboutView.swift in Sources */,
+				60BDD7A2FB82B5118B143965 /* UpdateChecker.swift in Sources */,
+				BA4DDD0FEB175536C7EAB167 /* UpdateCheckRow.swift in Sources */,
+				E5DEEP002 /* PlanGate.swift in Sources */,
+				E5DEEP003 /* GoalRunner.swift in Sources */,
+				E5DEEP004 /* WorkflowState.swift in Sources */,
 				E5DEEP005 /* WorkflowProgressView.swift in Sources */,
 				E5DEEP006 /* VerifyGate.swift in Sources */,
 				E5DEEP007 /* ClarifyGate.swift in Sources */,
@@ -3148,46 +3121,6 @@
 				E5S000004 /* CloudSyncSettingsView.swift in Sources */,
 				E5S000006 /* SyncDirtyScanner.swift in Sources */,
 				E5W000001 /* PortableRecord.swift in Sources */,
-				BKP000101 /* BackupFormat.swift in Sources */,
-				BKP000119 /* BackupRestoreJournal.swift in Sources */,
-				BKP000118 /* BackupSecretsImporter.swift in Sources */,
-				BKP000117 /* BackupOpenRouter.swift in Sources */,
-				BKP000116 /* BackupRestoreView.swift in Sources */,
-				BKP000114 /* BackupDelivery.swift in Sources */,
-				BKP000130 /* BackupDestinations.swift in Sources */,
-				BKP000131 /* BackupActivityLock.swift in Sources */,
-				BKP000140 /* BackupKeepAlive.swift in Sources */,
-				BKP000141 /* BackupProgressReporter.swift in Sources */,
-				BKP000142 /* BackupZipWriter.swift in Sources */,
-				BKP000143 /* BackupTransferStatus.swift in Sources */,
-				BKP000144 /* BackupSkippedFilesView.swift in Sources */,
-				BKP000132 /* BackupExportJournal.swift in Sources */,
-				BKP000133 /* BackupRescueIndex.swift in Sources */,
-				RCL000118 /* BackupRunController.swift in Sources */,
-				RCL000117 /* BackupHistory.swift in Sources */,
-				RCL000110 /* RcloneBridge.swift in Sources */,
-				RCL000113 /* RcloneBackendCatalog.swift in Sources */,
-				RCL000112 /* RcloneChunkedUpload.swift in Sources */,
-				RCL000111 /* RcloneRemoteStore.swift in Sources */,
-				BKP000115 /* BackupSettingsView.swift in Sources */,
-				BKP000134 /* BackupAndRestoreView.swift in Sources */,
-				RCL000114 /* RcloneAddServerView.swift in Sources */,
-				RCL000115 /* BackupDestinationPicker.swift in Sources */,
-				RCL000119 /* BackupHistoryDetailView.swift in Sources */,
-				RCL000120 /* BackupCategoryIcon.swift in Sources */,
-				RCL000121 /* BackupHUD.swift in Sources */,
-				RCL000116 /* BackupDestinationDetailView.swift in Sources */,
-				BKP000113 /* BackupCrypto.swift in Sources */,
-				BKP000112 /* BackupSecrets.swift in Sources */,
-				BKP000109 /* BackupImporter.swift in Sources */,
-				BKP000110 /* BackupZipExtractor.swift in Sources */,
-				BKP000111 /* BackupImporter+Categories.swift in Sources */,
-				BKP000106 /* BackupPackageReader.swift in Sources */,
-				BKP000107 /* DebugRPCBackup.swift in Sources */,
-				BKP000104 /* BackupFileTreeExporter.swift in Sources */,
-				BKP000105 /* BackupExporter.swift in Sources */,
-				BKP000102 /* BackupBlobStore.swift in Sources */,
-				BKP000103 /* BackupJSONLWriter.swift in Sources */,
 				E5W000002 /* Syncable.swift in Sources */,
 				E5W000003 /* SyncableTypeRegistry.swift in Sources */,
 				E5W000004 /* SyncTransport.swift in Sources */,
@@ -3224,27 +3157,7 @@
 				8B886DA8A270E8FB58A9A1FA /* SpeechPlayerControl.swift in Sources */,
 				7A49962E84F115865D41B933 /* AudioSessionCoordinator.swift in Sources */,
 				C0B1AF9A75C90C3C178A8804 /* VoiceTextSanitizer.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		E5E000041 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				E5E000001 /* ShareViewController.swift in Sources */,
-				E5E000003 /* ShareViewModel.swift in Sources */,
-				E5E000004 /* PendingShare.swift in Sources */,
-				E5E000005 /* SharedContainerStore.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		E5FP00041 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				E5FP00001 /* FileProviderExtension.swift in Sources */,
-				E5FP00002 /* FileProviderEnumerator.swift in Sources */,
-				E5FP00003 /* FileProviderItem.swift in Sources */,
+			);			E5FP00003 /* FileProviderItem.swift in Sources */,
 				E5FP00200 /* FPSyncTraceLog.swift in Sources */,
 				E5SHV0002 /* SharedFolderVisibility.swift in Sources */,
 			);
