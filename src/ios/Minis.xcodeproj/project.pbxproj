@@ -1577,6 +1577,8 @@
 				E7A000030 /* OpenRouter */,
 				EXA000030 /* xAI */,
 				42A3821DABA8773E8A5BA57E /* Voice */,
+				GD00000010 /* GoogleDrive */,
+				LS00000010 /* LocalSync */,
 			);
 			path = Providers;
 			sourceTree = "<group>";
@@ -1858,6 +1860,7 @@
 				E5E0000A2 /* ExternalFileImporter.swift */,
 				E5E000017 /* SharedContainerStore.swift */,
 				AADDA9E02F6ECCF400B66649 /* ThumbnailCache.swift */,
+				E5EP0011 /* EnvProfileStore.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -2033,6 +2036,9 @@
 			children = (
 				EAB000050 /* SyncMigrationDetailView.swift */,
 				EAB000080 /* CloudSyncSettingsV2View.swift */,
+				GD00000004 /* GoogleDriveSyncView.swift */,
+				LS00000004 /* LocalSyncView.swift */,
+				GD00000005 /* OtherSyncSettingsView.swift */,
 			);
 			path = Sync;
 			sourceTree = "<group>";
@@ -2090,7 +2096,11 @@
 				E5DEEP104 /* WorkflowState.swift */,
 				E5DEEP106 /* VerifyGate.swift */,
 				E5DEEP107 /* ClarifyGate.swift */,
-);
+				E5COG9101 /* CognitiveLoadMonitor.swift */,
+				E5ROOT101 /* ErrorRootCauseAnalyzer.swift */,
+				E5MPATH101 /* MultiPathPlanner.swift */,
+				E5SEQ9101 /* SequentialThinkingTool.swift */,
+			);
 			path = Chat;
 			sourceTree = "<group>";
 		};
@@ -2147,7 +2157,10 @@
 				E5SOUL101 /* SoulStore.swift */,
 							E5DEEP101 /* DeepModeStore.swift */,
 				E5RULE101 /* DeepModeRule.swift */,
-);
+				E5XSES101 /* CrossSessionContextStore.swift */,
+				E5SMEM101 /* StructuredMemoryStore.swift */,
+				E5SUB101 /* SubagentSession.swift */,
+			);
 			path = Session;
 			sourceTree = "<group>";
 		};
@@ -2204,6 +2217,7 @@
 				EAB000070 /* UploadPolicy.swift */,
 				E5W00001D /* ChatStoreSyncHydrators.swift */,
 				E5W00003B /* SessionFileChangeTracker.swift */,
+				E5W00001E /* AppSettingsSync.swift */,
 			);
 			path = V2;
 			sourceTree = "<group>";
@@ -2258,7 +2272,8 @@
 				F1W0E100 /* WebLoadError.swift */,
 				A44D403A6D05BD06BBADC1CF /* Voice */,
 							E5DEEP105 /* WorkflowProgressView.swift */,
-);
+				E5SUB102 /* SubagentCard.swift */,
+			);
 			path = Chat;
 			sourceTree = "<group>";
 		};
@@ -2293,6 +2308,9 @@
 				E5SOUL102 /* SoulSettingsView.swift */,
 				E5LOCK102 /* FaceIDProtectionSettingsView.swift */,
 				E5LOCK103 /* AppLockOverlay.swift */,
+				E5EP0012 /* EnvProfileView.swift */,
+				916D13280F6990C9672C9EDA /* UpdateCheckRow.swift */,
+				AFBEAE0AA581446458C6B23E /* UpdateChecker.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -2368,6 +2386,35 @@
 			path = MCP;
 			sourceTree = "<group>";
 		};
+		GD00000010 /* GoogleDrive */ = {
+			isa = PBXGroup;
+			children = (
+				GD00000002 /* GoogleDriveAPI.swift */,
+			GD00000003 /* GoogleDriveSyncManager.swift */,
+			GD00000011 /* OAuth */,
+			);
+			path = GoogleDrive;
+			sourceTree = "<group>";
+		};
+
+		GD00000011 /* OAuth */ = {
+			isa = PBXGroup;
+			children = (
+				GD00000001 /* GoogleDriveOAuthManager.swift */,
+			);
+			path = OAuth;
+			sourceTree = "<group>";
+		};
+
+		LS00000010 /* LocalSync */ = {
+			isa = PBXGroup;
+			children = (
+				LS00000003 /* LocalSyncManager.swift */,
+			);
+			path = LocalSync;
+			sourceTree = "<group>";
+		};
+
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
