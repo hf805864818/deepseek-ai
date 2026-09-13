@@ -726,34 +726,6 @@
 		B7E2CB0D0D63E6D6FDB45568 /* VoiceActivityDetector.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VoiceActivityDetector.swift; sourceTree = "<group>"; };
 		BB1000010F700000000000AA /* MinisTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MinisTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		BB1000110F700000000000AA /* ContextPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextPolicy.swift; sourceTree = "<group>"; };
-		BKP000201 /* BackupFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupFormat.swift; sourceTree = "<group>"; };
-		BKP000202 /* BackupBlobStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupBlobStore.swift; sourceTree = "<group>"; };
-		BKP000203 /* BackupJSONLWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupJSONLWriter.swift; sourceTree = "<group>"; };
-		BKP000204 /* BackupFileTreeExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupFileTreeExporter.swift; sourceTree = "<group>"; };
-		BKP000205 /* BackupExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupExporter.swift; sourceTree = "<group>"; };
-		BKP000206 /* BackupPackageReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupPackageReader.swift; sourceTree = "<group>"; };
-		BKP000207 /* DebugRPCBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugRPCBackup.swift; sourceTree = "<group>"; };
-		BKP000209 /* BackupImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupImporter.swift; sourceTree = "<group>"; };
-		BKP000210 /* BackupZipExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupZipExtractor.swift; sourceTree = "<group>"; };
-		BKP000211 /* BackupImporter+Categories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BackupImporter+Categories.swift"; sourceTree = "<group>"; };
-		BKP000212 /* BackupSecrets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSecrets.swift; sourceTree = "<group>"; };
-		BKP000213 /* BackupCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupCrypto.swift; sourceTree = "<group>"; };
-		BKP000214 /* BackupDelivery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDelivery.swift; sourceTree = "<group>"; };
-		BKP000215 /* BackupSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSettingsView.swift; sourceTree = "<group>"; };
-		BKP000216 /* BackupRestoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRestoreView.swift; sourceTree = "<group>"; };
-		BKP000217 /* BackupOpenRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupOpenRouter.swift; sourceTree = "<group>"; };
-		BKP000218 /* BackupSecretsImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSecretsImporter.swift; sourceTree = "<group>"; };
-		BKP000219 /* BackupRestoreJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRestoreJournal.swift; sourceTree = "<group>"; };
-		BKP000230 /* BackupDestinations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDestinations.swift; sourceTree = "<group>"; };
-		BKP000231 /* BackupActivityLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupActivityLock.swift; sourceTree = "<group>"; };
-		BKP000232 /* BackupExportJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupExportJournal.swift; sourceTree = "<group>"; };
-		BKP000233 /* BackupRescueIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRescueIndex.swift; sourceTree = "<group>"; };
-		BKP000234 /* BackupAndRestoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupAndRestoreView.swift; sourceTree = "<group>"; };
-		BKP000240 /* BackupKeepAlive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupKeepAlive.swift; sourceTree = "<group>"; };
-		BKP000241 /* BackupProgressReporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupProgressReporter.swift; sourceTree = "<group>"; };
-		BKP000242 /* BackupZipWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupZipWriter.swift; sourceTree = "<group>"; };
-		BKP000243 /* BackupTransferStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupTransferStatus.swift; sourceTree = "<group>"; };
-		BKP000244 /* BackupSkippedFilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSkippedFilesView.swift; sourceTree = "<group>"; };
 		D7656F4130247E4002A3AC0C /* VoiceTextSanitizer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VoiceTextSanitizer.swift; sourceTree = "<group>"; };
 		DE154CF628D8699BD99CF9CB /* AudioSessionCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AudioSessionCoordinator.swift; sourceTree = "<group>"; };
 		E51000010 /* Minis.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Minis.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -1199,18 +1171,6 @@
 		F2941B643B8A2F048A2B154E /* VoiceProviderFactory.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VoiceProviderFactory.swift; sourceTree = "<group>"; };
 		LOC00002 /* AppLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLocalization.swift; sourceTree = "<group>"; };
 		RCL000020 /* Rclone.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Rclone.xcframework; path = ../../deps/frameworks/Rclone.xcframework; sourceTree = "<group>"; };
-		RCL000210 /* RcloneBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneBridge.swift; path = Remote/RcloneBridge.swift; sourceTree = "<group>"; };
-		RCL000211 /* RcloneRemoteStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneRemoteStore.swift; path = Remote/RcloneRemoteStore.swift; sourceTree = "<group>"; };
-		RCL000212 /* RcloneChunkedUpload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneChunkedUpload.swift; path = Remote/RcloneChunkedUpload.swift; sourceTree = "<group>"; };
-		RCL000213 /* RcloneBackendCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneBackendCatalog.swift; path = Remote/RcloneBackendCatalog.swift; sourceTree = "<group>"; };
-		RCL000214 /* RcloneAddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RcloneAddServerView.swift; sourceTree = "<group>"; };
-		RCL000215 /* BackupDestinationPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDestinationPicker.swift; sourceTree = "<group>"; };
-		RCL000216 /* BackupDestinationDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDestinationDetailView.swift; sourceTree = "<group>"; };
-		RCL000217 /* BackupHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupHistory.swift; sourceTree = "<group>"; };
-		RCL000218 /* BackupRunController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRunController.swift; sourceTree = "<group>"; };
-		RCL000219 /* BackupHistoryDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupHistoryDetailView.swift; sourceTree = "<group>"; };
-		RCL000220 /* BackupCategoryIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupCategoryIcon.swift; sourceTree = "<group>"; };
-		RCL000221 /* BackupHUD.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupHUD.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -1400,35 +1360,6 @@
 		BKP000010 /* Backup */ = {
 			isa = PBXGroup;
 			children = (
-				BKP000201 /* BackupFormat.swift */,
-				BKP000219 /* BackupRestoreJournal.swift */,
-				BKP000218 /* BackupSecretsImporter.swift */,
-				BKP000214 /* BackupDelivery.swift */,
-				BKP000230 /* BackupDestinations.swift */,
-				BKP000231 /* BackupActivityLock.swift */,
-				BKP000240 /* BackupKeepAlive.swift */,
-				BKP000241 /* BackupProgressReporter.swift */,
-				BKP000242 /* BackupZipWriter.swift */,
-				BKP000243 /* BackupTransferStatus.swift */,
-				BKP000232 /* BackupExportJournal.swift */,
-				BKP000233 /* BackupRescueIndex.swift */,
-				RCL000218 /* BackupRunController.swift */,
-				RCL000217 /* BackupHistory.swift */,
-				RCL000210 /* RcloneBridge.swift */,
-				RCL000213 /* RcloneBackendCatalog.swift */,
-				RCL000212 /* RcloneChunkedUpload.swift */,
-				RCL000211 /* RcloneRemoteStore.swift */,
-				BKP000217 /* BackupOpenRouter.swift */,
-				BKP000213 /* BackupCrypto.swift */,
-				BKP000212 /* BackupSecrets.swift */,
-				BKP000209 /* BackupImporter.swift */,
-				BKP000210 /* BackupZipExtractor.swift */,
-				BKP000211 /* BackupImporter+Categories.swift */,
-				BKP000206 /* BackupPackageReader.swift */,
-				BKP000204 /* BackupFileTreeExporter.swift */,
-				BKP000205 /* BackupExporter.swift */,
-				BKP000202 /* BackupBlobStore.swift */,
-				BKP000203 /* BackupJSONLWriter.swift */,
 			);
 			path = Backup;
 			sourceTree = "<group>";
@@ -1593,7 +1524,6 @@
 			isa = PBXGroup;
 			children = (
 				E54000011 /* DebugServer.swift */,
-				BKP000207 /* DebugRPCBackup.swift */,
 				E54000AB2 /* DebugAuth.swift */,
 				E54000041 /* DebugLocalDispatch.swift */,
 				E54000051 /* MinisDebugLogReader.swift */,
@@ -2249,16 +2179,6 @@
 				E5N0000142F3B941A00049557 /* MemoryManagementView.swift */,
 				E8A000013 /* OffloadPermissionSettingsView.swift */,
 				AA0838CD2F3B941A00049557 /* StorageManagementView.swift */,
-				BKP000215 /* BackupSettingsView.swift */,
-				BKP000234 /* BackupAndRestoreView.swift */,
-				RCL000214 /* RcloneAddServerView.swift */,
-				RCL000215 /* BackupDestinationPicker.swift */,
-				RCL000219 /* BackupHistoryDetailView.swift */,
-				BKP000244 /* BackupSkippedFilesView.swift */,
-				RCL000220 /* BackupCategoryIcon.swift */,
-				RCL000221 /* BackupHUD.swift */,
-				RCL000216 /* BackupDestinationDetailView.swift */,
-				BKP000216 /* BackupRestoreView.swift */,
 				E5MNT0101 /* MountedFoldersManager.swift */,
 				E5MNT0102 /* MountedFolderCoordinator.swift */,
 				E5MNT0103 /* MountedFoldersSettingsView.swift */,
@@ -2739,19 +2659,6 @@
 				E5DEEP002 /* PlanGate.swift in Sources */,
 				E5DEEP003 /* GoalRunner.swift in Sources */,
 				E5DEEP004 /* WorkflowState.swift in Sources */,
-				E5DEEP005 /* WorkfE51000041 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				AC0000202 /* ProviderCustomizationGenerated.swift in Sources */,
-				E54000AC1 /* DebugSkillGenerated.swift in Sources */,
-				E5FP00100 /* AppGroupChangeWatcher.swift in Sources */,
-				AA0838A02F3B941A00049557 /* AboutView.swift in Sources */,
-				60BDD7A2FB82B5118B143965 /* UpdateChecker.swift in Sources */,
-				BA4DDD0FEB175536C7EAB167 /* UpdateCheckRow.swift in Sources */,
-				E5DEEP002 /* PlanGate.swift in Sources */,
-				E5DEEP003 /* GoalRunner.swift in Sources */,
-				E5DEEP004 /* WorkflowState.swift in Sources */,
 				E5DEEP005 /* WorkflowProgressView.swift in Sources */,
 				E5DEEP006 /* VerifyGate.swift in Sources */,
 				E5DEEP007 /* ClarifyGate.swift in Sources */,
@@ -3157,7 +3064,27 @@
 				8B886DA8A270E8FB58A9A1FA /* SpeechPlayerControl.swift in Sources */,
 				7A49962E84F115865D41B933 /* AudioSessionCoordinator.swift in Sources */,
 				C0B1AF9A75C90C3C178A8804 /* VoiceTextSanitizer.swift in Sources */,
-			);			E5FP00003 /* FileProviderItem.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E5E000041 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E5E000001 /* ShareViewController.swift in Sources */,
+				E5E000003 /* ShareViewModel.swift in Sources */,
+				E5E000004 /* PendingShare.swift in Sources */,
+				E5E000005 /* SharedContainerStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E5FP00041 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E5FP00001 /* FileProviderExtension.swift in Sources */,
+				E5FP00002 /* FileProviderEnumerator.swift in Sources */,
+				E5FP00003 /* FileProviderItem.swift in Sources */,
 				E5FP00200 /* FPSyncTraceLog.swift in Sources */,
 				E5SHV0002 /* SharedFolderVisibility.swift in Sources */,
 			);
@@ -3238,7 +3165,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -3247,7 +3174,7 @@
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -3262,12 +3189,12 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -3283,7 +3210,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -3299,7 +3226,7 @@
 					"$(SRCROOT)/Vendor/cppjieba/include",
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -3316,7 +3243,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -3328,7 +3255,7 @@
 					"$(SRCROOT)/Vendor/cppjieba/include",
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -3477,7 +3404,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = Minis.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_ASSET_PATHS = "\"Preview Content\"";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
@@ -3506,7 +3433,7 @@
 					"@executable_path/Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../../deps/libs";
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				OTHER_LDFLAGS = (
 					"-lish_emu",
 					"-lish",
@@ -3531,7 +3458,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = Minis.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_ASSET_PATHS = "\"Preview Content\"";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
@@ -3560,7 +3487,7 @@
 					"@executable_path/Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../../deps/libs";
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				OTHER_LDFLAGS = (
 					"-lish_emu",
 					"-lish",
@@ -3581,7 +3508,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = ShareExtension/Info.plist;
@@ -3593,7 +3520,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -3608,7 +3535,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = ShareExtension/Info.plist;
@@ -3620,7 +3547,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -3635,7 +3562,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FileProvider/FileProvider.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FileProvider/Info.plist;
@@ -3647,7 +3574,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.FileProvider;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -3662,7 +3589,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FileProvider/FileProvider.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FileProvider/Info.plist;
@@ -3674,7 +3601,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.FileProvider;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -3689,7 +3616,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = AgentWidget/AgentWidget.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = AgentWidget/Info.plist;
@@ -3701,7 +3628,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.AgentWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -3716,7 +3643,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = AgentWidget/AgentWidget.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = AgentWidget/Info.plist;
@@ -3728,7 +3655,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.AgentWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
