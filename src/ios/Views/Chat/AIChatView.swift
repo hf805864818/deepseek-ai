@@ -982,7 +982,9 @@ struct AIChatView: View {
                 ISHTerminalView(sessionId: vm.sessionId, showCloseButton: true, initCommand: terminalInitCommand)
                     .onAppear {
                         if let sid = vm.sessionId {
-                            minisLogger.info("🔍MOUNT Terminal onAppear — re-mounting minis for session \(sid)")
+                            var mountLog = "🔍MOUNT Terminal onAppear — re-mounting minis for session "
+                            mountLog += sid
+                            minisLogger.info(mountLog)
                             vm.mountMinis(for: sid)
                         } else {
                             minisLogger.info("🔍MOUNT Terminal onAppear — no sessionId, skipping mount")

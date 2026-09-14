@@ -167,20 +167,6 @@ struct MoveToSessionSheet: View {
     }
 }
 
-// MARK: - UIView helpers
-
-extension UIView {
-    /// Walk the responder chain to find the nearest UIViewController.
-    var nearestViewController: UIViewController? {
-        var responder: UIResponder? = self
-        while let r = responder {
-            if let vc = r as? UIViewController { return vc }
-            responder = r.next
-        }
-        return nil
-    }
-}
-
 // MARK: - Face ID Session Lock Overlay
 //
 // Encapsulates the entire Face ID gate (state + overlay UI + lifecycle
