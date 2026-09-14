@@ -717,7 +717,9 @@ struct AIChatView: View {
                     // whether a center-spinner report corresponds to
                     // this overlay or some other ProgressView in the
                     // chat.
-                    minisLogger.warning("[SpinnerTrace] isLoadingSession → \(newValue) sid=\(vm.sessionId?.prefix(8) ?? "nil") msgs=\(vm.messages.count)")
+                    let spinnerSid = vm.sessionId?.prefix(8) ?? "nil"
+                    let spinnerMsg = "[SpinnerTrace] isLoadingSession → \(newValue) sid=\(spinnerSid) msgs=\(vm.messages.count)"
+                    minisLogger.warning(spinnerMsg)
                 }
 
             // Full-screen kernel boot overlay
@@ -1262,7 +1264,8 @@ struct AIChatView: View {
         }
         .onChange(of: shareCoordinator.bufferVersion) { newVersion in
             // Warm start: user is already in a session when share arrives
-            minisLogger.info("[Share] AIChatView.onChange(bufferVersion)=\(newVersion) sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil") hasBuffer=\(shareCoordinator.pendingShareBuffer != nil)")
+            let shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)=\(newVersion) sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil") hasBuffer=\(shareCoordinator.pendingShareBuffer != nil)"
+            minisLogger.info(shareBufMsg)
             injectPendingShareIfNeeded()
         }
         .onDisappear {
@@ -1304,7 +1307,8 @@ struct AIChatView: View {
                 AppLogger(category: "InputBarLayout").info("chat onDisappear — released a lingering first responder (would have left a phantom keyboard inset on the window)")
             }
             // Capsule auto-shows whenever audio is loaded — no manual activation needed.
-            minisLogger.info("🔑DRAFT AIChatView.onDisappear vm=\(vm.vmInstanceId) sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil") vm.sessionId=\(vm.sessionId ?? "nil") vm.isProcessing=\(vm.isProcessing)")
+            let disappearMsg = "🔑DRAFT AIChatView.onDisappear vm=\(vm.vmInstanceId) sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil") vm.sessionId=\(vm.sessionId ?? "nil") vm.isProcessing=\(vm.isProcessing)"
+            minisLogger.info(disappearMsg)
         }
         // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
         // and the transcript editor is NOT open, there is no legitimate keyboard
