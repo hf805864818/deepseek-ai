@@ -342,268 +342,7 @@ struct AIChatView: View {
     @State private var missingMinisFileName: String?
 
     var body: some View {
-        ZStack {
-            // Messages — floating tool preview overlaid at bottom
-            messagesArea
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    // Error banner
-                    if let error = vm.errorMessage {
-                        errorBanner(error)
-                    }
-                    // Transient notice (e.g. request-level image budget
-                    // elision). Auto-dismisses after ~4s.
-                    if let notice = vm.transientNotice {
-                        Text(notice)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.black.opacity(0.75))
-                            .onAppear {
-                                let captured = notice
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                                    if vm.transientNotice == captured {
-                                        vm.transientNotice = nil
-                                    }
-                                }
-                            }
-                    }
-                    // [T-deep-mode-workflow] Phase 1 visualization feedback, hard-gated
-                    // on the master switch so turning deep mode off removes ALL
-                    // workflow UI with zero residue. Approval/edit still flows
-                    // through vm.confirmPlan()/editPlan()/cancelPlan().
-                    if vm.deepModeEnabled {
-                        // [T-deep-mode-clarify-gate] Phase 2: clarification banner.
-                        // Shown before planning — if the gate detected ambiguity
-                        // in the user's request, ask a clarifying question first.
-                        if case .awaitingClarification = vm.clarifyState {
-                            clarifyBanner
-                        } else if case .awaitingApproval = vm.planGateState {
-                            // Planning: parsed steps preview + confirm/edit bar.
-                            VStack(alignment: .leading, spacing: 0) {
-                                if !vm.workflowSteps.isEmpty {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        Text("计划步骤")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundColor(ChatColors.secondaryText)
-                                        WorkflowStepsList(steps: vm.workflowSteps)
-                                    }
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 10)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(ChatColors.secondaryBg)
-                                }
-                                planGateBanner
-                            }
-                        } else if vm.workflowPhase == .executing || vm.workflowPhase == .verifying {
-                            // Executing / verifying: live step progress.
-                            WorkflowProgressView(phase: vm.workflowPhase,
-                                                 steps: vm.workflowSteps)
-                        }
-                    }
-                    // [T-phase5] Subagent status capsules — shown at the top
-                    // of the chat area when deep mode is on and there are
-                    // active subagent sessions. Uses the same capsule style
-                    // as ToolCapsuleView for visual consistency. Total-switch
-                    // safe: when the master switch is off, activeSubagents is
-                    // cleared, so this view is EmptyView.
-                    if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
-                        SubagentCardStack(subagents: vm.activeSubagents)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 4)
-                            .transition(.opacity)
-                    }
-                }
-                .overlay(alignment: .bottom) {
-                    // Tool preview + input bar stacked at the bottom.
-                    // Both overlay on top of the message list for immersive scrolling.
-                    //
-                    // The slash / mention popup is attached to THIS stack as
-                    // a `.overlay(alignment: .bottom)` on a placeholder
-                    // sitting just above the input bar — that way SwiftUI's
-                    // own layout pins the popup's bottom edge to the input
-                    // bar's top edge directly, with no `inputBarHeight`
-                    // @State round-trip and no screen-bottom math. The
-                    // popup follows the input bar automatically when
-                    // attachments / waveform expand it, when the keyboard
-                    // animates, or when safe-area insets change.
-                    //
-                    // Popup uses the EXACT same constraint toolbar uses
-                    // with inputBar: bottom edge of popup = top edge of
-                    // inputBar, with the SAME gap (i.e. whatever VStack
-                    // spacing produces between toolbar and inputBar —
-                    // which is 0 here, the visual gap toolbar exhibits
-                    // comes from its own internal padding).
-                    //
-                    // To achieve this without re-implementing layout
-                    // math: popup is an `.overlay(alignment: .top)` on
-                    // the inputBar with `alignmentGuide(.top){$0[.bottom]}`
-                    // — this anchors popup's BOTTOM to inputBar's TOP.
-                    // The popup card carries its OWN bottom padding
-                    // equal to what the toolbar's own internal bottom
-                    // spacing produces, so the visual gap is identical
-                    // whether toolbar is visible or not. Popup ALWAYS
-                    // sits flush with inputBar top, covering the toolbar
-                    // when it's also there.
-                    // Wrap input stack in a ZStack so the popup can have a
-                    // sibling-level frame (full ZStack size) with proper hit
-                    // testing — `.overlay(alignment: .top)` on inputBar was
-                    // failing to receive touches for the popup card because
-                    // SwiftUI doesn't hit-test overlay content drawn outside
-                    // the host's own frame.
-                    //
-                    // Layout structure (z-order bottom→top inside ZStack):
-                    //   1. VStack { toolbar; inputBar } — anchored .bottom
-                    //   2. Popup with alignmentGuide pinning its BOTTOM
-                    //      edge to inputBar's TOP edge — also anchored
-                    //      .bottom, but `alignmentGuide(.bottom) { d in
-                    //      d[.bottom] + inputBarHeight }` would require
-                    //      reading inputBar height again. Instead we use
-                    //      `.padding(.bottom, inputBarHeight)` so the
-                    //      popup's bottom edge sits exactly at inputBar's
-                    //      top edge. inputBarHeight here is just the input
-                    //      bar (NOT including toolbar) so popup covers
-                    //      toolbar when both visible.
-                    ZStack(alignment: .bottom) {
-                        // Tap-outside catcher placed UNDER the popup (declared
-                        // first → lower z-order). When the popup is visible,
-                        // the catcher fills the ZStack and absorbs taps that
-                        // land outside the popup card. Taps on the popup
-                        // itself naturally fall through to the popup view
-                        // because it sits on top in z-order.
-                        if vm.showSlashMenu || vm.showMentionMenu {
-                            Color.clear
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    if vm.showSlashMenu { vm.dismissSlashMenu() }
-                                    else if vm.showMentionMenu { vm.dismissMentionMenu() }
-                                }
-                        }
-                        VStack(spacing: 0) {
-                            floatingToolPreview
-                                .shadow(color: Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0, alpha: 0.25) : UIColor(white: 0, alpha: 0) }), radius: 6, x: 0, y: 4)
-                            #if DEBUG
-                            if isReadOnly {
-                                forkBanner
-                            } else {
-                                inputBar
-                            }
-                            #else
-                            inputBar
-                            #endif
-                        }
-                        // Register the composer (tool preview + input bar) as a
-                        // region the global speech capsule must not cover.
-                        .capsuleProtectedFrame("inputBar")
-                        inputPopupOverlay
-                            .padding(.bottom, inputBarHeight)
-                    }
-                }
-                // Collapse the expanded speech player on a tap anywhere in the chat
-                // area. Attached as a SIMULTANEOUS TapGesture directly on the content
-                // (no full-screen hit-test overlay, which blocked scrolling) so a tap
-                // collapses the player while scroll/drag still work normally. The tap
-                // only acts when the player is expanded; otherwise it's a no-op.
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        if vm.speakEnabled && vm.speechPlayerExpanded {
-                            withAnimation(.easeInOut(duration: 0.16)) {
-                                vm.speechPlayerExpanded = false
-                            }
-                        }
-                    }
-                )
-                .overlay(alignment: .bottomTrailing) {
-                    floatingSpeechButton
-                }
-                .overlay {
-                    // Session-loading indicator, two flavors by scenario:
-                    //  • ENTERING the session (first load, nothing rendered yet)
-                    //    → centered soft loading card with a gentle fade+scale
-                    //    exit, replacing the abrupt bare system spinner.
-                    //  • Any LATER reload (iCloud sync, compaction, stale-cache
-                    //    refresh) while content is on screen → keep the small
-                    //    unobtrusive spinner; the big card must never cover
-                    //    content the user is already reading.
-                    ZStack {
-                        // Pre-load window: isLoadingSession only flips once
-                        // loadSession() actually begins (onAppear → Task →
-                        // repairSessionIfNeeded → loadSession), so gating the
-                        // card on it alone left a blank screen for that gap.
-                        // Treat "real session, nothing loaded yet" as loading
-                        // from the very first frame of the push.
-                        let enteringUnloaded = sessionId != nil
-                            && vm.messages.isEmpty
-                            && !vm.hasCompletedInitialLoad
-                        if (vm.isLoadingSession || enteringUnloaded) && vm.messages.isEmpty {
-                            // Entering: nothing rendered yet — show the dots.
-                            // In-place reloads with content on screen (iCloud
-                            // sync fetch → reloadMessagesFromDB → loadSession
-                            // right after entry is the common case) show NO
-                            // overlay at all: the content stays visible and
-                            // interactive, and a centered gray "…" right after
-                            // the blue entry dots read as a glitch, not
-                            // feedback (user report 2026-07-06).
-                            SessionLoadingCard()
-                                .transition(.opacity.combined(with: .scale(scale: 0.92)))
-                                .accessibilityIdentifier("sessionLoadingCard")
-                        }
-                    }
-                    .animation(.easeOut(duration: 0.28), value: vm.isLoadingSession)
-                    .allowsHitTesting(false)
-                }
-                .overlay {
-                    SessionLockGateOverlay(sessionId: vm.sessionId)
-                }
-                .onChange(of: vm.isLoadingSession, perform: handleLoadingSessionChange)
-
-            // Full-screen kernel boot overlay
-            kernelBootOverlay
-        }
-        .background(ChatColors.background)
-        .onDrop(of: [.image, .movie, .fileURL, .data], isTargeted: $isDropTargeted) { providers in
-            handleDropProviders(providers)
-            return true
-        }
-        .overlay {
-            if isDropTargeted {
-                RoundedRectangle(cornerRadius: 16)
-                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8]))
-                    .background(Color.accentColor.opacity(0.08).clipShape(RoundedRectangle(cornerRadius: 16)))
-                    .padding(8)
-                    .allowsHitTesting(false)
-            }
-        }
-        .environment(\.chatSessionId, vm.sessionId)
-        .modifier(NavBarStyleModifier(topSafeAreaInset: $topSafeAreaInset))
-        .navigationBarTitleDisplayMode(.inline)
-        // [T-ios-navbar-toolbar-host] The ENTIRE toolbar now lives inside an
-        // equatable-gated host child. Root cause of the mid-streaming "..."
-        // menu refresh (4th attempt, this one from instrumentation): with
-        // .toolbar attached on this (per-token re-evaluated) chain, the
-        // ToolbarContent builder itself re-ran on EVERY streaming tick
-        // (NavbarEval toolbarPass=34/stream) and handed the bridge a brand-new
-        // ToolbarContent value each time — which it re-pushed to the
-        // UINavigationItem, refreshing the OPEN UIMenu, even while both inner
-        // Equatable gates provably held (titleEval=3, menuEval=2). Hosting the
-        // toolbar in a child whose body is gated on the displayed inputs means
-        // the builder simply never re-runs during a stream: no new
-        // ToolbarContent, nothing to re-push, and the native SwiftUI Menu
-        // (with the system's round Liquid-Glass chrome) can stay.
-        // .equatable() is MANDATORY here, not an optimization hint: device
-        // instrumentation (2026-07-17 23:53, == FALSE count 0 while
-        // hostEval == toolbarPass) proved SwiftUI does NOT consult a plain
-        // Equatable conformance for this generic closure-holding view in the
-        // .background position — the gate silently never engaged. EquatableView
-        // wrapping is the only guaranteed path to ==.
-        .background(
-            ChatToolbarHost(key: chatToolbarKey, title: {
-                chatNavPrincipalContent
-            }, trailing: {
-                trailingMenu
-            })
-            .equatable()
-        )
+        coreView
         .sheet(item: $titlePillEditSession) { session in
             SessionEditSheet(session: session) { newTitle, newCategory in
                 Task {
@@ -984,6 +723,288 @@ struct AIChatView: View {
         // descendants (e.g. ToolCapsuleView's long-press menu) can react to
         // `vm.isProcessing` without threading the vm through every level.
         .environmentObject(vm)
+    }
+
+    // MARK: - Core View (AnyView)
+    /// Wraps the ZStack and core layout modifiers in AnyView to break
+    /// the body's generic type chain. Without this erasure, the 30+
+    /// chained .sheet/.alert/.fullScreenCover modifiers create a
+    /// mangled type that exceeds Swift's type-checker limit.
+    private var coreView: AnyView {
+        AnyView(
+                    ZStack {
+                        // Messages — floating tool preview overlaid at bottom
+                        messagesArea
+                            .safeAreaInset(edge: .top, spacing: 0) {
+                                // Error banner
+                                if let error = vm.errorMessage {
+                                    errorBanner(error)
+                                }
+                                // Transient notice (e.g. request-level image budget
+                                // elision). Auto-dismisses after ~4s.
+                                if let notice = vm.transientNotice {
+                                    Text(notice)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 12).padding(.vertical, 8)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Color.black.opacity(0.75))
+                                        .onAppear {
+                                            let captured = notice
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                                                if vm.transientNotice == captured {
+                                                    vm.transientNotice = nil
+                                                }
+                                            }
+                                        }
+                                }
+                                deepModeWorkflowBanner
+                            }
+                            .overlay(alignment: .bottom) {
+                                // Tool preview + input bar stacked at the bottom.
+                                // Both overlay on top of the message list for immersive scrolling.
+                                //
+                                // The slash / mention popup is attached to THIS stack as
+                                // a `.overlay(alignment: .bottom)` on a placeholder
+                                // sitting just above the input bar — that way SwiftUI's
+                                // own layout pins the popup's bottom edge to the input
+                                // bar's top edge directly, with no `inputBarHeight`
+                                // @State round-trip and no screen-bottom math. The
+                                // popup follows the input bar automatically when
+                                // attachments / waveform expand it, when the keyboard
+                                // animates, or when safe-area insets change.
+                                //
+                                // Popup uses the EXACT same constraint toolbar uses
+                                // with inputBar: bottom edge of popup = top edge of
+                                // inputBar, with the SAME gap (i.e. whatever VStack
+                                // spacing produces between toolbar and inputBar —
+                                // which is 0 here, the visual gap toolbar exhibits
+                                // comes from its own internal padding).
+                                //
+                                // To achieve this without re-implementing layout
+                                // math: popup is an `.overlay(alignment: .top)` on
+                                // the inputBar with `alignmentGuide(.top){$0[.bottom]}`
+                                // — this anchors popup's BOTTOM to inputBar's TOP.
+                                // The popup card carries its OWN bottom padding
+                                // equal to what the toolbar's own internal bottom
+                                // spacing produces, so the visual gap is identical
+                                // whether toolbar is visible or not. Popup ALWAYS
+                                // sits flush with inputBar top, covering the toolbar
+                                // when it's also there.
+                                // Wrap input stack in a ZStack so the popup can have a
+                                // sibling-level frame (full ZStack size) with proper hit
+                                // testing — `.overlay(alignment: .top)` on inputBar was
+                                // failing to receive touches for the popup card because
+                                // SwiftUI doesn't hit-test overlay content drawn outside
+                                // the host's own frame.
+                                //
+                                // Layout structure (z-order bottom→top inside ZStack):
+                                //   1. VStack { toolbar; inputBar } — anchored .bottom
+                                //   2. Popup with alignmentGuide pinning its BOTTOM
+                                //      edge to inputBar's TOP edge — also anchored
+                                //      .bottom, but `alignmentGuide(.bottom) { d in
+                                //      d[.bottom] + inputBarHeight }` would require
+                                //      reading inputBar height again. Instead we use
+                                //      `.padding(.bottom, inputBarHeight)` so the
+                                //      popup's bottom edge sits exactly at inputBar's
+                                //      top edge. inputBarHeight here is just the input
+                                //      bar (NOT including toolbar) so popup covers
+                                //      toolbar when both visible.
+                                ZStack(alignment: .bottom) {
+                                    // Tap-outside catcher placed UNDER the popup (declared
+                                    // first → lower z-order). When the popup is visible,
+                                    // the catcher fills the ZStack and absorbs taps that
+                                    // land outside the popup card. Taps on the popup
+                                    // itself naturally fall through to the popup view
+                                    // because it sits on top in z-order.
+                                    if vm.showSlashMenu || vm.showMentionMenu {
+                                        Color.clear
+                                            .contentShape(Rectangle())
+                                            .onTapGesture {
+                                                if vm.showSlashMenu { vm.dismissSlashMenu() }
+                                                else if vm.showMentionMenu { vm.dismissMentionMenu() }
+                                            }
+                                    }
+                                    VStack(spacing: 0) {
+                                        floatingToolPreview
+                                            .shadow(color: Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0, alpha: 0.25) : UIColor(white: 0, alpha: 0) }), radius: 6, x: 0, y: 4)
+                                        #if DEBUG
+                                        if isReadOnly {
+                                            forkBanner
+                                        } else {
+                                            inputBar
+                                        }
+                                        #else
+                                        inputBar
+                                        #endif
+                                    }
+                                    // Register the composer (tool preview + input bar) as a
+                                    // region the global speech capsule must not cover.
+                                    .capsuleProtectedFrame("inputBar")
+                                    inputPopupOverlay
+                                        .padding(.bottom, inputBarHeight)
+                                }
+                            }
+                            // Collapse the expanded speech player on a tap anywhere in the chat
+                            // area. Attached as a SIMULTANEOUS TapGesture directly on the content
+                            // (no full-screen hit-test overlay, which blocked scrolling) so a tap
+                            // collapses the player while scroll/drag still work normally. The tap
+                            // only acts when the player is expanded; otherwise it's a no-op.
+                            .simultaneousGesture(
+                                TapGesture().onEnded {
+                                    if vm.speakEnabled && vm.speechPlayerExpanded {
+                                        withAnimation(.easeInOut(duration: 0.16)) {
+                                            vm.speechPlayerExpanded = false
+                                        }
+                                    }
+                                }
+                            )
+                            .overlay(alignment: .bottomTrailing) {
+                                floatingSpeechButton
+                            }
+                            .overlay {
+                                // Session-loading indicator, two flavors by scenario:
+                                //  • ENTERING the session (first load, nothing rendered yet)
+                                //    → centered soft loading card with a gentle fade+scale
+                                //    exit, replacing the abrupt bare system spinner.
+                                //  • Any LATER reload (iCloud sync, compaction, stale-cache
+                                //    refresh) while content is on screen → keep the small
+                                //    unobtrusive spinner; the big card must never cover
+                                //    content the user is already reading.
+                                ZStack {
+                                    // Pre-load window: isLoadingSession only flips once
+                                    // loadSession() actually begins (onAppear → Task →
+                                    // repairSessionIfNeeded → loadSession), so gating the
+                                    // card on it alone left a blank screen for that gap.
+                                    // Treat "real session, nothing loaded yet" as loading
+                                    // from the very first frame of the push.
+                                    let enteringUnloaded = sessionId != nil
+                                        && vm.messages.isEmpty
+                                        && !vm.hasCompletedInitialLoad
+                                    if (vm.isLoadingSession || enteringUnloaded) && vm.messages.isEmpty {
+                                        // Entering: nothing rendered yet — show the dots.
+                                        // In-place reloads with content on screen (iCloud
+                                        // sync fetch → reloadMessagesFromDB → loadSession
+                                        // right after entry is the common case) show NO
+                                        // overlay at all: the content stays visible and
+                                        // interactive, and a centered gray "…" right after
+                                        // the blue entry dots read as a glitch, not
+                                        // feedback (user report 2026-07-06).
+                                        SessionLoadingCard()
+                                            .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                                            .accessibilityIdentifier("sessionLoadingCard")
+                                    }
+                                }
+                                .animation(.easeOut(duration: 0.28), value: vm.isLoadingSession)
+                                .allowsHitTesting(false)
+                            }
+                            .overlay {
+                                SessionLockGateOverlay(sessionId: vm.sessionId)
+                            }
+                            .onChange(of: vm.isLoadingSession, perform: handleLoadingSessionChange)
+
+                        // Full-screen kernel boot overlay
+                        kernelBootOverlay
+                    }
+                    .background(ChatColors.background)
+                    .onDrop(of: [.image, .movie, .fileURL, .data], isTargeted: $isDropTargeted) { providers in
+                        handleDropProviders(providers)
+                        return true
+                    }
+                    .overlay {
+                        if isDropTargeted {
+                            RoundedRectangle(cornerRadius: 16)
+                                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                                .background(Color.accentColor.opacity(0.08).clipShape(RoundedRectangle(cornerRadius: 16)))
+                                .padding(8)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .environment(\.chatSessionId, vm.sessionId)
+                    .modifier(NavBarStyleModifier(topSafeAreaInset: $topSafeAreaInset))
+                    .navigationBarTitleDisplayMode(.inline)
+                    // [T-ios-navbar-toolbar-host] The ENTIRE toolbar now lives inside an
+                    // equatable-gated host child. Root cause of the mid-streaming "..."
+                    // menu refresh (4th attempt, this one from instrumentation): with
+                    // .toolbar attached on this (per-token re-evaluated) chain, the
+                    // ToolbarContent builder itself re-ran on EVERY streaming tick
+                    // (NavbarEval toolbarPass=34/stream) and handed the bridge a brand-new
+                    // ToolbarContent value each time — which it re-pushed to the
+                    // UINavigationItem, refreshing the OPEN UIMenu, even while both inner
+                    // Equatable gates provably held (titleEval=3, menuEval=2). Hosting the
+                    // toolbar in a child whose body is gated on the displayed inputs means
+                    // the builder simply never re-runs during a stream: no new
+                    // ToolbarContent, nothing to re-push, and the native SwiftUI Menu
+                    // (with the system's round Liquid-Glass chrome) can stay.
+                    // .equatable() is MANDATORY here, not an optimization hint: device
+                    // instrumentation (2026-07-17 23:53, == FALSE count 0 while
+                    // hostEval == toolbarPass) proved SwiftUI does NOT consult a plain
+                    // Equatable conformance for this generic closure-holding view in the
+                    // .background position — the gate silently never engaged. EquatableView
+                    // wrapping is the only guaranteed path to ==.
+                    .background(
+                        ChatToolbarHost(key: chatToolbarKey, title: {
+                            chatNavPrincipalContent
+                        }, trailing: {
+                            trailingMenu
+                        })
+                        .equatable()
+                    )
+        )
+    }
+
+    // MARK: - Deep Mode Workflow Banner
+    /// Extracted Deep Mode workflow UI (clarification banner,
+    /// plan gate, step progress, subagent cards) to reduce
+    /// body type-check complexity.
+    private var deepModeWorkflowBanner: AnyView {
+        AnyView(Group {
+            // [T-deep-mode-workflow] Phase 1 visualization feedback, hard-gated
+            // on the master switch so turning deep mode off removes ALL
+            // workflow UI with zero residue. Approval/edit still flows
+            // through vm.confirmPlan()/editPlan()/cancelPlan().
+            if vm.deepModeEnabled {
+                // [T-deep-mode-clarify-gate] Phase 2: clarification banner.
+                // Shown before planning — if the gate detected ambiguity
+                // in the user's request, ask a clarifying question first.
+                if case .awaitingClarification = vm.clarifyState {
+                    clarifyBanner
+                } else if case .awaitingApproval = vm.planGateState {
+                    // Planning: parsed steps preview + confirm/edit bar.
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !vm.workflowSteps.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("计划步骤")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(ChatColors.secondaryText)
+                                WorkflowStepsList(steps: vm.workflowSteps)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(ChatColors.secondaryBg)
+                        }
+                        planGateBanner
+                    }
+                } else if vm.workflowPhase == .executing || vm.workflowPhase == .verifying {
+                    // Executing / verifying: live step progress.
+                    WorkflowProgressView(phase: vm.workflowPhase,
+                                         steps: vm.workflowSteps)
+                }
+            }
+            // [T-phase5] Subagent status capsules — shown at the top
+            // of the chat area when deep mode is on and there are
+            // active subagent sessions. Uses the same capsule style
+            // as ToolCapsuleView for visual consistency. Total-switch
+            // safe: when the master switch is off, activeSubagents is
+            // cleared, so this view is EmptyView.
+            if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
+                SubagentCardStack(subagents: vm.activeSubagents)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+                    .transition(.opacity)
+            }
+        })
     }
 
     // MARK: - Home Screen Quick Actions
