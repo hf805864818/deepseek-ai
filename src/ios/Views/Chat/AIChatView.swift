@@ -520,6 +520,51 @@ struct AIChatView: View {
                                 }
                             }
                     }
+                    // [T-deep-mode-workflow] Phase 1 visualization feedback, hard-gated
+                    // on the master switch so turning deep mode off removes ALL
+                    // workflow UI with zero residue. Approval/edit still flows
+                    // through vm.confirmPlan()/editPlan()/cancelPlan().
+                    if vm.deepModeEnabled {
+                        // [T-deep-mode-clarify-gate] Phase 2: clarification banner.
+                        // Shown before planning — if the gate detected ambiguity
+                        // in the user's request, ask a clarifying question first.
+                        if case .awaitingClarification = vm.clarifyState {
+                            clarifyBanner
+                        } else if case .awaitingApproval = vm.planGateState {
+                            // Planning: parsed steps preview + confirm/edit bar.
+                            VStack(alignment: .leading, spacing: 0) {
+                                if !vm.workflowSteps.isEmpty {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text("计划步骤")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(ChatColors.secondaryText)
+                                        WorkflowStepsList(steps: vm.workflowSteps)
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(ChatColors.secondaryBg)
+                                }
+                                planGateBanner
+                            }
+                        } else if vm.workflowPhase == .executing || vm.workflowPhase == .verifying {
+                            // Executing / verifying: live step progress.
+                            WorkflowProgressView(phase: vm.workflowPhase,
+                                                 steps: vm.workflowSteps)
+                        }
+                    }
+                    // [T-phase5] Subagent status capsules — shown at the top
+                    // of the chat area when deep mode is on and there are
+                    // active subagent sessions. Uses the same capsule style
+                    // as ToolCapsuleView for visual consistency. Total-switch
+                    // safe: when the master switch is off, activeSubagents is
+                    // cleared, so this view is EmptyView.
+                    if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
+                        SubagentCardStack(subagents: vm.activeSubagents)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 4)
+                            .transition(.opacity)
+                    }
                 }
                 .overlay(alignment: .bottom) {
                     // Tool preview + input bar stacked at the bottom.
@@ -2568,6 +2613,107 @@ struct AIChatView: View {
         .background(Color.red.opacity(0.12))
     }
 
+    // MARK: - Deep Mode Banners
+
+    /// [T-deep-mode-clarify-gate] Phase 2: clarification banner shown above the
+    /// message list when the gate detected ambiguity in the user's request.
+    /// The user can reply in the composer (their answer gets merged with the
+    /// original request), skip straight to execution, or cancel.
+    private var clarifyBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "questionmark.circle")
+                    .font(.caption)
+                    .foregroundColor(.accentColor)
+                Text("深度龙虾Ai · 需要澄清")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(ChatColors.primaryText)
+                Spacer(minLength: 8)
+                Button { vm.cancelClarification() } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption)
+                        .foregroundColor(ChatColors.secondaryText)
+                }
+                .buttonStyle(.plain)
+            }
+            if case .awaitingClarification(let question, _) = vm.clarifyState {
+                Text(question)
+                    .font(.caption2)
+                    .foregroundColor(ChatColors.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 10) {
+                Spacer(minLength: 8)
+                Button { vm.skipClarification() } label: {
+                    Text("直接执行")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 8).padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+                Text("或在下方输入答复后发送")
+                    .font(.caption2)
+                    .foregroundColor(ChatColors.secondaryText)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ChatColors.secondaryBg)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(ChatColors.toolBorder).frame(height: 0.5)
+        }
+    }
+
+    /// [T-deep-mode-plan-gate] Confirm/edit bar rendered above the messages
+    /// while a deep-mode plan is awaiting approval. Approval re-enters the
+    /// normal send path; edit parks the plan text in the composer.
+    private var planGateBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.caption)
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("深度龙虾Ai · 已拟定执行计划")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(ChatColors.primaryText)
+                Text("确认后开始执行，或修改计划细节")
+                    .font(.caption2)
+                    .foregroundColor(ChatColors.secondaryText)
+            }
+            Spacer(minLength: 8)
+            Button { vm.editPlan() } label: {
+                Text("修改")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            Button { vm.confirmPlan() } label: {
+                Text("确认执行")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(Color.accentColor)
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            Button { vm.cancelPlan() } label: {
+                Image(systemName: "xmark")
+                    .font(.caption)
+                    .foregroundColor(ChatColors.secondaryText)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ChatColors.secondaryBg)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(ChatColors.toolBorder).frame(height: 0.5)
+        }
+    }
+
     #if DEBUG
     /// Build a JSON representation of the full agent conversation history and copy it.
     private func copySessionDataToClipboard() {
@@ -4147,7 +4293,17 @@ struct AIChatView: View {
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 2)
                         }
-                        if cmd.id == "thinking" {
+                        if cmd.id == "deepmode" {
+                            SlashCommandRow(
+                                cmd: cmd,
+                                isSelected: isSelected,
+                                memoryEnabled: vm.memoryEnabled,
+                                deepModeLevel: vm.deepModeLevel,
+                                onSetDeepModeLevel: { level in
+                                    vm.setDeepModeLevel(level)
+                                }
+                            )
+                        } else if cmd.id == "thinking" {
                             let supported = vm.currentModelSupportsReasoning
                             SlashCommandRow(
                                 cmd: cmd,
@@ -4396,6 +4552,9 @@ struct AIChatView: View {
         var availableLevels: [ThinkingLevel] = ThinkingLevel.allCases
         var onSetThinkingLevel: ((ThinkingLevel) -> Void)?
         var onToggleThinking: (() -> Void)?
+        // [T-deep-mode-level] Deep mode intensity picker (low/medium/high)
+        var deepModeLevel: DeepModeLevel = .medium
+        var onSetDeepModeLevel: ((DeepModeLevel) -> Void)?
 
         var body: some View {
             HStack(spacing: 8) {
@@ -4411,18 +4570,18 @@ struct AIChatView: View {
                                 .font(.system(size: 14, weight: .medium))
                         }
                     }
-                    .foregroundStyle(thinkingIconColor)
+                    .foregroundStyle(rowIconColor)
                     .frame(width: 20)
                     VStack(alignment: .leading, spacing: 1) {
                         let isThinkingActive = cmd.id == "thinking" && thinkingLevel.isEnabled && thinkingSupported
                         let titleColor: Color = isThinkingActive
-                            ? .blue : (isSelected ? .white : ChatColors.primaryText)
+                            ? .blue : (cmd.id == "deepmode" ? .purple : (isSelected ? .white : ChatColors.primaryText))
                         let subtitleText = (cmd.id == "thinking" && !thinkingSupported)
                             ? AppLocalized("Not supported by current model")
                             : cmd.subtitle
                         let subtitleColor: Color = (cmd.id == "thinking" && !thinkingSupported)
                             ? .secondary
-                            : (isThinkingActive ? .blue.opacity(0.7) : (isSelected ? .white.opacity(0.7) : ChatColors.secondaryText))
+                            : (isThinkingActive ? .blue.opacity(0.7) : (cmd.id == "deepmode" ? .purple.opacity(0.7) : (isSelected ? .white.opacity(0.7) : ChatColors.secondaryText)))
                         // [T-slash-picker-product-rules] Title + subtitle
                         // each clamped to a single line. Long skill names
                         // and descriptions used to wrap and pump the row
@@ -4457,6 +4616,9 @@ struct AIChatView: View {
                                 : AppLocalized("Memory off", comment: "VoiceOver label for the memory status icon when disabled")
                         ))
                 }
+                if cmd.id == "deepmode" {
+                    deepModeLevelPicker
+                }
                 if cmd.id == "thinking" && thinkingSupported {
                     thinkingLevelPicker
                 }
@@ -4466,12 +4628,41 @@ struct AIChatView: View {
             .frame(minHeight: 44)
         }
 
-        private var thinkingIconColor: Color {
+        private var rowIconColor: Color {
+            if cmd.id == "deepmode" {
+                return .purple
+            }
             guard cmd.id == "thinking" else {
                 return isSelected ? .white.opacity(0.8) : ChatColors.secondaryText
             }
             if !thinkingSupported { return .secondary }
             return thinkingLevel.isEnabled ? .blue : (isSelected ? .white.opacity(0.8) : ChatColors.secondaryText)
+        }
+
+        // [T-deep-mode-level] Three-tier purple picker for deep mode intensity.
+        // Mirrors the thinking-level picker layout but with purple accent
+        // to distinguish it from the blue ThinkingLevel picker.
+        private var deepModeLevelPicker: some View {
+            HStack(spacing: 0) {
+                ForEach(DeepModeLevel.allCases, id: \.self) { level in
+                    let isExactMatch = deepModeLevel == level
+                    HStack(spacing: 1) {
+                        Text(level.displayName)
+                            .font(.system(size: 11, weight: isExactMatch ? .bold : .regular))
+                    }
+                    .foregroundStyle(isExactMatch ? .white : .secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    .background(
+                        isExactMatch ? Color.purple : Color.clear
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture { onSetDeepModeLevel?(level) }
+                    .id(level)
+                }
+            }
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
         }
 
         private var thinkingLevelPicker: some View {
