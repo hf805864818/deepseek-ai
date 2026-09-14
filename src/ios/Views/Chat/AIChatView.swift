@@ -920,60 +920,7 @@ struct AIChatView: View {
             SessionMemoryView(vm: cached.vm)
         }
         .sheet(isPresented: $showMoveToSheet) {
-            MoveToSessionSheet(currentSessionId: vm.sessionId) { targetId in
-                // [T-ios-moveto-transfer-race] Stash bound to the target, so
-                // only that session can consume it.
-                let movedText = vm.inputText
-                let movedAttachments = vm.attachments
-                let stash = ViewModelCache.PendingTransfer(
-                    targetId: targetId,
-                    inputText: movedText,
-                    attachments: movedAttachments
-                )
-                ViewModelCache.pendingTransfer = stash
-                // Clear the source composer optimistically so the move reads as
-                // instant, but keep a copy: if the target never consumes the
-                // stash (navigation swallowed, wrong session opened), restore it
-                // here rather than letting the user's content vanish. Attachment
-                // files are NOT deleted on this path — both the stash and this
-                // restore reference the same cacheURLs.
-                vm.inputText = ""
-                vm.attachments.removeAll()
-                // The share content is no longer here — reset the flag that
-                // gates the "Move to…" pill. Currently `hasMovableShareContent`
-                // hides the pill anyway now the composer is empty, so this is
-                // not user-visible, but leaving it true is a latent trap for
-                // anything else that reads it.
-                hasInjectedShareContent = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + ViewModelCache.PendingTransfer.staleAfter) {
-                    // Match the exact stash we staged, not just its target: a
-                    // second move to the same target within the stale window
-                    // replaces the slot, and this timer must not restore that
-                    // newer content out from under it.
-                    guard let stranded = ViewModelCache.pendingTransfer,
-                          stranded.targetId == targetId,
-                          stranded.createdAt == stash.createdAt else { return }
-                    // Still sitting in the slot → nobody consumed it.
-                    ViewModelCache.pendingTransfer = nil
-                    minisLogger.info("[MoveTo] Transfer to \(targetId) was never consumed — restoring content to source session")
-                    if vm.inputText.isEmpty {
-                        vm.inputText = movedText
-                    } else if !movedText.isEmpty {
-                        vm.inputText += "\n" + movedText
-                    }
-                    vm.attachments.append(contentsOf: movedAttachments)
-                }
-                // Dismiss keyboard first so it doesn't linger during transition
-                inputFocused = false
-                // Post navigation after sheet dismiss animation completes
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    NotificationCenter.default.post(
-                        name: .moveInputToSession,
-                        object: nil,
-                        userInfo: ["targetId": targetId]
-                    )
-                }
-            }
+            MoveToSessionSheet(currentSessionId: vm.sessionId, onSelect: handleMoveToSession)
         }
         .fullScreenCover(isPresented: $showTerminal) {
             terminalInitCommand = nil
@@ -4460,6 +4407,67 @@ struct AIChatView: View {
     private var hasMovableShareContent: Bool {
         !vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !vm.attachments.isEmpty
+    }
+
+    /// Handle the "Move input to another session" action from the MoveTo sheet.
+    /// Extracted from the `.sheet` inline closure to reduce type-checker load.
+    private func handleMoveToSession(targetId: String) {
+        // [T-ios-moveto-transfer-race] Stash bound to the target, so
+        // only that session can consume it.
+        let movedText = vm.inputText
+        let movedAttachments = vm.attachments
+        let stash = ViewModelCache.PendingTransfer(
+            targetId: targetId,
+            inputText: movedText,
+            attachments: movedAttachments
+        )
+        ViewModelCache.pendingTransfer = stash
+        // Clear the source composer optimistically so the move reads as
+        // instant, but keep a copy: if the target never consumes the
+        // stash (navigation swallowed, wrong session opened), restore it
+        // here rather than letting the user's content vanish. Attachment
+        // files are NOT deleted on this path — both the stash and this
+        // restore reference the same cacheURLs.
+        vm.inputText = ""
+        vm.attachments.removeAll()
+        // The share content is no longer here — reset the flag that
+        // gates the "Move to…" pill. Currently `hasMovableShareContent`
+        // hides the pill anyway now the composer is empty, so this is
+        // not user-visible, but leaving it true is a latent trap for
+        // anything else that reads it.
+        hasInjectedShareContent = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + ViewModelCache.PendingTransfer.staleAfter) { [weak vm] in
+            guard let vm else { return }
+            // Match the exact stash we staged, not just its target: a
+            // second move to the same target within the stale window
+            // replaces the slot, and this timer must not restore that
+            // newer content out from under it.
+            guard let stranded = ViewModelCache.pendingTransfer,
+                  stranded.targetId == targetId,
+                  stranded.createdAt == stash.createdAt else { return }
+            // Still sitting in the slot → nobody consumed it.
+            ViewModelCache.pendingTransfer = nil
+            var logMsg = "[MoveTo] Transfer to "
+            logMsg += targetId
+            logMsg += " was never consumed — restoring content to source session"
+            minisLogger.info(logMsg)
+            if vm.inputText.isEmpty {
+                vm.inputText = movedText
+            } else if !movedText.isEmpty {
+                vm.inputText += "\n" + movedText
+            }
+            vm.attachments.append(contentsOf: movedAttachments)
+        }
+        // Dismiss keyboard first so it doesn't linger during transition
+        inputFocused = false
+        // Post navigation after sheet dismiss animation completes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            NotificationCenter.default.post(
+                name: .moveInputToSession,
+                object: nil,
+                userInfo: ["targetId": targetId]
+            )
+        }
     }
 
 
