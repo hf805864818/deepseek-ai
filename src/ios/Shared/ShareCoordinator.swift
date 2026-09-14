@@ -107,6 +107,10 @@ final class ShareCoordinator: ObservableObject {
     struct PendingShareBuffer {
         let share: PendingShare
         let bufferedAt: Date
+        /// Session this buffer is addressed to. nil = "any session" (cold launch).
+        let targetSessionId: String?
+        /// Draft this buffer is addressed to. nil = "any draft" (cold launch).
+        let targetDraftId: UUID?
     }
 
     /// Written by processPendingShare() in ContentView, consumed once by AIChatView.
@@ -125,21 +129,54 @@ final class ShareCoordinator: ObservableObject {
     /// attachment file names are UUID-suffixed so distinct files never
     /// collide, while a doubled delivery of the same record stays single.
     /// bufferedAt renews so the merged buffer gets a fresh TTL window.
-    func storeBuffer(_ share: PendingShare) {
+    func storeBuffer(_ share: PendingShare, sessionId: String? = nil, draftId: UUID? = nil) {
         if let existing = pendingShareBuffer {
             var merged = existing.share.items
             for item in share.items where !merged.contains(where: { $0.kind == item.kind && $0.value == item.value }) {
                 merged.append(item)
             }
             let mergedShare = PendingShare(items: merged, timestamp: share.timestamp)
-            pendingShareBuffer = PendingShareBuffer(share: mergedShare, bufferedAt: Date())
+            // Merge: inherit the more specific target (new non-nil wins over old nil).
+            let mergedSessionId = sessionId ?? existing.targetSessionId
+            let mergedDraftId = draftId ?? existing.targetDraftId
+            pendingShareBuffer = PendingShareBuffer(
+                share: mergedShare,
+                bufferedAt: Date(),
+                targetSessionId: mergedSessionId,
+                targetDraftId: mergedDraftId
+            )
             bufferVersion += 1
-            shareLog.info("[Share] storeBuffer: MERGED \(existing.share.items.count) existing + \(share.items.count) new → \(merged.count) items (v\(bufferVersion))")
+            shareLog.info("[Share] storeBuffer: MERGED \(existing.share.items.count) existing + \(share.items.count) new → \(merged.count) items (v\(bufferVersion)) targetSession=\(mergedSessionId ?? "nil") targetDraft=\(mergedDraftId?.uuidString ?? "nil")")
             return
         }
-        pendingShareBuffer = PendingShareBuffer(share: share, bufferedAt: Date())
+        pendingShareBuffer = PendingShareBuffer(
+            share: share,
+            bufferedAt: Date(),
+            targetSessionId: sessionId,
+            targetDraftId: draftId
+        )
         bufferVersion += 1
-        shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) at \(Date())")
+        shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) targetSession=\(sessionId ?? "nil") targetDraft=\(draftId?.uuidString ?? "nil") at \(Date())")
+    }
+
+    /// Returns true when the pending buffer targets the given session/draft,
+    /// or when no target is stamped on the buffer (cold launch — any session
+    /// may consume it).
+    func bufferTargets(_ sessionId: String?, draftId: UUID?) -> Bool {
+        guard let buf = pendingShareBuffer else { return false }
+        // If buffer has no target stamp, it passes for any caller.
+        if buf.targetSessionId == nil && buf.targetDraftId == nil {
+            return true
+        }
+        // If a session target is set, it must match.
+        if let targetSession = buf.targetSessionId, targetSession != sessionId {
+            return false
+        }
+        // If a draft target is set, it must match.
+        if let targetDraft = buf.targetDraftId, targetDraft != draftId {
+            return false
+        }
+        return true
     }
 
     /// Consume the buffer. Returns nil (and cleans up) if expired or empty.

@@ -381,6 +381,16 @@ func renderMarkdownBlocks(_ blocks: [BlockNode]) -> NSAttributedString {
     return renderer.render(blocks: blocks)
 }
 
+/// Background-thread-safe version of `renderMarkdownBlocks`.
+/// Accepts an explicit `baseFontSize` so the caller does not need to touch
+/// `FontSettings.shared` (which is main-actor isolated) from a background task.
+/// The renderer itself only constructs UIFont / UIColor values and builds an
+/// NSAttributedString — all of which are safe to invoke off the main thread.
+func renderMarkdownBlocksOffMain(_ blocks: [BlockNode], baseFontSize: CGFloat) -> NSAttributedString {
+    let renderer = MarkdownNSRenderer(baseFontSize: baseFontSize)
+    return renderer.render(blocks: blocks)
+}
+
 // MARK: - MarkdownNSRenderer
 
 /// Converts `[BlockNode]` → `NSMutableAttributedString` for display in a UITextView.

@@ -83,6 +83,10 @@ enum ChatColors {
     static let accent = Color(UIColor.label)
     static let sendButton = Color(UIColor.label)
     static let sendButtonDisabled = Color(UIColor.quaternaryLabel)
+    /// Semantic "success / completed" color. Used for done state glyphs (e.g.
+    /// workflow step tracker) so a change of success-color is one centralized
+    /// edit instead of scattered hard-coded `.green` literals.
+    static let success = Color(UIColor.systemGreen)
 }
 
 // MARK: - System Resource Monitor
@@ -1438,123 +1442,7 @@ struct AIChatView: View {
             edges: (voiceInputActive && !voiceVM.isEditingTranscript) ? .bottom : []
         )
         .onChange(of: scenePhase) { phase in
-            if phase == .active {
-                // [T-voice-inputbar-fg-stale-debounce] iOS changes safe area
-                // insets while backgrounded, causing onGeometryChange to fire
-                // with shifted geometry. That measurement spawns a debounce
-                // Task carrying stale height. Cancel it so the stale value
-                // never lands. The post-foreground onGeometryChange re-fires
-                // with the correct geometry and enters a fresh debounce.
-                // NOTE: do NOT reset didSeedInputBarHeight here. The seed path
-                // is synchronous (no debounce) so it would capture a mid-
-                // animation frame if the panel is expanding/collapsing when the
-                // app returns to foreground — the debounce path is the correct
-                // one for an already-visible view.
-                inputBarHeightDebounce?.cancel()
-                inputBarHeightDebounce = nil
-                // [T-voice-inputbar-collapse-selfheal] …EXCEPT when the composer
-                // has stopped reporting geometry altogether, which is the one
-                // state the note above cannot cover.
-                //
-                // Device 2026-08-18 01:29 (iPhone 17 Pro, no lock, no manual app
-                // switch): a transcript landed and collapsed the panel band in a
-                // single frame (transcriptContentHeight 262→42, an intermediate
-                // panel frame reaching y=1119 on an 874pt window). The system
-                // then drove six inactive↔active cycles in 20s on its own
-                // (snapshot / audio-session interruption right after
-                // `end(.capture)`), each logging `hadResponder=true`. After
-                // `inputBarHeight settled=282.0` at 01:29:15.597 the composer's
-                // onGeometryChange NEVER fired again: its SwiftUI host survived
-                // with alpha=1 and zero subviews (confirmed live via
-                // debug.viewTree — FloatingBarHostingView nkids=0), so the whole
-                // bottom of the screen was empty black with no input bar.
-                //
-                // Nothing could wake it: this subtree deliberately ignores the
-                // keyboard safe area while the voice panel is up
-                // ([T-voice-bg-fg-gap], see the .ignoresSafeArea above), so the
-                // inset churn that would normally force a re-layout is filtered
-                // out by design, and onGeometryChange is the ONLY writer of
-                // inputBarHeight. The user's own workaround — leave the session
-                // and re-enter — worked precisely because `.onAppear` re-arms
-                // the seed ([T-inputbar-stale-across-reentry]); this is that
-                // same recovery, applied without making the user find it.
-                //
-                // Re-arm only when the composer is provably not reporting: the
-                // last on-screen sample disagrees with the committed height, or
-                // no sample was ever recorded. In the healthy case both values
-                // match and this is a no-op, so the mid-animation hazard the
-                // note above warns about is not reintroduced — a re-seed can
-                // only happen where the alternative is a permanently wrong (or
-                // missing) bar.
-                let committedH = inputBarHeight
-                let latestH = latestInputBarFrameH
-                let sinceReport = inputBarLastGeometryAt.map { CFAbsoluteTimeGetCurrent() - $0 } ?? -1
-                if didSeedInputBarHeight,
-                   latestH <= 0 || abs(latestH - committedH) > 0.5 {
-                    didSeedInputBarHeight = false
-                    AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene active — composer geometry stale (committed=\(committedH) latest=\(latestH) lastReport=\(String(format: "%.1f", sinceReport))s ago); re-arming seed so the next callback re-measures")
-                }
-
-                // [T-voice-inputbar-collapse-selfheal] Re-arming only makes the
-                // seed ELIGIBLE to fire; it cannot make a host that has stopped
-                // reporting geometry start again. In the observed failure that
-                // host had zero subviews and emitted nothing for minutes, so
-                // verify the wake-up actually happened and say so loudly when it
-                // did not — this is the line that tells the next investigation
-                // "the self-heal ran and was not enough" instead of leaving them
-                // to re-derive it from a silent log.
-                inputBarHealthProbe?.cancel()
-                let probeBaseline = inputBarGeometryTick
-                inputBarHealthProbe = Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(900))
-                    guard !Task.isCancelled else { return }
-                    let ticked = inputBarGeometryTick != probeBaseline
-                    let age = inputBarLastGeometryAt.map { CFAbsoluteTimeGetCurrent() - $0 } ?? -1
-                    if ticked {
-                        AppLogger(category: "InputBarLayout").info("[InputBarHealth] OK after foreground — composer re-reported geometry (h=\(latestInputBarFrameH) committed=\(inputBarHeight))")
-                    } else {
-                        AppLogger(category: "InputBarLayout").error("[InputBarHealth] STALLED — no geometry callback 900ms after foreground. committed=\(inputBarHeight) latest=\(latestInputBarFrameH) lastReport=\(String(format: "%.1f", age))s ago voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript) seeded=\(didSeedInputBarHeight). The composer host is not laying out; expect a blank bottom area. Leaving and re-entering the session rebuilds it.")
-                    }
-                }
-                // [T-voice-bg-fg-gap] Foreground reseal: if we return to a
-                // voice-mode-not-editing state, no responder should be armed.
-                // Releasing here is a no-op when nothing is focused and clears
-                // any responder UIKit resurrected during the background pass.
-                if voiceInputActive && !voiceVM.isEditingTranscript {
-                    let keyWindow = UIApplication.shared.connectedScenes
-                        .compactMap { $0 as? UIWindowScene }
-                        .flatMap(\.windows)
-                        .first(where: \.isKeyWindow)
-                    if let keyWindow, keyWindow.endEditing(true) {
-                        AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene active — released a resurrected responder (voice mode, not editing)")
-                    }
-                }
-            }
-            if phase != .active, voiceInputActive, !voiceVM.isEditingTranscript {
-                // [T-voice-bg-fg-gap] Complete any in-flight keyboard dismissal
-                // BEFORE the snapshot/suspend layout pass — but ONLY in the
-                // voice-mode-not-editing state, where no responder is ever
-                // legitimate (text mode keeps its focused composer across app
-                // switches; edit mode keeps its editor keyboard — resigning
-                // those would be a visible regression). If the edit→send
-                // teardown's dismiss animation is still running when the app
-                // backgrounds, iOS can freeze the window mid-dismissal with a
-                // partial keyboard inset that survives into the next foreground.
-                // Synchronous resign + no-animation layout guarantees the window
-                // geometry is final before UIKit snapshots it.
-                let keyWindow = UIApplication.shared.connectedScenes
-                    .compactMap { $0 as? UIWindowScene }
-                    .flatMap(\.windows)
-                    .first(where: \.isKeyWindow)
-                if let keyWindow {
-                    let hadResponder = keyWindow.endEditing(true)
-                    UIView.performWithoutAnimation { keyWindow.layoutIfNeeded() }
-                    AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene \(phase == .inactive ? "inactive" : "background") — forced keyboard-dismiss completion (hadResponder=\(hadResponder)) voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript)")
-                }
-            }
-            if phase != .active, speechManager.state == .recording {
-                speechManager.stopRecording()
-            }
+            handleScenePhaseChange(phase)
         }
         .onChange(of: deepLink.showTerminal) { show in
             if show {
@@ -1652,6 +1540,130 @@ struct AIChatView: View {
             onWaitingMatch: { tryMarkWorkflowChatReady(reason: "modifier-waiting") },
             onChatReady: { action in applyQuickAction(action) }
         )
+    }
+
+    // MARK: - Scene phase handling
+
+    /// Extracted from `.onChange(of: scenePhase)` to keep that closure small
+    /// and avoid the Swift type-checker timing out on a large inline closure.
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        if phase == .active {
+            // [T-voice-inputbar-fg-stale-debounce] iOS changes safe area
+            // insets while backgrounded, causing onGeometryChange to fire
+            // with shifted geometry. That measurement spawns a debounce
+            // Task carrying stale height. Cancel it so the stale value
+            // never lands. The post-foreground onGeometryChange re-fires
+            // with the correct geometry and enters a fresh debounce.
+            // NOTE: do NOT reset didSeedInputBarHeight here. The seed path
+            // is synchronous (no debounce) so it would capture a mid-
+            // animation frame if the panel is expanding/collapsing when the
+            // app returns to foreground — the debounce path is the correct
+            // one for an already-visible view.
+            inputBarHeightDebounce?.cancel()
+            inputBarHeightDebounce = nil
+            // [T-voice-inputbar-collapse-selfheal] …EXCEPT when the composer
+            // has stopped reporting geometry altogether, which is the one
+            // state the note above cannot cover.
+            //
+            // Device 2026-08-18 01:29 (iPhone 17 Pro, no lock, no manual app
+            // switch): a transcript landed and collapsed the panel band in a
+            // single frame (transcriptContentHeight 262→42, an intermediate
+            // panel frame reaching y=1119 on an 874pt window). The system
+            // then drove six inactive↔active cycles in 20s on its own
+            // (snapshot / audio-session interruption right after
+            // `end(.capture)`), each logging `hadResponder=true`. After
+            // `inputBarHeight settled=282.0` at 01:29:15.597 the composer's
+            // onGeometryChange NEVER fired again: its SwiftUI host survived
+            // with alpha=1 and zero subviews (confirmed live via
+            // debug.viewTree — FloatingBarHostingView nkids=0), so the whole
+            // bottom of the screen was empty black with no input bar.
+            //
+            // Nothing could wake it: this subtree deliberately ignores the
+            // keyboard safe area while the voice panel is up
+            // ([T-voice-bg-fg-gap], see the .ignoresSafeArea above), so the
+            // inset churn that would normally force a re-layout is filtered
+            // out by design, and onGeometryChange is the ONLY writer of
+            // inputBarHeight. The user's own workaround — leave the session
+            // and re-enter — worked precisely because `.onAppear` re-arms
+            // the seed ([T-inputbar-stale-across-reentry]); this is that
+            // same recovery, applied without making the user find it.
+            //
+            // Re-arm only when the composer is provably not reporting: the
+            // last on-screen sample disagrees with the committed height, or
+            // no sample was ever recorded. In the healthy case both values
+            // match and this is a no-op, so the mid-animation hazard the
+            // note above warns about is not reintroduced — a re-seed can
+            // only happen where the alternative is a permanently wrong (or
+            // missing) bar.
+            let committedH = inputBarHeight
+            let latestH = latestInputBarFrameH
+            let sinceReport = inputBarLastGeometryAt.map { CFAbsoluteTimeGetCurrent() - $0 } ?? -1
+            if didSeedInputBarHeight,
+               latestH <= 0 || abs(latestH - committedH) > 0.5 {
+                didSeedInputBarHeight = false
+                AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene active — composer geometry stale (committed=\(committedH) latest=\(latestH) lastReport=\(String(format: "%.1f", sinceReport))s ago); re-arming seed so the next callback re-measures")
+            }
+
+            // [T-voice-inputbar-collapse-selfheal] Re-arming only makes the
+            // seed ELIGIBLE to fire; it cannot make a host that has stopped
+            // reporting geometry start again. In the observed failure that
+            // host had zero subviews and emitted nothing for minutes, so
+            // verify the wake-up actually happened and say so loudly when it
+            // did not — this is the line that tells the next investigation
+            // "the self-heal ran and was not enough" instead of leaving them
+            // to re-derive it from a silent log.
+            inputBarHealthProbe?.cancel()
+            let probeBaseline = inputBarGeometryTick
+            inputBarHealthProbe = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(900))
+                guard !Task.isCancelled else { return }
+                let ticked = inputBarGeometryTick != probeBaseline
+                let age = inputBarLastGeometryAt.map { CFAbsoluteTimeGetCurrent() - $0 } ?? -1
+                if ticked {
+                    AppLogger(category: "InputBarLayout").info("[InputBarHealth] OK after foreground — composer re-reported geometry (h=\(latestInputBarFrameH) committed=\(inputBarHeight))")
+                } else {
+                    AppLogger(category: "InputBarLayout").error("[InputBarHealth] STALLED — no geometry callback 900ms after foreground. committed=\(inputBarHeight) latest=\(latestInputBarFrameH) lastReport=\(String(format: "%.1f", age))s ago voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript) seeded=\(didSeedInputBarHeight). The composer host is not laying out; expect a blank bottom area. Leaving and re-entering the session rebuilds it.")
+                }
+            }
+            // [T-voice-bg-fg-gap] Foreground reseal: if we return to a
+            // voice-mode-not-editing state, no responder should be armed.
+            // Releasing here is a no-op when nothing is focused and clears
+            // any responder UIKit resurrected during the background pass.
+            if voiceInputActive && !voiceVM.isEditingTranscript {
+                let keyWindow = UIApplication.shared.connectedScenes
+                    .compactMap { $0 as? UIWindowScene }
+                    .flatMap(\.windows)
+                    .first(where: \.isKeyWindow)
+                if let keyWindow, keyWindow.endEditing(true) {
+                    AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene active — released a resurrected responder (voice mode, not editing)")
+                }
+            }
+        }
+        if phase != .active, voiceInputActive, !voiceVM.isEditingTranscript {
+            // [T-voice-bg-fg-gap] Complete any in-flight keyboard dismissal
+            // BEFORE the snapshot/suspend layout pass — but ONLY in the
+            // voice-mode-not-editing state, where no responder is ever
+            // legitimate (text mode keeps its focused composer across app
+            // switches; edit mode keeps its editor keyboard — resigning
+            // those would be a visible regression). If the edit→send
+            // teardown's dismiss animation is still running when the app
+            // backgrounds, iOS can freeze the window mid-dismissal with a
+            // partial keyboard inset that survives into the next foreground.
+            // Synchronous resign + no-animation layout guarantees the window
+            // geometry is final before UIKit snapshots it.
+            let keyWindow = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+                .first(where: \.isKeyWindow)
+            if let keyWindow {
+                let hadResponder = keyWindow.endEditing(true)
+                UIView.performWithoutAnimation { keyWindow.layoutIfNeeded() }
+                AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene \(phase == .inactive ? "inactive" : "background") — forced keyboard-dismiss completion (hadResponder=\(hadResponder)) voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript)")
+            }
+        }
+        if phase != .active, speechManager.state == .recording {
+            speechManager.stopRecording()
+        }
     }
 
     /// Tell the workflow this view is alive + showing the right

@@ -1104,6 +1104,7 @@ final class CellStateBridgeV2: ObservableObject {
     @Published var onRetry: (() -> Void)?
     @Published var onEdit: (() -> Void)?
     @Published var onWithdraw: (() -> Void)?
+    @Published var onDeleteFrom: ((UUID) -> Void)?
     @Published var autoRetryAttempt: Int = 0
     @Published var autoRetryCountdown: Int = 0
     @Published var canResume: Bool = false
