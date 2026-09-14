@@ -110,7 +110,7 @@ final class ShareCoordinator: ObservableObject {
         /// Session this buffer is addressed to. nil = "any session" (cold launch).
         let targetSessionId: String?
         /// Draft this buffer is addressed to. nil = "any draft" (cold launch).
-        let targetDraftId: UUID?
+        let targetDraftId: String?
     }
 
     /// Written by processPendingShare() in ContentView, consumed once by AIChatView.
@@ -129,7 +129,7 @@ final class ShareCoordinator: ObservableObject {
     /// attachment file names are UUID-suffixed so distinct files never
     /// collide, while a doubled delivery of the same record stays single.
     /// bufferedAt renews so the merged buffer gets a fresh TTL window.
-    func storeBuffer(_ share: PendingShare, sessionId: String? = nil, draftId: UUID? = nil) {
+    func storeBuffer(_ share: PendingShare, sessionId: String? = nil, draftId: String? = nil) {
         if let existing = pendingShareBuffer {
             var merged = existing.share.items
             for item in share.items where !merged.contains(where: { $0.kind == item.kind && $0.value == item.value }) {
@@ -146,7 +146,7 @@ final class ShareCoordinator: ObservableObject {
                 targetDraftId: mergedDraftId
             )
             bufferVersion += 1
-            shareLog.info("[Share] storeBuffer: MERGED \(existing.share.items.count) existing + \(share.items.count) new → \(merged.count) items (v\(bufferVersion)) targetSession=\(mergedSessionId ?? "nil") targetDraft=\(mergedDraftId?.uuidString ?? "nil")")
+            shareLog.info("[Share] storeBuffer: MERGED \(existing.share.items.count) existing + \(share.items.count) new → \(merged.count) items (v\(bufferVersion)) targetSession=\(mergedSessionId ?? "nil") targetDraft=\(mergedDraftId ?? "nil")")
             return
         }
         pendingShareBuffer = PendingShareBuffer(
@@ -156,13 +156,13 @@ final class ShareCoordinator: ObservableObject {
             targetDraftId: draftId
         )
         bufferVersion += 1
-        shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) targetSession=\(sessionId ?? "nil") targetDraft=\(draftId?.uuidString ?? "nil") at \(Date())")
+        shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) targetSession=\(sessionId ?? "nil") targetDraft=\(draftId ?? "nil") at \(Date())")
     }
 
     /// Returns true when the pending buffer targets the given session/draft,
     /// or when no target is stamped on the buffer (cold launch — any session
     /// may consume it).
-    func bufferTargets(_ sessionId: String?, draftId: UUID?) -> Bool {
+    func bufferTargets(_ sessionId: String?, draftId: String?) -> Bool {
         guard let buf = pendingShareBuffer else { return false }
         // If buffer has no target stamp, it passes for any caller.
         if buf.targetSessionId == nil && buf.targetDraftId == nil {

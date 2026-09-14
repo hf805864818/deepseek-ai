@@ -660,6 +660,13 @@ final class NoAnimationCollectionView: UICollectionView {
     /// NSInternalInconsistencyException inside UIKit.
     var isApplyingSnapshot = false
 
+    /// [T-ios-preapply-endediting] Tracks the currently-active text responder
+    /// inside the collection view so applySnapshot can quickly check whether
+    /// it needs to end editing before applying — without walking the entire
+    /// subview tree. Set by SelectableMarkdownView on becomeFirstResponder,
+    /// cleared on resignFirstResponder. Weak to avoid retaining the cell/view.
+    weak var trackedTextResponder: UIResponder?
+
     /// [T-ios-stream-grow-anim] When true, non-snapshot programmatic layout
     /// passes (a streaming cell growing taller) animate ONLY the contentOffset
     /// over a fixed 0.2s window so the viewport glides to the new bottom instead
@@ -1104,7 +1111,7 @@ final class CellStateBridgeV2: ObservableObject {
     @Published var onRetry: (() -> Void)?
     @Published var onEdit: (() -> Void)?
     @Published var onWithdraw: (() -> Void)?
-    @Published var onDeleteFrom: ((UUID) -> Void)?
+    @Published var onDeleteFrom: (() -> Void)?
     @Published var autoRetryAttempt: Int = 0
     @Published var autoRetryCountdown: Int = 0
     @Published var canResume: Bool = false

@@ -4242,6 +4242,20 @@ actor ChatStore {
         let sessionId: String
         let date: Date
         let usage: StoredTokenUsage
+        /// [T-token-attribution-snapshot] True if this record has a
+        /// per-message model snapshot (modelDisplayName / providerType).
+        /// When false, the model attribution is inferred from the session's
+        /// current model_id and may be inaccurate if the session switched
+        /// models during its lifetime.
+        let hasSnapshot: Bool
+        /// [T-token-attribution-snapshot] Snapshot of the model display name
+        /// taken when the message was generated. Survives provider/model
+        /// deletion in the live config. nil for pre-snapshot rows.
+        let modelDisplayName: String?
+        /// [T-token-attribution-snapshot] Snapshot of the ProviderType rawValue
+        /// taken when the message was generated. Used to group usage stats
+        /// by provider even after the instance is deleted. nil for pre-snapshot rows.
+        let providerType: String?
     }
 
     /// Fetch all messages that have token usage, joined with their session's model_id.
@@ -4290,7 +4304,8 @@ actor ChatStore {
 
                 records.append(UsageRecord(
                     modelId: modelId, sessionId: sessionId,
-                    date: createdAt, usage: usage
+                    date: createdAt, usage: usage,
+                    hasSnapshot: false, modelDisplayName: nil, providerType: nil
                 ))
             }
         }

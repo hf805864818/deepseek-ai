@@ -1323,7 +1323,8 @@ struct AIChatView: View {
                     }
                 } else {
                     let reuseStart = CFAbsoluteTimeGetCurrent()
-                    minisLogger.info("🔄SESSION AIChatView.onAppear REUSING cached vm for \(sessionId) isProcessing=\(vm.isProcessing) msgs=\(vm.messages.count)")
+                    let reuseMsg = "🔄SESSION AIChatView.onAppear REUSING cached vm for \(sessionId) isProcessing=\(vm.isProcessing) msgs=\(vm.messages.count)"
+                    minisLogger.info(reuseMsg)
                     // Remount minis for this session (in case another session took over)
                     vm.mountMinis(for: sessionId)
                     // While the user was off this view, an iCloud / LAN

@@ -10,6 +10,8 @@ struct SoulSettingsView: View {
     @State private var rawEmoji: String = SoulMetadata.default.emoji
     @State private var style: String = SoulMetadata.default.style
     @State private var lang: String = SoulMetadata.default.lang
+    /// [T-soul-custom-icon] User-chosen identity icon. Empty = default sparkle.
+    @State private var icon: String = SoulMetadata.default.icon
     @State private var bodyText: String = ""
     @State private var saveError: String? = nil
     @State private var didJustSave: Bool = false
@@ -223,7 +225,8 @@ struct SoulSettingsView: View {
                 // rewritten on save.
                 emoji: rawEmoji,
                 style: style,
-                lang: lang
+                lang: lang,
+                icon: icon
             ),
             body: bodyText
         )
@@ -239,6 +242,7 @@ struct SoulSettingsView: View {
         rawEmoji = file.metadata.emoji
         style = file.metadata.style
         lang = file.metadata.lang
+        icon = file.metadata.icon
         bodyText = file.body
         loadedRef.value = file
         saveError = nil
@@ -287,6 +291,7 @@ struct SoulSettingsView: View {
         rawEmoji = parsed.metadata.emoji
         style = parsed.metadata.style
         lang = parsed.metadata.lang
+        icon = parsed.metadata.icon
         bodyText = parsed.body
         save()
     }

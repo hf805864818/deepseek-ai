@@ -1008,8 +1008,7 @@ struct InlineVoiceInputView: View {
             let suggestion = await VoiceCorrectionEngine.shared.correct(
                 transcript: text,
                 locale: PhoneticNormalizerRegistry.normalizedLocaleKey(viewModel.language),
-                context: context,
-                trigger: "manual")
+                context: context)
             await MainActor.run {
                 isCorrecting = false
                 // Bail if the transcript changed under us (re-recorded / edited / sent while
