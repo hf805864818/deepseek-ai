@@ -1145,9 +1145,15 @@ struct AIChatView: View {
             // and is a no-op when nothing is focused.
             inputFocused = false
             let scenes = UIApplication.shared.connectedScenes
-            let windowScenes: [UIWindowScene] = scenes.compactMap { $0 as? UIWindowScene }
-            let allWindows: [UIWindow] = windowScenes.flatMap { $0.windows }
-            let keyWindow = allWindows.first(where: { $0.isKeyWindow })
+            let windowScenes: [UIWindowScene] = scenes.compactMap { scene in
+                scene as? UIWindowScene
+            }
+            let allWindows: [UIWindow] = windowScenes.flatMap { ws in
+                ws.windows
+            }
+            let keyWindow = allWindows.first { w in
+                w.isKeyWindow
+            }
             if let keyWindow, keyWindow.endEditing(true) {
                 AppLogger(category: "InputBarLayout").info("chat onDisappear — released a lingering first responder (would have left a phantom keyboard inset on the window)")
             }
