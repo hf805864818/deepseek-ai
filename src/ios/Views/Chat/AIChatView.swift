@@ -925,19 +925,7 @@ struct AIChatView: View {
         .fullScreenCover(isPresented: $showTerminal) {
             terminalInitCommand = nil
         } content: {
-            NavigationStack {
-                ISHTerminalView(sessionId: vm.sessionId, showCloseButton: true, initCommand: terminalInitCommand)
-                    .onAppear {
-                        if let sid = vm.sessionId {
-                            var mountLog = "🔍MOUNT Terminal onAppear — re-mounting minis for session "
-                            mountLog += sid
-                            minisLogger.info(mountLog)
-                            vm.mountMinis(for: sid)
-                        } else {
-                            minisLogger.info("🔍MOUNT Terminal onAppear — no sessionId, skipping mount")
-                        }
-                    }
-            }
+            terminalContentView
         }
         .fullScreenCover(isPresented: $showCamera, onDismiss: {
             minisLogger.info("[QuickAction] fullScreenCover(camera) onDismiss showCamera=\(showCamera)")
@@ -973,63 +961,7 @@ struct AIChatView: View {
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItems,
                       maxSelectionCount: 50, matching: .any(of: [.images, .videos]))
-        .onChange(of: selectedPhotoItems) { items in
-            guard !items.isEmpty else { return }
-            // [T-ios-photo-pick-placeholder] 1) Insert a loading placeholder chip
-            // for every picked item RIGHT NOW (one main-actor batch update), so the
-            // user immediately sees how many they picked instead of watching photos
-            // trickle in one-by-one. 2) Load all of them CONCURRENTLY via a
-            // TaskGroup. 3) Resolve each placeholder in place as its bytes arrive
-            // (success → real thumbnail, failure → error chip). The send button is
-            // gated on `hasLoadingAttachments` until every item settles.
-            let kinds = items.map { item -> InputAttachment.Kind in
-                item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) ? .video : .image
-            }
-            let placeholderIDs = vm.addLoadingPlaceholders(kinds: kinds)
-
-            // Snapshot per-item metadata synchronously (PHAsset fetch + UTI) so the
-            // concurrent loaders don't touch SwiftUI state or PhotosUI mid-flight.
-            struct PickJob { let id: UUID; let item: PhotosPickerItem; let isVideo: Bool; let ext: String?; let date: Date? }
-            let jobs: [PickJob] = zip(placeholderIDs, items).map { pid, item in
-                let isVideo = item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) })
-                var assetDate: Date?
-                if let aid = item.itemIdentifier,
-                   let asset = PHAsset.fetchAssets(withLocalIdentifiers: [aid], options: nil).firstObject {
-                    assetDate = asset.creationDate
-                }
-                let ext = item.supportedContentTypes
-                    .first(where: { $0.conforms(to: .image) })?
-                    .preferredFilenameExtension
-                return PickJob(id: pid, item: item, isVideo: isVideo, ext: ext, date: assetDate)
-            }
-            selectedPhotoItems = []
-
-            Task {
-                await withTaskGroup(of: Void.self) { group in
-                    for job in jobs {
-                        group.addTask {
-                            if job.isVideo {
-                                if let videoURL = try? await job.item.loadTransferable(type: VideoFileTransferable.self) {
-                                    await MainActor.run {
-                                        vm.finalizeVideoPlaceholder(id: job.id, from: videoURL.url, originalDate: job.date)
-                                    }
-                                } else {
-                                    await MainActor.run { vm.markPlaceholderFailed(id: job.id) }
-                                }
-                            } else if let data = try? await job.item.loadTransferable(type: Data.self) {
-                                // Preserve original encoded bytes (PNG transparency,
-                                // HEIC, animated GIFs, EXIF) — written verbatim.
-                                await MainActor.run {
-                                    vm.finalizeImagePlaceholder(id: job.id, data: data, fileExtension: job.ext, originalDate: job.date)
-                                }
-                            } else {
-                                await MainActor.run { vm.markPlaceholderFailed(id: job.id) }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        .onChange(of: selectedPhotoItems, perform: handlePhotoSelectionChange)
         .fileImporter(
             isPresented: $showDocumentPicker,
             allowedContentTypes: [.image, .pdf, .plainText, .json, .sourceCode, .presentation, .spreadsheet, .data],
@@ -1932,6 +1864,18 @@ struct AIChatView: View {
         }
     }
 
+    /// Force-sync handler for the message-list long-press menu.
+    /// Lighter-weight than `runForceSync` (no pull-toast / isForcePulling state).
+    private func forceSyncMessages() {
+        guard let sid = vm.sessionId else { return }
+        Task {
+            let count = await ChatStore.shared.forceSyncSession(sid)
+            if #available(iOS 17.0, *), count > 0 {
+                SyncCore.shared.scheduleSend(delay: 1)
+            }
+        }
+    }
+
     private func runForcePull() {
         guard let sid = vm.sessionId, !isForcePulling else { return }
         isForcePulling = true
@@ -2724,15 +2668,7 @@ struct AIChatView: View {
                 onStop: { vm.stopCurrentCommand() },
                 onCompact: { msgId in compactConfirmMessageId = msgId },
                 onRevertCompact: { Task { await vm.revertCompact() } },
-                onForceSync: { [self] in
-                    guard let sid = vm.sessionId else { return }
-                    Task {
-                        let count = await ChatStore.shared.forceSyncSession(sid)
-                        if #available(iOS 17.0, *), count > 0 {
-                            SyncCore.shared.scheduleSend(delay: 1)
-                        }
-                    }
-                },
+                onForceSync: forceSyncMessages,
                 onScreenshotImage: { image in
                     screenshotPreview = ChatScreenshotPreview(image: image)
                 },
@@ -2950,6 +2886,26 @@ struct AIChatView: View {
         }
     }
     #endif
+
+    /// Terminal full-screen cover content. Extracted from the inline
+    /// `.fullScreenCover` content closure to keep body's type-checker load low.
+    private var terminalContentView: some View {
+        NavigationStack {
+            ISHTerminalView(sessionId: vm.sessionId, showCloseButton: true, initCommand: terminalInitCommand)
+                .onAppear(perform: handleTerminalOnAppear)
+        }
+    }
+
+    private func handleTerminalOnAppear() {
+        if let sid = vm.sessionId {
+            var mountLog = "🔍MOUNT Terminal onAppear — re-mounting minis for session "
+            mountLog += sid
+            minisLogger.info(mountLog)
+            vm.mountMinis(for: sid)
+        } else {
+            minisLogger.info("🔍MOUNT Terminal onAppear — no sessionId, skipping mount")
+        }
+    }
 
     // MARK: - Input Bar
 
@@ -4470,6 +4426,67 @@ struct AIChatView: View {
         }
     }
 
+
+    /// Handle photo picker selection changes.
+    /// Extracted from `.onChange(of: selectedPhotoItems)` inline closure to
+    /// reduce the body's type-checker load.
+    private func handlePhotoSelectionChange(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        // [T-ios-photo-pick-placeholder] 1) Insert a loading placeholder chip
+        // for every picked item RIGHT NOW (one main-actor batch update), so the
+        // user immediately sees how many they picked instead of watching photos
+        // trickle in one-by-one. 2) Load all of them CONCURRENTLY via a
+        // TaskGroup. 3) Resolve each placeholder in place as its bytes arrive
+        // (success → real thumbnail, failure → error chip). The send button is
+        // gated on `hasLoadingAttachments` until every item settles.
+        struct PickJob { let id: UUID; let item: PhotosPickerItem; let isVideo: Bool; let ext: String?; let date: Date? }
+        let kinds = items.map { item -> InputAttachment.Kind in
+            item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) ? .video : .image
+        }
+        let placeholderIDs = vm.addLoadingPlaceholders(kinds: kinds)
+
+        // Snapshot per-item metadata synchronously (PHAsset fetch + UTI) so the
+        // concurrent loaders don't touch SwiftUI state or PhotosUI mid-flight.
+        let jobs: [PickJob] = zip(placeholderIDs, items).map { pid, item in
+            let isVideo = item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) })
+            var assetDate: Date?
+            if let aid = item.itemIdentifier,
+               let asset = PHAsset.fetchAssets(withLocalIdentifiers: [aid], options: nil).firstObject {
+                assetDate = asset.creationDate
+            }
+            let ext = item.supportedContentTypes
+                .first(where: { $0.conforms(to: .image) })?
+                .preferredFilenameExtension
+            return PickJob(id: pid, item: item, isVideo: isVideo, ext: ext, date: assetDate)
+        }
+        selectedPhotoItems = []
+
+        Task {
+            await withTaskGroup(of: Void.self) { group in
+                for job in jobs {
+                    group.addTask {
+                        if job.isVideo {
+                            if let videoURL = try? await job.item.loadTransferable(type: VideoFileTransferable.self) {
+                                await MainActor.run {
+                                    vm.finalizeVideoPlaceholder(id: job.id, from: videoURL.url, originalDate: job.date)
+                                }
+                            } else {
+                                await MainActor.run { vm.markPlaceholderFailed(id: job.id) }
+                            }
+                        } else if let data = try? await job.item.loadTransferable(type: Data.self) {
+                            // Preserve original encoded bytes (PNG transparency,
+                            // HEIC, animated GIFs, EXIF) — written verbatim.
+                            await MainActor.run {
+                                vm.finalizeImagePlaceholder(id: job.id, data: data, fileExtension: job.ext, originalDate: job.date)
+                            }
+                        } else {
+                            await MainActor.run { vm.markPlaceholderFailed(id: job.id) }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private func performEnqueue() {
         // Dismiss the software keyboard on enqueue. With a hardware keyboard,
