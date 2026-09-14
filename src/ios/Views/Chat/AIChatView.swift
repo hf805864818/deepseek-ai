@@ -342,269 +342,7 @@ struct AIChatView: View {
     @State private var missingMinisFileName: String?
 
     var body: some View {
-        coreView
-        .sheet(item: $titlePillEditSession) { session in
-            SessionEditSheet(session: session) { newTitle, newCategory in
-                Task {
-                    await ChatStore.shared.updateSessionTitle(session.id, title: newTitle, category: newCategory)
-                    refreshTitlePillSession()
-                }
-                titlePillEditSession = nil
-            }
-        }
-        .alert(AppLocalized("Force Pull Messages"), isPresented: $showForcePullConfirm) {
-            Button(AppLocalized("Pull from iCloud"), role: .destructive) {
-                runForcePull()
-            }
-            Button(AppLocalized("Cancel"), role: .cancel) {}
-        } message: {
-            Text(AppLocalized("This will delete all local messages for this chat and re-download them from iCloud. Local changes that haven't synced yet will be lost. Continue?"))
-        }
-        // [T-ios-json-open-provider-import-prompt] Shared/opened Provider-export
-        // JSON: let the user choose import-as-provider vs add-as-attachment.
-        // Extracted into a single modifier so the body's type-check stays cheap.
-        .modifier(ProviderImportPromptModifier(
-            pending: $pendingProviderImport,
-            result: $providerImportResult,
-            onImport: { json in configStore.importInstanceJSON(json) },
-            onAttach: { url in vm.addFileAttachment(from: url) }
-        ))
-        .overlay(alignment: .top) {
-            if let msg = forcePullToast {
-                Text(msg)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.accentColor, in: Capsule())
-                    .padding(.top, 8)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-        }
-        .animation(.spring(response: 0.3), value: forcePullToast)
-        // [T-browser-download-ux-v2] Downloads panel opened from the floating
-        // download button (mounted next to the scroll buttons, see
-        // downloadFloatingButton). Completed rows jump to the file browser
-        // located at the downloaded file in the session workspace.
-        .sheet(isPresented: $showDownloadsPanel) {
-            BrowserDownloadPanelSheet(sessionId: vm.sessionId ?? "") { filename in
-                showDownloadsPanel = false
-                locateDownloadTarget = DownloadLocateTarget(filename: filename)
-            }
-        }
-        .sheet(item: $locateDownloadTarget) { target in
-            if let sid = vm.sessionId {
-                NavigationStack {
-                    FileBrowserView(
-                        rootPath: AIChatViewModel.minisWorkspacePersistentDir(for: sid),
-                        rootLabel: "/var/minis/workspace",
-                        highlightFileName: target.filename
-                    )
-                }
-            }
-        }
-        .alert("Enhanced Cache", isPresented: $showEnhancedCacheAlert) {
-            Button("Enable") {
-                UserDefaults.standard.set(true, forKey: "enhancedCacheConfirmed")
-                cached.vm.enhancedCacheEnabled = true
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Enhanced cache extends the cache TTL from 5 minutes to 1 hour. Cache writes cost more (2x vs 1.25x base price), but cache reads remain cheap (0.1x). Recommended for long coding sessions where request gaps may exceed 5 minutes.")
-        }
-        .alert(AppLocalized("Context Near Capacity"), isPresented: Binding(get: { vm.showCompactBeforeSendPrompt }, set: { vm.showCompactBeforeSendPrompt = $0 })) {
-            Button(AppLocalized("Compact & Send")) {
-                vm.compactAndSend()
-            }
-            // [T-chat-auto-compact-opt-in] One-tap opt-in: compact now AND
-            // remember (globally, UserDefaults "autoCompactOnThreshold") to
-            // auto-compact without prompting whenever the threshold fires in
-            // future conversations.
-            Button(AppLocalized("Compact & Enable Auto-Compact")) {
-                vm.autoCompactEnabled = true
-                vm.compactAndSend()
-            }
-            Button(AppLocalized("Cancel"), role: .cancel) {
-                vm.cancelCompactBeforeSend()
-            }
-        } message: {
-            Text(AppLocalized("Conversation context is nearly full. Compact the history to free up space before sending. Enabling auto-compact will do this automatically from now on."))
-        }
-        .alert(AppLocalized("Context Full"), isPresented: Binding(get: { vm.showContextExhaustedPrompt }, set: { vm.showContextExhaustedPrompt = $0 })) {
-            Button(AppLocalized("New Session")) {
-                vm.showContextExhaustedPrompt = false
-                vm.cancelCompactBeforeSend()
-                NotificationCenter.default.post(name: .newChatRequested, object: nil)
-            }
-            Button(AppLocalized("Clear Chat"), role: .destructive) {
-                vm.showContextExhaustedPrompt = false
-                vm.cancelCompactBeforeSend()
-                vm.clearChat()
-            }
-            Button(AppLocalized("Cancel"), role: .cancel) {
-                vm.cancelCompactBeforeSend()
-            }
-        } message: {
-            Text(AppLocalized("The conversation context has reached its limit. Start a new session or clear the chat to continue."))
-        }
-        // [T-new-chat-menu-entry] Streaming guard for the "…" menu's New Chat:
-        // confirm → stop the running task, then create; cancel → stay put.
-        .alert(AppLocalized("Task Running"), isPresented: $showNewChatStopConfirm) {
-            Button(AppLocalized("Stop & New Chat"), role: .destructive) {
-                vm.cancel()
-                NotificationCenter.default.post(name: .newChatRequested, object: nil)
-            }
-            Button(AppLocalized("Cancel"), role: .cancel) {}
-        } message: {
-            Text(AppLocalized("A task is running in this chat. Starting a new chat will stop it."))
-        }
-        .alert(AppLocalized("Clear Chat"), isPresented: $showClearChatConfirm) {
-            Button(AppLocalized("Clear"), role: .destructive) { vm.clearChat() }
-            Button(AppLocalized("Cancel"), role: .cancel) {}
-        } message: {
-            Text(AppLocalized("All messages in this session will be permanently deleted."))
-        }
-        // Bridge VM's slash-command "/clear" request into the local @State that
-        // drives the confirmation alert above, so the menu and slash-command
-        // entry points share one alert instance.
-        .onChange(of: vm.clearChatConfirmRequested, perform: handleClearChatConfirmRequest)
-        .alert(AppLocalized("Compact Above"), isPresented: Binding(
-            get: { compactConfirmMessageId != nil },
-            set: { if !$0 { compactConfirmMessageId = nil } }
-        )) {
-            Button(AppLocalized("Compact"), role: .destructive) {
-                if let id = compactConfirmMessageId {
-                    Task { await vm.compactBefore(id) }
-                }
-            }
-            Button(AppLocalized("Cancel"), role: .cancel) {}
-        } message: {
-            Text(AppLocalized("Messages above this point will be compacted into a summary. This cannot be undone."))
-        }
-        .offloadPermissionDialog()
-        .environment(\.openMinisURL, OpenMinisURLAction { url in
-            handleMinisURLTap(url)
-        })
-        .environment(\.openImageGallery, OpenImageGalleryAction { presentation in
-            imageGallery = presentation
-        })
-        .fullScreenCover(item: $previewImageFile) { fileURL in
-            MinisImageFilePreviewView(fileURL: fileURL)
-        }
-        .alert(
-            AppLocalized("File Not Found"),
-            isPresented: Binding(
-                get: { missingMinisFileName != nil },
-                set: { if !$0 { missingMinisFileName = nil } }
-            ),
-            presenting: missingMinisFileName
-        ) { _ in
-            Button(AppLocalized("OK"), role: .cancel) { missingMinisFileName = nil }
-        } message: { name in
-            Text(AppLocalized("\(name) is unavailable. It may have been deleted or not yet synced from iCloud."))
-        }
-        .fullScreenCover(item: $imageGallery) { presentation in
-            MessageImageGallery(items: presentation.items, startIndex: presentation.startIndex)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: MarkdownImageTapRouter.tappedNotification)) { note in
-            handleMarkdownImageTap(note)
-        }
-        .modifier(DismissImmersiveCoversListener(onDismiss: dismissAllOwnedImmersiveCovers))
-        .onReceive(vm.requestComposerFocusSignal, perform: handleComposerFocusRequest)
-        .modifier(ChatInputAppendListener(vm: vm, inputFocused: $inputFocused))
-        .modifier(RerunFromToolBlockListener(vm: vm))
-        .fullScreenCover(item: $previewVideoFile) { fileURL in
-            MinisVideoFullscreenPlayer(fileURL: fileURL)
-        }
-        .sheet(item: $previewAudioFile) { fileURL in
-            MinisAudioPreviewView(fileURL: fileURL)
-                .presentationDetents([.large])
-                .presentationDragIndicator(.hidden)
-        }
-        .sheet(item: $previewTextFile) { fileURL in
-            MinisTextPreviewView(fileURL: fileURL)
-        }
-        .sheet(item: $previewMarkdownFile) { fileURL in
-            MinisMarkdownPreviewView(fileURL: fileURL)
-        }
-        .sheet(item: $previewDocumentFile) { fileURL in
-            MinisDocumentPreviewView(fileURL: fileURL)
-        }
-        .sheet(item: $shareFile) { fileURL in
-            MinisShareSheet(url: fileURL)
-        }
-        .sheet(item: $safariURL) { url in
-            MinisLinkPreviewView(url: url, browserPool: vm.browserTabPool, onExpand: { _ in
-                fullBrowserIsLocal = false
-                let targetURL = url
-                safariURL = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    fullBrowserURL = targetURL
-                }
-            })
-        }
-        // Auto-present the in-app preview when a shell tool's stdout emits
-        // an OSC MinisOpenURL marker (via /usr/local/bin/minis-open).
-        //
-        // Dispatch by scheme:
-        //  - http/https/about: in-chat WKWebView preview. ToolLiveSheet
-        //    observes the same broker and takes priority for web URLs when
-        //    it is on top (broker.toolSheetVisible).
-        //  - minis://...: chat-resource file preview (image/markdown/html/
-        //    pdf/...). Routed through handleMinisURLTap which already
-        //    picks the right sheet by extension. Always dispatched here
-        //    because ToolLiveSheet cannot host fullscreen file previews.
-        //
-        // `.dropFirst()` skips the current value that `@Published` delivers
-        // to new subscribers on first attach — without it, a chat view
-        // created after a previous OSC capture would re-present a stale URL.
-        .onReceive(MinisOpenURLBroker.shared.$pendingURL.dropFirst().compactMap { $0 }, perform: handlePendingURL)
-        .sheet(item: $previewHTMLFile) { fileURL in
-            MinisHTMLPreviewView(fileURL: fileURL, onExpand: { _ in
-                fullBrowserIsLocal = true
-                let targetURL = fileURL
-                previewHTMLFile = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    fullBrowserURL = targetURL
-                }
-            })
-        }
-        .fullScreenCover(item: $fullBrowserURL) { url in
-            let wasLocal = fullBrowserIsLocal
-            MinisSafariView(url: url, localFile: wasLocal, onCollapse: {
-                fullBrowserURL = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    if wasLocal {
-                        previewHTMLFile = url
-                    } else {
-                        safariURL = url
-                    }
-                }
-            })
-        }
-        .sheet(isPresented: $showFileBrowser) {
-            NavigationStack {
-                let base = RootfsManager.shared.dataPath
-                FileBrowserView(rootPath: base, initialPath: base.appendingPathComponent("var/minis"), rootLabel: "/")
-            }
-        }
-        .sheet(isPresented: $showBrowserSheet) {
-            BrowserSheetView(pool: vm.browserTabPool, isAgentBusy: vm.browserTabPool.isAgentBrowsing, onTakeover: {
-                vm.browserTakeoverActive = true
-            })
-        }
-        .sheet(isPresented: $showModelPicker) {
-            NavigationStack {
-                SessionModelPicker(sessionId: vm.sessionId) {
-                    await vm.ensureSessionReturningId()
-                }
-            }
-            .presentationDetents([.large])
-        }
-        .sheet(isPresented: $showTokenUsage) {
-            TokenUsageSheet(vm: cached.vm)
-                .presentationDetents([.fraction(0.8), .large])
-        }
+        presentationLayer2
         .sheet(item: $screenshotPreview) { preview in
             ChatScreenshotPreviewSheet(image: preview.image)
         }
@@ -723,6 +461,286 @@ struct AIChatView: View {
         // descendants (e.g. ToolCapsuleView's long-press menu) can react to
         // `vm.isProcessing` without threading the vm through every level.
         .environmentObject(vm)
+    }
+
+    // MARK: - Presentation Layer 2 (AnyView)
+    /// Second group of sheets/alerts/fullScreenCovers, erased to AnyView
+    /// to break the body's modifier chain at the midpoint.
+    private var presentationLayer2: AnyView {
+        AnyView(
+            presentationLayer1
+            .alert(
+                AppLocalized("File Not Found"),
+                isPresented: Binding(
+                    get: { missingMinisFileName != nil },
+                    set: { if !$0 { missingMinisFileName = nil } }
+                ),
+                presenting: missingMinisFileName
+            ) { _ in
+                Button(AppLocalized("OK"), role: .cancel) { missingMinisFileName = nil }
+            } message: { name in
+                Text(AppLocalized("\(name) is unavailable. It may have been deleted or not yet synced from iCloud."))
+            }
+            .fullScreenCover(item: $imageGallery) { presentation in
+                MessageImageGallery(items: presentation.items, startIndex: presentation.startIndex)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: MarkdownImageTapRouter.tappedNotification)) { note in
+                handleMarkdownImageTap(note)
+            }
+            .modifier(DismissImmersiveCoversListener(onDismiss: dismissAllOwnedImmersiveCovers))
+            .onReceive(vm.requestComposerFocusSignal, perform: handleComposerFocusRequest)
+            .modifier(ChatInputAppendListener(vm: vm, inputFocused: $inputFocused))
+            .modifier(RerunFromToolBlockListener(vm: vm))
+            .fullScreenCover(item: $previewVideoFile) { fileURL in
+                MinisVideoFullscreenPlayer(fileURL: fileURL)
+            }
+            .sheet(item: $previewAudioFile) { fileURL in
+                MinisAudioPreviewView(fileURL: fileURL)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.hidden)
+            }
+            .sheet(item: $previewTextFile) { fileURL in
+                MinisTextPreviewView(fileURL: fileURL)
+            }
+            .sheet(item: $previewMarkdownFile) { fileURL in
+                MinisMarkdownPreviewView(fileURL: fileURL)
+            }
+            .sheet(item: $previewDocumentFile) { fileURL in
+                MinisDocumentPreviewView(fileURL: fileURL)
+            }
+            .sheet(item: $shareFile) { fileURL in
+                MinisShareSheet(url: fileURL)
+            }
+            .sheet(item: $safariURL) { url in
+                MinisLinkPreviewView(url: url, browserPool: vm.browserTabPool, onExpand: { _ in
+                    fullBrowserIsLocal = false
+                    let targetURL = url
+                    safariURL = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        fullBrowserURL = targetURL
+                    }
+                })
+            }
+            // Auto-present the in-app preview when a shell tool's stdout emits
+            // an OSC MinisOpenURL marker (via /usr/local/bin/minis-open).
+            //
+            // Dispatch by scheme:
+            //  - http/https/about: in-chat WKWebView preview. ToolLiveSheet
+            //    observes the same broker and takes priority for web URLs when
+            //    it is on top (broker.toolSheetVisible).
+            //  - minis://...: chat-resource file preview (image/markdown/html/
+            //    pdf/...). Routed through handleMinisURLTap which already
+            //    picks the right sheet by extension. Always dispatched here
+            //    because ToolLiveSheet cannot host fullscreen file previews.
+            //
+            // `.dropFirst()` skips the current value that `@Published` delivers
+            // to new subscribers on first attach — without it, a chat view
+            // created after a previous OSC capture would re-present a stale URL.
+            .onReceive(MinisOpenURLBroker.shared.$pendingURL.dropFirst().compactMap { $0 }, perform: handlePendingURL)
+            .sheet(item: $previewHTMLFile) { fileURL in
+                MinisHTMLPreviewView(fileURL: fileURL, onExpand: { _ in
+                    fullBrowserIsLocal = true
+                    let targetURL = fileURL
+                    previewHTMLFile = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        fullBrowserURL = targetURL
+                    }
+                })
+            }
+            .fullScreenCover(item: $fullBrowserURL) { url in
+                let wasLocal = fullBrowserIsLocal
+                MinisSafariView(url: url, localFile: wasLocal, onCollapse: {
+                    fullBrowserURL = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        if wasLocal {
+                            previewHTMLFile = url
+                        } else {
+                            safariURL = url
+                        }
+                    }
+                })
+            }
+            .sheet(isPresented: $showFileBrowser) {
+                NavigationStack {
+                    let base = RootfsManager.shared.dataPath
+                    FileBrowserView(rootPath: base, initialPath: base.appendingPathComponent("var/minis"), rootLabel: "/")
+                }
+            }
+            .sheet(isPresented: $showBrowserSheet) {
+                BrowserSheetView(pool: vm.browserTabPool, isAgentBusy: vm.browserTabPool.isAgentBrowsing, onTakeover: {
+                    vm.browserTakeoverActive = true
+                })
+            }
+            .sheet(isPresented: $showModelPicker) {
+                NavigationStack {
+                    SessionModelPicker(sessionId: vm.sessionId) {
+                        await vm.ensureSessionReturningId()
+                    }
+                }
+                .presentationDetents([.large])
+            }
+            .sheet(isPresented: $showTokenUsage) {
+                TokenUsageSheet(vm: cached.vm)
+                    .presentationDetents([.fraction(0.8), .large])
+            }
+        )
+    }
+
+    // MARK: - Presentation Layer 1 (AnyView)
+    /// First group of sheets/alerts, erased to AnyView
+    /// to break the body's modifier chain.
+    private var presentationLayer1: AnyView {
+        AnyView(
+            coreView
+            .sheet(item: $titlePillEditSession) { session in
+                SessionEditSheet(session: session) { newTitle, newCategory in
+                    Task {
+                        await ChatStore.shared.updateSessionTitle(session.id, title: newTitle, category: newCategory)
+                        refreshTitlePillSession()
+                    }
+                    titlePillEditSession = nil
+                }
+            }
+            .alert(AppLocalized("Force Pull Messages"), isPresented: $showForcePullConfirm) {
+                Button(AppLocalized("Pull from iCloud"), role: .destructive) {
+                    runForcePull()
+                }
+                Button(AppLocalized("Cancel"), role: .cancel) {}
+            } message: {
+                Text(AppLocalized("This will delete all local messages for this chat and re-download them from iCloud. Local changes that haven't synced yet will be lost. Continue?"))
+            }
+            // [T-ios-json-open-provider-import-prompt] Shared/opened Provider-export
+            // JSON: let the user choose import-as-provider vs add-as-attachment.
+            // Extracted into a single modifier so the body's type-check stays cheap.
+            .modifier(ProviderImportPromptModifier(
+                pending: $pendingProviderImport,
+                result: $providerImportResult,
+                onImport: { json in configStore.importInstanceJSON(json) },
+                onAttach: { url in vm.addFileAttachment(from: url) }
+            ))
+            .overlay(alignment: .top) {
+                if let msg = forcePullToast {
+                    Text(msg)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Color.accentColor, in: Capsule())
+                        .padding(.top, 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.spring(response: 0.3), value: forcePullToast)
+            // [T-browser-download-ux-v2] Downloads panel opened from the floating
+            // download button (mounted next to the scroll buttons, see
+            // downloadFloatingButton). Completed rows jump to the file browser
+            // located at the downloaded file in the session workspace.
+            .sheet(isPresented: $showDownloadsPanel) {
+                BrowserDownloadPanelSheet(sessionId: vm.sessionId ?? "") { filename in
+                    showDownloadsPanel = false
+                    locateDownloadTarget = DownloadLocateTarget(filename: filename)
+                }
+            }
+            .sheet(item: $locateDownloadTarget) { target in
+                if let sid = vm.sessionId {
+                    NavigationStack {
+                        FileBrowserView(
+                            rootPath: AIChatViewModel.minisWorkspacePersistentDir(for: sid),
+                            rootLabel: "/var/minis/workspace",
+                            highlightFileName: target.filename
+                        )
+                    }
+                }
+            }
+            .alert("Enhanced Cache", isPresented: $showEnhancedCacheAlert) {
+                Button("Enable") {
+                    UserDefaults.standard.set(true, forKey: "enhancedCacheConfirmed")
+                    cached.vm.enhancedCacheEnabled = true
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Enhanced cache extends the cache TTL from 5 minutes to 1 hour. Cache writes cost more (2x vs 1.25x base price), but cache reads remain cheap (0.1x). Recommended for long coding sessions where request gaps may exceed 5 minutes.")
+            }
+            .alert(AppLocalized("Context Near Capacity"), isPresented: Binding(get: { vm.showCompactBeforeSendPrompt }, set: { vm.showCompactBeforeSendPrompt = $0 })) {
+                Button(AppLocalized("Compact & Send")) {
+                    vm.compactAndSend()
+                }
+                // [T-chat-auto-compact-opt-in] One-tap opt-in: compact now AND
+                // remember (globally, UserDefaults "autoCompactOnThreshold") to
+                // auto-compact without prompting whenever the threshold fires in
+                // future conversations.
+                Button(AppLocalized("Compact & Enable Auto-Compact")) {
+                    vm.autoCompactEnabled = true
+                    vm.compactAndSend()
+                }
+                Button(AppLocalized("Cancel"), role: .cancel) {
+                    vm.cancelCompactBeforeSend()
+                }
+            } message: {
+                Text(AppLocalized("Conversation context is nearly full. Compact the history to free up space before sending. Enabling auto-compact will do this automatically from now on."))
+            }
+            .alert(AppLocalized("Context Full"), isPresented: Binding(get: { vm.showContextExhaustedPrompt }, set: { vm.showContextExhaustedPrompt = $0 })) {
+                Button(AppLocalized("New Session")) {
+                    vm.showContextExhaustedPrompt = false
+                    vm.cancelCompactBeforeSend()
+                    NotificationCenter.default.post(name: .newChatRequested, object: nil)
+                }
+                Button(AppLocalized("Clear Chat"), role: .destructive) {
+                    vm.showContextExhaustedPrompt = false
+                    vm.cancelCompactBeforeSend()
+                    vm.clearChat()
+                }
+                Button(AppLocalized("Cancel"), role: .cancel) {
+                    vm.cancelCompactBeforeSend()
+                }
+            } message: {
+                Text(AppLocalized("The conversation context has reached its limit. Start a new session or clear the chat to continue."))
+            }
+            // [T-new-chat-menu-entry] Streaming guard for the "…" menu's New Chat:
+            // confirm → stop the running task, then create; cancel → stay put.
+            .alert(AppLocalized("Task Running"), isPresented: $showNewChatStopConfirm) {
+                Button(AppLocalized("Stop & New Chat"), role: .destructive) {
+                    vm.cancel()
+                    NotificationCenter.default.post(name: .newChatRequested, object: nil)
+                }
+                Button(AppLocalized("Cancel"), role: .cancel) {}
+            } message: {
+                Text(AppLocalized("A task is running in this chat. Starting a new chat will stop it."))
+            }
+            .alert(AppLocalized("Clear Chat"), isPresented: $showClearChatConfirm) {
+                Button(AppLocalized("Clear"), role: .destructive) { vm.clearChat() }
+                Button(AppLocalized("Cancel"), role: .cancel) {}
+            } message: {
+                Text(AppLocalized("All messages in this session will be permanently deleted."))
+            }
+            // Bridge VM's slash-command "/clear" request into the local @State that
+            // drives the confirmation alert above, so the menu and slash-command
+            // entry points share one alert instance.
+            .onChange(of: vm.clearChatConfirmRequested, perform: handleClearChatConfirmRequest)
+            .alert(AppLocalized("Compact Above"), isPresented: Binding(
+                get: { compactConfirmMessageId != nil },
+                set: { if !$0 { compactConfirmMessageId = nil } }
+            )) {
+                Button(AppLocalized("Compact"), role: .destructive) {
+                    if let id = compactConfirmMessageId {
+                        Task { await vm.compactBefore(id) }
+                    }
+                }
+                Button(AppLocalized("Cancel"), role: .cancel) {}
+            } message: {
+                Text(AppLocalized("Messages above this point will be compacted into a summary. This cannot be undone."))
+            }
+            .offloadPermissionDialog()
+            .environment(\.openMinisURL, OpenMinisURLAction { url in
+                handleMinisURLTap(url)
+            })
+            .environment(\.openImageGallery, OpenImageGalleryAction { presentation in
+                imageGallery = presentation
+            })
+            .fullScreenCover(item: $previewImageFile) { fileURL in
+                MinisImageFilePreviewView(fileURL: fileURL)
+            }
+        )
     }
 
     // MARK: - Core View (AnyView)
