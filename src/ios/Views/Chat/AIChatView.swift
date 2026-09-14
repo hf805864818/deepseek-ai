@@ -1292,7 +1292,8 @@ struct AIChatView: View {
                     // Load session if: (a) VM is freshly created, or (b) cache hit but messages
                     // are empty — this can happen on iOS 16 where NavigationStack may recreate
                     // @StateObject unexpectedly, causing isNew=false but an empty VM.
-                    minisLogger.info("🔄SESSION AIChatView.onAppear loading session \(sessionId) isNew=\(cached.isNew) msgs=\(vm.messages.count)")
+                    let loadMsg = "🔄SESSION AIChatView.onAppear loading session \(sessionId) isNew=\(cached.isNew) msgs=\(vm.messages.count)"
+                    minisLogger.info(loadMsg)
                     // [T-ios-session-coldload-listsessions-block] .userInitiated
                     // so the actual session-open work wins the serialized
                     // ChatStore actor queue over background sidebar-refresh
