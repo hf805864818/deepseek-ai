@@ -1266,8 +1266,11 @@ struct AIChatView: View {
             // Warm start: user is already in a session when share arrives
             let bvSid = sessionId ?? "nil"
             let bvDid = draftId ?? "nil"
-            let bvHasBuf = shareCoordinator.pendingShareBuffer != nil
-            let shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)=\(newVersion) sessionId=\(bvSid) draftId=\(bvDid) hasBuffer=\(bvHasBuf)"
+            let bvHasBufStr = shareCoordinator.pendingShareBuffer != nil ? "true" : "false"
+            var shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)=\(newVersion) "
+            shareBufMsg += "sessionId=\(bvSid) "
+            shareBufMsg += "draftId=\(bvDid) "
+            shareBufMsg += "hasBuffer=\(bvHasBufStr)"
             minisLogger.info(shareBufMsg)
             injectPendingShareIfNeeded()
         }
@@ -1544,8 +1547,7 @@ struct AIChatView: View {
         if GCKeyboard.coalesced != nil {
             inputFocused = true
         } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                guard let self else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 guard !hasOverlayPresented, isChatViewVisible else { return }
                 guard !vm.isProcessing, vm.promptQueue.isEmpty else { return }
                 guard !vm.turnStartedByRetry else { return }
