@@ -1305,10 +1305,10 @@ struct AIChatView: View {
             // with the keyboard. Releasing the responder at the source is correct
             // and is a no-op when nothing is focused.
             inputFocused = false
-            let keyWindow = UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .flatMap(\.windows)
-                .first(where: \.isKeyWindow)
+            let scenes = UIApplication.shared.connectedScenes
+            let windowScenes: [UIWindowScene] = scenes.compactMap { $0 as? UIWindowScene }
+            let allWindows: [UIWindow] = windowScenes.flatMap { $0.windows }
+            let keyWindow = allWindows.first(where: { $0.isKeyWindow })
             if let keyWindow, keyWindow.endEditing(true) {
                 AppLogger(category: "InputBarLayout").info("chat onDisappear — released a lingering first responder (would have left a phantom keyboard inset on the window)")
             }
