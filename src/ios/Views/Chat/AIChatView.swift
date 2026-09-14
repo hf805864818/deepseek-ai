@@ -1264,19 +1264,7 @@ struct AIChatView: View {
         }
         .onChange(of: shareCoordinator.bufferVersion) { newVersion in
             // Warm start: user is already in a session when share arrives
-            let bvSid = sessionId ?? "nil"
-            let bvDid = draftId ?? "nil"
-            let bvHasBufStr = shareCoordinator.pendingShareBuffer != nil ? "true" : "false"
-            let verStr = String(describing: newVersion)
-            var shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)="
-            shareBufMsg += verStr
-            shareBufMsg += " sessionId="
-            shareBufMsg += bvSid
-            shareBufMsg += " draftId="
-            shareBufMsg += bvDid
-            shareBufMsg += " hasBuffer="
-            shareBufMsg += bvHasBufStr
-            minisLogger.info(shareBufMsg)
+            logShareBufferChange(newVersion: newVersion)
             injectPendingShareIfNeeded()
         }
         .onDisappear {
@@ -1866,6 +1854,21 @@ struct AIChatView: View {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func logShareBufferChange(newVersion: Int) {
+        let bvSid = sessionId ?? "nil"
+        let bvDid = draftId ?? "nil"
+        let bvHasBufStr = shareCoordinator.pendingShareBuffer != nil ? "true" : "false"
+        var shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)="
+        shareBufMsg += String(newVersion)
+        shareBufMsg += " sessionId="
+        shareBufMsg += bvSid
+        shareBufMsg += " draftId="
+        shareBufMsg += bvDid
+        shareBufMsg += " hasBuffer="
+        shareBufMsg += bvHasBufStr
+        minisLogger.info(shareBufMsg)
     }
 
     private func injectPendingShareIfNeeded() {
