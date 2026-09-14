@@ -342,125 +342,136 @@ struct AIChatView: View {
     @State private var missingMinisFileName: String?
 
     var body: some View {
-        presentationLayer2
-        .sheet(item: $screenshotPreview) { preview in
-            ChatScreenshotPreviewSheet(image: preview.image)
-        }
-        .sheet(isPresented: $showSessionSkills) {
-            // Pass the real id (nil for a draft) plus an ensure-session closure
-            // so a pre-first-message toggle binds its override to the session
-            // the chat will actually persist under, instead of the "" phantom
-            // key (T-ios-session-skill-override-init-timing).
-            SessionSkillsView(sessionId: vm.sessionId) {
-                await vm.ensureSessionReturningId()
+        // [T-ios-runtime-demangle-watchdog] Wrap the entire body in AnyView to
+        // prevent runtime type metadata demangle from hitting the stack recursion
+        // limit during cold launch. With DeepMode UI + v1.13 additions, the
+        // body's mangled type causes Swift's runtime type decoder to recurse
+        // 198+ frames deep (~17 nested demangle cycles), exhausting the 19.65s
+        // scene-create watchdog budget. AnyView erases the entire type at the
+        // outermost level, so Swift only needs to demangle `AnyView` itself
+        // (trivial). The inner 3-layer AnyView split remains for compile-time
+        // type-checker performance.
+        AnyView(
+                presentationLayer2
+                .sheet(item: $screenshotPreview) { preview in
+                ChatScreenshotPreviewSheet(image: preview.image)
             }
-        }
-        .sheet(isPresented: $showSessionMCPs) {
-            SessionMCPsView(sessionId: vm.sessionId) {
-                await vm.ensureSessionReturningId()
+            .sheet(isPresented: $showSessionSkills) {
+                // Pass the real id (nil for a draft) plus an ensure-session closure
+                // so a pre-first-message toggle binds its override to the session
+                // the chat will actually persist under, instead of the "" phantom
+                // key (T-ios-session-skill-override-init-timing).
+                SessionSkillsView(sessionId: vm.sessionId) {
+                    await vm.ensureSessionReturningId()
+                }
             }
-        }
-        .sheet(isPresented: $showSessionMemory) {
-            SessionMemoryView(vm: cached.vm)
-        }
-        .sheet(isPresented: $showMoveToSheet) {
-            MoveToSessionSheet(currentSessionId: vm.sessionId, onSelect: handleMoveToSession)
-        }
-        .fullScreenCover(isPresented: $showTerminal) {
-            terminalInitCommand = nil
-        } content: {
-            terminalContentView
-        }
-        .fullScreenCover(isPresented: $showCamera, onDismiss: {
-            minisLogger.info("[QuickAction] fullScreenCover(camera) onDismiss showCamera=\(showCamera)")
-        }) {
-            // AnyView erases the camera sheet's view tree from the
-            // outer body's generic chain. Without it, AIChatView.body's
-            // mangled type pushes Swift's runtime type decoder past its
-            // recursion limit on cold launch via the share/quick-action
-            // path — SIGSEGV in __swift_instantiateConcreteTypeFromMangledNameV2
-            // with `attachmentMenuButton.getter` at the stack top (a
-            // bystander; whichever leaf the decoder reached when the
-            // stack ran out gets named). Same class of crash as the
-            // 2026-04-17 `inputBar.getter` blow-up — the
-            // `.observingQuickActions(modifier:)` modifier added by
-            // T-quick-action-workflow tipped a chain that was already
-            // sitting at the threshold. AnyView here is the minimal,
-            // surgical cut: it sinks the largest closure in this
-            // modifier (CameraPicker + .ignoresSafeArea + .onAppear)
-            // into an erased subtree so the outer body type stays
-            // demangle-able. Keep until the body is structurally split
-            // into separate View structs (v1.10 follow-up).
-            AnyView(
-                CameraPicker { image in
-                    minisLogger.info("[QuickAction] CameraPicker onCapture size=\(Int(image.size.width))x\(Int(image.size.height))")
-                    vm.addImageAttachment(image)
+            .sheet(isPresented: $showSessionMCPs) {
+                SessionMCPsView(sessionId: vm.sessionId) {
+                    await vm.ensureSessionReturningId()
                 }
-                .ignoresSafeArea()
-                .onAppear {
-                    minisLogger.info("[QuickAction] fullScreenCover(camera) content onAppear — notifying workflow")
-                    QuickActionWorkflow.shared.markCoverPresented()
+            }
+            .sheet(isPresented: $showSessionMemory) {
+                SessionMemoryView(vm: cached.vm)
+            }
+            .sheet(isPresented: $showMoveToSheet) {
+                MoveToSessionSheet(currentSessionId: vm.sessionId, onSelect: handleMoveToSession)
+            }
+            .fullScreenCover(isPresented: $showTerminal) {
+                terminalInitCommand = nil
+            } content: {
+                terminalContentView
+            }
+            .fullScreenCover(isPresented: $showCamera, onDismiss: {
+                minisLogger.info("[QuickAction] fullScreenCover(camera) onDismiss showCamera=\(showCamera)")
+            }) {
+                // AnyView erases the camera sheet's view tree from the
+                // outer body's generic chain. Without it, AIChatView.body's
+                // mangled type pushes Swift's runtime type decoder past its
+                // recursion limit on cold launch via the share/quick-action
+                // path — SIGSEGV in __swift_instantiateConcreteTypeFromMangledNameV2
+                // with `attachmentMenuButton.getter` at the stack top (a
+                // bystander; whichever leaf the decoder reached when the
+                // stack ran out gets named). Same class of crash as the
+                // 2026-04-17 `inputBar.getter` blow-up — the
+                // `.observingQuickActions(modifier:)` modifier added by
+                // T-quick-action-workflow tipped a chain that was already
+                // sitting at the threshold. AnyView here is the minimal,
+                // surgical cut: it sinks the largest closure in this
+                // modifier (CameraPicker + .ignoresSafeArea + .onAppear)
+                // into an erased subtree so the outer body type stays
+                // demangle-able. Keep until the body is structurally split
+                // into separate View structs (v1.10 follow-up).
+                AnyView(
+                    CameraPicker { image in
+                        minisLogger.info("[QuickAction] CameraPicker onCapture size=\(Int(image.size.width))x\(Int(image.size.height))")
+                        vm.addImageAttachment(image)
+                    }
+                    .ignoresSafeArea()
+                    .onAppear {
+                        minisLogger.info("[QuickAction] fullScreenCover(camera) content onAppear — notifying workflow")
+                        QuickActionWorkflow.shared.markCoverPresented()
+                    }
+                )
+            }
+            .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItems,
+                          maxSelectionCount: 50, matching: .any(of: [.images, .videos]))
+            .onChange(of: selectedPhotoItems, perform: handlePhotoSelectionChange)
+            .fileImporter(
+                isPresented: $showDocumentPicker,
+                allowedContentTypes: [.image, .pdf, .plainText, .json, .sourceCode, .presentation, .spreadsheet, .data],
+                allowsMultipleSelection: true
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    for url in urls {
+                        vm.addFileAttachment(from: url)
+                    }
+                case .failure(let error):
+                    minisLogger.error("File import failed: \(error.localizedDescription)")
                 }
+            }
+            .onAppear(perform: handleOnAppear)
+            .observingQuickActions(modifier: quickActionObserver)
+            .onChange(of: vm.sessionId, perform: handleSessionIdChange)
+            .onReceive(NotificationCenter.default.publisher(for: .sessionDidUpdate), perform: handleSessionDidUpdate)
+            .onChange(of: shareCoordinator.bufferVersion, perform: handleShareBufferChange)
+            .onDisappear(perform: handleOnDisappear)
+            // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
+            // and the transcript editor is NOT open, there is no legitimate keyboard
+            // in this subtree — so ignore the keyboard safe-area entirely in that
+            // state. Device log 2026-07-17 12:12 showed the panel shifting from
+            // y=686…778 to y=638…730 (exactly 48pt, the keyboard-accessory height)
+            // during the didEnterBackground layout pass: iOS re-asserted a keyboard
+            // inset while snapshotting, the app suspended before the matching hide
+            // was processed, and no keyboard event fires on foreground return — the
+            // zombie inset persisted and the panel floated (the reported bottom
+            // gap). Ignoring the keyboard edge in this state makes ANY such stale
+            // inset harmless; edit mode (edges: []) keeps normal avoidance so the
+            // panel still lifts above the keyboard while editing, and text mode is
+            // untouched.
+            .ignoresSafeArea(
+                .keyboard,
+                edges: (voiceInputActive && !voiceVM.isEditingTranscript) ? .bottom : []
             )
-        }
-        .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItems,
-                      maxSelectionCount: 50, matching: .any(of: [.images, .videos]))
-        .onChange(of: selectedPhotoItems, perform: handlePhotoSelectionChange)
-        .fileImporter(
-            isPresented: $showDocumentPicker,
-            allowedContentTypes: [.image, .pdf, .plainText, .json, .sourceCode, .presentation, .spreadsheet, .data],
-            allowsMultipleSelection: true
-        ) { result in
-            switch result {
-            case .success(let urls):
-                for url in urls {
-                    vm.addFileAttachment(from: url)
-                }
-            case .failure(let error):
-                minisLogger.error("File import failed: \(error.localizedDescription)")
+            .onChange(of: scenePhase) { phase in
+                handleScenePhaseChange(phase)
             }
-        }
-        .onAppear(perform: handleOnAppear)
-        .observingQuickActions(modifier: quickActionObserver)
-        .onChange(of: vm.sessionId, perform: handleSessionIdChange)
-        .onReceive(NotificationCenter.default.publisher(for: .sessionDidUpdate), perform: handleSessionDidUpdate)
-        .onChange(of: shareCoordinator.bufferVersion, perform: handleShareBufferChange)
-        .onDisappear(perform: handleOnDisappear)
-        // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
-        // and the transcript editor is NOT open, there is no legitimate keyboard
-        // in this subtree — so ignore the keyboard safe-area entirely in that
-        // state. Device log 2026-07-17 12:12 showed the panel shifting from
-        // y=686…778 to y=638…730 (exactly 48pt, the keyboard-accessory height)
-        // during the didEnterBackground layout pass: iOS re-asserted a keyboard
-        // inset while snapshotting, the app suspended before the matching hide
-        // was processed, and no keyboard event fires on foreground return — the
-        // zombie inset persisted and the panel floated (the reported bottom
-        // gap). Ignoring the keyboard edge in this state makes ANY such stale
-        // inset harmless; edit mode (edges: []) keeps normal avoidance so the
-        // panel still lifts above the keyboard while editing, and text mode is
-        // untouched.
-        .ignoresSafeArea(
-            .keyboard,
-            edges: (voiceInputActive && !voiceVM.isEditingTranscript) ? .bottom : []
+            .onChange(of: deepLink.showTerminal, perform: handleDeepLinkShowTerminal)
+            // [T-ios-voiceover-announce] Announce the end of a turn to VoiceOver.
+            // Deliberately a SEPARATE observer from the auto-focus handler below:
+            // that one returns early when the auto-focus setting is off, and a
+            // blind user must still hear that the reply ended regardless of an
+            // unrelated keyboard preference. The outcome closure is evaluated at
+            // the end edge so it sees the final cancel/error state.
+            .announceChatTurnEnd(isProcessing: vm.isProcessing, outcomeAtEnd: chatTurnOutcome)
+            .onChange(of: vm.isProcessing) { processing in
+                handleProcessingChange(processing)
+            }
+            // [T-ios-retry-hide-when-processing] Inject the view model so deep
+            // descendants (e.g. ToolCapsuleView's long-press menu) can react to
+            // `vm.isProcessing` without threading the vm through every level.
+            .environmentObject(vm)
         )
-        .onChange(of: scenePhase) { phase in
-            handleScenePhaseChange(phase)
-        }
-        .onChange(of: deepLink.showTerminal, perform: handleDeepLinkShowTerminal)
-        // [T-ios-voiceover-announce] Announce the end of a turn to VoiceOver.
-        // Deliberately a SEPARATE observer from the auto-focus handler below:
-        // that one returns early when the auto-focus setting is off, and a
-        // blind user must still hear that the reply ended regardless of an
-        // unrelated keyboard preference. The outcome closure is evaluated at
-        // the end edge so it sees the final cancel/error state.
-        .announceChatTurnEnd(isProcessing: vm.isProcessing, outcomeAtEnd: chatTurnOutcome)
-        .onChange(of: vm.isProcessing) { processing in
-            handleProcessingChange(processing)
-        }
-        // [T-ios-retry-hide-when-processing] Inject the view model so deep
-        // descendants (e.g. ToolCapsuleView's long-press menu) can react to
-        // `vm.isProcessing` without threading the vm through every level.
-        .environmentObject(vm)
     }
 
     // MARK: - Presentation Layer 2 (AnyView)
