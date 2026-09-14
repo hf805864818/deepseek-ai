@@ -1148,11 +1148,7 @@ struct AIChatView: View {
         // blind user must still hear that the reply ended regardless of an
         // unrelated keyboard preference. The outcome closure is evaluated at
         // the end edge so it sees the final cancel/error state.
-        .announceChatTurnEnd(isProcessing: vm.isProcessing) {
-            if vm.userDidCancel { return .stopped }
-            if vm.errorMessage != nil { return .failed }
-            return .finished
-        }
+        .announceChatTurnEnd(isProcessing: vm.isProcessing, outcomeAtEnd: chatTurnOutcome)
         .onChange(of: vm.isProcessing) { processing in
             handleProcessingChange(processing)
         }
@@ -1336,6 +1332,14 @@ struct AIChatView: View {
         if phase != .active, speechManager.state == .recording {
             speechManager.stopRecording()
         }
+    }
+
+    /// Extracted from `.announceChatTurnEnd` closure to keep the inline
+    /// closure small and avoid the Swift type-checker timing out.
+    private func chatTurnOutcome() -> ChatTurnOutcome {
+        if vm.userDidCancel { return .stopped }
+        if vm.errorMessage != nil { return .failed }
+        return .finished
     }
 
     /// Extracted from `.onChange(of: vm.isProcessing)` to keep that closure small

@@ -51,7 +51,7 @@ struct ComposerSurface: ViewModifier {
 /// JSON, plus a result alert. Extracted from AIChatView.body so the (already
 /// large) body's type-checker stays cheap. [T-ios-json-open-provider-import-prompt]
 struct ProviderImportPromptModifier: ViewModifier {
-    @Binding var pending: AIChatView.PendingProviderImport?
+    @Binding var pending: PendingProviderImport?
     @Binding var result: String?
     /// Import the provider from JSON; returns the new instance label on success.
     let onImport: (String) -> String?
