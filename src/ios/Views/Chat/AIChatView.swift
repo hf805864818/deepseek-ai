@@ -1320,15 +1320,19 @@ struct AIChatView: View {
             // Capsule auto-shows whenever audio is loaded — no manual activation needed.
             let disSid = sessionId ?? "nil"
             let disDid = draftId ?? "nil"
-            let disVmPid = vm.vmInstanceId
+            let disVmPidStr = String(describing: vm.vmInstanceId)
             let disVSid = vm.sessionId ?? "nil"
             let disProcStr = vm.isProcessing ? "true" : "false"
-            var disappearMsg = "🔑DRAFT AIChatView.onDisappear "
-            disappearMsg += "vm=\(disVmPid) "
-            disappearMsg += "sessionId=\(disSid) "
-            disappearMsg += "draftId=\(disDid) "
-            disappearMsg += "vm.sessionId=\(disVSid) "
-            disappearMsg += "vm.isProcessing=\(disProcStr)"
+            var disappearMsg = "🔑DRAFT AIChatView.onDisappear vm="
+            disappearMsg += disVmPidStr
+            disappearMsg += " sessionId="
+            disappearMsg += disSid
+            disappearMsg += " draftId="
+            disappearMsg += disDid
+            disappearMsg += " vm.sessionId="
+            disappearMsg += disVSid
+            disappearMsg += " vm.isProcessing="
+            disappearMsg += disProcStr
             minisLogger.info(disappearMsg)
         }
         // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
