@@ -1264,7 +1264,10 @@ struct AIChatView: View {
         }
         .onChange(of: shareCoordinator.bufferVersion) { newVersion in
             // Warm start: user is already in a session when share arrives
-            let shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)=\(newVersion) sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil") hasBuffer=\(shareCoordinator.pendingShareBuffer != nil)"
+            let bvSid = sessionId ?? "nil"
+            let bvDid = draftId ?? "nil"
+            let bvHasBuf = shareCoordinator.pendingShareBuffer != nil
+            let shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)=\(newVersion) sessionId=\(bvSid) draftId=\(bvDid) hasBuffer=\(bvHasBuf)"
             minisLogger.info(shareBufMsg)
             injectPendingShareIfNeeded()
         }
@@ -1307,7 +1310,12 @@ struct AIChatView: View {
                 AppLogger(category: "InputBarLayout").info("chat onDisappear — released a lingering first responder (would have left a phantom keyboard inset on the window)")
             }
             // Capsule auto-shows whenever audio is loaded — no manual activation needed.
-            let disappearMsg = "🔑DRAFT AIChatView.onDisappear vm=\(vm.vmInstanceId) sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil") vm.sessionId=\(vm.sessionId ?? "nil") vm.isProcessing=\(vm.isProcessing)"
+            let disSid = sessionId ?? "nil"
+            let disDid = draftId ?? "nil"
+            let disVmPid = vm.vmInstanceId
+            let disVSid = vm.sessionId ?? "nil"
+            let disProc = vm.isProcessing
+            let disappearMsg = "🔑DRAFT AIChatView.onDisappear vm=\(disVmPid) sessionId=\(disSid) draftId=\(disDid) vm.sessionId=\(disVSid) vm.isProcessing=\(disProc)"
             minisLogger.info(disappearMsg)
         }
         // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
@@ -1350,59 +1358,7 @@ struct AIChatView: View {
             return .finished
         }
         .onChange(of: vm.isProcessing) { processing in
-            if !processing {
-                // Reply reading is handled INCREMENTALLY during streaming (the
-                // SSE loop splits into sentences/titles + tool announcements and
-                // queues them as they arrive — see speakQueued/extractNewSentences).
-                // No whole-reply speak here; that would double-read everything.
-                // [T-keyboard-auto-pop default flip] Gate behind a Settings
-                // toggle. Default ON — most users want the composer ready
-                // for a follow-up immediately. `object(forKey:)` lets us
-                // distinguish "never toggled" (nil → use new ON default)
-                // from "explicitly set OFF" (NSNumber(false) → respect).
-                // Existing length-based skip is still applied so very long
-                // replies still don't trigger the auto-focus.
-                let autoFocusEnabled = (UserDefaults.standard.object(forKey: "chat.autoFocusAfterReply") as? Bool) ?? true
-                guard autoFocusEnabled else { return }
-                // [T-ios-retry-keyboard] Don't treat the end of a RETRIED turn
-                // as "a reply arrived".
-                //
-                // Trigger chain being cut: the user taps Retry on a failure from
-                // a while back -> retry() sets isProcessing=true -> the re-sent
-                // request fails fast (kernel down, no concurrency slot, or an
-                // immediate provider error) -> isProcessing flips back to false
-                // -> this observer fires. The edge is indistinguishable from a
-                // successful reply, and the delayed block's guards now all pass
-                // (the user IS looking at the chat, nothing is queued, and the
-                // errored message is short so the <600 length check succeeds) —
-                // so the keyboard rises seconds after a tap that only meant
-                // "try that again".
-                //
-                // Scoped to the turn's ORIGIN, not its outcome: auto-focus when
-                // a fresh send fails is existing, accepted behaviour and is
-                // deliberately left alone. Consumed (not just read) so it
-                // governs exactly one turn.
-                let wasRetry = vm.turnStartedByRetry
-                vm.turnStartedByRetry = false
-                guard !wasRetry else { return }
-                if GCKeyboard.coalesced != nil {
-                    inputFocused = true
-                } else {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        guard !hasOverlayPresented, isChatViewVisible else { return }
-                        guard !vm.isProcessing, vm.promptQueue.isEmpty else { return }
-                        // Re-check: a retry started during the 1.5s window would
-                        // otherwise be focused by this older timer.
-                        guard !vm.turnStartedByRetry else { return }
-                        let lastAssistantLength = vm.messages.last.flatMap {
-                            $0.role == .assistant ? $0.blocks.reduce(0) { $0 + $1.content.count } : nil
-                        } ?? 0
-                        if lastAssistantLength < 600 {
-                            inputFocused = true
-                        }
-                    }
-                }
-            }
+            handleProcessingChange(processing)
         }
         // [T-ios-retry-hide-when-processing] Inject the view model so deep
         // descendants (e.g. ToolCapsuleView's long-press menu) can react to
@@ -1487,7 +1443,9 @@ struct AIChatView: View {
             if didSeedInputBarHeight,
                latestH <= 0 || abs(latestH - committedH) > 0.5 {
                 didSeedInputBarHeight = false
-                AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene active — composer geometry stale (committed=\(committedH) latest=\(latestH) lastReport=\(String(format: "%.1f", sinceReport))s ago); re-arming seed so the next callback re-measures")
+                let sinceReportStr = String(format: "%.1f", sinceReport)
+                let staleLog = "[voice-bgfg] scene active — composer geometry stale (committed=\(committedH) latest=\(latestH) lastReport=\(sinceReportStr)s ago); re-arming seed so the next callback re-measures"
+                AppLogger(category: "InputBarLayout").info(staleLog)
             }
 
             // [T-voice-inputbar-collapse-selfheal] Re-arming only makes the
@@ -1508,7 +1466,9 @@ struct AIChatView: View {
                 if ticked {
                     AppLogger(category: "InputBarLayout").info("[InputBarHealth] OK after foreground — composer re-reported geometry (h=\(latestInputBarFrameH) committed=\(inputBarHeight))")
                 } else {
-                    AppLogger(category: "InputBarLayout").error("[InputBarHealth] STALLED — no geometry callback 900ms after foreground. committed=\(inputBarHeight) latest=\(latestInputBarFrameH) lastReport=\(String(format: "%.1f", age))s ago voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript) seeded=\(didSeedInputBarHeight). The composer host is not laying out; expect a blank bottom area. Leaving and re-entering the session rebuilds it.")
+                    let ageStr = String(format: "%.1f", age)
+                    let stalledLog = "[InputBarHealth] STALLED — no geometry callback 900ms after foreground. committed=\(inputBarHeight) latest=\(latestInputBarFrameH) lastReport=\(ageStr)s ago voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript) seeded=\(didSeedInputBarHeight). The composer host is not laying out; expect a blank bottom area. Leaving and re-entering the session rebuilds it."
+                    AppLogger(category: "InputBarLayout").error(stalledLog)
                 }
             }
             // [T-voice-bg-fg-gap] Foreground reseal: if we return to a
@@ -1544,7 +1504,9 @@ struct AIChatView: View {
             if let keyWindow {
                 let hadResponder = keyWindow.endEditing(true)
                 UIView.performWithoutAnimation { keyWindow.layoutIfNeeded() }
-                AppLogger(category: "InputBarLayout").info("[voice-bgfg] scene \(phase == .inactive ? "inactive" : "background") — forced keyboard-dismiss completion (hadResponder=\(hadResponder)) voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript)")
+                let phaseName = phase == .inactive ? "inactive" : "background"
+                let dismissLog = "[voice-bgfg] scene \(phaseName) — forced keyboard-dismiss completion (hadResponder=\(hadResponder)) voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript)"
+                AppLogger(category: "InputBarLayout").info(dismissLog)
             }
         }
         if phase != .active, speechManager.state == .recording {
@@ -1552,10 +1514,52 @@ struct AIChatView: View {
         }
     }
 
+    /// Extracted from `.onChange(of: vm.isProcessing)` to keep that closure small
+    /// and avoid the Swift type-checker timing out on a large inline closure.
+    private func handleProcessingChange(_ processing: Bool) {
+        guard !processing else { return }
+        // Reply reading is handled INCREMENTALLY during streaming (the
+        // SSE loop splits into sentences/titles + tool announcements and
+        // queues them as they arrive — see speakQueued/extractNewSentences).
+        // No whole-reply speak here; that would double-read everything.
+        // [T-keyboard-auto-pop default flip] Gate behind a Settings
+        // toggle. Default ON — most users want the composer ready
+        // for a follow-up immediately. `object(forKey:)` lets us
+        // distinguish "never toggled" (nil → use new ON default)
+        // from "explicitly set OFF" (NSNumber(false) → respect).
+        // Existing length-based skip is still applied so very long
+        // replies still don't trigger the auto-focus.
+        let autoFocusEnabled = (UserDefaults.standard.object(forKey: "chat.autoFocusAfterReply") as? Bool) ?? true
+        guard autoFocusEnabled else { return }
+        // [T-ios-retry-keyboard] Don't treat the end of a RETRIED turn
+        // as "a reply arrived".
+        let wasRetry = vm.turnStartedByRetry
+        vm.turnStartedByRetry = false
+        guard !wasRetry else { return }
+        if GCKeyboard.coalesced != nil {
+            inputFocused = true
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                guard !hasOverlayPresented, isChatViewVisible else { return }
+                guard !vm.isProcessing, vm.promptQueue.isEmpty else { return }
+                guard !vm.turnStartedByRetry else { return }
+                let lastAssistantLength = vm.messages.last.flatMap {
+                    $0.role == .assistant ? $0.blocks.reduce(0) { $0 + $1.content.count } : nil
+                } ?? 0
+                if lastAssistantLength < 600 {
+                    inputFocused = true
+                }
+            }
+        }
+    }
+
     /// Tell the workflow this view is alive + showing the right
     private func handleOnAppear() {
         let sinceInit = (CFAbsoluteTimeGetCurrent() - AIChatViewModel.onAppearTimestamp) * 1000
-        minisLogger.info("[SessionLoad] onAppear T+\(String(format: "%.0f", sinceInit))ms isNew=\(cached.isNew) msgs=\(vm.messages.count)")
+        let sinceInitStr = String(format: "%.0f", sinceInit)
+        let onAppearLog = "[SessionLoad] onAppear T+\(sinceInitStr)ms isNew=\(cached.isNew) msgs=\(vm.messages.count)"
+        minisLogger.info(onAppearLog)
         // [T-inputbar-stale-across-reentry] Re-arm the leading-edge seed on
         // EVERY appear. AIChatView is keyed `.id(sessionId)` in ContentView,
         // so re-entering the SAME session reuses the same SwiftUI identity
@@ -1596,7 +1600,8 @@ struct AIChatView: View {
                 // Load session if: (a) VM is freshly created, or (b) cache hit but messages
                 // are empty — this can happen on iOS 16 where NavigationStack may recreate
                 // @StateObject unexpectedly, causing isNew=false but an empty VM.
-                minisLogger.info("🔄SESSION AIChatView.onAppear loading session \(sessionId) isNew=\(cached.isNew) msgs=\(vm.messages.count)")
+                let loadLog = "🔄SESSION AIChatView.onAppear loading session \(sessionId) isNew=\(cached.isNew) msgs=\(vm.messages.count)"
+                minisLogger.info(loadLog)
                 // [T-ios-session-coldload-listsessions-block] .userInitiated
                 // so the actual session-open work wins the serialized
                 // ChatStore actor queue over background sidebar-refresh
@@ -1627,7 +1632,8 @@ struct AIChatView: View {
                 }
             } else {
                 let reuseStart = CFAbsoluteTimeGetCurrent()
-                minisLogger.info("🔄SESSION AIChatView.onAppear REUSING cached vm for \(sessionId) isProcessing=\(vm.isProcessing) msgs=\(vm.messages.count)")
+                let reuseLog = "🔄SESSION AIChatView.onAppear REUSING cached vm for \(sessionId) isProcessing=\(vm.isProcessing) msgs=\(vm.messages.count)"
+                minisLogger.info(reuseLog)
                 // Remount minis for this session (in case another session took over)
                 vm.mountMinis(for: sessionId)
                 // While the user was off this view, an iCloud / LAN
@@ -1649,7 +1655,10 @@ struct AIChatView: View {
                     vm.forceScrollToBottom.send()
                 }
                 let totalElapsed = (CFAbsoluteTimeGetCurrent() - reuseStart) * 1000
-                minisLogger.info("[SessionLoad] \(sessionId) — REUSE: \(String(format: "%.1f", totalElapsed))ms [mount: \(String(format: "%.1f", mountElapsed)) | msgs: \(vm.messages.count)]")
+                let totalStr = String(format: "%.1f", totalElapsed)
+                let mountStr = String(format: "%.1f", mountElapsed)
+                let reuseSummary = "[SessionLoad] \(sessionId) — REUSE: \(totalStr)ms [mount: \(mountStr) | msgs: \(vm.messages.count)]"
+                minisLogger.info(reuseSummary)
             }
         } else {
             minisLogger.info("🔄SESSION AIChatView.onAppear nil sessionId — draft mode")
@@ -1659,7 +1668,10 @@ struct AIChatView: View {
                 inputFocused = true
             }
         }
-        minisLogger.info("[Share] AIChatView.onAppear: sessionId=\(sessionId ?? "nil") bufferVersion=\(shareCoordinator.bufferVersion) hasBuffer=\(shareCoordinator.pendingShareBuffer != nil)")
+        let shareSid = sessionId ?? "nil"
+        let hasBuffer = shareCoordinator.pendingShareBuffer != nil
+        let shareLog = "[Share] AIChatView.onAppear: sessionId=\(shareSid) bufferVersion=\(shareCoordinator.bufferVersion) hasBuffer=\(hasBuffer)"
+        minisLogger.info(shareLog)
         injectPendingShareIfNeeded()
         injectPendingTransferIfNeeded()
         isChatViewVisible = true
@@ -1777,7 +1789,10 @@ struct AIChatView: View {
         // destination on the buffer before navigating; a nil stamp (cold
         // launch, where the launch flow owns the choice) still passes.
         guard shareCoordinator.bufferTargets(sessionId, draftId: draftId) else {
-            minisLogger.info("[Share] injectPendingShareIfNeeded — buffer is addressed to another session (mine: sessionId=\(sessionId ?? "nil") draftId=\(draftId ?? "nil")); leaving it")
+            let otherSid = sessionId ?? "nil"
+            let otherDid = draftId ?? "nil"
+            let otherLog = "[Share] injectPendingShareIfNeeded — buffer is addressed to another session (mine: sessionId=\(otherSid) draftId=\(otherDid)); leaving it"
+            minisLogger.info(otherLog)
             return
         }
         guard let pending = shareCoordinator.consumeBuffer() else {
@@ -1789,7 +1804,9 @@ struct AIChatView: View {
         for (i, item) in pending.items.enumerated() {
             switch item.kind {
             case .inlineText:
-                minisLogger.info("[Share] item[\(i)] inlineText: \(String(item.value.prefix(100)))")
+                let inlinePreview = String(item.value.prefix(100))
+                let inlineLog = "[Share] item[\(i)] inlineText: \(inlinePreview)"
+                minisLogger.info(inlineLog)
                 if !vm.inputText.isEmpty { vm.inputText += "\n" }
                 let text = item.value
                 // Append a trailing space to URLs so the cursor doesn't stick to the link
@@ -3932,7 +3949,9 @@ struct AIChatView: View {
                     didSeedInputBarHeight = true
                     inputBarHeightDebounce?.cancel()
                     inputBarHeight = newH
-                    AppLogger(category: "InputBarLayout").info("inputBarHeight seeded=\(newH) x=\(Int(frame.minX))")
+                    let seedX = Int(frame.minX)
+                    let seedLog = "inputBarHeight seeded=\(newH) x=\(seedX)"
+                    AppLogger(category: "InputBarLayout").info(seedLog)
                     // [T-inputbar-stale-across-reentry] The seed is applied
                     // SYNCHRONOUSLY (the message list needs a bottom inset on its
                     // very first pass, else it scrolls to a fake bottom). That
@@ -3950,7 +3969,8 @@ struct AIChatView: View {
                         let settled = latestInputBarFrameH
                         if settled > 0, abs(settled - newH) > 0.5 {
                             inputBarHeight = settled
-                            AppLogger(category: "InputBarLayout").info("inputBarHeight SEED-CORRECTED \(newH)→\(settled) — seed had caught an animation frame")
+                            let correctedLog = "inputBarHeight SEED-CORRECTED \(newH)→\(settled) — seed had caught an animation frame"
+                            AppLogger(category: "InputBarLayout").info(correctedLog)
                         }
                     }
                     return
@@ -3963,7 +3983,12 @@ struct AIChatView: View {
                 // Wait 300ms (> animation duration 200ms) to capture the settled
                 // post-animation value.
                 guard onscreen else {
-                    AppLogger(category: "InputBarLayout").info("inputBarHeight discarded=\(newH) offscreen x=\(Int(frame.minX))…\(Int(frame.maxX)) win=\(Int(hostWindow.minX))…\(Int(hostWindow.maxX))")
+                    let offX1 = Int(frame.minX)
+                    let offX2 = Int(frame.maxX)
+                    let winX1 = Int(hostWindow.minX)
+                    let winX2 = Int(hostWindow.maxX)
+                    let offscreenLog = "inputBarHeight discarded=\(newH) offscreen x=\(offX1)…\(offX2) win=\(winX1)…\(winX2)"
+                    AppLogger(category: "InputBarLayout").info(offscreenLog)
                     return
                 }
                 inputBarHeightDebounce?.cancel()
@@ -3985,14 +4010,18 @@ struct AIChatView: View {
                     // is wrong for the voice panel (~161pt compact). Discard
                     // if the branch flipped back by the time debounce fires.
                     if voiceAtCapture != voiceInputActive {
-                        AppLogger(category: "InputBarLayout").info("inputBarHeight discarded=\(newH) branchSwap voice=\(voiceAtCapture)→\(voiceInputActive)")
+                        let swapLog = "inputBarHeight discarded=\(newH) branchSwap voice=\(voiceAtCapture)→\(voiceInputActive)"
+                        AppLogger(category: "InputBarLayout").info(swapLog)
                         return
                     }
                     // Commit the LATEST height, not the one that armed the timer.
                     let committed = latestInputBarFrameH > 0 ? latestInputBarFrameH : newH
                     inputBarHeight = committed
                     let armed = newH
-                    AppLogger(category: "InputBarLayout").info("inputBarHeight settled=\(committed) x=\(Int(frame.minX))\(abs(committed - armed) > 0.5 ? " (armedWith=\(armed), used latest)" : "")")
+                    let settledX = Int(frame.minX)
+                    let armedSuffix = abs(committed - armed) > 0.5 ? " (armedWith=\(armed), used latest)" : ""
+                    let settledLog = "inputBarHeight settled=\(committed) x=\(settledX)\(armedSuffix)"
+                    AppLogger(category: "InputBarLayout").info(settledLog)
 
                     // [T-voice-inputbar-anim-tail] Settle-confirm. Even the
                     // latest recorded frame can be a tail sample if the final
@@ -4773,7 +4802,11 @@ struct AIChatView: View {
         // Intercept slash commands — execute instead of sending to LLM
         if vm.tryExecuteInputAsSlashCommand() { return }
 
-        minisLogger.info("🔑DRAFT performSend vm=\(vm.vmInstanceId) vm.sessionId=\(vm.sessionId ?? "nil") draftId=\(draftId ?? "nil") inputText='\(String(vm.inputText.prefix(50)))' isProcessing=\(vm.isProcessing)")
+        let sendSid = vm.sessionId ?? "nil"
+        let sendDid = draftId ?? "nil"
+        let sendText = String(vm.inputText.prefix(50))
+        let sendLog = "🔑DRAFT performSend vm=\(vm.vmInstanceId) vm.sessionId=\(sendSid) draftId=\(sendDid) inputText='\(sendText)' isProcessing=\(vm.isProcessing)"
+        minisLogger.info(sendLog)
         // Keep SwiftUI focus when a hardware keyboard is connected — dropping
         // it would force the user to tap the field again before typing the
         // next message. With only the software keyboard, clear focus and
