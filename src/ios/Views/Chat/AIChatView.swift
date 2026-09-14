@@ -3003,154 +3003,34 @@ struct AIChatView: View {
         )
     }
 
-    @ViewBuilder
-    private var inputFieldOrWaveform: AnyView {
-        let topPadding: CGFloat = (vm.attachments.isEmpty && vm.loadingVideoCount == 0) ? 16 : 11
-        if voiceInputActive {
-            return AnyView(
-                // [voice-correction §6] Recent conversation turns, straight from the
-                // already-loaded in-memory list (§12.1 forbids a DB query on this path),
-                // budgeted by CorrectionContextBuilder.
-                InlineVoiceInputView(
-                    viewModel: voiceVM,
-                    inputText: inputTextBinding,
-                    onPasteImage: { image in vm.addImageAttachment(image) },
-                    onPasteFile: { url in vm.addFileAttachment(from: url) },
-                    conversationContext: { voiceCorrectionContext(from: vm.messages) }
-                )
-            )
-        }
-        if speechManager.state == .recording {
-            // Transcript area grows with content up to a cap (~5 lines),
-            // then scrolls internally. ScrollView is greedy in its scroll
-            // axis, so we measure the Text's intrinsic height via a
-            // GeometryReader preference and clamp the ScrollView frame to
-            // min(measured, cap).
-            let transcriptMaxHeight: CGFloat = 100
-            let waveform = VStack(spacing: 6) {
-                AudioWaveformView(levels: speechManager.audioLevels)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 8)
-                if !speechManager.recognizedText.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical, showsIndicators: true) {
-                            Text(speechManager.recognizedText)
-                                .font(.subheadline)
-                                .foregroundStyle(ChatColors.secondaryText)
-                                .multilineTextAlignment(.center)
-                                .frame(maxWidth: .infinity)
-                                .background(GeometryReader { geo in
-                                    Color.clear.preference(key: TranscriptHeightKey.self, value: geo.size.height)
-                                })
-                                .id("transcriptTail")
-                        }
-                        .frame(height: min(max(transcriptHeight, 22), transcriptMaxHeight))
-                        .onPreferenceChange(TranscriptHeightKey.self) { transcriptHeight = $0 }
-                        .onReceive(speechManager.$recognizedText) { _ in
-                            withAnimation(.linear(duration: 0.1)) {
-                                proxy.scrollTo("transcriptTail", anchor: .bottom)
-                            }
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, topPadding)
-            .padding(.bottom, 10)
-            return AnyView(waveform)
-        }
-        let field = PastableTextView(
-            text: inputTextBinding,
-            isFocused: $inputFocused,
-            hasSelection: $inputHasSelection,
-            isScrollable: $inputIsScrollable,
-            isAtScrollBottom: $inputAtScrollBottom,
-            // `String(localized:)` with an interpolation extracts the
-            // `%@` form ("Message %@ (@ to mention files)") as the lookup
-            // key in Localizable.xcstrings, so translators get one
-            // parameterized entry per locale instead of one per soul name.
-            placeholder: AppLocalized("Message \(soulName) (@ to mention files)"),
-            onPasteImage: { image in vm.addImageAttachment(image) },
-            onPasteFile: { url in vm.addFileAttachment(from: url) },
+    /// [T-ios-runtime-demangle-watchdog] Extracted to InputFieldOrWaveformView
+    /// top-level struct to cut the type tree at a struct boundary.
+    private var inputFieldOrWaveform: some View {
+        InputFieldOrWaveformView(
+            vm: vm,
+            inputText: inputTextBinding,
+            inputFocused: $inputFocused,
+            inputHasSelection: $inputHasSelection,
+            inputIsScrollable: $inputIsScrollable,
+            inputAtScrollBottom: $inputAtScrollBottom,
+            transcriptHeight: $transcriptHeight,
+            voiceInputActive: voiceInputActive,
+            soulName: soulName,
+            composerTextHeight: composerTextHeight,
+            composerResizeEnabled: composerResizeEnabled,
+            composerDragOffset: $composerDragOffset,
+            composerHeightFraction: $composerHeightFraction,
+            speechManager: speechManager,
+            voiceVM: voiceVM,
             onReturnKey: handleReturnKey,
             onArrowUp: handleArrowUp,
             onArrowDown: handleArrowDown,
             onTab: handleTabKey,
             onCaretChange: handleCaretChange,
-            onSelectionReplace: { before, after in
-                // [T-text-input-correction-source] Feed composer select-and-
-                // replace edits into the SAME correction learner as voice
-                // transcript fixes, tagged source=text_input. Fire-and-forget
-                // off the keystroke path (design §12.2). The recorder applies
-                // the phonetic-admission + consent gate, so a plain reword is
-                // dropped and nothing is stored without opt-in. locale "zh" is
-                // the only phonetic normalizer currently active; the composer
-                // has no ASR language context, and a non-normalizable locale
-                // would just be discarded downstream.
-                Task.detached(priority: .utility) {
-                    await VoiceCorrectionRecorder.shared.recordEdit(
-                        before: before, after: after,
-                        locale: "zh", source: "text_input")
-                }
-            },
-            desiredCaret: vm.pendingCaret,
-            // [T-ipad-composer-resize] Raise the text view's growth cap in
-            // lockstep with the dragged frame, otherwise text would scroll at
-            // 120pt inside a taller box and the extra space would be dead.
-            maxHeightOverride: composerTextHeight
+            onToggleComposerHeight: toggleComposerHeight,
+            onPersistComposerHeight: persistComposerHeight,
+            voiceCorrectionContext: { voiceCorrectionContext(from: vm.messages) }
         )
-        return AnyView(composerBody(field: field, topPadding: topPadding))
-    }
-
-    /// [T-ipad-composer-resize] Wraps the text field with its (optional) fixed
-    /// height and the iPad drag handle.
-    ///
-    /// `.fixedSize(vertical:)` and an explicit `.frame(height:)` are mutually
-    /// exclusive: fixedSize asks the view for its intrinsic height, which is
-    /// exactly what we're overriding once the user has resized. So the two
-    /// modes are separate branches rather than modifiers stacked on one view.
-    private func composerBody(field: PastableTextView, topPadding: CGFloat) -> some View {
-        Group {
-            if let height = composerTextHeight {
-                field.frame(height: height)
-            } else {
-                field.fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, topPadding)
-        .padding(.bottom, 10)
-        .overlay(alignment: .top) {
-            if composerResizeEnabled { composerResizeHandle }
-        }
-    }
-
-    /// The grab affordance. Dragging UP makes the composer taller, so the drag
-    /// translation is negated. Double-tapping toggles between the two extremes.
-    private var composerResizeHandle: some View {
-        Capsule()
-            .fill(ChatColors.secondaryText.opacity(0.35))
-            .frame(width: 36, height: 5)
-            .padding(.top, 4)
-            .contentShape(Rectangle().inset(by: -12))  // enlarge the hit area
-            // Order matters: the double-tap must be registered BEFORE the drag,
-            // otherwise the drag (minimumDistance 2) claims the touch sequence
-            // first and the second tap never forms.
-            .onTapGesture(count: 2) { toggleComposerHeight() }
-            .gesture(
-                DragGesture(minimumDistance: 2)
-                    .onChanged { value in composerDragOffset = -value.translation.height }
-                    .onEnded { value in
-                        let resolved = min(
-                            max(currentComposerHeight - value.translation.height,
-                                Self.composerDefaultHeight),
-                            composerMaxHeight)
-                        composerDragOffset = 0
-                        persistComposerHeight(resolved)
-                    }
-            )
-            .accessibilityLabel(AppLocalized("Resize input box"))
-            .accessibilityHint(AppLocalized("Drag to resize, double tap to toggle"))
     }
 
     /// Double-tap: jump between the 50% cap and the default height. Anything
