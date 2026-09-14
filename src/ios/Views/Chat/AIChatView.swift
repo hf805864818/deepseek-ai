@@ -1314,8 +1314,13 @@ struct AIChatView: View {
             let disDid = draftId ?? "nil"
             let disVmPid = vm.vmInstanceId
             let disVSid = vm.sessionId ?? "nil"
-            let disProc = vm.isProcessing
-            let disappearMsg = "🔑DRAFT AIChatView.onDisappear vm=\(disVmPid) sessionId=\(disSid) draftId=\(disDid) vm.sessionId=\(disVSid) vm.isProcessing=\(disProc)"
+            let disProcStr = vm.isProcessing ? "true" : "false"
+            var disappearMsg = "🔑DRAFT AIChatView.onDisappear "
+            disappearMsg += "vm=\(disVmPid) "
+            disappearMsg += "sessionId=\(disSid) "
+            disappearMsg += "draftId=\(disDid) "
+            disappearMsg += "vm.sessionId=\(disVSid) "
+            disappearMsg += "vm.isProcessing=\(disProcStr)"
             minisLogger.info(disappearMsg)
         }
         // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up

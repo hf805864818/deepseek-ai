@@ -1984,6 +1984,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// while this is true, and the canResume didSet does not replay the
     /// deferred reload; the next safe idle drains it. [T-ios-retry-usermsg-vanish]
     var isTruncatingForRetry = false
+    /// [T-ios-retry-keyboard] True when the current / most recent agent turn
+    /// was started by a retry action (retryFromMessage / retryFromToolBlock).
+    /// Used by the UI to skip the "reply arrived → focus composer" behavior
+    /// for retried turns, since the user already knows what they asked.
+    /// Reset to false by the view after the turn completes.
+    var turnStartedByRetry = false
 
     // MARK: - Browser
     let browserTabPool = BrowserTabPool()
@@ -4377,6 +4383,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
     func retryFromMessage(_ messageId: UUID, replacementAttachments: [InputAttachment]? = nil) {
         guard !isProcessing else { return }
+        // [T-ios-retry-keyboard] Mark this turn as retry-initiated so the UI
+        // can skip the "reply arrived → auto-focus composer" behavior.
+        turnStartedByRetry = true
         // [T-ios-retry-usermsg-vanish] Guard the whole truncation window so a
         // deferred iCloud-sync reload can't rebuild `messages` from a
         // mid-truncation DB snapshot and drop the retried user message. Cleared
@@ -4757,6 +4766,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// retryFromMessage(precedingUser) and skip the sub-message rewrite.
     func retryFromToolBlock(blockId: UUID) {
         guard !isProcessing else { return }
+        // [T-ios-retry-keyboard] Mark this turn as retry-initiated so the UI
+        // can skip the "reply arrived → auto-focus composer" behavior.
+        turnStartedByRetry = true
 
         // Locate the assistant UI message + the target block's index within it.
         guard let asstMsgIdx = messages.firstIndex(where: { m in
