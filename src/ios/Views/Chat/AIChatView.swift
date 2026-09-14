@@ -2602,35 +2602,14 @@ struct AIChatView: View {
     /// Background color for the scroll-to-bottom button.
     // MARK: - Floating Tool Preview
 
-    private var floatingToolPreview: AnyView {
-        AnyView(Group {
-            let allToolBlocks = vm.messages
-                .filter { $0.role == .assistant && !$0.isCompactedHistory }
-                .flatMap { $0.blocks.filter { $0.toolStatus != nil } }
-            if !allToolBlocks.isEmpty {
-                FloatingToolBar(toolBlocks: allToolBlocks, toolSnapshots: vm.toolSnapshots, browserPool: vm.browserTabPool, onBrowserTakeover: {
-                    vm.browserTakeoverActive = true
-                }, onTakeoverDone: {
-                    vm.resumeFromBrowserTakeover()
-                })
-                    .frame(maxWidth: maxContentWidth)
-                    .padding(.horizontal, 12)
-                    // [T-ios-geometry-observer-crash] onGeometryChange replaces the
-                    // GeometryReader+onAppear+onChange scaffold: writing state from
-                    // onChange(of: geo.*) inside the geometry-observer path re-drives
-                    // layout and trips a precondition on the iOS 18 async renderer
-                    // (ViewGraphGeometryObservers.needsUpdate SIGTRAP). The action
-                    // also fires with the initial value, covering the old onAppear.
-                    .onGeometryChange(for: CGFloat.self) { proxy in
-                        proxy.size.height
-                    } action: { newH in
-                        floatingBarHeight = newH
-                    }
-                    .onDisappear {
-                        floatingBarHeight = 0
-                    }
-            }
-        })
+    /// [T-ios-runtime-demangle-watchdog] Extracted to FloatingToolPreviewView
+    /// top-level struct to cut the type tree at a struct boundary.
+    private var floatingToolPreview: some View {
+        FloatingToolPreviewView(
+            vm: vm,
+            maxContentWidth: maxContentWidth,
+            floatingBarHeight: $floatingBarHeight
+        )
     }
 
     /// Whether the floating tool preview is visible.
