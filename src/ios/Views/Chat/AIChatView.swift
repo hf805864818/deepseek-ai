@@ -342,14 +342,7 @@ struct AIChatView: View {
     @State private var missingMinisFileName: String?
 
     var body: some View {
-        // [T-body-type-check-split]
-        // The body modifier chain is ~60 deep (sheets, alerts, onChange,
-        // onReceive, environments, etc.), which makes the Swift type-checker
-        // time out. We split the chain into three sections with AnyView
-        // boundaries so each section is type-checked independently.
-        // Same established pattern as inputFieldOrWaveform / inputBottomRow
-        // and the CameraPicker fullScreenCover.
-        let part1 = ZStack {
+        ZStack {
             // Messages — floating tool preview overlaid at bottom
             messagesArea
                 .safeAreaInset(edge: .top, spacing: 0) {
@@ -749,266 +742,248 @@ struct AIChatView: View {
         } message: {
             Text(AppLocalized("Messages above this point will be compacted into a summary. This cannot be undone."))
         }
-
-        // [T-body-type-check-split 1/2] First AnyView boundary.
-        // Erases the first section (ZStack + overlays + alerts +
-        // first batch of sheets) so the remaining modifiers start
-        // from a flat AnyView base instead of a 25-level deep generic.
-        let part2 = AnyView(part1)
-
-        part2
-            .offloadPermissionDialog()
-            .environment(\.openMinisURL, OpenMinisURLAction { url in
-                handleMinisURLTap(url)
-            })
-            .environment(\.openImageGallery, OpenImageGalleryAction { presentation in
-                imageGallery = presentation
-            })
-            .fullScreenCover(item: $previewImageFile) { fileURL in
-                MinisImageFilePreviewView(fileURL: fileURL)
-            }
-            .alert(
-                AppLocalized("File Not Found"),
-                isPresented: Binding(
-                    get: { missingMinisFileName != nil },
-                    set: { if !$0 { missingMinisFileName = nil } }
-                ),
-                presenting: missingMinisFileName
-            ) { _ in
-                Button(AppLocalized("OK"), role: .cancel) { missingMinisFileName = nil }
-            } message: { name in
-                Text(AppLocalized("\(name) is unavailable. It may have been deleted or not yet synced from iCloud."))
-            }
-            .fullScreenCover(item: $imageGallery) { presentation in
-                MessageImageGallery(items: presentation.items, startIndex: presentation.startIndex)
-            }
-            .onReceive(NotificationCenter.default.publisher(for: MarkdownImageTapRouter.tappedNotification)) { note in
-                handleMarkdownImageTap(note)
-            }
-            .modifier(DismissImmersiveCoversListener(onDismiss: dismissAllOwnedImmersiveCovers))
-            .onReceive(vm.requestComposerFocusSignal, perform: handleComposerFocusRequest)
-            .modifier(ChatInputAppendListener(vm: vm, inputFocused: $inputFocused))
-            .modifier(RerunFromToolBlockListener(vm: vm))
-            .fullScreenCover(item: $previewVideoFile) { fileURL in
-                MinisVideoFullscreenPlayer(fileURL: fileURL)
-            }
-            .sheet(item: $previewAudioFile) { fileURL in
-                MinisAudioPreviewView(fileURL: fileURL)
-                    .presentationDetents([.large])
-                    .presentationDragIndicator(.hidden)
-            }
-            .sheet(item: $previewTextFile) { fileURL in
-                MinisTextPreviewView(fileURL: fileURL)
-            }
-            .sheet(item: $previewMarkdownFile) { fileURL in
-                MinisMarkdownPreviewView(fileURL: fileURL)
-            }
-            .sheet(item: $previewDocumentFile) { fileURL in
-                MinisDocumentPreviewView(fileURL: fileURL)
-            }
-            .sheet(item: $shareFile) { fileURL in
-                MinisShareSheet(url: fileURL)
-            }
-            .sheet(item: $safariURL) { url in
-                MinisLinkPreviewView(url: url, browserPool: vm.browserTabPool, onExpand: { _ in
-                    fullBrowserIsLocal = false
-                    let targetURL = url
-                    safariURL = nil
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                        fullBrowserURL = targetURL
-                    }
-                })
-            }
-            // Auto-present the in-app preview when a shell tool's stdout emits
-            // an OSC MinisOpenURL marker (via /usr/local/bin/minis-open).
-            //
-            // Dispatch by scheme:
-            //  - http/https/about: in-chat WKWebView preview. ToolLiveSheet
-            //    observes the same broker and takes priority for web URLs when
-            //    it is on top (broker.toolSheetVisible).
-            //  - minis://...: chat-resource file preview (image/markdown/html/
-            //    pdf/...). Routed through handleMinisURLTap which already
-            //    picks the right sheet by extension. Always dispatched here
-            //    because ToolLiveSheet cannot host fullscreen file previews.
-            //
-            // `.dropFirst()` skips the current value that `@Published` delivers
-            // to new subscribers on first attach — without it, a chat view
-            // created after a previous OSC capture would re-present a stale URL.
-            .onReceive(MinisOpenURLBroker.shared.$pendingURL.dropFirst().compactMap { $0 }, perform: handlePendingURL)
-            .sheet(item: $previewHTMLFile) { fileURL in
-                MinisHTMLPreviewView(fileURL: fileURL, onExpand: { _ in
-                    fullBrowserIsLocal = true
-                    let targetURL = fileURL
-                    previewHTMLFile = nil
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                        fullBrowserURL = targetURL
-                    }
-                })
-            }
-            .fullScreenCover(item: $fullBrowserURL) { url in
-                let wasLocal = fullBrowserIsLocal
-                MinisSafariView(url: url, localFile: wasLocal, onCollapse: {
-                    fullBrowserURL = nil
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                        if wasLocal {
-                            previewHTMLFile = url
-                        } else {
-                            safariURL = url
-                        }
-                    }
-                })
-            }
-            .sheet(isPresented: $showFileBrowser) {
-                NavigationStack {
-                    let base = RootfsManager.shared.dataPath
-                    FileBrowserView(rootPath: base, initialPath: base.appendingPathComponent("var/minis"), rootLabel: "/")
-                }
-            }
-            .sheet(isPresented: $showBrowserSheet) {
-                BrowserSheetView(pool: vm.browserTabPool, isAgentBusy: vm.browserTabPool.isAgentBrowsing, onTakeover: {
-                    vm.browserTakeoverActive = true
-                })
-            }
-            .sheet(isPresented: $showModelPicker) {
-                NavigationStack {
-                    SessionModelPicker(sessionId: vm.sessionId) {
-                        await vm.ensureSessionReturningId()
-                    }
-                }
+        .offloadPermissionDialog()
+        .environment(\.openMinisURL, OpenMinisURLAction { url in
+            handleMinisURLTap(url)
+        })
+        .environment(\.openImageGallery, OpenImageGalleryAction { presentation in
+            imageGallery = presentation
+        })
+        .fullScreenCover(item: $previewImageFile) { fileURL in
+            MinisImageFilePreviewView(fileURL: fileURL)
+        }
+        .alert(
+            AppLocalized("File Not Found"),
+            isPresented: Binding(
+                get: { missingMinisFileName != nil },
+                set: { if !$0 { missingMinisFileName = nil } }
+            ),
+            presenting: missingMinisFileName
+        ) { _ in
+            Button(AppLocalized("OK"), role: .cancel) { missingMinisFileName = nil }
+        } message: { name in
+            Text(AppLocalized("\(name) is unavailable. It may have been deleted or not yet synced from iCloud."))
+        }
+        .fullScreenCover(item: $imageGallery) { presentation in
+            MessageImageGallery(items: presentation.items, startIndex: presentation.startIndex)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MarkdownImageTapRouter.tappedNotification)) { note in
+            handleMarkdownImageTap(note)
+        }
+        .modifier(DismissImmersiveCoversListener(onDismiss: dismissAllOwnedImmersiveCovers))
+        .onReceive(vm.requestComposerFocusSignal, perform: handleComposerFocusRequest)
+        .modifier(ChatInputAppendListener(vm: vm, inputFocused: $inputFocused))
+        .modifier(RerunFromToolBlockListener(vm: vm))
+        .fullScreenCover(item: $previewVideoFile) { fileURL in
+            MinisVideoFullscreenPlayer(fileURL: fileURL)
+        }
+        .sheet(item: $previewAudioFile) { fileURL in
+            MinisAudioPreviewView(fileURL: fileURL)
                 .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+        }
+        .sheet(item: $previewTextFile) { fileURL in
+            MinisTextPreviewView(fileURL: fileURL)
+        }
+        .sheet(item: $previewMarkdownFile) { fileURL in
+            MinisMarkdownPreviewView(fileURL: fileURL)
+        }
+        .sheet(item: $previewDocumentFile) { fileURL in
+            MinisDocumentPreviewView(fileURL: fileURL)
+        }
+        .sheet(item: $shareFile) { fileURL in
+            MinisShareSheet(url: fileURL)
+        }
+        .sheet(item: $safariURL) { url in
+            MinisLinkPreviewView(url: url, browserPool: vm.browserTabPool, onExpand: { _ in
+                fullBrowserIsLocal = false
+                let targetURL = url
+                safariURL = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    fullBrowserURL = targetURL
+                }
+            })
+        }
+        // Auto-present the in-app preview when a shell tool's stdout emits
+        // an OSC MinisOpenURL marker (via /usr/local/bin/minis-open).
+        //
+        // Dispatch by scheme:
+        //  - http/https/about: in-chat WKWebView preview. ToolLiveSheet
+        //    observes the same broker and takes priority for web URLs when
+        //    it is on top (broker.toolSheetVisible).
+        //  - minis://...: chat-resource file preview (image/markdown/html/
+        //    pdf/...). Routed through handleMinisURLTap which already
+        //    picks the right sheet by extension. Always dispatched here
+        //    because ToolLiveSheet cannot host fullscreen file previews.
+        //
+        // `.dropFirst()` skips the current value that `@Published` delivers
+        // to new subscribers on first attach — without it, a chat view
+        // created after a previous OSC capture would re-present a stale URL.
+        .onReceive(MinisOpenURLBroker.shared.$pendingURL.dropFirst().compactMap { $0 }, perform: handlePendingURL)
+        .sheet(item: $previewHTMLFile) { fileURL in
+            MinisHTMLPreviewView(fileURL: fileURL, onExpand: { _ in
+                fullBrowserIsLocal = true
+                let targetURL = fileURL
+                previewHTMLFile = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    fullBrowserURL = targetURL
+                }
+            })
+        }
+        .fullScreenCover(item: $fullBrowserURL) { url in
+            let wasLocal = fullBrowserIsLocal
+            MinisSafariView(url: url, localFile: wasLocal, onCollapse: {
+                fullBrowserURL = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    if wasLocal {
+                        previewHTMLFile = url
+                    } else {
+                        safariURL = url
+                    }
+                }
+            })
+        }
+        .sheet(isPresented: $showFileBrowser) {
+            NavigationStack {
+                let base = RootfsManager.shared.dataPath
+                FileBrowserView(rootPath: base, initialPath: base.appendingPathComponent("var/minis"), rootLabel: "/")
             }
-            .sheet(isPresented: $showTokenUsage) {
-                TokenUsageSheet(vm: cached.vm)
-                    .presentationDetents([.fraction(0.8), .large])
-            }
-            .sheet(item: $screenshotPreview) { preview in
-                ChatScreenshotPreviewSheet(image: preview.image)
-            }
-            .sheet(isPresented: $showSessionSkills) {
-                // Pass the real id (nil for a draft) plus an ensure-session closure
-                // so a pre-first-message toggle binds its override to the session
-                // the chat will actually persist under, instead of the "" phantom
-                // key (T-ios-session-skill-override-init-timing).
-                SessionSkillsView(sessionId: vm.sessionId) {
+        }
+        .sheet(isPresented: $showBrowserSheet) {
+            BrowserSheetView(pool: vm.browserTabPool, isAgentBusy: vm.browserTabPool.isAgentBrowsing, onTakeover: {
+                vm.browserTakeoverActive = true
+            })
+        }
+        .sheet(isPresented: $showModelPicker) {
+            NavigationStack {
+                SessionModelPicker(sessionId: vm.sessionId) {
                     await vm.ensureSessionReturningId()
                 }
             }
-            .sheet(isPresented: $showSessionMCPs) {
-                SessionMCPsView(sessionId: vm.sessionId) {
-                    await vm.ensureSessionReturningId()
+            .presentationDetents([.large])
+        }
+        .sheet(isPresented: $showTokenUsage) {
+            TokenUsageSheet(vm: cached.vm)
+                .presentationDetents([.fraction(0.8), .large])
+        }
+        .sheet(item: $screenshotPreview) { preview in
+            ChatScreenshotPreviewSheet(image: preview.image)
+        }
+        .sheet(isPresented: $showSessionSkills) {
+            // Pass the real id (nil for a draft) plus an ensure-session closure
+            // so a pre-first-message toggle binds its override to the session
+            // the chat will actually persist under, instead of the "" phantom
+            // key (T-ios-session-skill-override-init-timing).
+            SessionSkillsView(sessionId: vm.sessionId) {
+                await vm.ensureSessionReturningId()
+            }
+        }
+        .sheet(isPresented: $showSessionMCPs) {
+            SessionMCPsView(sessionId: vm.sessionId) {
+                await vm.ensureSessionReturningId()
+            }
+        }
+        .sheet(isPresented: $showSessionMemory) {
+            SessionMemoryView(vm: cached.vm)
+        }
+        .sheet(isPresented: $showMoveToSheet) {
+            MoveToSessionSheet(currentSessionId: vm.sessionId, onSelect: handleMoveToSession)
+        }
+        .fullScreenCover(isPresented: $showTerminal) {
+            terminalInitCommand = nil
+        } content: {
+            terminalContentView
+        }
+        .fullScreenCover(isPresented: $showCamera, onDismiss: {
+            minisLogger.info("[QuickAction] fullScreenCover(camera) onDismiss showCamera=\(showCamera)")
+        }) {
+            // AnyView erases the camera sheet's view tree from the
+            // outer body's generic chain. Without it, AIChatView.body's
+            // mangled type pushes Swift's runtime type decoder past its
+            // recursion limit on cold launch via the share/quick-action
+            // path — SIGSEGV in __swift_instantiateConcreteTypeFromMangledNameV2
+            // with `attachmentMenuButton.getter` at the stack top (a
+            // bystander; whichever leaf the decoder reached when the
+            // stack ran out gets named). Same class of crash as the
+            // 2026-04-17 `inputBar.getter` blow-up — the
+            // `.observingQuickActions(modifier:)` modifier added by
+            // T-quick-action-workflow tipped a chain that was already
+            // sitting at the threshold. AnyView here is the minimal,
+            // surgical cut: it sinks the largest closure in this
+            // modifier (CameraPicker + .ignoresSafeArea + .onAppear)
+            // into an erased subtree so the outer body type stays
+            // demangle-able. Keep until the body is structurally split
+            // into separate View structs (v1.10 follow-up).
+            AnyView(
+                CameraPicker { image in
+                    minisLogger.info("[QuickAction] CameraPicker onCapture size=\(Int(image.size.width))x\(Int(image.size.height))")
+                    vm.addImageAttachment(image)
                 }
-            }
-            .sheet(isPresented: $showSessionMemory) {
-                SessionMemoryView(vm: cached.vm)
-            }
-            .sheet(isPresented: $showMoveToSheet) {
-                MoveToSessionSheet(currentSessionId: vm.sessionId, onSelect: handleMoveToSession)
-            }
-
-        // [T-body-type-check-split 2/2] Second AnyView boundary.
-        // Further splits the remaining modifier chain so the final
-        // section (terminal, camera, onChange, onReceive, etc.)
-        // starts from a fresh erased base.
-        let part3 = AnyView(part2)
-
-        part3
-            .fullScreenCover(isPresented: $showTerminal) {
-                terminalInitCommand = nil
-            } content: {
-                terminalContentView
-            }
-            .fullScreenCover(isPresented: $showCamera, onDismiss: {
-                minisLogger.info("[QuickAction] fullScreenCover(camera) onDismiss showCamera=\(showCamera)")
-            }) {
-                // AnyView erases the camera sheet's view tree from the
-                // outer body's generic chain. Without it, AIChatView.body's
-                // mangled type pushes Swift's runtime type decoder past its
-                // recursion limit on cold launch via the share/quick-action
-                // path — SIGSEGV in __swift_instantiateConcreteTypeFromMangledNameV2
-                // with `attachmentMenuButton.getter` at the stack top (a
-                // bystander; whichever leaf the decoder reached when the
-                // stack ran out gets named). Same class of crash as the
-                // 2026-04-17 `inputBar.getter` blow-up — the
-                // `.observingQuickActions(modifier:)` modifier added by
-                // T-quick-action-workflow tipped a chain that was already
-                // sitting at the threshold. AnyView here is the minimal,
-                // surgical cut: it sinks the largest closure in this
-                // modifier (CameraPicker + .ignoresSafeArea + .onAppear)
-                // into an erased subtree so the outer body type stays
-                // demangle-able. Keep until the body is structurally split
-                // into separate View structs (v1.10 follow-up).
-                AnyView(
-                    CameraPicker { image in
-                        minisLogger.info("[QuickAction] CameraPicker onCapture size=\(Int(image.size.width))x\(Int(image.size.height))")
-                        vm.addImageAttachment(image)
-                    }
-                    .ignoresSafeArea()
-                    .onAppear {
-                        minisLogger.info("[QuickAction] fullScreenCover(camera) content onAppear — notifying workflow")
-                        QuickActionWorkflow.shared.markCoverPresented()
-                    }
-                )
-            }
-            .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItems,
-                          maxSelectionCount: 50, matching: .any(of: [.images, .videos]))
-            .onChange(of: selectedPhotoItems, perform: handlePhotoSelectionChange)
-            .fileImporter(
-                isPresented: $showDocumentPicker,
-                allowedContentTypes: [.image, .pdf, .plainText, .json, .sourceCode, .presentation, .spreadsheet, .data],
-                allowsMultipleSelection: true
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    for url in urls {
-                        vm.addFileAttachment(from: url)
-                    }
-                case .failure(let error):
-                    minisLogger.error("File import failed: \(error.localizedDescription)")
+                .ignoresSafeArea()
+                .onAppear {
+                    minisLogger.info("[QuickAction] fullScreenCover(camera) content onAppear — notifying workflow")
+                    QuickActionWorkflow.shared.markCoverPresented()
                 }
-            }
-            .onAppear(perform: handleOnAppear)
-            .observingQuickActions(modifier: quickActionObserver)
-            .onChange(of: vm.sessionId, perform: handleSessionIdChange)
-            .onReceive(NotificationCenter.default.publisher(for: .sessionDidUpdate), perform: handleSessionDidUpdate)
-            .onChange(of: shareCoordinator.bufferVersion, perform: handleShareBufferChange)
-            .onDisappear(perform: handleOnDisappear)
-            // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
-            // and the transcript editor is NOT open, there is no legitimate keyboard
-            // in this subtree — so ignore the keyboard safe-area entirely in that
-            // state. Device log 2026-07-17 12:12 showed the panel shifting from
-            // y=686…778 to y=638…730 (exactly 48pt, the keyboard-accessory height)
-            // during the didEnterBackground layout pass: iOS re-asserted a keyboard
-            // inset while snapshotting, the app suspended before the matching hide
-            // was processed, and no keyboard event fires on foreground return — the
-            // zombie inset persisted and the panel floated (the reported bottom
-            // gap). Ignoring the keyboard edge in this state makes ANY such stale
-            // inset harmless; edit mode (edges: []) keeps normal avoidance so the
-            // panel still lifts above the keyboard while editing, and text mode is
-            // untouched.
-            .ignoresSafeArea(
-                .keyboard,
-                edges: (voiceInputActive && !voiceVM.isEditingTranscript) ? .bottom : []
             )
-            .onChange(of: scenePhase) { phase in
-                handleScenePhaseChange(phase)
+        }
+        .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItems,
+                      maxSelectionCount: 50, matching: .any(of: [.images, .videos]))
+        .onChange(of: selectedPhotoItems, perform: handlePhotoSelectionChange)
+        .fileImporter(
+            isPresented: $showDocumentPicker,
+            allowedContentTypes: [.image, .pdf, .plainText, .json, .sourceCode, .presentation, .spreadsheet, .data],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                for url in urls {
+                    vm.addFileAttachment(from: url)
+                }
+            case .failure(let error):
+                minisLogger.error("File import failed: \(error.localizedDescription)")
             }
-            .onChange(of: deepLink.showTerminal, perform: handleDeepLinkShowTerminal)
-            // [T-ios-voiceover-announce] Announce the end of a turn to VoiceOver.
-            // Deliberately a SEPARATE observer from the auto-focus handler below:
-            // that one returns early when the auto-focus setting is off, and a
-            // blind user must still hear that the reply ended regardless of an
-            // unrelated keyboard preference. The outcome closure is evaluated at
-            // the end edge so it sees the final cancel/error state.
-            .announceChatTurnEnd(isProcessing: vm.isProcessing, outcomeAtEnd: chatTurnOutcome)
-            .onChange(of: vm.isProcessing) { processing in
-                handleProcessingChange(processing)
-            }
-            // [T-ios-retry-hide-when-processing] Inject the view model so deep
-            // descendants (e.g. ToolCapsuleView's long-press menu) can react to
-            // `vm.isProcessing` without threading the vm through every level.
-            .environmentObject(vm)
-
-        return part3
+        }
+        .onAppear(perform: handleOnAppear)
+        .observingQuickActions(modifier: quickActionObserver)
+        .onChange(of: vm.sessionId, perform: handleSessionIdChange)
+        .onReceive(NotificationCenter.default.publisher(for: .sessionDidUpdate), perform: handleSessionDidUpdate)
+        .onChange(of: shareCoordinator.bufferVersion, perform: handleShareBufferChange)
+        .onDisappear(perform: handleOnDisappear)
+        // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
+        // and the transcript editor is NOT open, there is no legitimate keyboard
+        // in this subtree — so ignore the keyboard safe-area entirely in that
+        // state. Device log 2026-07-17 12:12 showed the panel shifting from
+        // y=686…778 to y=638…730 (exactly 48pt, the keyboard-accessory height)
+        // during the didEnterBackground layout pass: iOS re-asserted a keyboard
+        // inset while snapshotting, the app suspended before the matching hide
+        // was processed, and no keyboard event fires on foreground return — the
+        // zombie inset persisted and the panel floated (the reported bottom
+        // gap). Ignoring the keyboard edge in this state makes ANY such stale
+        // inset harmless; edit mode (edges: []) keeps normal avoidance so the
+        // panel still lifts above the keyboard while editing, and text mode is
+        // untouched.
+        .ignoresSafeArea(
+            .keyboard,
+            edges: (voiceInputActive && !voiceVM.isEditingTranscript) ? .bottom : []
+        )
+        .onChange(of: scenePhase) { phase in
+            handleScenePhaseChange(phase)
+        }
+        .onChange(of: deepLink.showTerminal, perform: handleDeepLinkShowTerminal)
+        // [T-ios-voiceover-announce] Announce the end of a turn to VoiceOver.
+        // Deliberately a SEPARATE observer from the auto-focus handler below:
+        // that one returns early when the auto-focus setting is off, and a
+        // blind user must still hear that the reply ended regardless of an
+        // unrelated keyboard preference. The outcome closure is evaluated at
+        // the end edge so it sees the final cancel/error state.
+        .announceChatTurnEnd(isProcessing: vm.isProcessing, outcomeAtEnd: chatTurnOutcome)
+        .onChange(of: vm.isProcessing) { processing in
+            handleProcessingChange(processing)
+        }
+        // [T-ios-retry-hide-when-processing] Inject the view model so deep
+        // descendants (e.g. ToolCapsuleView's long-press menu) can react to
+        // `vm.isProcessing` without threading the vm through every level.
+        .environmentObject(vm)
     }
 
     // MARK: - Home Screen Quick Actions
