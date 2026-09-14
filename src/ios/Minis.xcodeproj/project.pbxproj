@@ -3455,7 +3455,13 @@
 					"-lish",
 					"-lfakefs",
 				);
-				OTHER_SWIFT_FLAGS = "";
+				OTHER_SWIFT_FLAGS = (
+					"$(inherited)",
+					"-Xfrontend",
+					"-type-checker-timeout",
+					"-Xfrontend",
+					600,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -3509,7 +3515,13 @@
 					"-lish",
 					"-lfakefs",
 				);
-				OTHER_SWIFT_FLAGS = "";
+				OTHER_SWIFT_FLAGS = (
+					"$(inherited)",
+					"-Xfrontend",
+					"-type-checker-timeout",
+					"-Xfrontend",
+					600,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
