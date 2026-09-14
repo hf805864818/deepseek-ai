@@ -1013,14 +1013,7 @@ struct AIChatView: View {
         .onChange(of: scenePhase) { phase in
             handleScenePhaseChange(phase)
         }
-        .onChange(of: deepLink.showTerminal) { show in
-            if show {
-                terminalInitCommand = deepLink.terminalInitCommand
-                showTerminal = true
-                deepLink.showTerminal = false
-                deepLink.terminalInitCommand = nil
-            }
-        }
+        .onChange(of: deepLink.showTerminal, perform: handleDeepLinkShowTerminal)
         // [T-ios-voiceover-announce] Announce the end of a turn to VoiceOver.
         // Deliberately a SEPARATE observer from the auto-focus handler below:
         // that one returns early when the auto-focus setting is off, and a
@@ -1210,6 +1203,42 @@ struct AIChatView: View {
         }
         if phase != .active, speechManager.state == .recording {
             speechManager.stopRecording()
+        }
+    }
+
+    /// Extracted from `.onChange(of: deepLink.showTerminal)` to keep that closure small
+    /// and avoid the Swift type-checker timing out on a large inline closure.
+    private func handleDeepLinkShowTerminal(_ show: Bool) {
+        if show {
+            terminalInitCommand = deepLink.terminalInitCommand
+            showTerminal = true
+            deepLink.showTerminal = false
+            deepLink.terminalInitCommand = nil
+        }
+    }
+
+    /// Extracted from `.onChange(of: vm.fallbackTrigger)` to keep that closure small
+    /// and avoid the Swift type-checker timing out on a large inline closure.
+    private func handleFallbackTrigger(_: Int) {
+        // 3× pulse: fade in then out, repeated 3 times
+        fallbackPulseOpacity = 0
+        withAnimation(.easeInOut(duration: 0.35)) {
+            fallbackPulseOpacity = 1
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            withAnimation(.easeInOut(duration: 0.35)) { self.fallbackPulseOpacity = 0 }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            withAnimation(.easeInOut(duration: 0.35)) { self.fallbackPulseOpacity = 1 }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) {
+            withAnimation(.easeInOut(duration: 0.35)) { self.fallbackPulseOpacity = 0 }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+            withAnimation(.easeInOut(duration: 0.35)) { self.fallbackPulseOpacity = 1 }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.75) {
+            withAnimation(.easeInOut(duration: 0.35)) { self.fallbackPulseOpacity = 0 }
         }
     }
 
@@ -2283,28 +2312,7 @@ struct AIChatView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color.red.opacity(0.35 * fallbackPulseOpacity))
             )
-            .onChange(of: vm.fallbackTrigger) { _ in
-                // 3× pulse: fade in then out, repeated 3 times
-                fallbackPulseOpacity = 0
-                withAnimation(.easeInOut(duration: 0.35)) {
-                    fallbackPulseOpacity = 1
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    withAnimation(.easeInOut(duration: 0.35)) { fallbackPulseOpacity = 0 }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-                    withAnimation(.easeInOut(duration: 0.35)) { fallbackPulseOpacity = 1 }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) {
-                    withAnimation(.easeInOut(duration: 0.35)) { fallbackPulseOpacity = 0 }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                    withAnimation(.easeInOut(duration: 0.35)) { fallbackPulseOpacity = 1 }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.75) {
-                    withAnimation(.easeInOut(duration: 0.35)) { fallbackPulseOpacity = 0 }
-                }
-            }
+            .onChange(of: vm.fallbackTrigger, perform: handleFallbackTrigger)
         }
         // [T-navbar-title-clip 2026-05-21] Nudge the whole legacy title
         // stack down so the first row clears the status-bar / Dynamic
