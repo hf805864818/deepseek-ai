@@ -1113,68 +1113,7 @@ struct AIChatView: View {
             logShareBufferChange(newVersion: newVersion)
             injectPendingShareIfNeeded()
         }
-        .onDisappear {
-            isChatViewVisible = false
-            // [T-voice-inputbar-collapse-selfheal] The health probe must not
-            // outlive the view — its report would describe a composer that no
-            // longer exists.
-            inputBarHealthProbe?.cancel()
-            inputBarHealthProbe = nil
-            if speechManager.state == .recording {
-                speechManager.stopRecording()
-            }
-            // [T-inputbar-keyboard-leaks-to-home] Cut the ONLY channel by which
-            // chat composer geometry can reach the HOME screen.
-            //
-            // `inputBarHeight` is per-view @State and only feeds the message
-            // list's bottom inset — it cannot touch home. What CAN is a stranded
-            // first responder: leaving the chat while the composer (or the voice
-            // transcript editor) still holds focus leaves the keyboard's inset
-            // reserved on the WINDOW, and SwiftUI's automatic keyboard avoidance
-            // applies that window-wide. The home screen's 新建/搜索 FAB row is a
-            // `.safeAreaInset(edge: .bottom)` (ContentView 1213/1326) with no
-            // `.ignoresSafeArea(.keyboard)` opt-out, so it reads that inflated
-            // bottom safe area and floats upward — the reported symptom. Same
-            // failure class as the offscreen-WebView phantom keyboard (8232308a)
-            // and the voice-editor stranded responder (4c530bf4); this closes the
-            // remaining door, the chat→home transition itself.
-            //
-            // Blanket-disabling keyboard avoidance on the home FAB row would be
-            // the wrong fix — its inline search field legitimately needs to rise
-            // with the keyboard. Releasing the responder at the source is correct
-            // and is a no-op when nothing is focused.
-            inputFocused = false
-            let scenes = UIApplication.shared.connectedScenes
-            let windowScenes: [UIWindowScene] = scenes.compactMap { scene in
-                scene as? UIWindowScene
-            }
-            let allWindows: [UIWindow] = windowScenes.flatMap { ws in
-                ws.windows
-            }
-            let keyWindow = allWindows.first { w in
-                w.isKeyWindow
-            }
-            if let keyWindow, keyWindow.endEditing(true) {
-                AppLogger(category: "InputBarLayout").info("chat onDisappear — released a lingering first responder (would have left a phantom keyboard inset on the window)")
-            }
-            // Capsule auto-shows whenever audio is loaded — no manual activation needed.
-            let disSid = sessionId ?? "nil"
-            let disDid = draftId ?? "nil"
-            let disVmPidStr = String(describing: vm.vmInstanceId)
-            let disVSid = vm.sessionId ?? "nil"
-            let disProcStr = vm.isProcessing ? "true" : "false"
-            var disappearMsg = "🔑DRAFT AIChatView.onDisappear vm="
-            disappearMsg += disVmPidStr
-            disappearMsg += " sessionId="
-            disappearMsg += disSid
-            disappearMsg += " draftId="
-            disappearMsg += disDid
-            disappearMsg += " vm.sessionId="
-            disappearMsg += disVSid
-            disappearMsg += " vm.isProcessing="
-            disappearMsg += disProcStr
-            minisLogger.info(disappearMsg)
-        }
+        .onDisappear(perform: handleOnDisappear)
         // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
         // and the transcript editor is NOT open, there is no legitimate keyboard
         // in this subtree — so ignore the keyboard safe-area entirely in that
@@ -1436,6 +1375,72 @@ struct AIChatView: View {
                 }
             }
         }
+    }
+
+    /// Tell the workflow this view is going away — clean up transient state.
+    /// Extracted from inline .onDisappear to keep the view builder lean and
+    /// avoid SwiftUI type-check timeouts on large closure bodies.
+    private func handleOnDisappear() {
+        isChatViewVisible = false
+        // [T-voice-inputbar-collapse-selfheal] The health probe must not
+        // outlive the view — its report would describe a composer that no
+        // longer exists.
+        inputBarHealthProbe?.cancel()
+        inputBarHealthProbe = nil
+        if speechManager.state == .recording {
+            speechManager.stopRecording()
+        }
+        // [T-inputbar-keyboard-leaks-to-home] Cut the ONLY channel by which
+        // chat composer geometry can reach the HOME screen.
+        //
+        // `inputBarHeight` is per-view @State and only feeds the message
+        // list's bottom inset — it cannot touch home. What CAN is a stranded
+        // first responder: leaving the chat while the composer (or the voice
+        // transcript editor) still holds focus leaves the keyboard's inset
+        // reserved on the WINDOW, and SwiftUI's automatic keyboard avoidance
+        // applies that window-wide. The home screen's 新建/搜索 FAB row is a
+        // `.safeAreaInset(edge: .bottom)` (ContentView 1213/1326) with no
+        // `.ignoresSafeArea(.keyboard)` opt-out, so it reads that inflated
+        // bottom safe area and floats upward — the reported symptom. Same
+        // failure class as the offscreen-WebView phantom keyboard (8232308a)
+        // and the voice-editor stranded responder (4c530bf4); this closes the
+        // remaining door, the chat→home transition itself.
+        //
+        // Blanket-disabling keyboard avoidance on the home FAB row would be
+        // the wrong fix — its inline search field legitimately needs to rise
+        // with the keyboard. Releasing the responder at the source is correct
+        // and is a no-op when nothing is focused.
+        inputFocused = false
+        let scenes = UIApplication.shared.connectedScenes
+        let windowScenes: [UIWindowScene] = scenes.compactMap { scene in
+            scene as? UIWindowScene
+        }
+        let allWindows: [UIWindow] = windowScenes.flatMap { ws in
+            ws.windows
+        }
+        let keyWindow = allWindows.first { w in
+            w.isKeyWindow
+        }
+        if let keyWindow, keyWindow.endEditing(true) {
+            AppLogger(category: "InputBarLayout").info("chat onDisappear — released a lingering first responder (would have left a phantom keyboard inset on the window)")
+        }
+        // Capsule auto-shows whenever audio is loaded — no manual activation needed.
+        let disSid = sessionId ?? "nil"
+        let disDid = draftId ?? "nil"
+        let disVmPidStr = String(describing: vm.vmInstanceId)
+        let disVSid = vm.sessionId ?? "nil"
+        let disProcStr = vm.isProcessing ? "true" : "false"
+        var disappearMsg = "🔑DRAFT AIChatView.onDisappear vm="
+        disappearMsg += disVmPidStr
+        disappearMsg += " sessionId="
+        disappearMsg += disSid
+        disappearMsg += " draftId="
+        disappearMsg += disDid
+        disappearMsg += " vm.sessionId="
+        disappearMsg += disVSid
+        disappearMsg += " vm.isProcessing="
+        disappearMsg += disProcStr
+        minisLogger.info(disappearMsg)
     }
 
     /// Tell the workflow this view is alive + showing the right
