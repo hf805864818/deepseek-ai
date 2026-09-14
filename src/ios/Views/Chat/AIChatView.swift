@@ -555,16 +555,7 @@ struct AIChatView: View {
                 .overlay {
                     SessionLockGateOverlay(sessionId: vm.sessionId)
                 }
-                .onChange(of: vm.isLoadingSession) { newValue in
-                    // [SpinnerTrace] Every transition of the
-                    // session-loading overlay logged, so we can confirm
-                    // whether a center-spinner report corresponds to
-                    // this overlay or some other ProgressView in the
-                    // chat.
-                    let spinnerSid = vm.sessionId?.prefix(8) ?? "nil"
-                    let spinnerMsg = "[SpinnerTrace] isLoadingSession → \(newValue) sid=\(spinnerSid) msgs=\(vm.messages.count)"
-                    minisLogger.warning(spinnerMsg)
-                }
+                .onChange(of: vm.isLoadingSession, perform: handleLoadingSessionChange)
 
             // Full-screen kernel boot overlay
             kernelBootOverlay
@@ -737,12 +728,7 @@ struct AIChatView: View {
         // Bridge VM's slash-command "/clear" request into the local @State that
         // drives the confirmation alert above, so the menu and slash-command
         // entry points share one alert instance.
-        .onChange(of: vm.clearChatConfirmRequested) { requested in
-            if requested {
-                showClearChatConfirm = true
-                vm.clearChatConfirmRequested = false
-            }
-        }
+        .onChange(of: vm.clearChatConfirmRequested, perform: handleClearChatConfirmRequest)
         .alert(AppLocalized("Compact Above"), isPresented: Binding(
             get: { compactConfirmMessageId != nil },
             set: { if !$0 { compactConfirmMessageId = nil } }
@@ -785,12 +771,7 @@ struct AIChatView: View {
             handleMarkdownImageTap(note)
         }
         .modifier(DismissImmersiveCoversListener(onDismiss: dismissAllOwnedImmersiveCovers))
-        .onReceive(vm.requestComposerFocusSignal) {
-            // VM fires this after filling the composer programmatically
-            // (e.g. /skill tap) so the keyboard pops up immediately and
-            // the user can keep typing without an extra tap on the field.
-            inputFocused = true
-        }
+        .onReceive(vm.requestComposerFocusSignal, perform: handleComposerFocusRequest)
         .modifier(ChatInputAppendListener(vm: vm, inputFocused: $inputFocused))
         .modifier(RerunFromToolBlockListener(vm: vm))
         .fullScreenCover(item: $previewVideoFile) { fileURL in
@@ -838,21 +819,7 @@ struct AIChatView: View {
         // `.dropFirst()` skips the current value that `@Published` delivers
         // to new subscribers on first attach — without it, a chat view
         // created after a previous OSC capture would re-present a stale URL.
-        .onReceive(MinisOpenURLBroker.shared.$pendingURL.dropFirst().compactMap { $0 }) { url in
-            if MinisOpenURLBroker.isWebScheme(url.scheme) {
-                // Skip when a topmost host wants to present the web preview
-                // itself: ToolLiveSheet (`toolSheetVisible`) or the
-                // full-screen iSH terminal (`terminalVisible`). Otherwise
-                // our sheet fights their presentation and the terminal's
-                // fullScreenCover gets dismissed mid-animation.
-                guard !MinisOpenURLBroker.shared.toolSheetVisible,
-                      !MinisOpenURLBroker.shared.terminalVisible else { return }
-                withAnimation { safariURL = url }
-            } else {
-                _ = handleMinisURLTap(url)
-            }
-            MinisOpenURLBroker.shared.consume()
-        }
+        .onReceive(MinisOpenURLBroker.shared.$pendingURL.dropFirst().compactMap { $0 }, perform: handlePendingURL)
         .sheet(item: $previewHTMLFile) { fileURL in
             MinisHTMLPreviewView(fileURL: fileURL, onExpand: { _ in
                 fullBrowserIsLocal = true
@@ -978,20 +945,9 @@ struct AIChatView: View {
         }
         .onAppear(perform: handleOnAppear)
         .observingQuickActions(modifier: quickActionObserver)
-        .onChange(of: vm.sessionId) { _ in
-            refreshTitlePillSession()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .sessionDidUpdate)) { note in
-            guard let sid = vm.sessionId,
-                  let updatedId = note.object as? String,
-                  updatedId == sid else { return }
-            refreshTitlePillSession()
-        }
-        .onChange(of: shareCoordinator.bufferVersion) { newVersion in
-            // Warm start: user is already in a session when share arrives
-            logShareBufferChange(newVersion: newVersion)
-            injectPendingShareIfNeeded()
-        }
+        .onChange(of: vm.sessionId, perform: handleSessionIdChange)
+        .onReceive(NotificationCenter.default.publisher(for: .sessionDidUpdate), perform: handleSessionDidUpdate)
+        .onChange(of: shareCoordinator.bufferVersion, perform: handleShareBufferChange)
         .onDisappear(perform: handleOnDisappear)
         // [T-voice-bg-fg-gap] Structural immunity: while the voice panel is up
         // and the transcript editor is NOT open, there is no legitimate keyboard
@@ -1240,6 +1196,70 @@ struct AIChatView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.75) {
             withAnimation(.easeInOut(duration: 0.35)) { self.fallbackPulseOpacity = 0 }
         }
+    }
+
+    /// Extracted from `.onChange(of: vm.isLoadingSession)` to keep that closure small
+    /// and avoid the Swift type-checker timing out on a large inline closure.
+    private func handleLoadingSessionChange(_ newValue: Bool) {
+        // [SpinnerTrace] Every transition of the
+        // session-loading overlay logged, so we can confirm
+        // whether a center-spinner report corresponds to
+        // this overlay or some other ProgressView in the
+        // chat.
+        let spinnerSid = vm.sessionId?.prefix(8) ?? "nil"
+        let spinnerMsg = "[SpinnerTrace] isLoadingSession → \(newValue) sid=\(spinnerSid) msgs=\(vm.messages.count)"
+        minisLogger.warning(spinnerMsg)
+    }
+
+    /// Extracted from `.onChange(of: vm.clearChatConfirmRequested)` to keep
+    /// that closure small and avoid the Swift type-checker timing out.
+    private func handleClearChatConfirmRequest(_ requested: Bool) {
+        if requested {
+            showClearChatConfirm = true
+            vm.clearChatConfirmRequested = false
+        }
+    }
+
+    /// Extracted from `.onReceive(vm.requestComposerFocusSignal)` to keep
+    /// that closure small and avoid the Swift type-checker timing out.
+    private func handleComposerFocusRequest() {
+        // VM fires this after filling the composer programmatically
+        // (e.g. /skill tap) so the keyboard pops up immediately and
+        // the user can keep typing without an extra tap on the field.
+        inputFocused = true
+    }
+
+    /// Extracted from `.onReceive(MinisOpenURLBroker.shared.$pendingURL)` to
+    /// keep that closure small and avoid the Swift type-checker timing out.
+    private func handlePendingURL(_ url: URL) {
+        if MinisOpenURLBroker.isWebScheme(url.scheme) {
+            // Skip when a topmost host wants to present the web preview
+            // itself: ToolLiveSheet (`toolSheetVisible`) or the
+            // full-screen iSH terminal (`terminalVisible`). Otherwise
+            // our sheet fights their presentation and the terminal's
+            // fullScreenCover gets dismissed mid-animation.
+            guard !MinisOpenURLBroker.shared.toolSheetVisible,
+                  !MinisOpenURLBroker.shared.terminalVisible else { return }
+            withAnimation { safariURL = url }
+        } else {
+            _ = handleMinisURLTap(url)
+        }
+        MinisOpenURLBroker.shared.consume()
+    }
+
+    /// Extracted from `.onChange(of: vm.sessionId)` to keep that closure small
+    /// and avoid the Swift type-checker timing out.
+    private func handleSessionIdChange(_: String?) {
+        refreshTitlePillSession()
+    }
+
+    /// Extracted from `.onReceive(.sessionDidUpdate)` to keep that closure small
+    /// and avoid the Swift type-checker timing out.
+    private func handleSessionDidUpdate(_ note: Notification) {
+        guard let sid = vm.sessionId,
+              let updatedId = note.object as? String,
+              updatedId == sid else { return }
+        refreshTitlePillSession()
     }
 
     /// Extracted from `.announceChatTurnEnd` closure to keep the inline
@@ -1627,6 +1647,14 @@ struct AIChatView: View {
         shareBufMsg += " hasBuffer="
         shareBufMsg += bvHasBufStr
         minisLogger.info(shareBufMsg)
+    }
+
+    /// Extracted from `.onChange(of: shareCoordinator.bufferVersion)` to keep
+    /// that closure small and avoid the Swift type-checker timing out.
+    private func handleShareBufferChange(_ newVersion: Int) {
+        // Warm start: user is already in a session when share arrives
+        logShareBufferChange(newVersion: newVersion)
+        injectPendingShareIfNeeded()
     }
 
     private func injectPendingShareIfNeeded() {
