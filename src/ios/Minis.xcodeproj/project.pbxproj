@@ -2178,7 +2178,7 @@
 				A11Y0002 /* ChatAccessibilityAnnouncer.swift */,
 				F1W0E100 /* WebLoadError.swift */,
 				A44D403A6D05BD06BBADC1CF /* Voice */,
-							E5DEEP105 /* WorkflowProgressView.swift */,
+				E5DEEP105 /* WorkflowProgressView.swift */,
 				E5DEEP108 /* DeepModeBanners.swift */,
 				E5SUB102 /* SubagentCard.swift */,
 			);
