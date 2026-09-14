@@ -2472,47 +2472,11 @@ struct AIChatView: View {
     }
 
     // MARK: - Kernel Boot Overlay
-
-    private var kernelBootOverlay: AnyView {
-        AnyView(Group {
-            switch vm.kernelStatus {
-            case .booting:
-                ZStack {
-                    ChatColors.background
-                        .ignoresSafeArea()
-                    VStack(spacing: 16) {
-                        // Same three-dot language as SessionLoadingCard — this
-                        // overlay can appear right after the loading card on a
-                        // cold entry, so a system spinner here read as "the old
-                        // 菊花 came back".
-                        LoadingDotsView(dotSize: 9, color: ChatColors.secondaryText)
-                            .frame(height: 20)
-                        Text("Booting Kernel")
-                            .font(.subheadline)
-                            .foregroundStyle(ChatColors.secondaryText)
-                    }
-                }
-                .transition(.opacity)
-            case .failed(let msg):
-                ZStack {
-                    ChatColors.background
-                        .ignoresSafeArea()
-                    VStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .font(.title2)
-                            .foregroundStyle(.red)
-                        Text(msg)
-                            .font(.subheadline)
-                            .foregroundStyle(.red)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 40)
-                    }
-                }
-                .transition(.opacity)
-            default:
-                EmptyView()
-            }
-        })
+    /// [T-ios-runtime-demangle-watchdog] Full-screen kernel boot overlay,
+    /// extracted to `KernelBootOverlayView` top-level struct in
+    /// ChatOverlays.swift to cut the type tree at a struct boundary.
+    private var kernelBootOverlay: some View {
+        KernelBootOverlayView(status: vm.kernelStatus)
     }
 
     // MARK: - Error Banner

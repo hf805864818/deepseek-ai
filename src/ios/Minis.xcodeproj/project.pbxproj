@@ -34,6 +34,7 @@
 		E5DEEP005 /* WorkflowProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP105 /* WorkflowProgressView.swift */; };
 		E5DEEP008 /* DeepModeBanners.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP108 /* DeepModeBanners.swift */; };
 		E5MSG001 /* MessagesAreaView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5MSG101 /* MessagesAreaView.swift */; };
+		E5OVL001 /* ChatOverlays.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5OVL101 /* ChatOverlays.swift */; };
 		E5DEEP006 /* VerifyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP106 /* VerifyGate.swift */; };
 		E5DEEP007 /* ClarifyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP107 /* ClarifyGate.swift */; };
 		E5EP0001 /* EnvProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5EP0011 /* EnvProfileStore.swift */; };
@@ -623,6 +624,7 @@
 		E5DEEP105 /* WorkflowProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkflowProgressView.swift; sourceTree = "<group>"; };
 		E5DEEP108 /* DeepModeBanners.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeBanners.swift; sourceTree = "<group>"; };
 		E5MSG101 /* MessagesAreaView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesAreaView.swift; sourceTree = "<group>"; };
+		E5OVL101 /* ChatOverlays.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatOverlays.swift; sourceTree = "<group>"; };
 		E5DEEP106 /* VerifyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerifyGate.swift; sourceTree = "<group>"; };
 		E5DEEP107 /* ClarifyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClarifyGate.swift; sourceTree = "<group>"; };
 		E5EP0011 /* EnvProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvProfileStore.swift; sourceTree = "<group>"; };
@@ -2183,6 +2185,7 @@
 				E5DEEP105 /* WorkflowProgressView.swift */,
 				E5DEEP108 /* DeepModeBanners.swift */,
 				E5MSG101 /* MessagesAreaView.swift */,
+				E5OVL101 /* ChatOverlays.swift */,
 				E5SUB102 /* SubagentCard.swift */,
 			);
 			path = Chat;
@@ -2683,6 +2686,7 @@
 				E5DEEP005 /* WorkflowProgressView.swift in Sources */,
 				E5DEEP008 /* DeepModeBanners.swift in Sources */,
 				E5MSG001 /* MessagesAreaView.swift in Sources */,
+				E5OVL001 /* ChatOverlays.swift in Sources */,
 				E5DEEP006 /* VerifyGate.swift in Sources */,
 				E5DEEP007 /* ClarifyGate.swift in Sources */,
 				GD0000000A /* GoogleDriveOAuthManager.swift in Sources */,
