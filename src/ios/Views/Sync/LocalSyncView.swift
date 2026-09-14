@@ -91,21 +91,21 @@ struct LocalSyncView: View {
                 backupsSection
             }
         }
-        .navigationTitle(String(localized: "Local Sync", comment: "Navigation title for local sync settings"))
+        .navigationTitle(AppLocalized("Local Sync", comment: "Navigation title for local sync settings"))
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if syncManager.hasDestination {
                 loadBackups()
             }
         }
-        .alert(String(localized: "Error", comment: "Error alert title"), isPresented: $showError) {
-            Button(String(localized: "OK", comment: "Error alert confirm button"), role: .cancel) {}
+        .alert(AppLocalized("Error", comment: "Error alert title"), isPresented: $showError) {
+            Button(AppLocalized("OK", comment: "Error alert confirm button"), role: .cancel) {}
         } message: {
-            Text(errorMessage ?? String(localized: "An unknown error occurred.", comment: "Generic error message"))
+            Text(errorMessage ?? AppLocalized("An unknown error occurred.", comment: "Generic error message"))
         }
-        .alert(String(localized: "Restore Backup?", comment: "Restore confirmation alert title"), isPresented: $showRestoreConfirm) {
-            Button(String(localized: "Cancel", comment: "Restore confirmation cancel button"), role: .cancel) {}
-            Button(String(localized: "Restore", comment: "Restore confirmation confirm button")) {
+        .alert(AppLocalized("Restore Backup?", comment: "Restore confirmation alert title"), isPresented: $showRestoreConfirm) {
+            Button(AppLocalized("Cancel", comment: "Restore confirmation cancel button"), role: .cancel) {}
+            Button(AppLocalized("Restore", comment: "Restore confirmation confirm button")) {
                 if let backup = restoreBackup {
                     performRestore(from: backup)
                 }
@@ -113,7 +113,7 @@ struct LocalSyncView: View {
         } message: {
             if let backup = restoreBackup {
                 Text(String.localizedStringWithFormat(
-                    String(localized: "This will overwrite files in the app's documents directory with the contents of \"%@\". This cannot be undone.",
+                    AppLocalized("This will overwrite files in the app's documents directory with the contents of \"%@\". This cannot be undone.",
                            comment: "Restore confirmation message with file name"),
                     backup.name
                 ))
@@ -177,7 +177,7 @@ struct LocalSyncView: View {
                 HStack {
                     settingsIcon("folder.fill", color: .green)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(String(localized: "Folder Selected", comment: "Local sync destination selected status"))
+                        Text(AppLocalized("Folder Selected", comment: "Local sync destination selected status"))
                             .font(.subheadline)
                         if let name = syncManager.destinationName {
                             Text(name)
@@ -189,7 +189,7 @@ struct LocalSyncView: View {
                     Button {
                         showFolderPicker = true
                     } label: {
-                        Text(String(localized: "Change", comment: "Local sync change folder button"))
+                        Text(AppLocalized("Change", comment: "Local sync change folder button"))
                     }
                     .buttonStyle(.plain)
                 }
@@ -197,7 +197,7 @@ struct LocalSyncView: View {
                     syncManager.clearDestination()
                     backups = []
                 } label: {
-                    Text(String(localized: "Clear Folder", comment: "Local sync clear folder button"))
+                    Text(AppLocalized("Clear Folder", comment: "Local sync clear folder button"))
                 }
                 .buttonStyle(.plain)
             } else {
@@ -206,7 +206,7 @@ struct LocalSyncView: View {
                 } label: {
                     HStack {
                         settingsIcon("folder.badge.plus", color: .green)
-                        Text(String(localized: "Choose Folder", comment: "Local sync choose folder button"))
+                        Text(AppLocalized("Choose Folder", comment: "Local sync choose folder button"))
                             .foregroundStyle(Color.primary)
                         Spacer()
                         Image(systemName: "chevron.right")
@@ -217,9 +217,9 @@ struct LocalSyncView: View {
                 .buttonStyle(.plain)
             }
         } header: {
-            Text(String(localized: "Destination", comment: "Local sync destination section header"))
+            Text(AppLocalized("Destination", comment: "Local sync destination section header"))
         } footer: {
-            Text(String(localized: "Pick a folder in the Files app. Backups are saved there as ZIP files and persist even if the app is uninstalled.",
+            Text(AppLocalized("Pick a folder in the Files app. Backups are saved there as ZIP files and persist even if the app is uninstalled.",
                          comment: "Local sync destination footer"))
         }
     }
@@ -232,20 +232,20 @@ struct LocalSyncView: View {
             if syncManager.hasDestination {
                 if let date = syncManager.lastSyncDate {
                     HStack {
-                        Text(String(localized: "Last Synced", comment: "Last sync time label"))
+                        Text(AppLocalized("Last Synced", comment: "Last sync time label"))
                         Spacer()
                         Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
                             .foregroundStyle(.secondary)
                     }
                 }
                 HStack {
-                    Text(String(localized: "Backups", comment: "Backup count label"))
+                    Text(AppLocalized("Backups", comment: "Backup count label"))
                     Spacer()
                     Text("\(syncManager.backupCount)")
                         .foregroundStyle(.secondary)
                 }
                 HStack {
-                    Text(String(localized: "Total Size", comment: "Total backup size label"))
+                    Text(AppLocalized("Total Size", comment: "Total backup size label"))
                     Spacer()
                     Text(formatSize(syncManager.totalBackupSize))
                         .foregroundStyle(.secondary)
@@ -261,14 +261,14 @@ struct LocalSyncView: View {
                 HStack {
                     settingsIcon("arrow.up.circle.fill", color: .blue)
                     if syncManager.isBackingUp {
-                        Text(String(localized: "Backing Up...", comment: "Backup in progress status"))
+                        Text(AppLocalized("Backing Up...", comment: "Backup in progress status"))
                             .foregroundStyle(Color.primary)
                     } else {
-                        Text(String(localized: "Backup Now", comment: "Backup now button"))
+                        Text(AppLocalized("Backup Now", comment: "Backup now button"))
                             .foregroundStyle(Color.primary)
                         Spacer()
                         if !syncManager.hasDestination {
-                            Text(String(localized: "Choose Folder", comment: "Hint shown when no destination is set"))
+                            Text(AppLocalized("Choose Folder", comment: "Hint shown when no destination is set"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -291,13 +291,13 @@ struct LocalSyncView: View {
                     HStack {
                         settingsIcon("arrow.down.circle.fill", color: .green)
                         if syncManager.isRestoring {
-                            Text(String(localized: "Restoring...", comment: "Restore in progress status"))
+                            Text(AppLocalized("Restoring...", comment: "Restore in progress status"))
                                 .foregroundStyle(Color.primary)
                             Spacer()
                             ProgressView()
                                 .controlSize(.small)
                         } else {
-                            Text(String(localized: "Restore from Latest", comment: "Restore from latest backup button"))
+                            Text(AppLocalized("Restore from Latest", comment: "Restore from latest backup button"))
                                 .foregroundStyle(Color.primary)
                         }
                     }
@@ -306,10 +306,10 @@ struct LocalSyncView: View {
                 .disabled(syncManager.isBackingUp || syncManager.isRestoring)
             }
         } header: {
-            Text(String(localized: "Sync", comment: "Local sync section header"))
+            Text(AppLocalized("Sync", comment: "Local sync section header"))
         } footer: {
             if !syncManager.hasDestination {
-                Text(String(localized: "Tap \"Backup Now\" to choose a folder and export your data.",
+                Text(AppLocalized("Tap \"Backup Now\" to choose a folder and export your data.",
                              comment: "Local sync footer when no destination is set"))
             }
         }
@@ -332,13 +332,13 @@ struct LocalSyncView: View {
             )) {
                 HStack {
                     settingsIcon("arrow.triangle.2.circlepath", color: .orange)
-                    Text(String(localized: "Auto Sync", comment: "Auto sync toggle label"))
+                    Text(AppLocalized("Auto Sync", comment: "Auto sync toggle label"))
                 }
             }
         } header: {
-            Text(String(localized: "Auto Sync", comment: "Auto sync section header"))
+            Text(AppLocalized("Auto Sync", comment: "Auto sync section header"))
         } footer: {
-            Text(String(localized: "Automatically backs up your data to the selected folder every 4 hours when the app is running.",
+            Text(AppLocalized("Automatically backs up your data to the selected folder every 4 hours when the app is running.",
                          comment: "Local auto sync description footer"))
         }
     }
@@ -352,13 +352,13 @@ struct LocalSyncView: View {
                     Spacer()
                     ProgressView()
                         .controlSize(.small)
-                    Text(String(localized: "Loading backups...", comment: "Loading backups status"))
+                    Text(AppLocalized("Loading backups...", comment: "Loading backups status"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
                 }
             } else if backups.isEmpty {
-                Text(String(localized: "No backups yet. Tap \"Backup Now\" to create one.",
+                Text(AppLocalized("No backups yet. Tap \"Backup Now\" to create one.",
                              comment: "Empty backups state message"))
                     .foregroundStyle(.secondary)
                     .font(.callout)
@@ -395,13 +395,13 @@ struct LocalSyncView: View {
                         Button(role: .destructive) {
                             performDelete(backup)
                         } label: {
-                            Label(String(localized: "Delete", comment: "Delete backup swipe action"), systemImage: "trash")
+                            Label(AppLocalized("Delete", comment: "Delete backup swipe action"), systemImage: "trash")
                         }
                     }
                 }
             }
         } header: {
-            Text(String(localized: "Backups", comment: "Backups list section header"))
+            Text(AppLocalized("Backups", comment: "Backups list section header"))
         }
     }
 
@@ -434,20 +434,20 @@ struct LocalSyncView: View {
 
         case .collecting:
             capsuleIcon = .spinner
-            capsuleMessage = String(localized: "Collecting data…", comment: "Capsule: collecting data phase")
+            capsuleMessage = AppLocalized("Collecting data…", comment: "Capsule: collecting data phase")
             withAnimation(.easeInOut(duration: 0.3)) { showCapsule = true }
 
         case .packaging:
             capsuleIcon = .spinner
-            capsuleMessage = String(localized: "Packaging data…", comment: "Capsule: packaging data phase")
+            capsuleMessage = AppLocalized("Packaging data…", comment: "Capsule: packaging data phase")
 
         case .saving:
             capsuleIcon = .spinner
-            capsuleMessage = String(localized: "Saving backup…", comment: "Capsule: saving backup phase")
+            capsuleMessage = AppLocalized("Saving backup…", comment: "Capsule: saving backup phase")
 
         case .done:
             capsuleIcon = .success
-            capsuleMessage = String(localized: "Backup complete!", comment: "Capsule: backup done")
+            capsuleMessage = AppLocalized("Backup complete!", comment: "Capsule: backup done")
             // Auto-dismiss after 2 seconds, then reset the phase.
             Task {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -459,7 +459,7 @@ struct LocalSyncView: View {
 
         case .error:
             capsuleIcon = .failure
-            capsuleMessage = String(localized: "Backup failed", comment: "Capsule: backup error")
+            capsuleMessage = AppLocalized("Backup failed", comment: "Capsule: backup error")
             Task {
                 try? await Task.sleep(nanoseconds: 2_500_000_000)
                 await MainActor.run {
@@ -532,22 +532,22 @@ struct LocalSyncView: View {
     private func formatSize(_ bytes: Int64) -> String {
         if bytes >= 1_073_741_824 {
             return String.localizedStringWithFormat(
-                String(localized: "%.1f GB", comment: "Gigabytes size format"),
+                AppLocalized("%.1f GB", comment: "Gigabytes size format"),
                 Double(bytes) / 1_073_741_824
             )
         } else if bytes >= 1_048_576 {
             return String.localizedStringWithFormat(
-                String(localized: "%.1f MB", comment: "Megabytes size format"),
+                AppLocalized("%.1f MB", comment: "Megabytes size format"),
                 Double(bytes) / 1_048_576
             )
         } else if bytes >= 1024 {
             return String.localizedStringWithFormat(
-                String(localized: "%.1f KB", comment: "Kilobytes size format"),
+                AppLocalized("%.1f KB", comment: "Kilobytes size format"),
                 Double(bytes) / 1024
             )
         } else {
             return String.localizedStringWithFormat(
-                String(localized: "%lld B", comment: "Bytes size format"),
+                AppLocalized("%lld B", comment: "Bytes size format"),
                 bytes
             )
         }

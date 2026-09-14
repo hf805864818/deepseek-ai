@@ -124,14 +124,14 @@ struct ModelGroupsView: View {
                         showCreateGroup = true
                         newGroupName = ""
                     } label: {
-                        Label(String(localized: "New Group"), systemImage: "plus")
+                        Label(AppLocalized("New Group"), systemImage: "plus")
                     }
                     if #available(iOS 17.0, *), iCloudSyncEnabled {
                         Divider()
                         Button {
                             Task { await forceSyncGroups() }
                         } label: {
-                            Label(String(localized: "Force iCloud Sync"),
+                            Label(AppLocalized("Force iCloud Sync"),
                                   systemImage: "arrow.triangle.2.circlepath.icloud")
                         }
                     }
@@ -192,7 +192,7 @@ struct ModelGroupsView: View {
     private func forceSyncGroups() async {
         _ = await ForceSyncHelper.markProvidersDirty()
         await ForceSyncHelper.bidirectionalSync(recordTypes: ["ProviderConfig", "ProviderConfigV2"])
-        forceSyncToast = String(localized: "Syncing model groups via iCloud")
+        forceSyncToast = AppLocalized("Syncing model groups via iCloud")
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             forceSyncToast = nil
         }
@@ -215,7 +215,7 @@ private struct GroupRow: View {
 
     private var memberSummary: String {
         let entries = group.memberEntryIds.compactMap { store.entry(for: $0) }
-        if entries.isEmpty { return String(localized: "No models") }
+        if entries.isEmpty { return AppLocalized("No models") }
         let names = entries.prefix(3).map(\.model.displayName)
         let suffix = entries.count > 3 ? " +\(entries.count - 3)" : ""
         return names.joined(separator: ", ") + suffix
@@ -258,35 +258,35 @@ private struct GroupRow: View {
         case .videoOutput:
             Image(systemName: "video.badge.plus")
                 .font(.caption).foregroundStyle(.tint)
-                .accessibilityLabel(String(localized: "Video generation"))
+                .accessibilityLabel(AppLocalized("Video generation"))
         case .imageOutput:
             Image(systemName: "photo.badge.plus")
                 .font(.caption).foregroundStyle(.tint)
-                .accessibilityLabel(String(localized: "Image generation"))
+                .accessibilityLabel(AppLocalized("Image generation"))
         case .audioOutput:
             Image(systemName: "speaker.wave.2")
                 .font(.caption).foregroundStyle(.tint)
-                .accessibilityLabel(String(localized: "Speech output"))
+                .accessibilityLabel(AppLocalized("Speech output"))
         case .audioInput:
             Image(systemName: "waveform.badge.mic")
                 .font(.caption).foregroundStyle(.secondary)
-                .accessibilityLabel(String(localized: "Speech transcription"))
+                .accessibilityLabel(AppLocalized("Speech transcription"))
         case .videoInput:
             Image(systemName: "video")
                 .font(.caption).foregroundStyle(.secondary)
-                .accessibilityLabel(String(localized: "Video input"))
+                .accessibilityLabel(AppLocalized("Video input"))
         case .imageInput:
             Image(systemName: "photo")
                 .font(.caption).foregroundStyle(.secondary)
-                .accessibilityLabel(String(localized: "Image input"))
+                .accessibilityLabel(AppLocalized("Image input"))
         case .pdfInput:
             Image(systemName: "doc")
                 .font(.caption).foregroundStyle(.secondary)
-                .accessibilityLabel(String(localized: "PDF input"))
+                .accessibilityLabel(AppLocalized("PDF input"))
         case .textOutput:
             Image(systemName: "text.alignleft")
                 .font(.caption).foregroundStyle(.secondary)
-                .accessibilityLabel(String(localized: "Text generation"))
+                .accessibilityLabel(AppLocalized("Text generation"))
         default:
             EmptyView()
         }
@@ -323,14 +323,14 @@ private struct GroupRow: View {
                     Text("·")
                         .font(.caption)
                         .foregroundStyle(.quaternary)
-                    Text(group.fallbackStrategy == .always ? String(localized: "Always") : String(localized: "Default"))
+                    Text(group.fallbackStrategy == .always ? AppLocalized("Always") : AppLocalized("Default"))
                         .font(.caption)
                         .foregroundStyle(group.fallbackStrategy == .always ? .orange : .secondary)
                 }
                 Text("·")
                     .font(.caption)
                     .foregroundStyle(.quaternary)
-                Text(String(localized: "\(group.memberEntryIds.count) models"))
+                Text(AppLocalized("\(group.memberEntryIds.count) models"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

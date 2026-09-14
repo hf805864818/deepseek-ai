@@ -1059,7 +1059,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             logger.info("[CrossSession] C14: active project context saved")
         }
         planGateState = .idle
-        inputText = String(localized: "计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
+        inputText = AppLocalized("计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
         send()
         // [T-deep-mode-workflow] `send()` can early-return before committing
         // (context near/exhausted shows a dialog, read-only mode, still
@@ -4491,6 +4491,88 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         launchRerunAgentLoop(label: "retryFromMessage")
     }
 
+    /// Delete the selected user message and every message after it.
+    ///
+    /// Truncation rules are the same as retry — the anchor must be a user
+    /// bubble, and history is trimmed by user-bubble count rather than array
+    /// index, so tool_use/tool_result pairs stay intact.
+    ///
+    /// The one difference from retry: the anchor user message is removed too
+    /// (`keepUpTo - 1`), so the surviving history ends on the PREVIOUS
+    /// assistant turn — still a valid, self-consistent context.
+    func deleteFromMessage(_ messageId: UUID) {
+        guard !isProcessing else { return }
+        // Same truncation guard as retry: a deferred iCloud-sync reload landing
+        // mid-truncation would rebuild `messages` from a stale DB snapshot and
+        // resurrect the rows we are deleting. Unlike retry there is no
+        // `isProcessing = true` afterwards to keep suppressing reloads, so this
+        // flag must stay set until the DB delete has actually committed.
+        isTruncatingForRetry = true
+        canResume = false
+        userDidCancel = false
+        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
+              messages[idx].role == .user else {
+            isTruncatingForRetry = false
+            return
+        }
+
+        let deletedCount = messages.count - idx
+
+        // Remove the selected user message AND everything after it.
+        messages.removeSubrange(idx...)
+        // [T-ios-retry-ui-clear] Force a top-level publish so the cells clear on
+        // this tick; the $messages sink alone fires off-tick.
+        if !transitionSuspended { objectWillChange.send() }
+
+        // Anchor in agentHistory by user-bubble count, exactly as retry does.
+        // `messages` is already truncated, so its remaining .user rows are
+        // precisely the bubbles that must survive; the deleted bubble is the
+        // (keepUserCount + 1)-th one in agentHistory, and we keep everything
+        // strictly before it.
+        // The bubble being deleted is the (keepUserCount + 1)-th in
+        // agentHistory. Find its index and keep everything strictly before it;
+        // that index IS the cut point whether or not more bubbles follow.
+        let keepUserCount = messages.filter { $0.role == .user }.count
+        var usersSeen = 0
+        var keepUpTo = -1  // index of the last agentHistory entry to keep
+        var anchorFound = false
+        for (i, entry) in agentHistory.enumerated() where Self.isUserBubbleEntry(entry) {
+            usersSeen += 1
+            if usersSeen == keepUserCount + 1 {
+                keepUpTo = i - 1
+                anchorFound = true
+                break
+            }
+        }
+        // [T-ios-retry-anchor-synthetic-user] Fail OPEN on a UI↔history
+        // mismatch, same as retry: keep the full history rather than silently
+        // nuking the session. The UI + DB still truncate, so the worst case is
+        // an over-long context, not a corrupt one. Deleting the FIRST user
+        // bubble legitimately yields keepUpTo = -1 with anchorFound = true —
+        // that clears the whole history and is not an error.
+        if !anchorFound {
+            logger.error("[DeleteDiag] deleteFromMessage anchor NOT FOUND (keepUserCount=\(keepUserCount), history=\(self.agentHistory.count)) — keeping full history")
+            keepUpTo = agentHistory.count - 1
+        }
+        if keepUpTo + 1 < agentHistory.count {
+            agentHistory.removeSubrange((keepUpTo + 1)...)
+        }
+
+        logger.info("[DeleteDiag] deleteFromMessage idx=\(idx) deleted=\(deletedCount) messagesLeft=\(self.messages.count) historyLeft=\(self.agentHistory.count)")
+
+        let persistedKeepCount = agentHistory.count
+        if let sessionId {
+            Task { @MainActor [weak self] in
+                await ChatStore.shared.deleteMessagesAfter(sessionId: sessionId, keepCount: persistedKeepCount)
+                self?.isTruncatingForRetry = false
+            }
+        } else {
+            isTruncatingForRetry = false
+        }
+
+        rebuildToolSnapshotsFromMessages()
+    }
+
     /// Rebuild `toolSnapshots` to only those still referenced by a tool_use
     /// block in the (post-truncation) messages list. Shared by the user-
     /// message retry path and the tool-block re-run path.
@@ -5792,7 +5874,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // Resolve provider from ProviderConfigStore
         guard let entry = resolveCurrentEntry() else {
             let errMsg = ChatMessage(role: .assistant, content: "", blocks: [])
-            errMsg.error = String(localized: "No model configured. Add a provider in Settings.")
+            errMsg.error = AppLocalized("No model configured. Add a provider in Settings.")
             messages.append(errMsg)
             return
         }
@@ -6247,7 +6329,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 fallthrough
             case .exhausted:
                 logger.info("[Context] In-loop exhausted — stopping loop with resumable notice (turnCount=\(turnCount))")
-                appendSystemInfo(String(localized: "Context is full and could not be compacted further. Start a new session or clear the chat to continue."), icon: "exclamationmark.triangle")
+                appendSystemInfo(AppLocalized("Context is full and could not be compacted further. Start a new session or clear the chat to continue."), icon: "exclamationmark.triangle")
                 canResume = true
                 hitTurnLimit = false
                 break loopLabel
@@ -6434,7 +6516,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                         msgIdx = resynced
                         let trailLines = fallbackReasons.map { "⚠️ \($0.model) (\($0.instance)): \($0.reason)" }
                         let instanceLabel = ProviderConfigStore.shared.instance(for: newEntry.providerInstanceId)?.label ?? newEntry.model.provider
-                        let noticeText = trailLines.joined(separator: "\n") + "\n" + String(localized: "Switched to \(newEntry.model.displayName) (\(instanceLabel))")
+                        let noticeText = trailLines.joined(separator: "\n") + "\n" + AppLocalized("Switched to \(newEntry.model.displayName) (\(instanceLabel))")
                         let infoBlock = AssistantBlock(kind: .info, content: noticeText)
                         messages[msgIdx].blocks.insert(infoBlock, at: 0)
                         fallbackReasons.removeAll()
@@ -6918,14 +7000,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     // distinguish the wording so a partial reply reads as truncated
                     // rather than empty.
                     if assistantText.isEmpty {
-                        messages[msgIdx].error = String(localized: "Response ended unexpectedly (no content received)")
+                        messages[msgIdx].error = AppLocalized("Response ended unexpectedly (no content received)")
                     } else {
-                        messages[msgIdx].error = String(localized: "The connection dropped — this reply may be incomplete. Tap Resume to continue.")
+                        messages[msgIdx].error = AppLocalized("The connection dropped — this reply may be incomplete. Tap Resume to continue.")
                     }
                     canResume = true
                 } else if stopReason == .maxTokens {
                     logger.warning("Agent loop ended at max_tokens with no tool calls")
-                    messages[msgIdx].error = String(localized: "Response truncated (max tokens reached)")
+                    messages[msgIdx].error = AppLocalized("Response truncated (max tokens reached)")
                     canResume = true
                 } else if stopReason == .refusal {
                     // [T-ios-fable5-empty-response] Anthropic safety classifier declined the
@@ -6937,7 +7019,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     // identical request just gets declined again, so we surface it directly
                     // and steer the user to switch models rather than looping.
                     logger.warning("Agent loop ended with stop_reason=refusal — model declined the request")
-                    messages[msgIdx].error = String(localized: "The model declined to respond to this request. Try rephrasing, or switch to a different model.")
+                    messages[msgIdx].error = AppLocalized("The model declined to respond to this request. Try rephrasing, or switch to a different model.")
                     canResume = true
                 } else if stopReason == .endTurn && assistantText.isEmpty
                             && (streamResult.reasoningContent ?? "").isEmpty {
@@ -6957,9 +7039,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     let maxCtx = effectiveContextWindow(for: freshModel)
                     let curCtx = estimateContextTokens()
                     if maxCtx > 0 && curCtx > Int(Double(maxCtx) * 0.7) {
-                        messages[msgIdx].error = String(localized: "The model returned an empty response. The conversation context may be too large — try compacting or starting a new session.")
+                        messages[msgIdx].error = AppLocalized("The model returned an empty response. The conversation context may be too large — try compacting or starting a new session.")
                     } else {
-                        messages[msgIdx].error = String(localized: "Model returned an empty response. Please try again or switch models.")
+                        messages[msgIdx].error = AppLocalized("Model returned an empty response. Please try again or switch models.")
                     }
                     canResume = true
                 }
@@ -7325,7 +7407,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 // Show a warning and enable Resume so the user can continue.
                 if stopReason == .maxTokens {
                     logger.warning("Agent loop stopped: max_tokens reached")
-                    messages[msgIdx].error = String(localized: "Response truncated (max tokens reached)")
+                    messages[msgIdx].error = AppLocalized("Response truncated (max tokens reached)")
                     canResume = true
                 }
                 // [T-stream-drop-silent] nil stopReason after tool turns means the
@@ -7335,9 +7417,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 if stopReason == nil && toolEntries.isEmpty {
                     logger.warning("Agent loop stopped: stream ended without stop reason")
                     if assistantText.isEmpty {
-                        messages[msgIdx].error = String(localized: "Response ended unexpectedly (no content received)")
+                        messages[msgIdx].error = AppLocalized("Response ended unexpectedly (no content received)")
                     } else {
-                        messages[msgIdx].error = String(localized: "The connection dropped — this reply may be incomplete. Tap Resume to continue.")
+                        messages[msgIdx].error = AppLocalized("The connection dropped — this reply may be incomplete. Tap Resume to continue.")
                     }
                     canResume = true
                 }

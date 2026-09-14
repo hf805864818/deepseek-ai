@@ -298,7 +298,7 @@ class ISHTerminalViewModel: ObservableObject {
         if ISHKernel.shared.isBooted && RootfsManager.shared.didResetWhileBooted {
             isShellStarted = false
             logger.warning("[StartShell] rootfs was reset this session; refusing to reuse stale kernel mount")
-            let msg = "\r\n" + String(localized: "The Linux environment was reset. Please restart the app to reinstall it before using the terminal.") + "\r\n"
+            let msg = "\r\n" + AppLocalized("The Linux environment was reset. Please restart the app to reinstall it before using the terminal.") + "\r\n"
             if let data = msg.data(using: .utf8) {
                 emulator.feed(data)
             }

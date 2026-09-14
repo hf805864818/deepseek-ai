@@ -80,5 +80,5 @@ func AppLocalized(_ resource: LocalizedStringResource) -> String {
     // A LocalizedStringResource carries its own bundle reference, so it cannot
     // be re-pointed the way a literal key can. Resolve it as-is rather than
     // pretending the override applies.
-    String(localized: resource)
+    AppLocalized(resource)
 }

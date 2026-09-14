@@ -41,8 +41,8 @@ struct SwipeToSendHint: View {
                     .foregroundStyle(chipFg, chipBg)
                     .shadow(color: Color.black.opacity(0.18), radius: 6, y: 2)
                 Text(isEnqueue
-                     ? String(localized: "Release to queue")
-                     : String(localized: "Release to send"))
+                     ? AppLocalized("Release to queue")
+                     : AppLocalized("Release to send"))
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(chipFg)
                     .padding(.horizontal, 14)
@@ -172,30 +172,28 @@ struct InputAttachmentGridView: View {
     @State private var draggingID: UUID?
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(attachments) { attachment in
-                    AttachmentChip(attachment: attachment) {
-                        onRemove(attachment)
-                    }
-                    .opacity(draggingID == attachment.id ? 0.4 : 1)
-                    .onDrag {
-                        draggingID = attachment.id
-                        return NSItemProvider(object: attachment.id.uuidString as NSString)
-                    }
-                    .onDrop(of: [.text], delegate: AttachmentDropDelegate(
-                        targetID: attachment.id,
-                        draggingID: $draggingID,
-                        onMove: onMove
-                    ))
+        FlowLayout(hSpacing: 8, vSpacing: 8) {
+            ForEach(attachments) { attachment in
+                AttachmentChip(attachment: attachment) {
+                    onRemove(attachment)
                 }
-                ForEach(0..<loadingVideoCount, id: \.self) { _ in
-                    VideoLoadingChip()
+                .opacity(draggingID == attachment.id ? 0.4 : 1)
+                .onDrag {
+                    draggingID = attachment.id
+                    return NSItemProvider(object: attachment.id.uuidString as NSString)
                 }
+                .onDrop(of: [.text], delegate: AttachmentDropDelegate(
+                    targetID: attachment.id,
+                    draggingID: $draggingID,
+                    onMove: onMove
+                ))
             }
-            .padding(.top, 6)  // room for × button overhang (offset y: -4)
+            ForEach(0..<loadingVideoCount, id: \.self) { _ in
+                VideoLoadingChip()
+            }
         }
         .padding(.horizontal, 16)
+        .padding(.top, 6)  // room for × button overhang (offset y: -4)
     }
 }
 
@@ -325,7 +323,6 @@ private struct AttachmentChip: View {
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.5), radius: 2)
             }
-            .buttonStyle(.plain)
             .offset(x: 4, y: -4)
         }
         .fixedSize()
@@ -364,7 +361,6 @@ private struct AttachmentChip: View {
                         .foregroundStyle(.white)
                         .shadow(color: .black.opacity(0.5), radius: 2)
                 }
-                .buttonStyle(.plain)
                 .offset(x: 4, y: -4)
             }
             .fixedSize()
@@ -462,7 +458,6 @@ private struct AttachmentChip: View {
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.4), radius: 2)
             }
-            .buttonStyle(.plain)
             .offset(x: 4, y: -4)
         }
         .fixedSize()
@@ -1233,7 +1228,7 @@ class PastableUITextView: UITextView, UIDropInteractionDelegate {
         super.buildMenu(with: builder)
         if UserDefaults.standard.integer(forKey: "returnKeyBehavior") == 1 {
             let insert = UICommand(
-                title: String(localized: "Insert Line Break"),
+                title: AppLocalized("Insert Line Break"),
                 image: UIImage(systemName: "return"),
                 action: #selector(insertLineBreakFromMenu(_:))
             )

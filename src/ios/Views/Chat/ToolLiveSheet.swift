@@ -524,7 +524,6 @@ struct ToolLiveSheet: View {
                         .background(ChatColors.secondaryBg)
                         .clipShape(Circle())
                 }
-                .buttonStyle(.plain)
 
                 Spacer()
 
@@ -556,7 +555,6 @@ struct ToolLiveSheet: View {
                         .background(ChatColors.secondaryBg)
                         .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else if case .browserTool = block.kind, browserPool != nil {
                     Button { activeSheet = .takeoverBrowser } label: {
                         toolIcon
@@ -566,7 +564,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else if case .fileWriteTool = block.kind {
                     Button {
                         let text = block.streamingFileContent
@@ -583,7 +580,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else if case .fileReadTool = block.kind {
                     Button {
                         UIPasteboard.general.string = block.content
@@ -597,7 +593,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else if case .fileEditTool = block.kind {
                     Button {
                         let editStrings = extractEditStrings()
@@ -613,7 +608,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else if case .readImageTool = block.kind {
                     Button {
                         if let path = block.imageFilePath, let img = UIImage(contentsOfFile: path) {
@@ -629,7 +623,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else if case .memoryTool = block.kind {
                     Button {
                         let text = memoryWriteContentFromArgs() ?? block.content
@@ -644,7 +637,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 } else {
                     Button { showTerminal = true } label: {
                         toolIcon
@@ -654,7 +646,6 @@ struct ToolLiveSheet: View {
                             .background(ChatColors.secondaryBg)
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
                 }
             }
 
@@ -1219,9 +1210,9 @@ struct ToolLiveSheet: View {
                                 // cancelled → "Cancelled".
                                 let (label, labelColor): (String, Color) = {
                                     switch block.toolStatus {
-                                    case .failed:    return (String(localized: "Failed to edit"), .red)
-                                    case .cancelled: return (String(localized: "Cancelled"),     .orange)
-                                    default:         return (String(localized: "Edited"),        Color(UIColor.label))
+                                    case .failed:    return (AppLocalized("Failed to edit"), .red)
+                                    case .cancelled: return (AppLocalized("Cancelled"),     .orange)
+                                    default:         return (AppLocalized("Edited"),        Color(UIColor.label))
                                     }
                                 }()
                                 let isFailure: Bool = {
@@ -1593,14 +1584,12 @@ struct ToolLiveSheet: View {
                     Label("Load more (\(nextBatch * Self.lazyRenderChunkLines) lines)", systemImage: "chevron.down")
                         .font(.system(size: 13, weight: .medium))
                 }
-                .buttonStyle(.plain)
                 Button {
                     revealedChunkCount = totalChunks
                 } label: {
                     Text("Load all")
                         .font(.system(size: 13, weight: .medium))
                 }
-                .buttonStyle(.plain)
             }
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity)
@@ -1924,7 +1913,6 @@ struct ToolLiveSheet: View {
                         .font(.system(size: 18))
                         .foregroundStyle(currentIdx > 0 ? ChatColors.primaryText : ChatColors.tertiaryText)
                 }
-                .buttonStyle(.plain)
                 .disabled(currentIdx <= 0)
 
                 Spacer()
@@ -1953,7 +1941,6 @@ struct ToolLiveSheet: View {
                         .font(.system(size: 18))
                         .foregroundStyle(currentIdx < toolBlocks.count - 1 ? ChatColors.primaryText : ChatColors.tertiaryText)
                 }
-                .buttonStyle(.plain)
                 .disabled(currentIdx >= toolBlocks.count - 1)
             }
             .padding(.horizontal, 24)
@@ -2340,17 +2327,17 @@ private struct ToolPreviewThumbnail: View {
         case .shellTool(let cmd): return cmd.isEmpty ? "$ shell" : "$ \(cmd)"
         case .fileReadTool(let p):
             let name = (p as NSString).lastPathComponent
-            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : String(localized: "Read file")
+            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : AppLocalized("Read file")
         case .fileWriteTool(let p):
             let name = (p as NSString).lastPathComponent
-            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : String(localized: "Write file")
+            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : AppLocalized("Write file")
         case .fileEditTool(let p):
             let name = (p as NSString).lastPathComponent
-            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : String(localized: "Edit file")
+            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : AppLocalized("Edit file")
         case .browserTool(let a): return a
         case .readImageTool(let p):
             let name = (p as NSString).lastPathComponent
-            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : String(localized: "Read image")
+            return (!p.isEmpty && name != "/" && name.contains(".")) ? name : AppLocalized("Read image")
         case .memoryTool(let a): return a
         default: return ""
         }
@@ -2461,7 +2448,6 @@ private struct ToolStatusBar: View {
                             .frame(width: 20, height: 20)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                     .disabled(displayedIdx <= 0)
 
                     Text("\(displayedIdx + 1)/\(toolBlocks.count)")
@@ -2478,7 +2464,6 @@ private struct ToolStatusBar: View {
                             .frame(width: 20, height: 20)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                     .disabled(displayedIdx >= toolBlocks.count - 1)
                 }
             }

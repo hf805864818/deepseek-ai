@@ -19,7 +19,7 @@ struct OtherSyncSettingsView: View {
                 platformRow(
                     icon: "tray.and.arrow.down.fill",
                     color: .green,
-                    name: String(localized: "Local Sync", comment: "Local sync platform name"),
+                    name: AppLocalized("Local Sync", comment: "Local sync platform name"),
                     status: localSyncManager.hasDestination ? .connected : .disconnected
                 )
             }
@@ -55,7 +55,7 @@ struct OtherSyncSettingsView: View {
                 status: .comingSoon
             )
         }
-        .navigationTitle(String(localized: "Other Sync", comment: "Navigation title for third-party cloud sync settings"))
+        .navigationTitle(AppLocalized("Other Sync", comment: "Navigation title for third-party cloud sync settings"))
         .navigationBarTitleDisplayMode(.inline)
     }
 

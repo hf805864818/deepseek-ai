@@ -96,19 +96,19 @@ struct ProviderInstancesView: View {
                     Button {
                         showAddProvider = true
                     } label: {
-                        Label(String(localized: "Add Provider"), systemImage: "plus")
+                        Label(AppLocalized("Add Provider"), systemImage: "plus")
                     }
                     Button {
                         showImportFile = true
                     } label: {
-                        Label(String(localized: "Import Provider"), systemImage: "square.and.arrow.down")
+                        Label(AppLocalized("Import Provider"), systemImage: "square.and.arrow.down")
                     }
                     if #available(iOS 17.0, *), iCloudSyncEnabled {
                         Divider()
                         Button {
                             Task { await forceSyncProviders() }
                         } label: {
-                            Label(String(localized: "Force iCloud Sync"),
+                            Label(AppLocalized("Force iCloud Sync"),
                                   systemImage: "arrow.triangle.2.circlepath.icloud")
                         }
                     }
@@ -126,28 +126,28 @@ struct ProviderInstancesView: View {
             switch result {
             case .success(let url):
                 guard url.startAccessingSecurityScopedResource() else {
-                    importMessage = String(localized: "Cannot access the selected file.")
+                    importMessage = AppLocalized("Cannot access the selected file.")
                     showImportResult = true
                     return
                 }
                 defer { url.stopAccessingSecurityScopedResource() }
                 guard let data = try? Data(contentsOf: url),
                       let json = String(data: data, encoding: .utf8) else {
-                    importMessage = String(localized: "Failed to read file.")
+                    importMessage = AppLocalized("Failed to read file.")
                     showImportResult = true
                     return
                 }
                 if let label = store.importInstanceJSON(json) {
-                    importMessage = String(localized: "Imported provider \"\(label)\" successfully.")
+                    importMessage = AppLocalized("Imported provider \"\(label)\" successfully.")
                 } else {
-                    importMessage = String(localized: "Invalid provider configuration file.")
+                    importMessage = AppLocalized("Invalid provider configuration file.")
                 }
                 showImportResult = true
             case .failure:
                 break
             }
         }
-        .alert(String(localized: "Import"), isPresented: $showImportResult) {
+        .alert(AppLocalized("Import"), isPresented: $showImportResult) {
             Button("OK") {}
         } message: {
             if let msg = importMessage { Text(msg) }
@@ -171,7 +171,7 @@ struct ProviderInstancesView: View {
     private func forceSyncProviders() async {
         _ = await ForceSyncHelper.markProvidersDirty()
         await ForceSyncHelper.bidirectionalSync(recordTypes: ["ProviderConfig", "ProviderConfigV2"])
-        forceSyncToast = String(localized: "Syncing providers via iCloud")
+        forceSyncToast = AppLocalized("Syncing providers via iCloud")
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             forceSyncToast = nil
         }
@@ -246,9 +246,9 @@ private struct InstanceRow: View {
             if let key = ProviderKeychainHelper.loadAPIKey(instanceId: instance.id) {
                 return maskKey(key)
             }
-            return String(localized: "No API key")
+            return AppLocalized("No API key")
         case .oauth:
-            return oauthIsAuthenticated ? String(localized: "Authenticated") : String(localized: "Not authenticated")
+            return oauthIsAuthenticated ? AppLocalized("Authenticated") : AppLocalized("Not authenticated")
         }
     }
 
@@ -279,7 +279,7 @@ private struct InstanceRow: View {
                         .lineLimit(1)
                 }
                 if modelCount > 0 {
-                    Text(String(localized: "\(modelCount) models"))
+                    Text(AppLocalized("\(modelCount) models"))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -333,8 +333,8 @@ private struct ShadowVoiceRow: View {
 
     private func voiceSummary(asr: Int, tts: Int) -> String {
         var parts: [String] = []
-        if asr > 0 { parts.append(String(localized: "\(asr) speech-to-text", comment: "ASR model count")) }
-        if tts > 0 { parts.append(String(localized: "\(tts) text-to-speech", comment: "TTS model count")) }
+        if asr > 0 { parts.append(AppLocalized("\(asr) speech-to-text", comment: "ASR model count")) }
+        if tts > 0 { parts.append(AppLocalized("\(tts) text-to-speech", comment: "TTS model count")) }
         return parts.joined(separator: " · ")
     }
 }

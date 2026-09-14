@@ -110,7 +110,7 @@ extension AIChatViewModel {
             if sessionSource == "shortcut" {
                 logger.info("[Context] Exhausted — shortcut session cannot continue (optimistic UI path)")
                 let errMsg = ChatMessage(role: .assistant, content: "", blocks: [])
-                errMsg.error = String(localized: "Context full. Start a new session to continue.")
+                errMsg.error = AppLocalized("Context full. Start a new session to continue.")
                 messages.append(errMsg)
                 // Remove the queued user message since we can't send it
                 promptQueue.removeAll { $0.id == queuedPrompt.id }

@@ -205,10 +205,10 @@ extension AIChatViewModel {
                 // user's own terms instead of claiming completion.
                 if allAssistantTurns.contains(where: { isInternalOnly($0) }) {
                     logger.info("[BackgroundNotification] source=fallback-interrupted")
-                    return String(localized: "Task interrupted by a new message. Open the session to continue.")
+                    return AppLocalized("Task interrupted by a new message. Open the session to continue.")
                 }
                 logger.info("[BackgroundNotification] source=fallback")
-                return String(localized: "Task completed.")
+                return AppLocalized("Task completed.")
             }()
             logger.info("[BackgroundNotification] responseSummary ready length=\(responseSummary.count) first20=\(String(responseSummary.prefix(20)).debugDescription) wasBackground=\(wasBackground)")
             let fallbackTitle = messages.first(where: { $0.role == .user })?.content.prefix(60).description ?? "Agent task"

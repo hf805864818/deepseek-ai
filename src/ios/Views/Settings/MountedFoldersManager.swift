@@ -242,13 +242,13 @@ final class MountedFoldersManager {
 
         var errorDescription: String? {
             switch self {
-            case .invalidName: return String(localized: "Mount name is invalid.")
-            case .nameTaken: return String(localized: "A mount with this name already exists.")
-            case .scopeDenied: return String(localized: "Could not access the selected folder.")
+            case .invalidName: return AppLocalized("Mount name is invalid.")
+            case .nameTaken: return AppLocalized("A mount with this name already exists.")
+            case .scopeDenied: return AppLocalized("Could not access the selected folder.")
             case .bookmarkFailed(let msg): return msg
             case .limitReached(let max):
                 return String(
-                    format: String(localized: "Mount limit reached (%d). Remove an existing mount before adding a new one."),
+                    format: AppLocalized("Mount limit reached (%d). Remove an existing mount before adding a new one."),
                     max
                 )
             }

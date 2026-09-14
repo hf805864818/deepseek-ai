@@ -34,14 +34,14 @@ struct ThinkingRuleEditorView: View {
 
         var title: String {
             switch self {
-            case .omitEverything:       return String(localized: "Send nothing")
-            case .reasoningEffort:      return String(localized: "reasoning_effort (root)")
-            case .reasoningEffortNested:return String(localized: "reasoning.effort (nested)")
-            case .booleanToggle:        return String(localized: "Boolean toggle")
-            case .extraBodyToggle:      return String(localized: "extra_body toggle")
-            case .deepSeekSibling:      return String(localized: "thinking + reasoning_effort")
-            case .qwenDual:             return String(localized: "enable_thinking + budget")
-            case .customPath:           return String(localized: "Custom field path")
+            case .omitEverything:       return AppLocalized("Send nothing")
+            case .reasoningEffort:      return AppLocalized("reasoning_effort (root)")
+            case .reasoningEffortNested:return AppLocalized("reasoning.effort (nested)")
+            case .booleanToggle:        return AppLocalized("Boolean toggle")
+            case .extraBodyToggle:      return AppLocalized("extra_body toggle")
+            case .deepSeekSibling:      return AppLocalized("thinking + reasoning_effort")
+            case .qwenDual:             return AppLocalized("enable_thinking + budget")
+            case .customPath:           return AppLocalized("Custom field path")
             }
         }
 
@@ -50,21 +50,21 @@ struct ThinkingRuleEditorView: View {
         var explanation: String {
             switch self {
             case .omitEverything:
-                return String(localized: "No thinking field at all. Use for endpoints that reject unknown keys outright.")
+                return AppLocalized("No thinking field at all. Use for endpoints that reject unknown keys outright.")
             case .reasoningEffort:
-                return String(localized: "Standard OpenAI Chat Completions shape.")
+                return AppLocalized("Standard OpenAI Chat Completions shape.")
             case .reasoningEffortNested:
-                return String(localized: "OpenAI Responses / OpenRouter shape.")
+                return AppLocalized("OpenAI Responses / OpenRouter shape.")
             case .booleanToggle:
-                return String(localized: "A plain on/off switch with no intensity tiers.")
+                return AppLocalized("A plain on/off switch with no intensity tiers.")
             case .extraBodyToggle:
-                return String(localized: "A switch nested under extra_body, as some gateways require.")
+                return AppLocalized("A switch nested under extra_body, as some gateways require.")
             case .deepSeekSibling:
-                return String(localized: "DeepSeek's shape: a thinking switch and reasoning_effort as sibling root fields.")
+                return AppLocalized("DeepSeek's shape: a thinking switch and reasoning_effort as sibling root fields.")
             case .qwenDual:
-                return String(localized: "Qwen/DashScope: enable_thinking and a token budget, sent at the root and in extra_body.")
+                return AppLocalized("Qwen/DashScope: enable_thinking and a token budget, sent at the root and in extra_body.")
             case .customPath:
-                return String(localized: "Advanced: write a value at a dotted field path. Not validated by Minis.")
+                return AppLocalized("Advanced: write a value at a dotted field path. Not validated by Minis.")
             }
         }
     }
@@ -229,7 +229,7 @@ struct ThinkingRuleEditorView: View {
     private func seedFromExisting() {
         guard let e = existing else { return }
         label = createsNew && !e.isEditable
-            ? String(localized: "Copy of \(e.label)")
+            ? AppLocalized("Copy of \(e.label)")
             : e.label
         switch e.scope {
         case .allModels: scopeIsAllModels = true

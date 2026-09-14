@@ -5878,7 +5878,7 @@ extension ChatStore {
             pullResult = await SyncCore.shared.fetchSessionPortables(sessionId: sessionId)
         } else {
             iCloudLogger.warning("[ForcePull] sid=\(sessionId.prefix(8)) iOS < 17 — pull unavailable")
-            return .failed(String(localized: "Force Pull requires iOS 17 or newer."))
+            return .failed(AppLocalized("Force Pull requires iOS 17 or newer."))
         }
         let portables = pullResult.0
         if let err = pullResult.1 {

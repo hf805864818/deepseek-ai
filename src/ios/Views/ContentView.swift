@@ -1567,11 +1567,11 @@ struct ContentView: View {
                         ProgressView()
                             .controlSize(.large)
                         if let p = exportProgress, p.total > 0 {
-                            Text(String(localized: "Exporting… \(p.done) / \(p.total)"))
+                            Text(AppLocalized("Exporting… \(p.done) / \(p.total)"))
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         } else {
-                            Text(String(localized: "Exporting…"))
+                            Text(AppLocalized("Exporting…"))
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -3597,7 +3597,7 @@ struct ContentView: View {
         if cachedLockLabelKey == key, let cached = cachedLockLabel {
             return cached
         }
-        let value = String(localized: "Lock with \(biometry)")
+        let value = AppLocalized("Lock with \(biometry)")
         cachedLockLabel = value
         cachedLockLabelKey = key
         return value
@@ -3631,7 +3631,7 @@ struct ContentView: View {
                 SessionLockStore.shared.lock(sid)
             case .unlockSession(let sid):
                 Task {
-                    let reason = String(localized: "Unlock this session to remove \(BiometricAuth.biometryDisplayName) protection")
+                    let reason = AppLocalized("Unlock this session to remove \(BiometricAuth.biometryDisplayName) protection")
                     let ok = await BiometricAuth.authenticate(reason: reason)
                     if ok { SessionLockStore.shared.unlockPermanently(sid) }
                 }
@@ -4271,7 +4271,7 @@ struct ContentView: View {
                     .contextMenu {
                         let groups = Array(ProviderConfigStore.shared.config.modelGroups.prefix(10))
                         if !groups.isEmpty {
-                            Section(String(localized: "New Chat with Group")) {
+                            Section(AppLocalized("New Chat with Group")) {
                                 ForEach(groups) { group in
                                     Button {
                                         openSession(Self.makeNewSessionId(groupId: group.id))
@@ -4915,7 +4915,7 @@ struct ContentView: View {
             }
             await MainActor.run {
                 let sessionCount = ids.count
-                forceSyncToast = String(localized: "Marked \(sessionCount) sessions (\(totalMarked) records) for sync. iCloud is syncing now.")
+                forceSyncToast = AppLocalized("Marked \(sessionCount) sessions (\(totalMarked) records) for sync. iCloud is syncing now.")
                 forceSyncInFlight = false
                 if singleSession == nil {
                     // Multi-select path also exits selection mode for the user.
@@ -4937,7 +4937,7 @@ struct ContentView: View {
     private func runForcePullOnSession(_ sessionId: String) {
         guard !forceSyncInFlight else { return }
         forceSyncInFlight = true
-        forceSyncToast = String(localized: "Pulling from iCloud…")
+        forceSyncToast = AppLocalized("Pulling from iCloud…")
         // [T-ios-sessionrow-destroy-crash] Isolate the whole Task to @MainActor.
         // This is the site 6687cf1a (T-ios-state-publish-offmain-crash) MISSED:
         // a bare `Task {}` started from this non-isolated func inherits a
@@ -4953,11 +4953,11 @@ struct ContentView: View {
             let outcome = await ChatStore.shared.forcePullSession(sessionId: sessionId)
             switch outcome {
             case .applied(let pulled, let deleted):
-                forceSyncToast = String(localized: "Pulled \(pulled) records · removed \(deleted) local")
+                forceSyncToast = AppLocalized("Pulled \(pulled) records · removed \(deleted) local")
             case .cloudEmpty:
-                forceSyncToast = String(localized: "iCloud has no records for this chat — local messages preserved")
+                forceSyncToast = AppLocalized("iCloud has no records for this chat — local messages preserved")
             case .failed(let msg):
-                forceSyncToast = String(localized: "Force Pull failed: \(msg) — local messages preserved")
+                forceSyncToast = AppLocalized("Force Pull failed: \(msg) — local messages preserved")
             }
             forceSyncInFlight = false
             // Refresh sessions so any title/updatedAt that came down from
@@ -5665,7 +5665,7 @@ private struct ExportPreviewSheet: View {
                     // actually read instead, so Copy is offered exactly when there
                     // is something readable to copy.
                     if summary == nil, textSourceURL?.pathExtension.lowercased() != "zip" {
-                        actionButton(icon: "doc.on.doc", label: copied ? String(localized: "Copied") : String(localized: "Copy")) {
+                        actionButton(icon: "doc.on.doc", label: copied ? AppLocalized("Copied") : AppLocalized("Copy")) {
                             if let url = textSourceURL, let content = try? String(contentsOf: url, encoding: .utf8) {
                                 UIPasteboard.general.string = content
                             }
@@ -5673,21 +5673,21 @@ private struct ExportPreviewSheet: View {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
                         }
                     }
-                    actionButton(icon: "square.and.arrow.up", label: String(localized: "Share")) {
+                    actionButton(icon: "square.and.arrow.up", label: AppLocalized("Share")) {
                         showShareSheet = true
                     }
-                    actionButton(icon: "folder", label: String(localized: "Save to Files")) {
+                    actionButton(icon: "folder", label: AppLocalized("Save to Files")) {
                         showFilePicker = true
                     }
                 }
                 .padding(.vertical, 12)
                 .background(Color(UIColor.systemBackground))
             }
-            .navigationTitle(String(localized: "Export Preview"))
+            .navigationTitle(AppLocalized("Export Preview"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(String(localized: "Done")) { dismiss() }
+                    Button(AppLocalized("Done")) { dismiss() }
                 }
             }
             .sheet(isPresented: $showShareSheet) {
@@ -5738,12 +5738,12 @@ private struct ExportPreviewSheet: View {
 
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                summaryRow(String(localized: "Format"), s.format)
-                summaryRow(String(localized: "Sessions"), "\(s.sessionCount)")
-                summaryRow(String(localized: "Messages"), "\(s.totalMessages)")
-                summaryRow(String(localized: "Time range"), timeRange)
-                summaryRow(String(localized: "Attachments"), "\(s.attachmentCount)")
-                summaryRow(String(localized: "Estimated size"), sizeStr)
+                summaryRow(AppLocalized("Format"), s.format)
+                summaryRow(AppLocalized("Sessions"), "\(s.sessionCount)")
+                summaryRow(AppLocalized("Messages"), "\(s.totalMessages)")
+                summaryRow(AppLocalized("Time range"), timeRange)
+                summaryRow(AppLocalized("Attachments"), "\(s.attachmentCount)")
+                summaryRow(AppLocalized("Estimated size"), sizeStr)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -6525,16 +6525,16 @@ private struct SessionRow: View, Equatable {
         let seconds = Int(now.timeIntervalSince(date))
         if calendar.isDateInToday(date) {
             if seconds < 60 {
-                return String(localized: "Just now")
+                return AppLocalized("Just now")
             } else if seconds < 3600 {
                 let mins = seconds / 60
-                return String(localized: "\(mins) min ago")
+                return AppLocalized("\(mins) min ago")
             } else {
                 let hrs = seconds / 3600
-                return String(localized: "\(hrs) hr ago")
+                return AppLocalized("\(hrs) hr ago")
             }
         } else if calendar.isDateInYesterday(date) {
-            return String(localized: "Yesterday")
+            return AppLocalized("Yesterday")
         } else {
             let diff = calendar.dateComponents([.day], from: date, to: now)
             let formatter = DateFormatter()
@@ -7129,9 +7129,9 @@ private struct AppearanceSettingsView: View {
             }
 
             Section {
-                Picker(String(localized: "Return Key"), selection: $returnKeyBehavior) {
-                    Text(String(localized: "Newline")).tag(0)
-                    Text(String(localized: "Send")).tag(1)
+                Picker(AppLocalized("Return Key"), selection: $returnKeyBehavior) {
+                    Text(AppLocalized("Newline")).tag(0)
+                    Text(AppLocalized("Send")).tag(1)
                 }
                 .pickerStyle(.segmented)
             } header: {
@@ -7141,7 +7141,7 @@ private struct AppearanceSettingsView: View {
             }
 
             Section {
-                Toggle(String(localized: "Keep Screen Awake"), isOn: $keepScreenAwakeDuringTasks)
+                Toggle(AppLocalized("Keep Screen Awake"), isOn: $keepScreenAwakeDuringTasks)
             } header: {
                 Text("Keep Screen Awake")
             } footer: {
@@ -7149,7 +7149,7 @@ private struct AppearanceSettingsView: View {
             }
 
             Section {
-                Toggle(String(localized: "Auto-Focus Input After Reply"), isOn: $autoFocusAfterReply)
+                Toggle(AppLocalized("Auto-Focus Input After Reply"), isOn: $autoFocusAfterReply)
             } header: {
                 Text("Auto-Focus Input After Reply")
             } footer: {
@@ -7157,7 +7157,7 @@ private struct AppearanceSettingsView: View {
             }
 
             Section {
-                Toggle(String(localized: "Tool Preview Window"), isOn: $toolPreviewEnabled)
+                Toggle(AppLocalized("Tool Preview Window"), isOn: $toolPreviewEnabled)
             } header: {
                 Text("Tool Status Bar")
             } footer: {
@@ -7169,7 +7169,7 @@ private struct AppearanceSettingsView: View {
             // collapsed. Only affects the streaming auto-expand; manual taps
             // always work either way.
             Section {
-                Toggle(String(localized: "Expand Thinking While Streaming"), isOn: $autoExpandThinking)
+                Toggle(AppLocalized("Expand Thinking While Streaming"), isOn: $autoExpandThinking)
             } header: {
                 Text("Deep Thinking")
             } footer: {
@@ -7589,7 +7589,7 @@ private struct SettingsSheet: View {
                             OtherSyncSettingsView()
                         } label: {
                             Label {
-                                Text(String(localized: "Other Sync", comment: "Settings row for third-party cloud sync platforms"))
+                                Text(AppLocalized("Other Sync", comment: "Settings row for third-party cloud sync platforms"))
                             } icon: {
                                 Image(systemName: "arrow.triangle.swap")
                                     .font(.system(size: 9))

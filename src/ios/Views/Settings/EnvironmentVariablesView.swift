@@ -92,22 +92,22 @@ struct EnvironmentVariablesView: View {
             }
         }
         .alert(
-            String(localized: "Delete profile?"),
+            AppLocalized("Delete profile?"),
             isPresented: Binding(
                 get: { profileToDelete != nil },
                 set: { if !$0 { profileToDelete = nil } }
             ),
             presenting: profileToDelete
         ) { profile in
-            Button(String(localized: "Delete"), role: .destructive) {
+            Button(AppLocalized("Delete"), role: .destructive) {
                 profileStore.deleteProfile(id: profile.id)
                 profileToDelete = nil
             }
-            Button(String(localized: "Cancel"), role: .cancel) {
+            Button(AppLocalized("Cancel"), role: .cancel) {
                 profileToDelete = nil
             }
         } message: { profile in
-            Text(String(localized: "All env vars in \"\(profile.name)\" will be deleted. This cannot be undone."))
+            Text(AppLocalized("All env vars in \"\(profile.name)\" will be deleted. This cannot be undone."))
         }
         .onAppear {
             if let pending = deepLink.pendingEnvVarCreate {
@@ -133,19 +133,19 @@ struct EnvironmentVariablesView: View {
             }
         }
         .alert(
-            String(localized: "Replace existing value?"),
+            AppLocalized("Replace existing value?"),
             isPresented: Binding(
                 get: { overwriteConfirm != nil },
                 set: { if !$0 { overwriteConfirm = nil } }
             ),
             presenting: overwriteConfirm
         ) { request in
-            Button(String(localized: "Replace"), role: .destructive) {
+            Button(AppLocalized("Replace"), role: .destructive) {
                 store.update(id: request.entryId, key: request.key, value: request.newValue)
             }
-            Button(String(localized: "Cancel"), role: .cancel) {}
+            Button(AppLocalized("Cancel"), role: .cancel) {}
         } message: { request in
-            Text(String(localized: "\"\(request.key)\" already has a value. Replace it with \"\(request.newValue)\"?"))
+            Text(AppLocalized("\"\(request.key)\" already has a value. Replace it with \"\(request.newValue)\"?"))
         }
         .sheet(item: $editingEntry) { entry in
             EnvVarFormSheet(
@@ -451,14 +451,14 @@ struct EnvVarFormSheet: View {
         }
         .presentationDetents([.medium, .large])
         .alert(
-            String(localized: "Delete this variable?"),
+            AppLocalized("Delete this variable?"),
             isPresented: $showingDeleteConfirm
         ) {
-            Button(String(localized: "Delete"), role: .destructive) {
+            Button(AppLocalized("Delete"), role: .destructive) {
                 onDelete?()
                 dismiss()
             }
-            Button(String(localized: "Cancel"), role: .cancel) {}
+            Button(AppLocalized("Cancel"), role: .cancel) {}
         }
         .onAppear {
             key = initialKey
