@@ -37,6 +37,7 @@
 		E5OVL001 /* ChatOverlays.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5OVL101 /* ChatOverlays.swift */; };
 E5POP001 /* InputPopupOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5POP101 /* InputPopupOverlayView.swift */; };
 E5FTP001 /* FloatingToolPreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5FTP101 /* FloatingToolPreviewView.swift */; };
+E5IBR001 /* InputBottomRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5IBR101 /* InputBottomRowView.swift */; };
 		E5DEEP006 /* VerifyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP106 /* VerifyGate.swift */; };
 		E5DEEP007 /* ClarifyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP107 /* ClarifyGate.swift */; };
 		E5EP0001 /* EnvProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5EP0011 /* EnvProfileStore.swift */; };
@@ -629,6 +630,7 @@ E5FTP001 /* FloatingToolPreviewView.swift in Sources */ = {isa = PBXBuildFile; f
 		E5OVL101 /* ChatOverlays.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatOverlays.swift; sourceTree = "<group>"; };
 E5POP101 /* InputPopupOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputPopupOverlayView.swift; sourceTree = "<group>"; };
 E5FTP101 /* FloatingToolPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingToolPreviewView.swift; sourceTree = "<group>"; };
+E5IBR101 /* InputBottomRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputBottomRowView.swift; sourceTree = "<group>"; };
 		E5DEEP106 /* VerifyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerifyGate.swift; sourceTree = "<group>"; };
 		E5DEEP107 /* ClarifyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClarifyGate.swift; sourceTree = "<group>"; };
 		E5EP0011 /* EnvProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvProfileStore.swift; sourceTree = "<group>"; };
@@ -2192,6 +2194,7 @@ E5FTP101 /* FloatingToolPreviewView.swift */ = {isa = PBXFileReference; lastKnow
 				E5OVL101 /* ChatOverlays.swift */,
 E5POP101 /* InputPopupOverlayView.swift */,
 E5FTP101 /* FloatingToolPreviewView.swift */,
+E5IBR101 /* InputBottomRowView.swift */,
 E5SUB102 /* SubagentCard.swift */,
 			);
 			path = Chat;

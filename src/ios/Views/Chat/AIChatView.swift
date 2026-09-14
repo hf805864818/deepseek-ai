@@ -2982,250 +2982,28 @@ struct AIChatView: View {
         }
     }
 
-    /// Attachment "+" button.
-    /// iOS 16's Menu has a vertical alignment bug inside HStack that causes it
-    /// to sit higher than sibling buttons when the keyboard is up.
-    /// Use confirmationDialog on iOS 16, Menu on iOS 17+.
+    /// [T-ios-runtime-demangle-watchdog] Bottom toolbar row extracted to
+    /// `InputBottomRowView` top-level struct to cut the type tree depth.
+    private var inputBottomRow: some View {
+        InputBottomRowView(
+            vm: vm,
+            inputFocused: $inputFocused,
+            showAttachmentMenu: $showAttachmentMenu,
+            showCamera: $showCamera,
+            showPhotoPicker: $showPhotoPicker,
+            showDocumentPicker: $showDocumentPicker,
+            voiceInputActive: voiceInputActive,
+            canSend: canSend,
+            canEnqueue: canEnqueue,
+            speechManager: speechManager,
+            voiceOutput: voiceOutput,
+            onSend: performSend,
+            onEnqueue: performEnqueue,
+            onMicTap: handleMicTap
+        )
+    }
+
     @ViewBuilder
-    private var attachmentMenuButton: some View {
-        // [T-ios-voiceover-labels] Labelled on the shared `icon` so both the
-        // iOS 17 Menu branch and the iOS 16 confirmationDialog branch below
-        // announce the same thing; otherwise VoiceOver reads "plus".
-        let icon = Image(systemName: "plus")
-            .font(.system(size: 18, weight: .medium))
-            .foregroundStyle(ChatColors.secondaryText)
-            .frame(width: 34, height: 34)
-            .accessibilityLabel(Text("Add attachment", comment: "VoiceOver label for the attachment button"))
-            .background(ChatColors.inputIconBg)
-            .clipShape(Circle())
-            .overlay(Circle().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
-
-        if #available(iOS 17, *) {
-            Menu {
-                Button { showCamera = true } label: { Label("Take Photo", systemImage: "camera") }
-                Button { showPhotoPicker = true } label: { Label("Choose Photos & Videos", systemImage: "photo.on.rectangle") }
-                Button { showDocumentPicker = true } label: { Label("Add File", systemImage: "doc") }
-            } label: {
-                icon
-            }
-        } else {
-            Button { showAttachmentMenu = true } label: {
-                icon
-            }
-            .confirmationDialog("Add Attachment", isPresented: $showAttachmentMenu) {
-                Button { showCamera = true } label: { Label("Take Photo", systemImage: "camera") }
-                Button { showPhotoPicker = true } label: { Label("Choose Photos & Videos", systemImage: "photo.on.rectangle") }
-                Button { showDocumentPicker = true } label: { Label("Add File", systemImage: "doc") }
-            }
-        }
-    }
-
-    /// Bottom toolbar under the text field (+ / edit-exit / mic / send).
-    /// Returns AnyView to keep `inputBar`'s generic type compact; SwiftUI
-    /// runtime demangle chokes on deep nested types otherwise.
-    private var inputBottomRow: AnyView {
-        let row = HStack(spacing: 12) {
-            attachmentMenuButton
-            slashMenuButton
-            if vm.editingMessageIndex != nil { editExitButton }
-            Spacer()
-            // Mutually exclusive with editExitButton: while editing a past
-            // message the exit capsule owns this row — showing both capsules
-            // overflows the row and they render overlapped.
-            if voiceInputActive, vm.editingMessageIndex == nil {
-                readAloudToolbarToggle
-                Spacer()
-            }
-            micButtonContainer
-            sendButton
-        }
-        return AnyView(row)
-    }
-
-    /// "Read replies aloud" toggle shown centered in the toolbar during voice
-    /// input (TTS on/off). Styled like the other secondary toolbar controls.
-    private var readAloudToolbarToggle: some View {
-        // Source of truth = vm.speakEnabled (also driven by the floating speaker's
-        // tap-cycle / long-press-off), so this toggle reflects those changes too.
-        // Three states, in lockstep with the global voice-output capsule:
-        //  • disabled  (!isEnabled)        → gray, slashed speaker
-        //  • muted     (isEnabled & muted) → accent, slashed speaker
-        //  • active    (isEnabled & !muted)→ accent, wave speaker
-        let on = voiceOutput.isEnabled
-        let muted = voiceOutput.isMuted
-        return Button {
-            if on && !muted {
-                // Active → mute (temporary silence, capsule stays visible).
-                voiceOutput.isMuted = true
-            } else if on && muted {
-                // Muted → fully off (capsule hides).
-                vm.speakEnabled = false
-                VoiceOutputPreferences.isEnabled = false
-            } else {
-                // Off → turn on (resume last speed, un-muted).
-                voiceOutput.isMuted = false
-                vm.speakEnabled = true
-                VoiceOutputPreferences.isEnabled = true
-            }
-        } label: {
-            HStack(spacing: 5) {
-                // Fixed-width icon slot so the size stays constant when the glyph
-                // swaps between wave / slash.
-                // [T-ios-voiceover-labels] The glyph only mirrors the on/off
-                // state that the accessibilityValue below already announces,
-                // and the row carries visible text — so it is pure decoration
-                // for VoiceOver and would otherwise be read as
-                // "speaker wave 2 fill".
-                Image(systemName: (on && !muted) ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                    .font(.system(size: 12))
-                    .frame(width: 16)
-                    .accessibilityHidden(true)
-                Text("Read replies", comment: "Voice TTS toggle (compact)")
-                    .font(.subheadline)
-            }
-            .foregroundStyle(on ? Color.accentColor : .secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-                Capsule().fill(on ? Color.accentColor.opacity(0.15)
-                                  : Color.secondary.opacity(0.10))
-            )
-            .fixedSize()
-        }
-        .buttonStyle(.plain)
-        // [T-ios-voiceover-labels] State goes in the VALUE, not the label:
-        // folding "on"/"off" into the label would lose VoiceOver's own
-        // "on/off" semantics and make the control's name change as it toggles.
-        // Muted is a third state the glyph distinguishes visually, so it is
-        // announced too rather than being flattened into "on".
-        .accessibilityValue(Text(
-            on ? (muted
-                    ? AppLocalized("On, muted", comment: "VoiceOver value for the read-replies toggle when enabled but muted")
-                    : AppLocalized("On", comment: "VoiceOver value for the read-replies toggle when enabled"))
-               : AppLocalized("Off", comment: "VoiceOver value for the read-replies toggle when disabled")
-        ))
-        .accessibilityHint(Text("Toggles reading replies aloud", comment: "VoiceOver hint for the read-replies toggle"))
-    }
-
-    /// `/` button that opens the slash command menu.
-    private var slashMenuButton: some View {
-        Button {
-            if vm.showSlashMenu {
-                vm.dismissSlashMenu()
-            } else {
-                vm.showSlashMenuOverInput()
-                inputFocused = true
-            }
-        } label: {
-            Text("/")
-                .font(.system(size: 18, weight: .semibold, design: .rounded))
-                .italic()
-                .foregroundStyle(ChatColors.secondaryText)
-                .frame(width: 34, height: 34)
-                .background(ChatColors.inputIconBg)
-                .clipShape(Circle())
-                .overlay(Circle().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
-        }
-    }
-
-    /// "Exit Edit Mode" capsule shown while editing a past message.
-    private var editExitButton: some View {
-        Button {
-            vm.cancelEdit()
-        } label: {
-            Text("Exit Edit Mode", comment: "Cancel message editing")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(ChatColors.secondaryText)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(ChatColors.inputIconBg)
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
-        }
-    }
-
-    /// Speech language badge shown only while recording.
-    private var languageBadgeButton: some View {
-        Button {
-            speechManager.showLanguagePicker = true
-        } label: {
-            Text(speechManager.languageLabel)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(ChatColors.secondaryText)
-                .frame(width: 34, height: 34)
-                .background(ChatColors.inputIconBg)
-                .clipShape(Circle())
-                .overlay(Circle().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
-        }
-    }
-
-    /// Mic button plus the attached language-picker sheet.
-    private var micButtonContainer: some View {
-        MicButton(speechManager: speechManager, inputFocused: $inputFocused, onTap: {
-            if voiceInputActive {
-                // Already in voice mode — the "T" button switches back to text.
-                // [T-ios-voice-keyboard-text-carry] Keep the transcript: the
-                // composer mirrors it, so clearing here would empty the input
-                // box and lose the dictated text on the way back to keyboard.
-                voiceVM.reset(clearTranscript: false)
-                withAnimation(.easeInOut(duration: 0.2)) { voiceInputActive = false }
-            } else {
-                // Mark the composition as voice-assisted (committed to the
-                // "voice" input-mode preference only at send time). Switch the
-                // composer into inline voice mode — the single voice entry point.
-                vm.voiceUsedInComposition = true
-                // Switching text→voice opens the panel expanded this one time;
-                // afterwards it resumes the remembered expand/compact state.
-                VoiceModePreference.shared.enteredFromText = true
-                withAnimation(.easeInOut(duration: 0.2)) { voiceInputActive = true }
-            }
-        }, isVoiceActive: voiceInputActive)
-    }
-
-    /// Send / Enqueue / Stop circular button.
-    ///
-    /// [T-ios-voiceover-labels] All three states are icon-only, and two of them
-    /// (send / enqueue) use the SAME glyph, so without explicit labels
-    /// VoiceOver reads "arrow up circle fill" for both and a blind user cannot
-    /// tell what pressing it will do. Each branch therefore names its own
-    /// action; the destructive one also carries a hint.
-    @ViewBuilder
-    private var sendButton: some View {
-        if vm.isProcessing && canEnqueue {
-            Button { performEnqueue() } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundStyle(ChatColors.sendButton)
-            }
-            .keyboardShortcut(.return, modifiers: .command)
-            .accessibilityLabel(Text("Add to queue", comment: "VoiceOver label for the send button while a reply is generating"))
-            .accessibilityHint(Text("Queues this message to send after the current reply finishes", comment: "VoiceOver hint for the queue button"))
-        } else if vm.isProcessing {
-            Button { vm.cancel() } label: {
-                Image(systemName: "stop.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundStyle(.red)
-            }
-            .accessibilityLabel(Text("Stop generating", comment: "VoiceOver label for the stop button"))
-            .accessibilityHint(Text("Stops the reply that is being generated", comment: "VoiceOver hint for the stop button"))
-        } else {
-            Button { performSend() } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundStyle(canSend ? ChatColors.sendButton : ChatColors.sendButtonDisabled)
-            }
-            .disabled(!canSend)
-            .keyboardShortcut(.return, modifiers: .command)
-            .accessibilityLabel(Text("Send", comment: "VoiceOver label for the send button"))
-        }
-    }
-
-    /// Either the multi-line text field or the audio waveform, depending on
-    /// whether speech recording is active. Returning `AnyView` erases the
-    /// nested `PastableTextView` generic so SwiftUI's runtime type metadata
-    /// decoder doesn't recurse past its stack limit (see crash 2026-04-17
-    /// where `AIChatView.inputBar.getter` blew the stack via
-    /// `__swift_instantiateConcreteTypeFromMangledNameV2`).
     private var inputFieldOrWaveform: AnyView {
         let topPadding: CGFloat = (vm.attachments.isEmpty && vm.loadingVideoCount == 0) ? 16 : 11
         if voiceInputActive {
@@ -3435,6 +3213,19 @@ struct AIChatView: View {
 
     private func handleCaretChange(_ caret: Int) {
         vm.inputCaret = caret
+    }
+
+    /// Handle mic button tap — extracted from inline micButtonContainer
+    /// so the bottom row can live in its own struct boundary.
+    private func handleMicTap() {
+        if voiceInputActive {
+            voiceVM.reset(clearTranscript: false)
+            withAnimation(.easeInOut(duration: 0.2)) { voiceInputActive = false }
+        } else {
+            vm.voiceUsedInComposition = true
+            VoiceModePreference.shared.enteredFromText = true
+            withAnimation(.easeInOut(duration: 0.2)) { voiceInputActive = true }
+        }
     }
 
     private var inputBar: some View {
