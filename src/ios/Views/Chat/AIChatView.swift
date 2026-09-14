@@ -984,57 +984,30 @@ struct AIChatView: View {
     }
 
     // MARK: - Deep Mode Workflow Banner
-    /// Extracted Deep Mode workflow UI (clarification banner,
-    /// plan gate, step progress, subagent cards) to reduce
-    /// body type-check complexity.
-    private var deepModeWorkflowBanner: AnyView {
-        AnyView(Group {
-            // [T-deep-mode-workflow] Phase 1 visualization feedback, hard-gated
-            // on the master switch so turning deep mode off removes ALL
-            // workflow UI with zero residue. Approval/edit still flows
-            // through vm.confirmPlan()/editPlan()/cancelPlan().
-            if vm.deepModeEnabled {
-                // [T-deep-mode-clarify-gate] Phase 2: clarification banner.
-                // Shown before planning — if the gate detected ambiguity
-                // in the user's request, ask a clarifying question first.
-                if case .awaitingClarification = vm.clarifyState {
-                    clarifyBanner
-                } else if case .awaitingApproval = vm.planGateState {
-                    // Planning: parsed steps preview + confirm/edit bar.
-                    VStack(alignment: .leading, spacing: 0) {
-                        if !vm.workflowSteps.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("计划步骤")
-                                    .font(.caption2.weight(.semibold))
-                                    .foregroundColor(ChatColors.secondaryText)
-                                WorkflowStepsList(steps: vm.workflowSteps)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(ChatColors.secondaryBg)
-                        }
-                        planGateBanner
-                    }
-                } else if vm.workflowPhase == .executing || vm.workflowPhase == .verifying {
-                    // Executing / verifying: live step progress.
-                    WorkflowProgressView(phase: vm.workflowPhase,
-                                         steps: vm.workflowSteps)
-                }
-            }
-            // [T-phase5] Subagent status capsules — shown at the top
-            // of the chat area when deep mode is on and there are
-            // active subagent sessions. Uses the same capsule style
-            // as ToolCapsuleView for visual consistency. Total-switch
-            // safe: when the master switch is off, activeSubagents is
-            // cleared, so this view is EmptyView.
-            if vm.deepModeEnabled && !vm.activeSubagents.isEmpty {
-                SubagentCardStack(subagents: vm.activeSubagents)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 4)
-                    .transition(.opacity)
-            }
-        })
+    /// [T-deep-mode-workflow] Deep mode workflow UI container — shows
+    /// clarification banner, plan gate, step progress, or subagent cards
+    /// depending on the current workflow phase.
+    ///
+    /// Implemented in DeepModeBanners.swift as a top-level struct to cut
+    /// the type tree at a struct boundary. Without this, the deep-mode
+    /// conditional branches would significantly deepen AIChatView.body's
+    /// mangled type, causing Swift's runtime type-metadata decoder to
+    /// recurse past its stack limit on cold launch.
+
+    private var deepModeWorkflowBanner: some View {
+        DeepModeWorkflowBanner(
+            deepModeEnabled: vm.deepModeEnabled,
+            clarifyState: vm.clarifyState,
+            planGateState: vm.planGateState,
+            workflowPhase: vm.workflowPhase,
+            workflowSteps: vm.workflowSteps,
+            activeSubagents: vm.activeSubagents,
+            onCancelClarification: { vm.cancelClarification() },
+            onSkipClarification: { vm.skipClarification() },
+            onEditPlan: { vm.editPlan() },
+            onConfirmPlan: { vm.confirmPlan() },
+            onCancelPlan: { vm.cancelPlan() }
+        )
     }
 
     // MARK: - Home Screen Quick Actions
@@ -2579,100 +2552,8 @@ struct AIChatView: View {
     /// message list when the gate detected ambiguity in the user's request.
     /// The user can reply in the composer (their answer gets merged with the
     /// original request), skip straight to execution, or cancel.
-    private var clarifyBanner: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: "questionmark.circle")
-                    .font(.caption)
-                    .foregroundColor(.accentColor)
-                Text("深度龙虾Ai · 需要澄清")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(ChatColors.primaryText)
-                Spacer(minLength: 8)
-                Button { vm.cancelClarification() } label: {
-                    Image(systemName: "xmark")
-                        .font(.caption)
-                        .foregroundColor(ChatColors.secondaryText)
-                }
-                .buttonStyle(.plain)
-            }
-            if case .awaitingClarification(let question, _) = vm.clarifyState {
-                Text(question)
-                    .font(.caption2)
-                    .foregroundColor(ChatColors.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 10) {
-                Spacer(minLength: 8)
-                Button { vm.skipClarification() } label: {
-                    Text("直接执行")
-                        .font(.caption.weight(.semibold))
-                        .foregroundColor(.accentColor)
-                        .padding(.horizontal, 8).padding(.vertical, 6)
-                }
-                .buttonStyle(.plain)
-                Text("或在下方输入答复后发送")
-                    .font(.caption2)
-                    .foregroundColor(ChatColors.secondaryText)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(ChatColors.secondaryBg)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(ChatColors.toolBorder).frame(height: 0.5)
-        }
-    }
-
-    /// [T-deep-mode-plan-gate] Confirm/edit bar rendered above the messages
-    /// while a deep-mode plan is awaiting approval. Approval re-enters the
-    /// normal send path; edit parks the plan text in the composer.
-    private var planGateBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle")
-                .font(.caption)
-                .foregroundColor(.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("深度龙虾Ai · 已拟定执行计划")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(ChatColors.primaryText)
-                Text("确认后开始执行，或修改计划细节")
-                    .font(.caption2)
-                    .foregroundColor(ChatColors.secondaryText)
-            }
-            Spacer(minLength: 8)
-            Button { vm.editPlan() } label: {
-                Text("修改")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.accentColor)
-                    .padding(.horizontal, 8).padding(.vertical, 6)
-            }
-            .buttonStyle(.plain)
-            Button { vm.confirmPlan() } label: {
-                Text("确认执行")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Color.accentColor)
-                    .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            Button { vm.cancelPlan() } label: {
-                Image(systemName: "xmark")
-                    .font(.caption)
-                    .foregroundColor(ChatColors.secondaryText)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(ChatColors.secondaryBg)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(ChatColors.toolBorder).frame(height: 0.5)
-        }
-    }
+    ///
+    /// Implemented in DeepModeBanners.swift as a top-level struct.
 
     #if DEBUG
     /// Build a JSON representation of the full agent conversation history and copy it.
