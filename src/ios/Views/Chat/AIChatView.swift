@@ -2474,45 +2474,46 @@ struct AIChatView: View {
 
     // MARK: - Kernel Boot Overlay
 
-    @ViewBuilder
-    private var kernelBootOverlay: some View {
-        switch vm.kernelStatus {
-        case .booting:
-            ZStack {
-                ChatColors.background
-                    .ignoresSafeArea()
-                VStack(spacing: 16) {
-                    // Same three-dot language as SessionLoadingCard — this
-                    // overlay can appear right after the loading card on a
-                    // cold entry, so a system spinner here read as "the old
-                    // 菊花 came back".
-                    LoadingDotsView(dotSize: 9, color: ChatColors.secondaryText)
-                        .frame(height: 20)
-                    Text("Booting Kernel")
-                        .font(.subheadline)
-                        .foregroundStyle(ChatColors.secondaryText)
+    private var kernelBootOverlay: AnyView {
+        AnyView(Group {
+            switch vm.kernelStatus {
+            case .booting:
+                ZStack {
+                    ChatColors.background
+                        .ignoresSafeArea()
+                    VStack(spacing: 16) {
+                        // Same three-dot language as SessionLoadingCard — this
+                        // overlay can appear right after the loading card on a
+                        // cold entry, so a system spinner here read as "the old
+                        // 菊花 came back".
+                        LoadingDotsView(dotSize: 9, color: ChatColors.secondaryText)
+                            .frame(height: 20)
+                        Text("Booting Kernel")
+                            .font(.subheadline)
+                            .foregroundStyle(ChatColors.secondaryText)
+                    }
                 }
-            }
-            .transition(.opacity)
-        case .failed(let msg):
-            ZStack {
-                ChatColors.background
-                    .ignoresSafeArea()
-                VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.red)
-                    Text(msg)
-                        .font(.subheadline)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 40)
+                .transition(.opacity)
+            case .failed(let msg):
+                ZStack {
+                    ChatColors.background
+                        .ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.red)
+                        Text(msg)
+                            .font(.subheadline)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 40)
+                    }
                 }
+                .transition(.opacity)
+            default:
+                EmptyView()
             }
-            .transition(.opacity)
-        default:
-            EmptyView()
-        }
+        })
     }
 
     // MARK: - Error Banner
@@ -2703,8 +2704,8 @@ struct AIChatView: View {
 
     // MARK: - Messages
 
-    private var messagesArea: some View {
-        ZStack {
+    private var messagesArea: AnyView {
+        let view = ZStack {
             CollectionViewMessageListV3(
                 vm: vm,
                 inputFocused: inputFocused,
@@ -2825,6 +2826,7 @@ struct AIChatView: View {
             .animation(.easeInOut(duration: 0.2), value: hasFloatingPreview)
             .capsuleProtectedFrame("downloadButton")
         }
+        return AnyView(view)
     }
 
     /// Shared label style for the floating scroll buttons (up / down), matching
@@ -2845,34 +2847,35 @@ struct AIChatView: View {
     /// Background color for the scroll-to-bottom button.
     // MARK: - Floating Tool Preview
 
-    @ViewBuilder
-    private var floatingToolPreview: some View {
-        let allToolBlocks = vm.messages
-            .filter { $0.role == .assistant && !$0.isCompactedHistory }
-            .flatMap { $0.blocks.filter { $0.toolStatus != nil } }
-        if !allToolBlocks.isEmpty {
-            FloatingToolBar(toolBlocks: allToolBlocks, toolSnapshots: vm.toolSnapshots, browserPool: vm.browserTabPool, onBrowserTakeover: {
-                vm.browserTakeoverActive = true
-            }, onTakeoverDone: {
-                vm.resumeFromBrowserTakeover()
-            })
-                .frame(maxWidth: maxContentWidth)
-                .padding(.horizontal, 12)
-                // [T-ios-geometry-observer-crash] onGeometryChange replaces the
-                // GeometryReader+onAppear+onChange scaffold: writing state from
-                // onChange(of: geo.*) inside the geometry-observer path re-drives
-                // layout and trips a precondition on the iOS 18 async renderer
-                // (ViewGraphGeometryObservers.needsUpdate SIGTRAP). The action
-                // also fires with the initial value, covering the old onAppear.
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.size.height
-                } action: { newH in
-                    floatingBarHeight = newH
-                }
-                .onDisappear {
-                    floatingBarHeight = 0
-                }
-        }
+    private var floatingToolPreview: AnyView {
+        AnyView(Group {
+            let allToolBlocks = vm.messages
+                .filter { $0.role == .assistant && !$0.isCompactedHistory }
+                .flatMap { $0.blocks.filter { $0.toolStatus != nil } }
+            if !allToolBlocks.isEmpty {
+                FloatingToolBar(toolBlocks: allToolBlocks, toolSnapshots: vm.toolSnapshots, browserPool: vm.browserTabPool, onBrowserTakeover: {
+                    vm.browserTakeoverActive = true
+                }, onTakeoverDone: {
+                    vm.resumeFromBrowserTakeover()
+                })
+                    .frame(maxWidth: maxContentWidth)
+                    .padding(.horizontal, 12)
+                    // [T-ios-geometry-observer-crash] onGeometryChange replaces the
+                    // GeometryReader+onAppear+onChange scaffold: writing state from
+                    // onChange(of: geo.*) inside the geometry-observer path re-drives
+                    // layout and trips a precondition on the iOS 18 async renderer
+                    // (ViewGraphGeometryObservers.needsUpdate SIGTRAP). The action
+                    // also fires with the initial value, covering the old onAppear.
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.size.height
+                    } action: { newH in
+                        floatingBarHeight = newH
+                    }
+                    .onDisappear {
+                        floatingBarHeight = 0
+                    }
+            }
+        })
     }
 
     /// Whether the floating tool preview is visible.
@@ -4157,24 +4160,25 @@ struct AIChatView: View {
     private static let slashPickerFixedHeight: CGFloat =
         slashPickerRowHeight * CGFloat(slashPickerVisibleRows) + 8
 
-    @ViewBuilder
-    private var inputPopupOverlay: some View {
-        ZStack {
-            if vm.showSlashMenu && !vm.filteredSlashCommands.isEmpty {
-                popupOverlayContainer(onDismiss: { vm.dismissSlashMenu() }) {
-                    slashCommandMenu
-                }
-            } else if vm.showMentionMenu {
-                popupOverlayContainer(onDismiss: { vm.dismissMentionMenu() }) {
-                    mentionMenu
+    private var inputPopupOverlay: AnyView {
+        AnyView(Group {
+            ZStack {
+                if vm.showSlashMenu && !vm.filteredSlashCommands.isEmpty {
+                    popupOverlayContainer(onDismiss: { vm.dismissSlashMenu() }) {
+                        slashCommandMenu
+                    }
+                } else if vm.showMentionMenu {
+                    popupOverlayContainer(onDismiss: { vm.dismissMentionMenu() }) {
+                        mentionMenu
+                    }
                 }
             }
-        }
-        // Single spring drives both popups' show/hide transitions. Short
-        // snappy curve (~0.22s) — instant on `/` / `@` keypress with a
-        // touch of overshoot to read as iOS 26-native.
-        .animation(.spring(response: 0.18, dampingFraction: 0.82), value: vm.showSlashMenu)
-        .animation(.spring(response: 0.18, dampingFraction: 0.82), value: vm.showMentionMenu)
+            // Single spring drives both popups' show/hide transitions. Short
+            // snappy curve (~0.22s) — instant on `/` / `@` keypress with a
+            // touch of overshoot to read as iOS 26-native.
+            .animation(.spring(response: 0.18, dampingFraction: 0.82), value: vm.showSlashMenu)
+            .animation(.spring(response: 0.18, dampingFraction: 0.82), value: vm.showMentionMenu)
+        })
     }
 
     /// [T-ipad-inputbar-height-zero] Bounds of the window hosting the chat, in
