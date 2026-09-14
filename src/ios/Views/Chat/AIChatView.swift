@@ -1267,10 +1267,15 @@ struct AIChatView: View {
             let bvSid = sessionId ?? "nil"
             let bvDid = draftId ?? "nil"
             let bvHasBufStr = shareCoordinator.pendingShareBuffer != nil ? "true" : "false"
-            var shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)=\(newVersion) "
-            shareBufMsg += "sessionId=\(bvSid) "
-            shareBufMsg += "draftId=\(bvDid) "
-            shareBufMsg += "hasBuffer=\(bvHasBufStr)"
+            let verStr = String(describing: newVersion)
+            var shareBufMsg = "[Share] AIChatView.onChange(bufferVersion)="
+            shareBufMsg += verStr
+            shareBufMsg += " sessionId="
+            shareBufMsg += bvSid
+            shareBufMsg += " draftId="
+            shareBufMsg += bvDid
+            shareBufMsg += " hasBuffer="
+            shareBufMsg += bvHasBufStr
             minisLogger.info(shareBufMsg)
             injectPendingShareIfNeeded()
         }
@@ -1475,7 +1480,24 @@ struct AIChatView: View {
                     AppLogger(category: "InputBarLayout").info("[InputBarHealth] OK after foreground — composer re-reported geometry (h=\(latestInputBarFrameH) committed=\(inputBarHeight))")
                 } else {
                     let ageStr = String(format: "%.1f", age)
-                    let stalledLog = "[InputBarHealth] STALLED — no geometry callback 900ms after foreground. committed=\(inputBarHeight) latest=\(latestInputBarFrameH) lastReport=\(ageStr)s ago voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript) seeded=\(didSeedInputBarHeight). The composer host is not laying out; expect a blank bottom area. Leaving and re-entering the session rebuilds it."
+                    let inputBarHStr = String(describing: inputBarHeight)
+                    let latestFrameHStr = String(describing: latestInputBarFrameH)
+                    let voiceActiveStr = String(describing: voiceInputActive)
+                    let isEditingStr = String(describing: voiceVM.isEditingTranscript)
+                    let seededStr = String(describing: didSeedInputBarHeight)
+                    var stalledLog = "[InputBarHealth] STALLED — no geometry callback 900ms after foreground. committed="
+                    stalledLog += inputBarHStr
+                    stalledLog += " latest="
+                    stalledLog += latestFrameHStr
+                    stalledLog += " lastReport="
+                    stalledLog += ageStr
+                    stalledLog += "s ago voice="
+                    stalledLog += voiceActiveStr
+                    stalledLog += " editing="
+                    stalledLog += isEditingStr
+                    stalledLog += " seeded="
+                    stalledLog += seededStr
+                    stalledLog += ". The composer host is not laying out; expect a blank bottom area. Leaving and re-entering the session rebuilds it."
                     AppLogger(category: "InputBarLayout").error(stalledLog)
                 }
             }
@@ -1513,7 +1535,18 @@ struct AIChatView: View {
                 let hadResponder = keyWindow.endEditing(true)
                 UIView.performWithoutAnimation { keyWindow.layoutIfNeeded() }
                 let phaseName = phase == .inactive ? "inactive" : "background"
-                let dismissLog = "[voice-bgfg] scene \(phaseName) — forced keyboard-dismiss completion (hadResponder=\(hadResponder)) voice=\(voiceInputActive) editing=\(voiceVM.isEditingTranscript)"
+                let hadResponderStr = String(describing: hadResponder)
+                let voiceActiveStr = String(describing: voiceInputActive)
+                let isEditingStr = String(describing: voiceVM.isEditingTranscript)
+                var dismissLog = "[voice-bgfg] scene "
+                dismissLog += phaseName
+                dismissLog += " — forced keyboard-dismiss completion (hadResponder="
+                dismissLog += hadResponderStr
+                dismissLog += ") voice="
+                dismissLog += voiceActiveStr
+                dismissLog += " editing="
+                dismissLog += isEditingStr
+                dismissLog += ")"
                 AppLogger(category: "InputBarLayout").info(dismissLog)
             }
         }
@@ -1565,7 +1598,14 @@ struct AIChatView: View {
     private func handleOnAppear() {
         let sinceInit = (CFAbsoluteTimeGetCurrent() - AIChatViewModel.onAppearTimestamp) * 1000
         let sinceInitStr = String(format: "%.0f", sinceInit)
-        let onAppearLog = "[SessionLoad] onAppear T+\(sinceInitStr)ms isNew=\(cached.isNew) msgs=\(vm.messages.count)"
+        let isNewStr = String(describing: cached.isNew)
+        let msgCountStr = String(describing: vm.messages.count)
+        var onAppearLog = "[SessionLoad] onAppear T+"
+        onAppearLog += sinceInitStr
+        onAppearLog += "ms isNew="
+        onAppearLog += isNewStr
+        onAppearLog += " msgs="
+        onAppearLog += msgCountStr
         minisLogger.info(onAppearLog)
         // [T-inputbar-stale-across-reentry] Re-arm the leading-edge seed on
         // EVERY appear. AIChatView is keyed `.id(sessionId)` in ContentView,
@@ -1607,7 +1647,14 @@ struct AIChatView: View {
                 // Load session if: (a) VM is freshly created, or (b) cache hit but messages
                 // are empty — this can happen on iOS 16 where NavigationStack may recreate
                 // @StateObject unexpectedly, causing isNew=false but an empty VM.
-                let loadLog = "🔄SESSION AIChatView.onAppear loading session \(sessionId) isNew=\(cached.isNew) msgs=\(vm.messages.count)"
+                let loadLogIsNew = String(describing: cached.isNew)
+                let loadLogMsgCount = String(describing: vm.messages.count)
+                var loadLog = "🔄SESSION AIChatView.onAppear loading session "
+                loadLog += sessionId
+                loadLog += " isNew="
+                loadLog += loadLogIsNew
+                loadLog += " msgs="
+                loadLog += loadLogMsgCount
                 minisLogger.info(loadLog)
                 // [T-ios-session-coldload-listsessions-block] .userInitiated
                 // so the actual session-open work wins the serialized
@@ -1639,7 +1686,14 @@ struct AIChatView: View {
                 }
             } else {
                 let reuseStart = CFAbsoluteTimeGetCurrent()
-                let reuseLog = "🔄SESSION AIChatView.onAppear REUSING cached vm for \(sessionId) isProcessing=\(vm.isProcessing) msgs=\(vm.messages.count)"
+                let reuseIsProc = String(describing: vm.isProcessing)
+                let reuseMsgCount = String(describing: vm.messages.count)
+                var reuseLog = "🔄SESSION AIChatView.onAppear REUSING cached vm for "
+                reuseLog += sessionId
+                reuseLog += " isProcessing="
+                reuseLog += reuseIsProc
+                reuseLog += " msgs="
+                reuseLog += reuseMsgCount
                 minisLogger.info(reuseLog)
                 // Remount minis for this session (in case another session took over)
                 vm.mountMinis(for: sessionId)
@@ -1664,7 +1718,16 @@ struct AIChatView: View {
                 let totalElapsed = (CFAbsoluteTimeGetCurrent() - reuseStart) * 1000
                 let totalStr = String(format: "%.1f", totalElapsed)
                 let mountStr = String(format: "%.1f", mountElapsed)
-                let reuseSummary = "[SessionLoad] \(sessionId) — REUSE: \(totalStr)ms [mount: \(mountStr) | msgs: \(vm.messages.count)]"
+                let msgCountStr = String(describing: vm.messages.count)
+                var reuseSummary = "[SessionLoad] "
+                reuseSummary += sessionId
+                reuseSummary += " — REUSE: "
+                reuseSummary += totalStr
+                reuseSummary += "ms [mount: "
+                reuseSummary += mountStr
+                reuseSummary += " | msgs: "
+                reuseSummary += msgCountStr
+                reuseSummary += "]"
                 minisLogger.info(reuseSummary)
             }
         } else {
@@ -1677,7 +1740,14 @@ struct AIChatView: View {
         }
         let shareSid = sessionId ?? "nil"
         let hasBuffer = shareCoordinator.pendingShareBuffer != nil
-        let shareLog = "[Share] AIChatView.onAppear: sessionId=\(shareSid) bufferVersion=\(shareCoordinator.bufferVersion) hasBuffer=\(hasBuffer)"
+        let bufVerStr = String(describing: shareCoordinator.bufferVersion)
+        let hasBufStr = String(describing: hasBuffer)
+        var shareLog = "[Share] AIChatView.onAppear: sessionId="
+        shareLog += shareSid
+        shareLog += " bufferVersion="
+        shareLog += bufVerStr
+        shareLog += " hasBuffer="
+        shareLog += hasBufStr
         minisLogger.info(shareLog)
         injectPendingShareIfNeeded()
         injectPendingTransferIfNeeded()
@@ -1707,7 +1777,19 @@ struct AIChatView: View {
     /// `chatReady` state. Flips the relevant @State so SwiftUI mounts
     /// the camera sheet / starts speech recognition.
     private func applyQuickAction(_ action: ChatLaunchAction) {
-        minisLogger.info("[QuickAction] applyQuickAction action=\(String(describing: action)) showCamera=\(showCamera) hasOverlay=\(hasOverlayPresented) chatVisible=\(isChatViewVisible)")
+        let actionStr = String(describing: action)
+        let showCamStr = String(describing: showCamera)
+        let hasOverlayStr = String(describing: hasOverlayPresented)
+        let chatVisibleStr = String(describing: isChatViewVisible)
+        var quickActionLog = "[QuickAction] applyQuickAction action="
+        quickActionLog += actionStr
+        quickActionLog += " showCamera="
+        quickActionLog += showCamStr
+        quickActionLog += " hasOverlay="
+        quickActionLog += hasOverlayStr
+        quickActionLog += " chatVisible="
+        quickActionLog += chatVisibleStr
+        minisLogger.info(quickActionLog)
         // Guard against late deliveries to a view that already
         // disappeared — workflow re-publishes chatReady on retry and
         // the modifier's onReceive can fire after our onDisappear set
@@ -3994,7 +4076,21 @@ struct AIChatView: View {
                     let offX2 = Int(frame.maxX)
                     let winX1 = Int(hostWindow.minX)
                     let winX2 = Int(hostWindow.maxX)
-                    let offscreenLog = "inputBarHeight discarded=\(newH) offscreen x=\(offX1)…\(offX2) win=\(winX1)…\(winX2)"
+                    let offX1Str = String(describing: offX1)
+                    let offX2Str = String(describing: offX2)
+                    let winX1Str = String(describing: winX1)
+                    let winX2Str = String(describing: winX2)
+                    let newHStr = String(describing: newH)
+                    var offscreenLog = "inputBarHeight discarded="
+                    offscreenLog += newHStr
+                    offscreenLog += " offscreen x="
+                    offscreenLog += offX1Str
+                    offscreenLog += "…"
+                    offscreenLog += offX2Str
+                    offscreenLog += " win="
+                    offscreenLog += winX1Str
+                    offscreenLog += "…"
+                    offscreenLog += winX2Str
                     AppLogger(category: "InputBarLayout").info(offscreenLog)
                     return
                 }
@@ -4812,7 +4908,18 @@ struct AIChatView: View {
         let sendSid = vm.sessionId ?? "nil"
         let sendDid = draftId ?? "nil"
         let sendText = String(vm.inputText.prefix(50))
-        let sendLog = "🔑DRAFT performSend vm=\(vm.vmInstanceId) vm.sessionId=\(sendSid) draftId=\(sendDid) inputText='\(sendText)' isProcessing=\(vm.isProcessing)"
+        let vmIdStr = String(describing: vm.vmInstanceId)
+        let isProcStr = String(describing: vm.isProcessing)
+        var sendLog = "🔑DRAFT performSend vm="
+        sendLog += vmIdStr
+        sendLog += " vm.sessionId="
+        sendLog += sendSid
+        sendLog += " draftId="
+        sendLog += sendDid
+        sendLog += " inputText='"
+        sendLog += sendText
+        sendLog += "' isProcessing="
+        sendLog += isProcStr
         minisLogger.info(sendLog)
         // Keep SwiftUI focus when a hardware keyboard is connected — dropping
         // it would force the user to tap the field again before typing the
