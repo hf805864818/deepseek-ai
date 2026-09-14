@@ -1251,7 +1251,9 @@ struct AIChatView: View {
         }
         .onAppear {
             let sinceInit = (CFAbsoluteTimeGetCurrent() - AIChatViewModel.onAppearTimestamp) * 1000
-            minisLogger.info("[SessionLoad] onAppear T+\(String(format: "%.0f", sinceInit))ms isNew=\(cached.isNew) msgs=\(vm.messages.count)")
+            let sinceInitStr = String(format: "%.0f", sinceInit)
+            let onAppearLog = "[SessionLoad] onAppear T+\(sinceInitStr)ms isNew=\(cached.isNew) msgs=\(vm.messages.count)"
+            minisLogger.info(onAppearLog)
             // [T-inputbar-stale-across-reentry] Re-arm the leading-edge seed on
             // EVERY appear. AIChatView is keyed `.id(sessionId)` in ContentView,
             // so re-entering the SAME session reuses the same SwiftUI identity
@@ -1309,7 +1311,7 @@ struct AIChatView: View {
                     // but this view appeared before it completed. Wait for it to finish,
                     // then reload if messages are still empty (objectWillChange may have
                     // fired between old and new CachedViewModel subscriptions).
-                    minisLogger.info("🔄SESSION AIChatView.onAppear WAITING for in-flight load session=\(sessionId)")
+                    minisLogger.info("🔄SESSION AIChatView.onAppear WAITING for in-flight load session=\(sessionId.uuidString)")
                     Task {
                         // Wait for the in-flight load to complete (poll at short intervals)
                         for _ in 0..<20 {
@@ -1318,7 +1320,7 @@ struct AIChatView: View {
                         }
                         // If messages are still empty after the load completed, retry
                         if vm.messages.isEmpty && !vm.isLoadingSession {
-                            minisLogger.warning("🔄SESSION AIChatView.onAppear RETRY load — messages still empty after in-flight load for \(sessionId)")
+                            minisLogger.warning("🔄SESSION AIChatView.onAppear RETRY load — messages still empty after in-flight load for \(sessionId.uuidString)")
                             await vm.loadSession()
                         }
                     }
@@ -1347,7 +1349,10 @@ struct AIChatView: View {
                         vm.forceScrollToBottom.send()
                     }
                     let totalElapsed = (CFAbsoluteTimeGetCurrent() - reuseStart) * 1000
-                    minisLogger.info("[SessionLoad] \(sessionId) — REUSE: \(String(format: "%.1f", totalElapsed))ms [mount: \(String(format: "%.1f", mountElapsed)) | msgs: \(vm.messages.count)]")
+                    let totalStr = String(format: "%.1f", totalElapsed)
+                    let mountStr = String(format: "%.1f", mountElapsed)
+                    let reuseLog = "[SessionLoad] \(sessionId.uuidString) — REUSE: \(totalStr)ms [mount: \(mountStr) | msgs: \(vm.messages.count)]"
+                    minisLogger.info(reuseLog)
                 }
             } else {
                 minisLogger.info("🔄SESSION AIChatView.onAppear nil sessionId — draft mode")
@@ -1357,7 +1362,8 @@ struct AIChatView: View {
                     inputFocused = true
                 }
             }
-            minisLogger.info("[Share] AIChatView.onAppear: sessionId=\(sessionId ?? "nil") bufferVersion=\(shareCoordinator.bufferVersion) hasBuffer=\(shareCoordinator.pendingShareBuffer != nil)")
+            let shareLog = "[Share] AIChatView.onAppear: sessionId=\(sessionId?.uuidString ?? "nil") bufferVersion=\(shareCoordinator.bufferVersion) hasBuffer=\(shareCoordinator.pendingShareBuffer != nil)"
+            minisLogger.info(shareLog)
             injectPendingShareIfNeeded()
             injectPendingTransferIfNeeded()
             isChatViewVisible = true
