@@ -108,6 +108,7 @@
 		E5SPL0002 /* AIChatView+Sheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SPL0102 /* AIChatView+Sheets.swift */; };
 		E5SPL0003 /* AIChatView+Toolbar.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SPL0103 /* AIChatView+Toolbar.swift */; };
 		E5SPL0004 /* AIChatView+Auxiliary.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SPL0104 /* AIChatView+Auxiliary.swift */; };
+		E5SPL0005 /* AIChatView+InputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SPL0105 /* AIChatView+InputBar.swift */; };
 		E53000004 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E53000014 /* ChatStore.swift */; };
 		E53000005 /* UsageStatsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E53000015 /* UsageStatsView.swift */; };
 		E53000006 /* CacheKeepAliveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E53000016 /* CacheKeepAliveManager.swift */; };
@@ -750,6 +751,7 @@
 		E5SPL0102 /* AIChatView+Sheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIChatView+Sheets.swift"; sourceTree = "<group>"; };
 		E5SPL0103 /* AIChatView+Toolbar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIChatView+Toolbar.swift"; sourceTree = "<group>"; };
 		E5SPL0104 /* AIChatView+Auxiliary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIChatView+Auxiliary.swift"; sourceTree = "<group>"; };
+		E5SPL0105 /* AIChatView+InputBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIChatView+InputBar.swift"; sourceTree = "<group>"; };
 		E53000014 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
 		E53000015 /* UsageStatsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageStatsView.swift; sourceTree = "<group>"; };
 		E53000016 /* CacheKeepAliveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheKeepAliveManager.swift; sourceTree = "<group>"; };
@@ -2148,6 +2150,7 @@
 				E5SPL0102 /* AIChatView+Sheets.swift */,
 				E5SPL0103 /* AIChatView+Toolbar.swift */,
 				E5SPL0104 /* AIChatView+Auxiliary.swift */,
+				E5SPL0105 /* AIChatView+InputBar.swift */,
 				E5F200011 /* MarkdownPrepRegex.swift */,
 				E5F200012 /* MinisMediaViews.swift */,
 				E5F200013 /* AssistantBlockView.swift */,
@@ -2781,6 +2784,7 @@
 				E5SPL0002 /* AIChatView+Sheets.swift in Sources */,
 				E5SPL0003 /* AIChatView+Toolbar.swift in Sources */,
 				E5SPL0004 /* AIChatView+Auxiliary.swift in Sources */,
+				E5SPL0005 /* AIChatView+InputBar.swift in Sources */,
 				E5CAL0001 /* CookieAuditLogger.swift in Sources */,
 				E5F200001 /* MarkdownPrepRegex.swift in Sources */,
 				E5F200002 /* MinisMediaViews.swift in Sources */,
@@ -3455,13 +3459,7 @@
 					"-lish",
 					"-lfakefs",
 				);
-				OTHER_SWIFT_FLAGS = (
-					"$(inherited)",
-					"-Xfrontend",
-					"-type-checker-timeout",
-					"-Xfrontend",
-					600,
-				);
+				OTHER_SWIFT_FLAGS = "";
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -3515,13 +3513,7 @@
 					"-lish",
 					"-lfakefs",
 				);
-				OTHER_SWIFT_FLAGS = (
-					"$(inherited)",
-					"-Xfrontend",
-					"-type-checker-timeout",
-					"-Xfrontend",
-					600,
-				);
+				OTHER_SWIFT_FLAGS = "";
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
