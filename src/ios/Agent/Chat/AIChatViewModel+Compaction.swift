@@ -1088,6 +1088,14 @@ extension AIChatViewModel {
 
             // Merge the two summaries into ONE message — the caller stores a
             // single summary string, so segmentation is invisible downstream.
+            //
+            // [T-deepseek-compact-merge-fallback] Prefer LLM merge for quality
+            // (cohesive de-duplicated summary), but fall back to a plain string
+            // join if the merge call fails — same rationale as upstream GH#235
+            // (v1.13 dropped the merge call entirely because an unprotected
+            // merge call could throw away two successfully-compressed segments).
+            // Here we keep the quality upgrade when it works, without risking
+            // the whole compaction on it.
             statusMsg.content = "Retry segments \(firstHalf.count)+\(secondHalf.count) (merging)..."
             let mergeInput = """
             Merge these partial summaries into a single cohesive context summary. \
@@ -1110,8 +1118,13 @@ extension AIChatViewModel {
 
             Part 2:\n\(summary2)
             """
-            let merged = try await generateCompactSummary(conversationText: mergeInput, statusMsg: statusMsg)
-            return merged
+            do {
+                let merged = try await generateCompactSummary(conversationText: mergeInput, statusMsg: statusMsg)
+                return merged
+            } catch {
+                logger.info("[Compact] merge call failed, falling back to string join: \(error.localizedDescription)")
+                return summary1 + "\n\n" + summary2
+            }
         }
     }
 
