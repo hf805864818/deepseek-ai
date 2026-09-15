@@ -130,19 +130,30 @@ struct MinisApp: App {
         // .onAppear refresh) locks the sidebar title to the default even when the
         // user set a custom name. refreshCache() only reads the tiny SOUL.md file.
         SoulStore.refreshCache()
-        // Pre-warm KaTeX WKWebView as fallback for formulas SwiftMath can't render
-        KaTeXRenderer.shared.warmUp()
-        // Pre-warm the biometric capability probe off the main thread. The
-        // first LAContext.canEvaluatePolicy call cold-starts the
-        // LocalAuthentication XPC daemon (~500 ms); without this it would run
-        // inline on the first sessionContextMenu builder during scroll and
-        // hang a frame. (T-ios-biometric-probe-scroll-hang)
-        BiometricAuth.prewarm()
         // Clean up Live Activities left over from a previous app session (e.g. app was killed)
         AgentLiveActivityManager.shared.cleanupStaleActivities(source: "MinisApp.init")
-        // Start screen-awake controller — it will observe running tasks
-        // + the user's opt-in flag and toggle the idle timer accordingly.
-        Task { @MainActor in KeepScreenAwakeController.shared.start() }
+        // [WatchdogFix] Delay pre-warm operations until after the first frame
+        // is rendered. KaTeXRenderer.shared.warmUp() creates a WKWebView
+        // (~200-500ms) and BiometricAuth.prewarm() cold-starts the
+        // LocalAuthentication XPC daemon (~500ms). Running these synchronously
+        // in init() blocks the main thread before scene-create can complete,
+        // causing a watchdog termination (0x8BADF00D, ~19.61s budget exhausted).
+        // By yielding first with Task.yield(), we let SwiftUI commit the first
+        // frame to satisfy the scene-create watchdog, then perform pre-warm.
+        Task { @MainActor in
+            await Task.yield()
+            // Pre-warm KaTeX WKWebView as fallback for formulas SwiftMath can't render
+            KaTeXRenderer.shared.warmUp()
+            // Pre-warm the biometric capability probe off the main thread. The
+            // first LAContext.canEvaluatePolicy call cold-starts the
+            // LocalAuthentication XPC daemon (~500 ms); without this it would run
+            // inline on the first sessionContextMenu builder during scroll and
+            // hang a frame. (T-ios-biometric-probe-scroll-hang)
+            BiometricAuth.prewarm()
+            // Start screen-awake controller — it will observe running tasks
+            // + the user's opt-in flag and toggle the idle timer accordingly.
+            KeepScreenAwakeController.shared.start()
+        }
     }
 
     var body: some Scene {
@@ -245,17 +256,10 @@ struct MinisApp: App {
                     }
                 }
                 .onAppear {
+                    // ── P0: UI-essential — must run before first frame ──
                     // Populate ConfigRegistry once. Idempotent — every
                     // appearance after the first is a no-op.
                     ConfigRegistry.shared.registerBuiltinsIfNeeded()
-                    // Register notification delegate for shortcut task tap-to-open
-                    ShortcutNotificationDelegate.shared.register()
-                    // Register App Shortcuts with the system so Siri and Spotlight discover them
-                    if #available(iOS 17.0, *) {
-                        MinisShortcutsProvider.updateAppShortcutParameters()
-                    }
-                    // Start logging if previously enabled
-                    LoggingManager.shared.startIfEnabled()
                     // HangFix(2026-05-14) — always-on hang detector. Was
                     // previously gated to `isProcessing == true`, but the
                     // user can also hit hang while just browsing a session
@@ -264,49 +268,82 @@ struct MinisApp: App {
                     // itself is cheap (100ms poll on a background thread,
                     // observer write on each runloop hop).
                     StreamingHangLogger.shared.acquire(reason: "app-launch always-on")
-                    // Migrate legacy provider config on first launch after upgrade
-                    ProviderMigration.migrateIfNeeded(store: ProviderConfigStore.shared)
-                    // Refresh model lists once per day to keep them current
-                    ProviderConfigStore.shared.refreshAllModelsIfNeeded()
-                    // [T-mimo-shadow-voice] One-time upgrade fix: force-refresh
-                    // mixed-modality providers (MiMo/DashScope) mis-classified by
-                    // the old voice-only whitelist, so their text models + shadow
-                    // voice rows recover promptly without waiting for a natural refresh.
-                    ProviderConfigStore.shared.migrateVoiceModalityIfNeeded()
-                    // For existing users with no model groups, create a default group silently
-                    Task { await ProviderConfigStore.shared.createDefaultGroupIfNeeded() }
-                    shareLog.info("[Share] onAppear — checking for pending share")
-                    shareCoordinator.checkForPendingShare()
-                    // Set up background keep-alive manager
-                    BackgroundKeepAliveManager.shared.setup()
-                    // Monitor network changes to keep iSH DNS up to date
-                    NetworkMonitor.shared.start()
-                    // Register FileProvider domain for shared files
-                    Self.registerFileProviderDomain()
-                    // Migrate legacy shared dir to App Group container
-                    Self.migrateSharedDirToAppGroup()
-                    // Trace the resolved AppGroup paths so we can confirm the
-                    // main app, FileProvider extension, and iSH bind mount all
-                    // agree on which directory holds the user's shared files.
-                    Self.logFPSyncTracePaths()
-                    // Start watching shared/skills/memory subtrees so iSH writes
-                    // and FileBrowserView mutations propagate to the Files app.
-                    AppGroupChangeWatcher.shared.start()
-                    // Activate security scopes for user-mounted external folders
-                    // (e.g. Obsidian vault in iCloud Drive). Held for app lifetime.
-                    MountedFoldersManager.shared.activateAll()
-                    // Create /var/minis/mounts/<name> symlinks in the fakefs now
-                    // that the rootfs exists and mounts are active.
-                    AIChatViewModel.refreshMountedFolderSymlinks()
-                    // Start iCloud sync engine. v2 takes precedence when its
-                    // feature flag is on (see SyncV2Bootstrap); v1 stays
-                    // paused while v2 is active. When v2 is off, v1 boots
-                    // exactly as before.
-                    if #available(iOS 17.0, *) {
-                        Task { @MainActor in
-                            await SyncV2Bootstrap.startIfEnabled()
-                            if !SyncV2Bootstrap.shouldPauseV1() {
-                                await CloudSyncEngine.shared.start()
+
+                    // ── P1: Deferred to next runloop after first frame ──
+                    // [WatchdogFix] These operations don't need to complete
+                    // before the first frame renders. By yielding with
+                    // Task.yield(), we let SwiftUI commit the first frame
+                    // first, then execute the remaining setup. This prevents
+                    // scene-create watchdog terminations on devices with
+                    // memory pressure or slow I/O.
+                    Task { @MainActor in
+                        await Task.yield()
+
+                        // Register notification delegate for shortcut task tap-to-open
+                        ShortcutNotificationDelegate.shared.register()
+                        // Register App Shortcuts with the system so Siri and Spotlight discover them
+                        if #available(iOS 17.0, *) {
+                            MinisShortcutsProvider.updateAppShortcutParameters()
+                        }
+                        // Start logging if previously enabled
+                        LoggingManager.shared.startIfEnabled()
+                        // Migrate legacy provider config on first launch after upgrade
+                        ProviderMigration.migrateIfNeeded(store: ProviderConfigStore.shared)
+                        // Refresh model lists once per day to keep them current
+                        ProviderConfigStore.shared.refreshAllModelsIfNeeded()
+                        // [T-mimo-shadow-voice] One-time upgrade fix: force-refresh
+                        // mixed-modality providers (MiMo/DashScope) mis-classified by
+                        // the old voice-only whitelist, so their text models + shadow
+                        // voice rows recover promptly without waiting for a natural refresh.
+                        ProviderConfigStore.shared.migrateVoiceModalityIfNeeded()
+                        // For existing users with no model groups, create a default group silently
+                        Task { await ProviderConfigStore.shared.createDefaultGroupIfNeeded() }
+                        shareLog.info("[Share] onAppear — checking for pending share")
+                        shareCoordinator.checkForPendingShare()
+                        // Set up background keep-alive manager
+                        BackgroundKeepAliveManager.shared.setup()
+                        // Monitor network changes to keep iSH DNS up to date
+                        NetworkMonitor.shared.start()
+                    }
+
+                    // ── P2: Background thread — file system & sync ──
+                    // [WatchdogFix] FileProvider registration, directory
+                    // migration, and iCloud sync startup are I/O-heavy and
+                    // don't affect first-frame rendering. Move them off the
+                    // main actor entirely to avoid blocking scene-create.
+                    Task.detached(priority: .utility) {
+                        await MainActor.run {
+                            // Register FileProvider domain for shared files
+                            Self.registerFileProviderDomain()
+                            // Migrate legacy shared dir to App Group container
+                            Self.migrateSharedDirToAppGroup()
+                            // Trace the resolved AppGroup paths so we can confirm the
+                            // main app, FileProvider extension, and iSH bind mount all
+                            // agree on which directory holds the user's shared files.
+                            Self.logFPSyncTracePaths()
+                            // Start watching shared/skills/memory subtrees so iSH writes
+                            // and FileBrowserView mutations propagate to the Files app.
+                            AppGroupChangeWatcher.shared.start()
+                            // Activate security scopes for user-mounted external folders
+                            // (e.g. Obsidian vault in iCloud Drive). Held for app lifetime.
+                            MountedFoldersManager.shared.activateAll()
+                            // Create /var/minis/mounts/<name> symlinks in the fakefs now
+                            // that the rootfs exists and mounts are active.
+                            AIChatViewModel.refreshMountedFolderSymlinks()
+                        }
+
+                        // Start iCloud sync engine. v2 takes precedence when its
+                        // feature flag is on (see SyncV2Bootstrap); v1 stays
+                        // paused while v2 is active. When v2 is off, v1 boots
+                        // exactly as before.
+                        if #available(iOS 17.0, *) {
+                            await MainActor.run {
+                                Task { @MainActor in
+                                    await SyncV2Bootstrap.startIfEnabled()
+                                    if !SyncV2Bootstrap.shouldPauseV1() {
+                                        await CloudSyncEngine.shared.start()
+                                    }
+                                }
                             }
                         }
                     }
