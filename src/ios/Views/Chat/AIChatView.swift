@@ -3108,7 +3108,15 @@ struct AIChatView: View {
         }
     }
 
-    private var inputBar: some View {
+    private var inputBar: AnyView {
+        // [T-ios-runtime-demangle-watchdog] The input bar is one of the
+        // deepest raw view bodies in this file (multi-layer VStack + speech
+        // gesture recognizer + DeepMode/swipe send states). Erase its type
+        // with AnyView so Swift's runtime type decoder doesn't have to
+        // demangle this giant nested generic when the chat is first
+        // instantiated during scene-create — the same demangle recursion
+        // that previously exhausted the 19.65s watchdog budget.
+        AnyView(
         VStack(spacing: 0) {
             if vm.isSuspended {
                 HStack(spacing: 8) {
@@ -3532,6 +3540,7 @@ struct AIChatView: View {
                 startPoint: .top,
                 endPoint: .bottom
             )
+        )
         )
     }
 
