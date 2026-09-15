@@ -423,7 +423,7 @@ struct MinisApp: App {
                 // would surface a ⏸ badge on a live, spinning session. Active ⇒
                 // never paused. (Mirrors the Android foreground reconcile.)
                 let activeNow = SessionActivityTracker.shared.activeSessions
-                let filteredIds = interruptedSessionsWithDates.keys.subtracting(activeNow)
+                let filteredIds = Set(interruptedSessionsWithDates.keys).subtracting(activeNow)
                 let filteredDates = filteredIds.reduce(into: [String: Date]()) { $0[$1] = interruptedSessionsWithDates[$1] }
                 SessionBadgeStore.shared.reconcileInterruptedSessions(filteredIds, entryDates: filteredDates, trigger: "foreground")
                 ISHKernel.shared.refreshDns()

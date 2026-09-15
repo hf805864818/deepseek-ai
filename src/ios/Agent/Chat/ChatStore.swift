@@ -4403,8 +4403,8 @@ actor ChatStore {
                 records.append(UsageRecord(
                     modelId: modelId, sessionId: sessionId,
                     date: createdAt, usage: usage,
-                    modelDisplayName: displayName, providerType: providerType,
-                    hasSnapshot: hasSnapshot
+                    hasSnapshot: hasSnapshot,
+                    modelDisplayName: displayName, providerType: providerType
                 ))
             }
         }
