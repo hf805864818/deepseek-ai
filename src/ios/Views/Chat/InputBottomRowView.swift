@@ -49,6 +49,7 @@ struct InputBottomRowView: View {
     }
     
     // MARK: - Attachment Menu Button
+    @ViewBuilder
     private var attachmentMenuButton: some View {
         let icon = Image(systemName: "plus")
             .font(.system(size: 18, weight: .medium))

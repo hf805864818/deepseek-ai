@@ -29,7 +29,7 @@ struct InputFieldOrWaveformView: View {
     
     // Composer resize state
     @Binding var composerDragOffset: CGFloat
-    @Binding var composerHeightFraction: CGFloat
+    @Binding var composerHeightFraction: Double
     
     // Managers
     var speechManager: SpeechRecognitionManager
