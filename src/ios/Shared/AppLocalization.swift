@@ -102,7 +102,12 @@ func AppLocalized(_ key: String.LocalizationValue, comment: StaticString? = nil)
 /// `String.LocalizationValue` (the key) and re-using the literal-key path so
 /// the in-app override still applies to the active bundle.
 func AppLocalized(_ resource: LocalizedStringResource) -> String {
-    // LocalizedStringResource.key is a String.LocalizationValue, so hand it
-    // straight to the bundle-aware resolver (the in-app override applies).
-    return String(localized: resource.key, bundle: AppBundle.current)
+    // LocalizedStringResource.key is a plain String on the current SDK (it was
+    // String.LocalizationValue on older ones), so plumbing it through
+    // String(localized:bundle:) is not type-stable across SDKs. Resolve via
+    // Bundle.localizedString(forKey:value:table:), which is the same seam the
+    // language-override swizzle already patches — `AppBundle.current` +
+    // `overrideLocalizedString` honor the in-app language and need no generic
+    // key-typed re-construction.
+    AppBundle.current.localizedString(forKey: resource.key, value: resource.key, table: nil)
 }
