@@ -65,7 +65,7 @@ import com.openminis.app.auth.GoogleDriveOAuthManager
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit, onLocalSyncClick: () -> Unit = {}) {
+fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit, onLocalSyncClick: () -> Unit = {}, onBackupClick: () -> Unit = {}) {
     val context = LocalContext.current
     val oauthManager = remember { GoogleDriveOAuthManager.forSync(context.applicationContext) }
     var googleDriveConnected by remember { mutableStateOf(oauthManager.isAuthenticated()) }
@@ -120,6 +120,17 @@ fun OtherSyncScreen(onBack: () -> Unit, onGoogleDriveClick: () -> Unit, onLocalS
                     title = stringResource(R.string.gdrive_title),
                     subtitle = if (googleDriveConnected) stringResource(R.string.sync_connected) else stringResource(R.string.sync_not_connected),
                     onClick = onGoogleDriveClick,
+                )
+                // [Merge-v1.13] Official backup system (create .minisbak
+                // packages, restore/merge, and rclone remote storage) hosted
+                // here next to Local Sync and Google Drive. The iCloud
+                // equivalent keeps its original Settings position.
+                OtherSyncItem(
+                    icon = Icons.Outlined.Sync,
+                    iconColor = Color(0xFF5856D6),
+                    title = stringResource(R.string.backup_title),
+                    subtitle = stringResource(R.string.settings_backup_restore_subtitle),
+                    onClick = onBackupClick,
                 )
                 OtherSyncItem(
                     icon = Icons.Outlined.CloudOff,

@@ -1,5 +1,6 @@
 package com.openminis.app.ui.settings
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -30,16 +32,27 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.openminis.app.R
 import com.openminis.app.agent.SoulBodyLimitCheck
 import com.openminis.app.agent.SoulFile
+import com.openminis.app.agent.SoulIcon
 import com.openminis.app.agent.SoulMDParser
 import com.openminis.app.agent.SoulMetadata
 import com.openminis.app.agent.SoulStore
@@ -81,6 +94,10 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
     // the identity emoji shown to the user is locked to ✨ everywhere
     // (see [SoulMetadata.displayEmoji]).
     var preservedEmoji by remember { mutableStateOf(SoulMetadata.DEFAULT.emoji) }
+    // [T-android-soul-custom-icon] Same round-trip rule as the emoji above:
+    // the icon lives in frontmatter and this editor doesn't manage it, so
+    // Save must not silently drop a custom icon set on another surface.
+    var preservedIcon by remember { mutableStateOf(SoulMetadata.DEFAULT.icon) }
 
     // Initial load + (defensive) ensureExists. The Application-level call
     // already seeded on first run, but loading from a freshly cleared app
@@ -91,6 +108,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
             val parsed = SoulStore.load(context) ?: SoulMDParser.parse(SoulStore.DEFAULT_CONTENT)
             name = parsed.metadata.name
             preservedEmoji = parsed.metadata.emoji
+            preservedIcon = parsed.metadata.icon
             style = parsed.metadata.style
             lang = parsed.metadata.lang
             body = parsed.body
@@ -234,6 +252,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                                         // see it silently rewritten when
                                         // they hit Save here.
                                         emoji = preservedEmoji.ifBlank { SoulMetadata.DEFAULT.emoji },
+                                        icon = preservedIcon.ifBlank { SoulMetadata.DEFAULT.icon },
                                         style = style,
                                         lang = lang.ifBlank { SoulMetadata.DEFAULT.lang },
                                     ),
@@ -263,6 +282,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                     val parsed = SoulMDParser.parse(SoulStore.DEFAULT_CONTENT)
                     name = parsed.metadata.name
                     preservedEmoji = parsed.metadata.emoji
+                    preservedIcon = parsed.metadata.icon
                     style = parsed.metadata.style
                     lang = parsed.metadata.lang
                     body = parsed.body
@@ -359,4 +379,52 @@ private fun LangPicker(lang: String, onLangChange: (String) -> Unit) {
         }
     }
     expanded // suppress unused-var warning
+}
+
+/**
+ * [T-android-soul-custom-icon] The icon itself, rendered the same way
+ * everywhere it appears: a decoded bitmap, an emoji, or the default sparkle.
+ *
+ * The bitmap decode is `remember`ed on the icon string. Without that, the
+ * chat header would re-decode base64 on every recomposition — and headers
+ * recompose on every streaming tick.
+ */
+@Composable
+internal fun SoulIconGlyph(
+    icon: String,
+    sizeDp: Dp,
+    emojiSp: TextUnit,
+    sparkleTint: Brush? = null,
+) {
+    val bitmap = remember(icon) { SoulIcon.decode(icon) }
+    when {
+        // Rounded rectangle, NOT a circle: at 18dp in the chat header a circle
+        // eats the corners of a small avatar. Clipping here is also what makes
+        // an opaque image acceptable at all — the refusal that used to guard
+        // against "opaque rectangle reads as a broken tile" was a presentation
+        // concern, and this is the presentation fix.
+        bitmap != null -> Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = Modifier
+                .size(sizeDp)
+                .clip(RoundedCornerShape(sizeDp * SoulIcon.CORNER_RADIUS_FRACTION)),
+        )
+        icon.isNotEmpty() -> Text(text = icon, fontSize = emojiSp)
+        // Unset: byte-for-byte the previous sparkle, so a user who never
+        // touches this sees no visual change at all.
+        sparkleTint != null -> Icon(
+            imageVector = Icons.Filled.AutoAwesome,
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier
+                .size(sizeDp)
+                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                .drawWithContent {
+                    drawContent()
+                    drawRect(brush = sparkleTint, blendMode = BlendMode.SrcIn)
+                },
+        )
+        else -> Text(text = SoulMetadata.DISPLAY_EMOJI, fontSize = emojiSp)
+    }
 }

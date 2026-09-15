@@ -3,6 +3,7 @@ package com.openminis.app.data.repository
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import com.openminis.app.backup.BackupSecrets
 import com.openminis.app.data.db.ProviderConfigDao
 import com.openminis.app.data.db.ProviderConfigMetaKeys
 import com.openminis.app.data.db.ProviderConfigSnapshot
@@ -2137,7 +2138,9 @@ class ProviderRepository(private val context: Context) {
                     )
                     ProviderType.gemini -> GeminiModelsApi.fetchModels(apiKey)
                     // [T-provider-custom-user-agent] models-list UA override.
-                    ProviderType.openAI -> OpenAIModelsApi.fetchModels(apiKey, baseURL, customUserAgent = instance.customUserAgent)
+                    // [T-android-provider-type-parity] Responses API shares the
+                    // OpenAI models endpoint; only the completion path differs.
+                    ProviderType.openAI, ProviderType.openAIResponses -> OpenAIModelsApi.fetchModels(apiKey, baseURL, customUserAgent = instance.customUserAgent)
                     ProviderType.openRouter -> OpenRouterModelsApi.fetchModels(apiKey)
                     // xAI: the OAuth model list is fixed (no /v1/models gating
                     // call needed — XAIModelsApi exposes the spec-mandated set).
@@ -2155,6 +2158,10 @@ class ProviderRepository(private val context: Context) {
                         baseURL ?: "${com.openminis.app.auth.KimiDeviceFlow.CODING_API_BASE}/v1",
                         customUserAgent = instance.customUserAgent,
                     )
+                    // [T-android-provider-type-parity] No models endpoint to
+                    // query for a type this build cannot drive; the instance
+                    // keeps whatever entries the restore brought with it.
+                    ProviderType.antigravity, ProviderType.unsupported -> emptyList()
                 }
             } catch (e: Exception) {
                 android.util.Log.e("ProviderRepo", "refreshModels fetch error: ${e.message}", e)
@@ -2274,10 +2281,15 @@ class ProviderRepository(private val context: Context) {
         return when (instance.providerType) {
             ProviderType.anthropic -> "https://api.anthropic.com/v1"
             ProviderType.gemini -> "https://generativelanguage.googleapis.com"
-            ProviderType.openAI -> "https://api.openai.com/v1"
+            // [T-android-provider-type-parity] Responses API instances point at
+            // the same OpenAI host; only the completion path differs.
+            ProviderType.openAI, ProviderType.openAIResponses -> "https://api.openai.com/v1"
             ProviderType.openRouter -> "https://openrouter.ai/api/v1"
             ProviderType.xAI -> "https://api.x.ai/v1"
             ProviderType.kimiCode -> "${com.openminis.app.auth.KimiDeviceFlow.CODING_API_BASE}/v1"
+            // No canonical host for a type this build cannot drive. Callers
+            // reaching here have already exhausted effectiveBaseURL.
+            ProviderType.antigravity, ProviderType.unsupported -> "https://api.openai.com/v1"
         }
     }
 
@@ -2458,6 +2470,231 @@ class ProviderRepository(private val context: Context) {
             instance.customUserAgent?.takeIf { it.isNotBlank() }?.let { put("customUserAgent", it) }
         }
         return obj.toString(2)
+    }
+
+    /**
+     * [T-android-backup-secrets] Collect ONE instance's credentials for the
+     * backup `secrets.json`, base64-encoded exactly as [exportInstanceJSON]
+     * does (same keychain + OAuth-manager access paths, same field semantics).
+     * Returns null when the instance carries no usable credential, so the
+     * caller can skip empty entries — matching iOS `BackupSecretsCollector`'s
+     * `if !secret.isEmpty` guard.
+     */
+    fun collectBackupProviderSecret(
+        instance: ProviderInstance,
+    ): BackupSecrets.ProviderSecret? {
+        fun b64(s: String): String =
+            Base64.encodeToString(s.toByteArray(), Base64.NO_WRAP)
+
+        val apiKey = loadApiKey(instance.id)?.let(::b64)
+        val manualOAuth = com.openminis.app.auth.OAuthManager
+            .forInstance(context, instance)?.loadManualBearerToken()
+            ?.takeIf { it.isNotEmpty() }?.let(::b64)
+
+        var oauthToken: String? = null
+        var oauthEmail: String? = null
+        var oauthGcpProject: String? = null
+        val mgr = oauthManagerFor(instance)
+        if (mgr != null) {
+            oauthToken = mgr.exportStoredTokensJson()?.let(::b64)
+            if (instance.providerType == ProviderType.gemini) {
+                oauthEmail = mgr.exportOAuthString("email")
+                    ?.takeIf { it.isNotEmpty() }?.let(::b64)
+                oauthGcpProject = mgr.exportOAuthString("gcp_project")
+                    ?.takeIf { it.isNotEmpty() }?.let(::b64)
+            }
+        }
+
+        val secret = BackupSecrets.ProviderSecret(
+            instanceId = instance.id,
+            label = instance.label,
+            providerType = instance.providerType.name,
+            apiKey = apiKey,
+            manualOAuthToken = manualOAuth,
+            oauthToken = oauthToken,
+            oauthEmail = oauthEmail,
+            oauthGcpProject = oauthGcpProject,
+        )
+        return if (secret.isEmpty) null else secret
+    }
+
+    /**
+     * [T-android-backup-secrets] Restore one instance's credentials from a
+     * backup `secrets.json` entry. Returns true if any credential was WRITTEN,
+     * false if the instance already had a key (kept) or the secret was empty —
+     * this true/false is what the importer accumulates into
+     * `providersRestored` vs `providersSkippedExisting` (the counts that drive
+     * the restore-complete credentials message, iOS parity).
+     *
+     * Keep-existing policy mirrors iOS: an API key already on this device is
+     * NOT overwritten, so restoring a backup onto its origin device reports
+     * "kept" rather than "restored".
+     */
+    fun restoreBackupProviderSecret(secret: BackupSecrets.ProviderSecret): Boolean {
+        fun deb64(s: String?): String? = s?.let {
+            runCatching { String(Base64.decode(it, Base64.NO_WRAP)) }.getOrNull()
+        }
+        val instance = instance(secret.instanceId) ?: return false
+        var wrote = false
+
+        deb64(secret.apiKey)?.let { key ->
+            if (loadApiKey(instance.id) == null) {
+                saveApiKey(instance.id, key)
+                wrote = true
+            }
+        }
+        deb64(secret.manualOAuthToken)?.let { tok ->
+            val mgr = com.openminis.app.auth.OAuthManager.forInstance(context, instance)
+            if (mgr != null && mgr.loadManualBearerToken().isNullOrEmpty()) {
+                mgr.saveManualBearerToken(tok)
+                wrote = true
+            }
+        }
+        val mgr = oauthManagerFor(instance)
+        if (mgr != null) {
+            deb64(secret.oauthToken)?.let { json ->
+                if (mgr.exportStoredTokensJson().isNullOrEmpty()) {
+                    mgr.importStoredTokensJson(json)
+                    wrote = true
+                }
+            }
+            if (instance.providerType == ProviderType.gemini) {
+                deb64(secret.oauthEmail)?.let {
+                    if (mgr.exportOAuthString("email").isNullOrEmpty()) {
+                        mgr.importOAuthString("email", it); wrote = true
+                    }
+                }
+                deb64(secret.oauthGcpProject)?.let {
+                    if (mgr.exportOAuthString("gcp_project").isNullOrEmpty()) {
+                        mgr.importOAuthString("gcp_project", it); wrote = true
+                    }
+                }
+            }
+        }
+        return wrote
+    }
+
+    /**
+     * [T-android-backup-restore-order] Non-destructive, ORDER-PRESERVING union
+     * merge of a restored [remote] ProviderConfig into the live config. This is
+     * the Android port of iOS `mergeProviderConfigFallback`
+     * (BackupImporter+Categories.swift), including the fix `T-backup-restore-order`
+     * (b33eb1ff6): the package decides POSITION for the items it carries, so a
+     * restore reproduces the backed-up arrangement instead of re-sorting by
+     * createdAt.
+     *
+     * Rules (identical to iOS):
+     *  - instances / modelGroups: rebuilt in PACKAGE order. For each remote id,
+     *    if the id already exists locally keep the LOCAL element (content wins),
+     *    else take the remote element. Local-only ids are appended afterwards in
+     *    their original relative order.
+     *  - modelEntries: additive by id (append remote ids not present locally);
+     *    order not significant (entries are looked up by id, ordered per group).
+     *  - agentLoop bindings: set-union.
+     *  - per-device pointers (default / voice / vision group ids, session
+     *    bindings) are NOT part of ProviderConfig here and are untouched.
+     *
+     * Returns (beforeInstances, afterInstances) so the caller derives
+     * imported = after-before and skipped = package.count - imported — the same
+     * counting iOS uses (fix 93cad55ae: union-by-id already-present is SKIPPED,
+     * not "updated").
+     */
+    fun mergeBackupProviderConfig(remote: ProviderConfig): Pair<Int, Int> {
+        ensureConfigLoaded()
+        return synchronized(configLock) {
+            val local = _config.value
+            val before = local.instances.size
+
+            val orderedInstances = mutableListOf<ProviderInstance>()
+            val placedInstances = mutableSetOf<String>()
+            for (ri in remote.instances) {
+                val existing = local.instances.firstOrNull { it.id == ri.id }
+                orderedInstances.add(existing ?: ri)
+                placedInstances.add(ri.id)
+            }
+            for (li in local.instances) {
+                if (li.id !in placedInstances) orderedInstances.add(li)
+            }
+
+            val mergedEntries = local.modelEntries.toMutableList()
+            val entryIds = mergedEntries.map { it.id }.toMutableSet()
+            for (entry in remote.modelEntries) {
+                if (entry.id !in entryIds) {
+                    mergedEntries.add(entry)
+                    entryIds.add(entry.id)
+                }
+            }
+
+            val orderedGroups = mutableListOf<ModelGroup>()
+            val placedGroups = mutableSetOf<String>()
+            for (rg in remote.modelGroups) {
+                val existing = local.modelGroups.firstOrNull { it.id == rg.id }
+                orderedGroups.add(existing ?: rg)
+                placedGroups.add(rg.id)
+            }
+            for (lg in local.modelGroups) {
+                if (lg.id !in placedGroups) orderedGroups.add(lg)
+            }
+
+            val mergedAgentEntries =
+                (local.agentLoopModelEntryIds + remote.agentLoopModelEntryIds).distinct()
+            val mergedAgentGroups =
+                (local.agentLoopGroupIds + remote.agentLoopGroupIds).distinct()
+
+            val merged = local.copy(
+                instances = orderedInstances,
+                modelEntries = mergedEntries,
+                modelGroups = orderedGroups,
+                agentLoopModelEntryIds = mergedAgentEntries.toMutableList(),
+                agentLoopGroupIds = mergedAgentGroups.toMutableList(),
+            )
+            saveConfig(merged)
+            val after = orderedInstances.size
+            android.util.Log.i(
+                "ProviderRepo",
+                "[Restore] provider merge: instances $before→$after " +
+                    "entries=${mergedEntries.size} groups=${orderedGroups.size}",
+            )
+            before to after
+        }
+    }
+
+    /**
+     * [T-android-backup-thinking-rules] Restore custom thinking rules by
+     * id-keyed replace. Returns (written, skipped).
+     *
+     * Divergence from iOS, called out deliberately: iOS does `updated_at` LWW
+     * (local equal-or-newer wins). Android's `provider_thinking_rules` table has
+     * NO time columns, so there is nothing to compare — a rule already present
+     * by id is left as-is (skipped), an absent one is inserted. This is the
+     * closest faithful behaviour the local schema allows; the record's carried
+     * createdAt/updatedAt are ignored on import.
+     */
+    fun restoreBackupThinkingRules(
+        rules: List<com.openminis.app.backup.BackupThinkingRuleRecord>,
+    ): Pair<Int, Int> = runBlocking {
+        if (rules.isEmpty()) return@runBlocking 0 to 0
+        val existing = providerDao.loadAllThinkingRules().map { it.id }.toSet()
+        var written = 0
+        var skipped = 0
+        for (r in rules) {
+            if (r.id in existing) { skipped++; continue }
+            providerDao.upsertThinkingRule(
+                com.openminis.app.data.db.ProviderThinkingRuleEntity(
+                    id = r.id,
+                    providerInstanceId = r.instanceId,
+                    label = r.label,
+                    scopeKind = r.scopeKind,
+                    scopePattern = r.scopePattern,
+                    wireFormatJson = r.wireFormatJson.takeIf { it.isNotBlank() && it != "{}" },
+                    reasoningEchoJson = null,
+                    sortOrder = r.sortOrder,
+                )
+            )
+            written++
+        }
+        loadAllThinkingRulesIntoCache()
+        written to skipped
     }
 
     /**

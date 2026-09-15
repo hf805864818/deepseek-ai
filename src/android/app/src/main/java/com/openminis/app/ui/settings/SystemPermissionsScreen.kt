@@ -17,6 +17,8 @@ import androidx.compose.material.icons.outlined.RecordVoiceOver
 import androidx.compose.material.icons.outlined.Accessibility
 import androidx.compose.material.icons.outlined.BatteryAlert
 import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.RestartAlt
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.AlertDialog
@@ -41,6 +43,7 @@ import androidx.compose.ui.res.stringResource
 import com.openminis.app.R
 import com.openminis.app.accessibility.AccessibilityRecoveryManager
 import com.openminis.app.accessibility.MinisAccessibilityService
+import com.openminis.app.accessibility.RestrictedSettingsManager
 import com.openminis.app.offload.ShizukuManager
 import com.openminis.app.power.PowerOptimizationManager
 import kotlinx.coroutines.delay
@@ -73,6 +76,24 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
     var shizukuReady by remember { mutableStateOf(false) }
     var repairing by remember { mutableStateOf(false) }
     var repairFailed by remember { mutableStateOf(false) }
+    // [T-android-restricted-settings] Shown ONLY when the OS has
+    // actually flagged this install (appop ACCESS_RESTRICTED_SETTINGS
+    // == MODE_ERRORED) and the service is still off — i.e. exactly the
+    // state where tapping the row above leads to a dead, greyed-out
+    // toggle. Without this the user sees "tap to enable in system
+    // Settings", follows it, and hits a wall with no explanation.
+    //
+    // We cannot clear the flag ourselves: it is set on our own uid and
+    // clearing needs the signature permission MANAGE_APP_OPS_MODES.
+    // That is deliberate — the policy exists to stop a sideloaded app
+    // from talking the user into granting it screen-reading power — so
+    // the manual route is the primary affordance and stays visible even
+    // when the Shizuku shortcut is offered.
+    var a11yRestricted by remember {
+        mutableStateOf(RestrictedSettingsManager.isRestricted(context))
+    }
+    var unrestricting by remember { mutableStateOf(false) }
+    var unrestrictFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
@@ -88,6 +109,10 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
             a11yRevoked = !inSettings && !connected &&
                 AccessibilityRecoveryManager.hasEverBeenGranted(context)
             shizukuReady = ShizukuManager.isReady()
+            // Restricted-settings detection keys on the install source, which
+            // never changes — but the Shizuku clear path flips an in-memory
+            // latch that this re-check must observe to drop the section.
+            a11yRestricted = RestrictedSettingsManager.isRestricted(context)
             delay(1000)
         }
     }
@@ -125,6 +150,70 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
                     onClick = { openAccessibilitySettings(context) },
                     showDivider = false,
                 )
+            }
+
+            // [T-android-restricted-settings] Shown ONLY when the OS has
+            // actually flagged this install (appop ACCESS_RESTRICTED_SETTINGS
+            // == MODE_ERRORED) and the service is still off — i.e. exactly the
+            // state where tapping the row above leads to a dead, greyed-out
+            // toggle. Without this the user sees "tap to enable in system
+            // Settings", follows it, and hits a wall with no explanation.
+            //
+            // We cannot clear the flag ourselves: it is set on our own uid and
+            // clearing needs the signature permission MANAGE_APP_OPS_MODES.
+            // That is deliberate — the policy exists to stop a sideloaded app
+            // from talking the user into granting it screen-reading power — so
+            // the manual route is the primary affordance and stays visible even
+            // when the Shizuku shortcut is offered.
+            if (a11yRestricted) {
+                SettingsSection(
+                    header = stringResource(R.string.system_permissions_a11y_restricted_header),
+                    footer = stringResource(R.string.system_permissions_a11y_restricted_footer),
+                ) {
+                    if (shizukuReady) {
+                        SettingsRow(
+                            icon = Icons.Outlined.LockOpen,
+                            iconColor = Color(0xFF34C759),
+                            title = stringResource(R.string.system_permissions_a11y_restricted_shizuku),
+                            subtitle = when {
+                                unrestricting ->
+                                    stringResource(R.string.system_permissions_a11y_restricted_working)
+                                unrestrictFailed ->
+                                    stringResource(R.string.system_permissions_a11y_restricted_failed)
+                                else ->
+                                    stringResource(R.string.system_permissions_a11y_restricted_shizuku_sub)
+                            },
+                            onClick = {
+                                if (unrestricting) return@SettingsRow
+                                unrestricting = true
+                                unrestrictFailed = false
+                                scope.launch {
+                                    val ok = RestrictedSettingsManager.clearWithShizuku(context)
+                                    unrestricting = false
+                                    unrestrictFailed = !ok
+                                    // On success the poll above clears
+                                    // a11yRestricted and this section vanishes.
+                                }
+                            },
+                        )
+                    }
+                    SettingsRow(
+                        icon = Icons.Outlined.Info,
+                        iconColor = Color(0xFFFF9500),
+                        title = stringResource(R.string.system_permissions_a11y_restricted_manual),
+                        subtitle = stringResource(R.string.system_permissions_a11y_restricted_manual_sub),
+                        // Lands on Minis' own App info page, where the
+                        // "Allow restricted settings" item lives in the
+                        // overflow menu. Reuses the existing helper, which
+                        // already falls back when an OEM hides the page.
+                        onClick = {
+                            (context as? Activity)?.let {
+                                PowerOptimizationManager.openAppDetailsSettings(it)
+                            }
+                        },
+                        showDivider = false,
+                    )
+                }
             }
 
             // [T-android-a11y-force-stop-recovery] Repair affordance, shown ONLY

@@ -408,6 +408,34 @@ fun SessionListScreen(
     onRootfsClick: () -> Unit = {},
     // [T-android-scheduled-tasks-design] Entry to the scheduled-tasks list.
     onScheduledTasksClick: () -> Unit = {},
+    /**
+     * [T-android-tablet-split] The session currently shown in the detail pane,
+     * highlighted in the list. Non-null only in two-pane (tablet) mode — in
+     * single-pane the list is never on screen next to a chat, so there is
+     * nothing to reflect and the parameter stays null, leaving phone rendering
+     * byte-identical to before.
+     *
+     * Deliberately NOT read from the nav back stack: in two-pane mode the
+     * detail pane is owned by the ListDetail pane navigator, not by a NavHost
+     * entry, so the back stack does not know what the detail is showing.
+     *
+     * A draft ("__new__…") id never matches a persisted row, so a new chat
+     * highlights nothing — which is the intended behaviour (iOS parity: the
+     * list has no selection until the draft is saved).
+     */
+    selectedSessionId: String? = null,
+    /**
+     * [T-android-draft-placeholder-row] Id of an unsaved draft the detail pane
+     * is showing. Renders a synthetic "New Chat / No messages yet" row at the
+     * top so the two-pane list always has a row matching the chat on screen.
+     *
+     * The row is a pure view construct with no database backing: a session is
+     * created only by `ChatViewModel.ensureSession()` on the first send, so an
+     * abandoned draft simply stops being passed here and the row disappears —
+     * nothing to clean up. Mirrors iOS `ContentView.displaySessions`, which
+     * prepends the same placeholder in split mode.
+     */
+    draftPlaceholderId: String? = null,
 ) {
     val context = LocalContext.current
     // [T-android-env-profile-session-binding] Env-profile repository pulled
@@ -428,7 +456,32 @@ fun SessionListScreen(
     val viewModel: SessionListViewModel = androidx.lifecycle.viewmodel.compose.viewModel(
         factory = SessionListViewModel.factory(chatRepository, providerRepository, context),
     )
-    val sessions by viewModel.displayedSessions.collectAsState()
+    val persistedSessions by viewModel.displayedSessions.collectAsState()
+    // [T-android-draft-placeholder-row] Prepend the synthetic draft row. Built
+    // here rather than in the ViewModel precisely because it must never reach
+    // the database or the repository's flows — it exists for exactly as long
+    // as the detail pane holds an unsaved draft, and vanishes on its own when
+    // the user switches away without sending. Mirrors iOS displaySessions.
+    val sessions = remember(persistedSessions, draftPlaceholderId) {
+        val draftId = draftPlaceholderId
+        if (draftId == null || persistedSessions.any { it.id == draftId }) {
+            persistedSessions
+        } else {
+            val now = System.currentTimeMillis()
+            listOf(
+                com.openminis.app.data.db.ChatSessionEntity(
+                    id = draftId,
+                    // Left null so the row falls through to the same
+                    // "New Chat" default a titleless persisted session uses.
+                    title = null,
+                    modelId = "",
+                    createdAt = now,
+                    updatedAt = now,
+                    folderId = null,
+                ),
+            ) + persistedSessions
+        }
+    }
     val isInitialLoadComplete by viewModel.isInitialLoadComplete.collectAsState()
     val isSearchActive by viewModel.isSearchActive.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
@@ -911,7 +964,24 @@ fun SessionListScreen(
                                     searchSnippet = searchSnippets[session.id],
                                     // Transparent so the folder container's
                                     // surface shows through member rows.
-                                    rowBackground = if (inFolder) Color.Transparent else null,
+                                    //
+                                    // [T-android-tablet-split] In two-pane mode
+                                    // the row backing the detail pane is tinted,
+                                    // giving the list the selected-row look iOS
+                                    // gets free from `List(selection:)`.
+                                    // primary@12% is the same treatment the
+                                    // mention picker uses for its highlighted
+                                    // row, so selection reads consistently.
+                                    // Ordering matters: the folder-member case
+                                    // stays transparent unless it is ALSO the
+                                    // selected row, or a selected row inside a
+                                    // group would show no highlight at all.
+                                    rowBackground = when {
+                                        session.id == selectedSessionId ->
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                        inFolder -> Color.Transparent
+                                        else -> null
+                                    },
                                 )
                                 }
                             }

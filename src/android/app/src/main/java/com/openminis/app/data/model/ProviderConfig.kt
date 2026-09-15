@@ -14,7 +14,60 @@ enum class ProviderType(val displayName: String) {
     // [T-kimi-oauth] Kimi Code (Coding Plan) — RFC 8628 device-code OAuth,
     // OpenAI-compatible upstream at api.kimi.com/coding/v1. DB round-trip is
     // name-based (ProviderCredential.valueOf), so appending is migration-safe.
-    kimiCode("Kimi Code");
+    kimiCode("Kimi Code"),
+
+    // [T-android-provider-type-parity] The cases below exist on iOS but were
+    // missing here. They are declared so a cross-platform restore or sync can
+    // DECODE them: without a case, kotlinx.serialization throws on the unknown
+    // name and takes the whole provider_config.json with it — one iOS-only
+    // provider silently cost the user every provider in the package,
+    // credentials included.
+    //
+    // Declared but not offered: `addableProviderTypes` in AddProviderScreen is
+    // a curated list, so these never appear as something the user can create
+    // here; they arrive only from an iOS package or a newer build.
+
+    /**
+     * OpenAI Responses API (`/v1/responses`). iOS `openAIResponses`.
+     *
+     * Fully usable on Android: it is exactly "OpenAI, forced to the Responses
+     * endpoint", which the existing OpenAI path already expresses through
+     * `ProviderInstance.useResponsesAPI` (iOS spells the same thing
+     * `forceResponsesAPI`). So a restored iOS instance of this type WORKS
+     * rather than merely surviving the import.
+     */
+    openAIResponses("Responses API (v3)"),
+
+    /**
+     * iOS `antigravity`. Decode-only here — Android has no implementation, so
+     * an instance restores and is visible but cannot serve a request.
+     */
+    antigravity("Antigravity"),
+
+    /**
+     * Sentinel for a provider type THIS build doesn't recognize — e.g. a newer
+     * build's package naming a type added after this release. Decoding to this
+     * preserves the instance (shown as unusable) instead of destroying the file
+     * it arrived in. Mirrors iOS `ProviderType.unsupported`.
+     *
+     * Never write this back as an instance's type where the original string is
+     * still available; it is a read-side fallback, not a real provider.
+     */
+    unsupported("Unsupported");
+
+    /**
+     * [T-android-provider-type-parity] True for types this build can decode and
+     * display but cannot actually drive a request with. Callers that need a
+     * working provider must check this rather than assuming every enum case is
+     * usable.
+     */
+    val isUsable: Boolean
+        get() = when (this) {
+            // openAIResponses included: it routes through the OpenAI provider
+            // with the Responses endpoint forced on.
+            anthropic, gemini, openAI, openRouter, xAI, kimiCode, openAIResponses -> true
+            antigravity, unsupported -> false
+        }
 
     val builtInModels: List<LLMModel>
         get() = when (this) {
@@ -24,7 +77,23 @@ enum class ProviderType(val displayName: String) {
             openRouter -> LLMModel.allOpenRouter
             xAI -> LLMModel.allXAI
             kimiCode -> LLMModel.allKimi
+            // No built-in catalog for the decode-only types; models restored
+            // alongside the instance still appear as custom entries.
+            openAIResponses, antigravity, unsupported -> emptyList()
         }
+
+    companion object {
+        /**
+         * [T-android-provider-type-parity] Decode a raw provider-type string,
+         * never throwing: an unrecognized value maps to [unsupported].
+         *
+         * Mirrors iOS `ProviderType.decoded(_:)`. Use this anywhere a value
+         * originates OUTSIDE this build — backup packages, sync payloads,
+         * config files — so one unknown string can't fail the whole document.
+         */
+        fun decoded(raw: String): ProviderType =
+            entries.firstOrNull { it.name == raw } ?: unsupported
+    }
 }
 
 @Serializable

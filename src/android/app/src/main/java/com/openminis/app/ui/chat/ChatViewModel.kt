@@ -845,6 +845,35 @@ class ChatViewModel(
     private var currentProvider: LLMProvider? = null
     private var currentModel: LLMModel? = null
 
+    /**
+     * [T-token-attribution-snapshot] Which model actually served the turn being
+     * persisted, for the message's attribution columns.
+     *
+     * Built from `currentModel` + `_activeEntryId` — the live request context —
+     * and deliberately NOT from the session row. Automatic failover rewrites
+     * `sessions.model_id` mid-turn (see the fallback path that reassigns
+     * `_activeEntryId` / `currentModel` when a candidate fails), so a session
+     * read at persist time can name a model that never produced this message.
+     * Both fields here are updated by that same fallback path, so they always
+     * describe the model that actually responded.
+     */
+    private fun currentModelSnapshot(): com.openminis.app.data.model.ModelAttributionSnapshot? {
+        val model = currentModel ?: return null
+        val entry = _activeEntryId.value?.let { id ->
+            providerRepository.config.value.modelEntries.find { it.id == id }
+        }
+        val instance = entry?.let { providerRepository.instance(it.providerInstanceId) }
+        return com.openminis.app.data.model.ModelAttributionSnapshot(
+            modelId = model.id,
+            displayName = model.displayName,
+            // `.name` is the enum's stable rawValue, never the localized
+            // displayName — grouping on display strings is what produced the
+            // duplicate "Google" / "Gemini" / "Google Gemini" sections.
+            providerTypeRaw = instance?.providerType?.name ?: "",
+            providerInstanceId = entry?.providerInstanceId,
+        )
+    }
+
     /** Structured agent history for the agent loop (contentParts-based). */
     private val agentHistory = mutableListOf<LLMMessage>()
 
@@ -9784,6 +9813,9 @@ class ChatViewModel(
         val entity = chatRepository.appendMessage(
             realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,
             reasoningContent = reasoningContent,
+            // [T-token-attribution-snapshot] From the live request context, not
+            // the session row — see currentModelSnapshot().
+            modelSnapshot = currentModelSnapshot(),
         )
         return entity.id
     }
@@ -9829,6 +9861,7 @@ class ChatViewModel(
         chatRepository.appendMessage(
             realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,
             reasoningContent = reasoningContent,
+            modelSnapshot = currentModelSnapshot(),
         )
     }
 

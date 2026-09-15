@@ -90,6 +90,10 @@ deps/ish/build-ios/
 deps/ish/build-native/
 deps/.cache/
 
+# rclone.aar is a build artifact of deps/build_rclone_android.sh (~15MB),
+# built alongside (deps/build_rclone_ios.sh).
+src/android/app/libs/rclone.aar
+
 # FFmpeg source (downloaded by build_ffmpeg.sh). Note the trailing -6.1.2:
 # a bare `deps/ffmpeg-*/` also swallowed deps/ffmpeg-patch/, which is hand
 # written source that the build needs and must stay tracked.

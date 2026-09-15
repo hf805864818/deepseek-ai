@@ -53,6 +53,7 @@ import com.openminis.app.ui.settings.EnvironmentVariablesScreen
 import com.openminis.app.ui.settings.AppearanceScreen
 import com.openminis.app.ui.settings.SettingsScreen
 import com.openminis.app.ui.settings.SystemPermissionsScreen
+import com.openminis.app.ui.settings.backup.BackupAndRestoreScreen
 import com.openminis.app.ui.settings.SessionStorageDetailScreen
 import com.openminis.app.ui.settings.SkillDetailScreen
 import com.openminis.app.ui.settings.StorageManagementScreen
@@ -170,6 +171,8 @@ object Routes {
     const val OTHER_SYNC = "other_sync"
     const val GOOGLE_DRIVE_SYNC = "google_drive_sync"
     const val LOCAL_SYNC = "local_sync"
+    // [Merge-v1.13] Backup & Restore — the official .minisbak backup system.
+    const val BACKUP = "backup"
     const val ONBOARDING_MODELS = "onboarding_models"
     /** T219-2: Mount external folders settings + detail. */
     const val MOUNTED_FOLDERS = "mounted_folders"
@@ -1217,6 +1220,13 @@ fun AppNavigation(
                 onBack = { navController.safePopBackStack() },
                 onGoogleDriveClick = { navController.safeNavigate(Routes.GOOGLE_DRIVE_SYNC) },
                 onLocalSyncClick = { navController.safeNavigate(Routes.LOCAL_SYNC) },
+                onBackupClick = { navController.safeNavigate(Routes.BACKUP) },
+            )
+        }
+
+        composable(Routes.BACKUP) {
+            BackupAndRestoreScreen(
+                onBack = { navController.safePopBackStack() },
             )
         }
 

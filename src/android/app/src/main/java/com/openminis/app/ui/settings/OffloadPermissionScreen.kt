@@ -1,5 +1,6 @@
 package com.openminis.app.ui.settings
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
@@ -8,6 +9,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Accessibility
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
@@ -19,6 +22,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -28,12 +32,15 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.openminis.app.R
 import com.openminis.app.accessibility.MinisAccessibilityService
+import com.openminis.app.accessibility.RestrictedSettingsManager
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.offload.OffloadPermissionManager
 import com.openminis.app.offload.ShizukuManager
+import com.openminis.app.power.PowerOptimizationManager
 import com.openminis.app.ui.components.MinisMenu
 import com.openminis.app.ui.components.MinisTextButton
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun OffloadPermissionScreen(
@@ -58,11 +65,22 @@ fun OffloadPermissionScreen(
     val context = LocalContext.current
 
     var a11yEnabled by remember { mutableStateOf(isA11yServiceEnabled(context)) }
+    // [T-android-restricted-settings] Same restricted-settings latch as
+    // SystemPermissionsScreen: when the OS has flagged this install, the
+    // "open system settings" row above dead-ends into a greyed-out toggle,
+    // so surface the Shizuku / manual routes here too.
+    var a11yRestricted by remember {
+        mutableStateOf(RestrictedSettingsManager.isRestricted(context))
+    }
+    var unrestricting by remember { mutableStateOf(false) }
+    var unrestrictFailed by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) {
         // Re-poll once a second so coming back from system Accessibility
         // settings flips the row without a manual refresh.
         while (true) {
             a11yEnabled = isA11yServiceEnabled(context) || MinisAccessibilityService.getInstance() != null
+            a11yRestricted = RestrictedSettingsManager.isRestricted(context)
             delay(1000)
         }
     }
@@ -123,6 +141,58 @@ fun OffloadPermissionScreen(
             systemActionTitleRes = R.string.perm_a11y_open_settings,
             onSystemAction = { openAccessibilitySettings(context) },
         )
+
+        // [T-android-restricted-settings] Shown ONLY when the OS has flagged
+        // this install — exactly the state where the "open settings" row
+        // above leads to a greyed-out toggle. Mirrors the section on
+        // SystemPermissionsScreen (same strings, same Shizuku / manual
+        // routes) so the two permission surfaces stay consistent.
+        if (a11yRestricted) {
+            SettingsSection(
+                header = stringResource(R.string.system_permissions_a11y_restricted_header),
+                footer = stringResource(R.string.system_permissions_a11y_restricted_footer),
+            ) {
+                if (shizukuSnap.state == ShizukuManager.State.READY) {
+                    SettingsRow(
+                        icon = Icons.Outlined.LockOpen,
+                        iconColor = Color(0xFF34C759),
+                        title = stringResource(R.string.system_permissions_a11y_restricted_shizuku),
+                        subtitle = when {
+                            unrestricting ->
+                                stringResource(R.string.system_permissions_a11y_restricted_working)
+                            unrestrictFailed ->
+                                stringResource(R.string.system_permissions_a11y_restricted_failed)
+                            else ->
+                                stringResource(R.string.system_permissions_a11y_restricted_shizuku_sub)
+                        },
+                        onClick = {
+                            if (unrestricting) return@SettingsRow
+                            unrestricting = true
+                            unrestrictFailed = false
+                            scope.launch {
+                                val ok = RestrictedSettingsManager.clearWithShizuku(context)
+                                unrestricting = false
+                                unrestrictFailed = !ok
+                                // On success the poll above clears
+                                // a11yRestricted and this section vanishes.
+                            }
+                        },
+                    )
+                }
+                SettingsRow(
+                    icon = Icons.Outlined.Info,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.system_permissions_a11y_restricted_manual),
+                    subtitle = stringResource(R.string.system_permissions_a11y_restricted_manual_sub),
+                    onClick = {
+                        (context as? Activity)?.let {
+                            PowerOptimizationManager.openAppDetailsSettings(it)
+                        }
+                    },
+                    showDivider = false,
+                )
+            }
+        }
 
         IntegrationSection(
             iconVector = Icons.Outlined.Shield,

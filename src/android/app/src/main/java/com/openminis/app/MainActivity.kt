@@ -39,6 +39,7 @@ import com.openminis.app.deeplink.DeepLinkHandler
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.service.SessionActivityTracker
 import com.openminis.app.data.UpdateChecker
+import com.openminis.app.ui.NewerDatabaseGuidanceScreen
 import com.openminis.app.ui.navigation.AppNavigation
 import com.openminis.app.ui.navigation.Routes
 import com.openminis.app.ui.navigation.safeNavigate
@@ -234,6 +235,22 @@ class MainActivity : ComponentActivity() {
         // assigned, so it stays false for exactly as long as composing is
         // genuinely unsafe.
         val minisApp = application as? MinisApp
+
+        // [T-android-downgrade-compat] A database written by a NEWER build is
+        // not a crash — it is a recoverable state with a specific remedy, and
+        // the file has deliberately been left untouched. Handle it before the
+        // generic crash-share path below, which would otherwise ask the user to
+        // send a bug report for something that is not a bug and offer no way
+        // out.
+        if (minisApp != null &&
+            minisApp.dbVersionDecision ==
+            com.openminis.app.data.db.DatabaseVersionGuard.Decision.SHOW_NEWER_DB_GUIDANCE
+        ) {
+            android.util.Log.w("MainActivity", "showing newer-database guidance screen")
+            setContent { NewerDatabaseGuidanceScreen(onExit = { finishAndRemoveTask() }) }
+            return
+        }
+
         if (minisApp == null || !minisApp.subsystemsInitialized) {
             android.util.Log.w(
                 "MainActivity",

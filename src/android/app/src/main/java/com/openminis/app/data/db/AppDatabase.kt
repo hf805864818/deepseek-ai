@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WebAppShortcutEntity::class,
         FolderEntity::class,
     ],
-    version = 12,
+    version = 13,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -206,6 +206,81 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * [T-token-attribution-snapshot] Per-message model attribution.
+         *
+         * Four nullable columns, no DEFAULT. `ADD COLUMN` is an O(1) metadata
+         * change in SQLite — existing rows are untouched and simply read NULL,
+         * which is the signal the Usage page uses to mark a row "estimated"
+         * rather than "measured". A `NOT NULL DEFAULT ''` would make old rows
+         * indistinguishable from new ones that genuinely have no model.
+         *
+         * Numbered 12 → 13 (not 11 → 12 like upstream): this fork already uses
+         * version 12 for `sessions.env_profile_id`, so the attribution columns
+         * land on the next free version to keep both schema lineages valid.
+         */
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN model_id TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN model_display_name TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN provider_type TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN provider_instance_id TEXT")
+            }
+        }
+
+        /**
+         * [T-android-downgrade-compat] Downgrade 13 → 12. Deliberately a NO-OP.
+         *
+         * ## Why this exists
+         *
+         * Room resolves a downgrade by calling `onUpgrade(from, to)` and
+         * looking for a migration path; when none exists it consults
+         * `isMigrationRequired`, which either throws or — with a destructive
+         * fallback enabled — calls `dropAllTables`. We enable no fallback, so
+         * installing an older build on top of a newer database threw
+         * `IllegalStateException` at first DB access and the app could not
+         * start at all. Data survived on disk, but the user experience was
+         * "the app is broken".
+         *
+         * Registering any 13 → 12 path is enough for Room to proceed; it does
+         * not inspect what the migration does. So the cheapest correct answer
+         * is to do nothing and let the extra columns stay.
+         *
+         * ## Why NOT `DROP COLUMN`
+         *
+         * Dropping would genuinely delete the attribution captured by the
+         * newer build, so a user who downgrades to look at something and then
+         * upgrades back would silently lose it — violating the "no data loss"
+         * constraint this whole mechanism exists to uphold. Keeping the
+         * columns costs a few dozen bytes per row and makes the round trip
+         * lossless. (`ALTER TABLE ... DROP COLUMN` also needs SQLite 3.35+ /
+         * API 34+, and a full table rebuild below that.)
+         *
+         * ## Why leaving the columns is safe for the older build
+         *
+         * - Room's generated DAOs bind by column NAME, never by position.
+         * - Room's schema validation checks that every column the entity
+         *   REQUIRES exists; extra columns in the table are ignored.
+         * - `SELECT *` is likewise resolved by name.
+         * - Old `INSERT` statements omit the new columns, which is fine
+         *   precisely because they are nullable with no DEFAULT.
+         *
+         * ## Scope
+         *
+         * This pattern generalises to ADD COLUMN / ADD TABLE / ADD INDEX. It
+         * does NOT cover renames, drops, type changes, or changes to the
+         * MEANING of existing data (Room cannot detect the last one at all).
+         * Those need a real reverse migration — or the version pre-check in
+         * [com.openminis.app.data.db.DatabaseVersionGuard], which is the
+         * backstop for exactly this case.
+         */
+        val MIGRATION_13_12 = object : Migration(13, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Intentionally empty. See the doc comment above — the four
+                // columns added by MIGRATION_12_13 are left in place.
+            }
+        }
+
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // sessions: add iOS-parity columns
@@ -243,7 +318,10 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "minis.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
+                    // MIGRATION_13_12 is the downgrade counterpart of
+                    // MIGRATION_12_13 — registering it is what lets an older
+                    // build open a newer database instead of failing to start.
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_12)
                     .build()
                     .also { INSTANCE = it }
             }

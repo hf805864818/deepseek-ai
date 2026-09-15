@@ -149,6 +149,21 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }
     .configureEach { dependsOn(copyBashismRules) }
 tasks.named("preBuild") { dependsOn(copyBashismRules) }
 
+// [Merge-v1.13-rclone] Stage the rclone .aar built by
+// `deps/build_rclone_android.sh` (output: deps/build/rclone/rclone.aar) into
+// app/libs/ so the flatDir repository and the `implementation(..., ext = "aar")`
+// dependency can resolve it. Local builds: run the script first or skip the
+// dependency — Gradle fails on the missing file so the gap is loud, not silent.
+// CI: the "Build rclone Android (rclone.aar)" step runs the script before
+// assembleRelease, so this copy is a no-op there that guarantees ordering.
+val stageRcloneAar by tasks.registering(Copy::class) {
+    val src = rootProject.file("../../deps/build/rclone/rclone.aar")
+    from(src) { include("rclone.aar") }
+    into(layout.projectDirectory.dir("libs"))
+    onlyIf { src.exists() }
+}
+tasks.named("preBuild") { dependsOn(stageRcloneAar) }
+
 // [T-android-debugserver-skill] Stage the debug-server skill + an Android
 // reference client into the DEBUG-ONLY asset source set, so the debug server
 // can serve them over GET /skill (mirrors the iOS "Generate Debug Skill" build
@@ -180,6 +195,19 @@ dependencies {
     implementation(composeBom)
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    // [T-android-tablet-split] Adaptive list-detail layout for tablets/large
+    // windows. Version pinned explicitly rather than left to the BOM: the
+    // 2025.09.00 BOM does not manage the material3.adaptive group at all, so
+    // an unversioned coordinate fails to resolve. 1.2.0, not 1.3.0: 1.3.0
+    // hard-requires compileSdk 37 AND AGP 9.1.0 (this module is compileSdk
+    // 36 / AGP 8.7.3 — it fails at configuration time). The navigation3
+    // artifact is NOT used — still alpha.
+    implementation("androidx.compose.material3:material3-window-size-class")
+    implementation("androidx.compose.material3.adaptive:adaptive:1.2.0")
+    implementation("androidx.compose.material3.adaptive:adaptive-layout:1.2.0")
+    implementation("androidx.compose.material3.adaptive:adaptive-navigation:1.2.0")
+
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
@@ -219,6 +247,12 @@ dependencies {
     // note in `ndk`; we ship arm64-v8a only.
     implementation("com.github.helloooideeeeea:RealTimeCutVADLibraryForAndroid:1.0.5@aar")
 
+    // rclone, via its official gomobile binding, for backup destinations
+    // (SMB / WebDAV / SFTP / S3 / FTP). Build it with
+    // `deps/build_rclone_android.sh` — the .aar is a build artifact under
+    // app/libs/, not a checked-in binary. Backends are decided by
+    // deps/rclone-mobile/backends/backends.go, shared with the iOS build.
+    implementation(group = "", name = "rclone", ext = "aar")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
