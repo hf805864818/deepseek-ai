@@ -1,3 +1,3 @@
-1.0.194
-build=196
-android_code=226
+1.0.195
+build=197
+android_code=227
