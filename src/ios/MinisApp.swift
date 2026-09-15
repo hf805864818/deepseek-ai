@@ -416,14 +416,16 @@ struct MinisApp: App {
                 // SIGKILL) never runs it, so the badge would be missing after
                 // restart. The persisted message tail is the durable source of
                 // truth — scan it on the actor, reconcile on the main actor.
-                let interruptedSessions = await ChatStore.shared.interruptedSessionIds()
+                let interruptedSessionsWithDates = await ChatStore.shared.interruptedSessionsWithTailDate()
                 // Exclude sessions that are actively streaming RIGHT NOW: a
                 // resumed/running session's DB tail still looks "interrupted"
                 // (mid-loop shape), but it is executing, not paused — flagging it
                 // would surface a ⏸ badge on a live, spinning session. Active ⇒
                 // never paused. (Mirrors the Android foreground reconcile.)
                 let activeNow = SessionActivityTracker.shared.activeSessions
-                SessionBadgeStore.shared.reconcileInterruptedSessions(interruptedSessions.subtracting(activeNow))
+                let filteredIds = interruptedSessionsWithDates.keys.subtracting(activeNow)
+                let filteredDates = filteredIds.reduce(into: [String: Date]()) { $0[$1] = interruptedSessionsWithDates[$1] }
+                SessionBadgeStore.shared.reconcileInterruptedSessions(filteredIds, entryDates: filteredDates, trigger: "foreground")
                 ISHKernel.shared.refreshDns()
 
                 #if DEBUG

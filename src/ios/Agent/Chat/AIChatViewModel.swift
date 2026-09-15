@@ -720,7 +720,19 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // shows one. (Mirrors the Android canResume collector.)
             if oldValue != canResume, let sid = sessionId {
                 if canResume {
-                    SessionBadgeStore.shared.pushFront(.paused, for: sid)
+                    // [T-ios-group-pause-badge-restamp] Only a REAL interruption
+                    // re-stamps the badge's entry time. This didSet is the single
+                    // chokepoint over every canResume setter, so it also fires
+                    // when a load/pre-warm merely RE-DETECTS an old interrupted
+                    // tail — that is not a new entry into the paused state, and
+                    // re-stamping it there is what let a days-old pause keep
+                    // looking "fresh" to the group card's 24h window forever.
+                    // The detecting site sets `isRedetectingInterruptedTail`
+                    // around its assignment; everything else is a live event.
+                    SessionBadgeStore.shared.pushFront(
+                        .paused, for: sid,
+                        restamp: !isRedetectingInterruptedTail,
+                        source: isRedetectingInterruptedTail ? .redetect : .push)
                 } else {
                     SessionBadgeStore.shared.remove(.paused, for: sid)
                 }

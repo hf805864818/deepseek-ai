@@ -5,13 +5,6 @@ private let logger = AppLogger(category: "AIChatVM")
 
 // MARK: - Stream Stall Timeout
 
-private struct StreamStallError: Error, LocalizedError {
-    let seconds: Int
-    var errorDescription: String? {
-        "No response from the server for \(seconds) seconds. The connection may have been dropped silently. Please try again."
-    }
-}
-
 private final class StreamIteratorBox<T: Sendable>: @unchecked Sendable {
     private var iterator: AsyncThrowingStream<T, Error>.AsyncIterator
     init(_ stream: AsyncThrowingStream<T, Error>) {
@@ -356,7 +349,13 @@ extension AIChatViewModel {
                         + "sinceLastEvent=\(String(format: "%.1f", sinceLastEvent))s eventsThisStream=\(eventSeq) "
                         + "appState=\(appState) iterStart=\(Self.diagTimestamp(iterationStartedAt)) firedAt=\(Self.diagTimestamp(firedAt))"
                     )
-                    throw StreamStallError(seconds: Int(stallTimeoutSeconds))
+                    // [T-ios-stream-stall-no-retry] An LLMError so the agent
+                    // loop's retryable-error gate catches it and the automatic
+                    // retry / group-fallback machinery activates. A bare
+                    // StreamStallError used to fall straight through to the
+                    // top-level error handler, losing the chance to retry a
+                    // transient stall — which is exactly what a stall is.
+                    throw LLMError.transientError(message: "No response from the server for \(Int(stallTimeoutSeconds)) seconds — the stream stalled mid-generation")
                 }
                 let result = try await group.next()!
                 group.cancelAll()
