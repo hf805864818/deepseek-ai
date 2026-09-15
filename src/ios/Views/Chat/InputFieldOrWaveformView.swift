@@ -68,7 +68,10 @@ struct InputFieldOrWaveformView: View {
                 hasSelection: $inputHasSelection,
                 isScrollable: $inputIsScrollable,
                 isAtScrollBottom: $inputAtScrollBottom,
-                placeholder: AppLocalized("Message \(soulName) (@ to mention files)"),
+                placeholder: String(
+                    format: AppLocalized("Message %@ (@ to mention files)"),
+                    soulName
+                ),
                 onPasteImage: { image in vm.addImageAttachment(image) },
                 onPasteFile: { url in vm.addFileAttachment(from: url) },
                 onReturnKey: onReturnKey,
