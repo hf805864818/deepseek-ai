@@ -4247,6 +4247,18 @@ struct ContentView: View {
 
     @ViewBuilder
     private var fabRowContent: some View {
+        // [T-ios-scene-create-fabrow-demangle] The row below carries two
+        // DraggableFABs (each GeometryReader + simultaneousGesture + position)
+        // and a nested GeometryReader search bar. Its SwiftUI type is very deep,
+        // and the first-frame stack (symbolized from the scene-create watchdog
+        // log) shows the main thread inside this row's layout tree when it
+        // burns the 19s allowance. Wrapping the entire row in AnyView truncates
+        // that type so the runtime demangles a shallow node on first render
+        // instead of recursing through the whole composition.
+        AnyView(fabRowContent_BODY)
+    }
+
+    private var fabRowContent_BODY: some View {
         ZStack {
             // New chat FAB (draggable)
             DraggableFAB(

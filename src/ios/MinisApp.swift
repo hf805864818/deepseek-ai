@@ -36,6 +36,7 @@ extension Bundle {
 
     /// Sets the override language. Pass `nil` or `""` to revert to system language.
     static func setLanguage(_ code: String?) {
+        defer { AppBundle.resetCache() }
         guard let code, !code.isEmpty,
               let path = Bundle.main.path(forResource: code, ofType: "lproj"),
               let bundle = Bundle(path: path) else {

@@ -50,8 +50,23 @@ import Foundation
 /// active. Falls back to `Bundle.main` when no in-app override is set, which is
 /// the normal case — the system language then applies exactly as before.
 enum AppBundle {
+    /// Memoized override bundle. Populated lazily on first use and cleared by
+    /// `Bundle.setLanguage(_:)` via `resetCache()`, so a language change in-app
+    /// still takes effect immediately without re-reading the ObjC associated
+    /// object on every localized lookup during first-frame render.
+    private static var cachedBundle: Bundle?
+
+    /// Call whenever the in-app language override changes so the next lookup
+    /// re-reads `Bundle.main.languageBundle`.
+    static func resetCache() {
+        cachedBundle = nil
+    }
+
     static var current: Bundle {
-        Bundle.main.languageBundle ?? Bundle.main
+        if let cachedBundle { return cachedBundle }
+        let resolved = (Bundle.main.languageBundle ?? Bundle.main)
+        cachedBundle = resolved
+        return resolved
     }
 }
 
@@ -76,9 +91,18 @@ func AppLocalized(_ key: String.LocalizationValue, comment: StaticString? = nil)
 
 /// `LocalizedStringResource` overload, for call sites that already hold a
 /// resource (App Intents build these) rather than a literal key.
+///
+/// [T-ios-crash-applocalized-recursion] Previous implementation called
+/// `AppLocalized(resource)` from its own body, i.e. unbounded self-recursion
+/// on the `LocalizedStringResource` overload — any call site that reached this
+/// overload spun the main thread indefinitely, which is what surfaced in the
+/// scene-create watchdog stack (the top app frame was `AppLocalized`).
+/// A `LocalizedStringResource` carries its own bundle reference, so it cannot
+/// be re-pointed the way a literal key can. Resolve it as-is — extracting the
+/// `String.LocalizationValue` (the key) and re-using the literal-key path so
+/// the in-app override still applies to the active bundle.
 func AppLocalized(_ resource: LocalizedStringResource) -> String {
-    // A LocalizedStringResource carries its own bundle reference, so it cannot
-    // be re-pointed the way a literal key can. Resolve it as-is rather than
-    // pretending the override applies.
-    AppLocalized(resource)
+    // LocalizedStringResource.key is a String.LocalizationValue, so hand it
+    // straight to the bundle-aware resolver (the in-app override applies).
+    return String(localized: resource.key, bundle: AppBundle.current)
 }
