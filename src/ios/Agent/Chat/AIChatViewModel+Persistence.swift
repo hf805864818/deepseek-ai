@@ -871,7 +871,7 @@ extension AIChatViewModel {
     /// matches the list's .paused badge.
     private func recheckCanResumeFromHistory() {
         guard let sessionId, !isProcessing, let lastEntry = agentHistory.last else { return }
-        let isInterrupted: Bool
+        var isInterrupted: Bool
         if lastEntry.role == .user {
             let allToolResults = !lastEntry.parts.isEmpty && lastEntry.parts.allSatisfy {
                 if case .toolResult = $0 { return true }; return false
