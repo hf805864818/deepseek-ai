@@ -7,6 +7,45 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		LBKB0001 /* BackupActivityLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0001 /* BackupActivityLock.swift */; };
+		LBKB0002 /* BackupBlobStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0002 /* BackupBlobStore.swift */; };
+		LBKB0003 /* BackupCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0003 /* BackupCrypto.swift */; };
+		LBKB0004 /* BackupDelivery.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0004 /* BackupDelivery.swift */; };
+		LBKB0005 /* BackupDestinations.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0005 /* BackupDestinations.swift */; };
+		LBKB0006 /* BackupExportJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0006 /* BackupExportJournal.swift */; };
+		LBKB0007 /* BackupExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0007 /* BackupExporter.swift */; };
+		LBKB0008 /* BackupFileTreeExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0008 /* BackupFileTreeExporter.swift */; };
+		LBKB0009 /* BackupFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0009 /* BackupFormat.swift */; };
+		LBKB0010 /* BackupHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0010 /* BackupHistory.swift */; };
+		LBKB0011 /* BackupImporter+Categories.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0011 /* BackupImporter+Categories.swift */; };
+		LBKB0012 /* BackupImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0012 /* BackupImporter.swift */; };
+		LBKB0013 /* BackupJSONLWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0013 /* BackupJSONLWriter.swift */; };
+		LBKB0014 /* BackupKeepAlive.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0014 /* BackupKeepAlive.swift */; };
+		LBKB0015 /* BackupOpenRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0015 /* BackupOpenRouter.swift */; };
+		LBKB0016 /* BackupPackageReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0016 /* BackupPackageReader.swift */; };
+		LBKB0017 /* BackupProgressReporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0017 /* BackupProgressReporter.swift */; };
+		LBKB0018 /* BackupRescueIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0018 /* BackupRescueIndex.swift */; };
+		LBKB0019 /* BackupRestoreJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0019 /* BackupRestoreJournal.swift */; };
+		LBKB0020 /* BackupRunController.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0020 /* BackupRunController.swift */; };
+		LBKB0021 /* BackupSecrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0021 /* BackupSecrets.swift */; };
+		LBKB0022 /* BackupSecretsImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0022 /* BackupSecretsImporter.swift */; };
+		LBKB0023 /* BackupTransferStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0023 /* BackupTransferStatus.swift */; };
+		LBKB0024 /* BackupZipExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0024 /* BackupZipExtractor.swift */; };
+		LBKB0025 /* BackupZipWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0025 /* BackupZipWriter.swift */; };
+		LBKB0026 /* RcloneBackendCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0026 /* RcloneBackendCatalog.swift */; };
+		LBKB0027 /* RcloneBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0027 /* RcloneBridge.swift */; };
+		LBKB0028 /* RcloneChunkedUpload.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0028 /* RcloneChunkedUpload.swift */; };
+		LBKB0029 /* RcloneRemoteStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0029 /* RcloneRemoteStore.swift */; };
+		LBKB0030 /* BackupAndRestoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0030 /* BackupAndRestoreView.swift */; };
+		LBKB0031 /* BackupCategoryIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0031 /* BackupCategoryIcon.swift */; };
+		LBKB0032 /* BackupDestinationDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0032 /* BackupDestinationDetailView.swift */; };
+		LBKB0033 /* BackupDestinationPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0033 /* BackupDestinationPicker.swift */; };
+		LBKB0034 /* BackupHUD.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0034 /* BackupHUD.swift */; };
+		LBKB0035 /* BackupHistoryDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0035 /* BackupHistoryDetailView.swift */; };
+		LBKB0036 /* BackupRestoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0036 /* BackupRestoreView.swift */; };
+		LBKB0037 /* BackupSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0037 /* BackupSettingsView.swift */; };
+		LBKB0038 /* BackupSkippedFilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0038 /* BackupSkippedFilesView.swift */; };
+		LBKB0039 /* RcloneAddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = LBF0039 /* RcloneAddServerView.swift */; };
 		21FED4B7BB6F6D9476C9992E /* VoiceProvider+System.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88993FC8E3F0199C6638F664 /* VoiceProvider+System.swift */; };
 		241D530017827D7F0EB604DE /* VoiceProviderFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2941B643B8A2F048A2B154E /* VoiceProviderFactory.swift */; };
 		2A4FD49F872431D703328384 /* VoiceOutputPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 424510790AF3FB2452D3CCE3 /* VoiceOutputPlayer.swift */; };
@@ -604,6 +643,45 @@ E5IFW001 /* InputFieldOrWaveformView.swift in Sources */ = {isa = PBXBuildFile; 
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		LBF0001 /* BackupActivityLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupActivityLock.swift; sourceTree = "<group>"; };
+		LBF0002 /* BackupBlobStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupBlobStore.swift; sourceTree = "<group>"; };
+		LBF0003 /* BackupCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupCrypto.swift; sourceTree = "<group>"; };
+		LBF0004 /* BackupDelivery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDelivery.swift; sourceTree = "<group>"; };
+		LBF0005 /* BackupDestinations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDestinations.swift; sourceTree = "<group>"; };
+		LBF0006 /* BackupExportJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupExportJournal.swift; sourceTree = "<group>"; };
+		LBF0007 /* BackupExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupExporter.swift; sourceTree = "<group>"; };
+		LBF0008 /* BackupFileTreeExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupFileTreeExporter.swift; sourceTree = "<group>"; };
+		LBF0009 /* BackupFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupFormat.swift; sourceTree = "<group>"; };
+		LBF0010 /* BackupHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupHistory.swift; sourceTree = "<group>"; };
+		LBF0011 /* BackupImporter+Categories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BackupImporter+Categories".swift; sourceTree = "<group>"; };
+		LBF0012 /* BackupImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupImporter.swift; sourceTree = "<group>"; };
+		LBF0013 /* BackupJSONLWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupJSONLWriter.swift; sourceTree = "<group>"; };
+		LBF0014 /* BackupKeepAlive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupKeepAlive.swift; sourceTree = "<group>"; };
+		LBF0015 /* BackupOpenRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupOpenRouter.swift; sourceTree = "<group>"; };
+		LBF0016 /* BackupPackageReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupPackageReader.swift; sourceTree = "<group>"; };
+		LBF0017 /* BackupProgressReporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupProgressReporter.swift; sourceTree = "<group>"; };
+		LBF0018 /* BackupRescueIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRescueIndex.swift; sourceTree = "<group>"; };
+		LBF0019 /* BackupRestoreJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRestoreJournal.swift; sourceTree = "<group>"; };
+		LBF0020 /* BackupRunController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRunController.swift; sourceTree = "<group>"; };
+		LBF0021 /* BackupSecrets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSecrets.swift; sourceTree = "<group>"; };
+		LBF0022 /* BackupSecretsImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSecretsImporter.swift; sourceTree = "<group>"; };
+		LBF0023 /* BackupTransferStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupTransferStatus.swift; sourceTree = "<group>"; };
+		LBF0024 /* BackupZipExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupZipExtractor.swift; sourceTree = "<group>"; };
+		LBF0025 /* BackupZipWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupZipWriter.swift; sourceTree = "<group>"; };
+		LBF0026 /* RcloneBackendCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneBackendCatalog.swift; path = Remote/RcloneBackendCatalog.swift; sourceTree = "<group>"; };
+		LBF0027 /* RcloneBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneBridge.swift; path = Remote/RcloneBridge.swift; sourceTree = "<group>"; };
+		LBF0028 /* RcloneChunkedUpload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneChunkedUpload.swift; path = Remote/RcloneChunkedUpload.swift; sourceTree = "<group>"; };
+		LBF0029 /* RcloneRemoteStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RcloneRemoteStore.swift; path = Remote/RcloneRemoteStore.swift; sourceTree = "<group>"; };
+		LBF0030 /* BackupAndRestoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupAndRestoreView.swift; sourceTree = "<group>"; };
+		LBF0031 /* BackupCategoryIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupCategoryIcon.swift; sourceTree = "<group>"; };
+		LBF0032 /* BackupDestinationDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDestinationDetailView.swift; sourceTree = "<group>"; };
+		LBF0033 /* BackupDestinationPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDestinationPicker.swift; sourceTree = "<group>"; };
+		LBF0034 /* BackupHUD.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupHUD.swift; sourceTree = "<group>"; };
+		LBF0035 /* BackupHistoryDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupHistoryDetailView.swift; sourceTree = "<group>"; };
+		LBF0036 /* BackupRestoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRestoreView.swift; sourceTree = "<group>"; };
+		LBF0037 /* BackupSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSettingsView.swift; sourceTree = "<group>"; };
+		LBF0038 /* BackupSkippedFilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSkippedFilesView.swift; sourceTree = "<group>"; };
+		LBF0039 /* RcloneAddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RcloneAddServerView.swift; sourceTree = "<group>"; };
 		0ED149397BEA7E0408C92688 /* GroupVoiceModelsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GroupVoiceModelsView.swift; sourceTree = "<group>"; };
 		0F5379380323FA8C6477708C /* GroupSlotPicker.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GroupSlotPicker.swift; sourceTree = "<group>"; };
 		16FF3462D09402F14B610CD6 /* VoiceWaveformView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VoiceWaveformView.swift; sourceTree = "<group>"; };
@@ -1384,6 +1462,35 @@ E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKno
 		BKP000010 /* Backup */ = {
 			isa = PBXGroup;
 			children = (
+				LBF0001 /* BackupActivityLock.swift */,
+				LBF0002 /* BackupBlobStore.swift */,
+				LBF0003 /* BackupCrypto.swift */,
+				LBF0004 /* BackupDelivery.swift */,
+				LBF0005 /* BackupDestinations.swift */,
+				LBF0006 /* BackupExportJournal.swift */,
+				LBF0007 /* BackupExporter.swift */,
+				LBF0008 /* BackupFileTreeExporter.swift */,
+				LBF0009 /* BackupFormat.swift */,
+				LBF0010 /* BackupHistory.swift */,
+				LBF0011 /* BackupImporter+Categories.swift */,
+				LBF0012 /* BackupImporter.swift */,
+				LBF0013 /* BackupJSONLWriter.swift */,
+				LBF0014 /* BackupKeepAlive.swift */,
+				LBF0015 /* BackupOpenRouter.swift */,
+				LBF0016 /* BackupPackageReader.swift */,
+				LBF0017 /* BackupProgressReporter.swift */,
+				LBF0018 /* BackupRescueIndex.swift */,
+				LBF0019 /* BackupRestoreJournal.swift */,
+				LBF0020 /* BackupRunController.swift */,
+				LBF0021 /* BackupSecrets.swift */,
+				LBF0022 /* BackupSecretsImporter.swift */,
+				LBF0023 /* BackupTransferStatus.swift */,
+				LBF0024 /* BackupZipExtractor.swift */,
+				LBF0025 /* BackupZipWriter.swift */,
+				LBF0026 /* RcloneBackendCatalog.swift */,
+				LBF0027 /* RcloneBridge.swift */,
+				LBF0028 /* RcloneChunkedUpload.swift */,
+				LBF0029 /* RcloneRemoteStore.swift */,
 			);
 			path = Backup;
 			sourceTree = "<group>";
@@ -2206,6 +2313,16 @@ E5SUB102 /* SubagentCard.swift */,
 		F1V00011 /* Settings */ = {
 			isa = PBXGroup;
 			children = (
+				LBF0030 /* BackupAndRestoreView.swift */,
+				LBF0031 /* BackupCategoryIcon.swift */,
+				LBF0032 /* BackupDestinationDetailView.swift */,
+				LBF0033 /* BackupDestinationPicker.swift */,
+				LBF0034 /* BackupHUD.swift */,
+				LBF0035 /* BackupHistoryDetailView.swift */,
+				LBF0036 /* BackupRestoreView.swift */,
+				LBF0037 /* BackupSettingsView.swift */,
+				LBF0038 /* BackupSkippedFilesView.swift */,
+				LBF0039 /* RcloneAddServerView.swift */,
 				AA0838A12F3B941A00049557 /* AboutView.swift */,
 				E5S000014 /* CloudSyncSettingsView.swift */,
 				E5G000013 /* EnhancedBackgroundSettingsView.swift */,
@@ -2686,6 +2803,45 @@ E5SUB102 /* SubagentCard.swift */,
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				LBKB0001 /* BackupActivityLock.swift in Sources */,
+				LBKB0002 /* BackupBlobStore.swift in Sources */,
+				LBKB0003 /* BackupCrypto.swift in Sources */,
+				LBKB0004 /* BackupDelivery.swift in Sources */,
+				LBKB0005 /* BackupDestinations.swift in Sources */,
+				LBKB0006 /* BackupExportJournal.swift in Sources */,
+				LBKB0007 /* BackupExporter.swift in Sources */,
+				LBKB0008 /* BackupFileTreeExporter.swift in Sources */,
+				LBKB0009 /* BackupFormat.swift in Sources */,
+				LBKB0010 /* BackupHistory.swift in Sources */,
+				LBKB0011 /* BackupImporter+Categories.swift in Sources */,
+				LBKB0012 /* BackupImporter.swift in Sources */,
+				LBKB0013 /* BackupJSONLWriter.swift in Sources */,
+				LBKB0014 /* BackupKeepAlive.swift in Sources */,
+				LBKB0015 /* BackupOpenRouter.swift in Sources */,
+				LBKB0016 /* BackupPackageReader.swift in Sources */,
+				LBKB0017 /* BackupProgressReporter.swift in Sources */,
+				LBKB0018 /* BackupRescueIndex.swift in Sources */,
+				LBKB0019 /* BackupRestoreJournal.swift in Sources */,
+				LBKB0020 /* BackupRunController.swift in Sources */,
+				LBKB0021 /* BackupSecrets.swift in Sources */,
+				LBKB0022 /* BackupSecretsImporter.swift in Sources */,
+				LBKB0023 /* BackupTransferStatus.swift in Sources */,
+				LBKB0024 /* BackupZipExtractor.swift in Sources */,
+				LBKB0025 /* BackupZipWriter.swift in Sources */,
+				LBKB0026 /* RcloneBackendCatalog.swift in Sources */,
+				LBKB0027 /* RcloneBridge.swift in Sources */,
+				LBKB0028 /* RcloneChunkedUpload.swift in Sources */,
+				LBKB0029 /* RcloneRemoteStore.swift in Sources */,
+				LBKB0030 /* BackupAndRestoreView.swift in Sources */,
+				LBKB0031 /* BackupCategoryIcon.swift in Sources */,
+				LBKB0032 /* BackupDestinationDetailView.swift in Sources */,
+				LBKB0033 /* BackupDestinationPicker.swift in Sources */,
+				LBKB0034 /* BackupHUD.swift in Sources */,
+				LBKB0035 /* BackupHistoryDetailView.swift in Sources */,
+				LBKB0036 /* BackupRestoreView.swift in Sources */,
+				LBKB0037 /* BackupSettingsView.swift in Sources */,
+				LBKB0038 /* BackupSkippedFilesView.swift in Sources */,
+				LBKB0039 /* RcloneAddServerView.swift in Sources */,
 				AC0000202 /* ProviderCustomizationGenerated.swift in Sources */,
 				E54000AC1 /* DebugSkillGenerated.swift in Sources */,
 				E5FP00100 /* AppGroupChangeWatcher.swift in Sources */,

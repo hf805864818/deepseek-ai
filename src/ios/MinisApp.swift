@@ -90,6 +90,11 @@ struct MinisApp: App {
     @StateObject private var shareCoordinator = ShareCoordinator.shared
     @ObservedObject private var fontSettings = FontSettings.shared
     @ObservedObject private var configConfirmGate = ConfigConfirmationGate.shared
+    /// [review S14] Drives the root-level restore sheet for a `.minisbak`
+    /// opened from outside the app.
+    @ObservedObject private var openRouter = BackupOpenRouter.shared
+    /// Observed so the restore sheet re-evaluates when the app locks/unlocks.
+    @ObservedObject private var sessionLockStore = SessionLockStore.shared
     @Environment(\.scenePhase) private var scenePhase
     /// Set by the OpenWebAppIntent notification observer; drives a fullScreenCover
     /// presenting `WebAppWebViewScreen`. Cleared when the user dismisses the
@@ -175,7 +180,9 @@ struct MinisApp: App {
                 .onReceive(SessionLockStore.shared.$appIsLocked) { locked in
                     guard !locked, let url = pendingURLWhileLocked else { return }
                     pendingURLWhileLocked = nil
-                    if ExternalFileImporter.canIngest(url) {
+                    if BackupOpenRouter.handle(url) {
+                        // .minisbak → restore flow, not the attachment pipeline.
+                    } else if ExternalFileImporter.canIngest(url) {
                         ExternalFileImporter.ingest(url, into: shareCoordinator)
                         return
                     }
@@ -205,6 +212,45 @@ struct MinisApp: App {
                 )) { _ in
                     ConfigConfirmSheet(gate: configConfirmGate)
                 }
+                // [review S14] Restore flow for a `.minisbak` opened from
+                // Files / AirDrop / a share sheet. Mounted HERE rather than in
+                // BackupSettingsView, which was the only observer before: the
+                // user opening a backup is almost always mid device-migration
+                // and standing on the chat list, so setting `pendingPackage`
+                // did nothing visible until they happened to walk into
+                // Settings — at which point a restore sheet appeared
+                // unprompted. This is the primary migration entry point, so it
+                // has to work from wherever the user actually is.
+                //
+                // Gated on the lock state, and deliberately at the sheet rather
+                // than at each call site: AppLockOverlay is a ZStack sibling, so
+                // a sheet presents OVER it. `handle()` runs from three places
+                // (onOpenURL, the unlock replay, and AppDelegate's scene URL
+                // path for a cold launch) and only the first checks the lock —
+                // so a locked device could otherwise show a restore sheet, with
+                // the package's device name and contents, to whoever is holding
+                // the phone. Gating the presentation covers every path at once.
+                // The pending package survives here until unlock, so nothing is
+                // lost — `appIsLocked` publishing flips this back on.
+                .sheet(item: Binding(
+                    get: { sessionLockStore.appIsLocked ? nil : openRouter.pendingPackage },
+                    set: { openRouter.pendingPackage = $0 }
+                )) { pending in
+                    NavigationStack {
+                        // Opens on the RESTORE tab with the package already
+                        // loaded. Someone who just tapped a .minisbak is mid
+                        // device-migration — landing them on the backup form
+                        // and making them find the switch would be exactly
+                        // backwards.
+                        BackupAndRestoreView(initialTab: .restore,
+                                             initialPackageURL: pending.url)
+                            .toolbar {
+                                ToolbarItem(placement: .cancellationAction) {
+                                    Button("Close") { openRouter.pendingPackage = nil }
+                                }
+                            }
+                    }
+                }
                 .environmentObject(shareCoordinator)
                 .preferredColorScheme(
                     appearanceMode == 1 ? .light : appearanceMode == 2 ? .dark : nil
@@ -218,7 +264,9 @@ struct MinisApp: App {
                         pendingURLWhileLocked = url
                         return
                     }
-                    if ExternalFileImporter.canIngest(url) {
+                    if BackupOpenRouter.handle(url) {
+                        // .minisbak → restore flow, not the attachment pipeline.
+                    } else if ExternalFileImporter.canIngest(url) {
                         ExternalFileImporter.ingest(url, into: shareCoordinator)
                         return
                     }

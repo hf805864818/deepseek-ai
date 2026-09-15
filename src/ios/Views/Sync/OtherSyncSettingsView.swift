@@ -37,6 +37,22 @@ struct OtherSyncSettingsView: View {
             }
             .buttonStyle(.plain)
 
+            // MARK: Backup & Restore
+
+            // [Merge-v1.13] The official backup system (create .minisbak
+            // packages, restore/merge, and rclone remote storage) is hosted
+            // here in the other-sync list, next to Local Sync and Google Drive.
+            // The iCloud Sync entry in Settings keeps its original position.
+            NavigationLink(destination: BackupAndRestoreView()) {
+                platformRow(
+                    icon: "arrow.triangle.2.circlepath",
+                    color: .indigo,
+                    name: AppLocalized("Backup & Restore"),
+                    status: .disconnected
+                )
+            }
+            .buttonStyle(.plain)
+
             // MARK: OneDrive (Coming Soon)
 
             platformRow(
