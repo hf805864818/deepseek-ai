@@ -698,6 +698,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
         }
     }
+    /// [T-ios-group-pause-badge-restamp] Set only while a load / pre-warm is
+    /// flipping `canResume` because the persisted tail STILL looks interrupted —
+    /// i.e. the session was already paused and we are re-deriving that fact, not
+    /// observing a new interruption. The `canResume` didSet reads this to decide
+    /// whether the badge's entry timestamp may be overwritten. Not `@Published`:
+    /// it is a transient annotation on the assignment, never UI state.
+    /// Internal (not `private`) because the detecting site lives in the
+    /// `+Persistence` extension, i.e. a different file.
+    var isRedetectingInterruptedTail = false
+
     @Published var canResume = false {
         didSet {
             // [T-session-paused-badge-active-false-positive] Drive the session-
@@ -3985,7 +3995,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                         }
                         Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
                     } else {
-                        self.errorMessage = displayDesc
+                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
                     }
                 }
             }
@@ -4063,6 +4073,24 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         Self.clearUncommittedStreamTail(lastMsg, committedBlockCount: committedBlockCount)
         // Also remove any trailing empty text blocks left by prior iterations
         lastMsg.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
+
+        // [T-error-persist-retry-clear-ios] Also clear the PERSISTED error_info,
+        // and do it BEFORE agentHistory.removeLast() below severs the only link
+        // to the stalled row's dbMessageId. `lastMsg.error = nil` above only
+        // clears the in-memory banner: the DB row written by persistErrorInfo at
+        // stall time kept its error_info, because the resumed loop persists its
+        // turns into NEW rows (the loop-end unconditional error write at
+        // [T-error-persist-ios] edge #5 keys off the NEW persistedId, never the
+        // orphaned old row). Observed on device (GH#181 family): a DeepSeek
+        // stream died silently mid-turn (no finish/[DONE]), the 120s stall
+        // watchdog fired and persisted the error, retry() resumed and the
+        // conversation completed — but the next session load re-materialised
+        // the stale banner from the DB, mid-way through a visibly finished
+        // conversation (row: created==updated, untouched since the stall).
+        if let staleDbId = agentHistory.last(where: { $0.role == .assistant && $0.dbMessageId != nil })?.dbMessageId {
+            Task { await ChatStore.shared.updateMessageErrorInfo(messageId: staleDbId, errorInfo: nil) }
+            logger.info("[ErrorPersist] retry() clearing persisted error_info on msg=\(staleDbId.prefix(8))")
+        }
 
         // Roll back only the last failed assistant entry from conversation history.
         // The history at this point looks like:
@@ -4162,7 +4190,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                             else if case .running = block.toolStatus { block.toolStatus = .cancelled }
                         }
                     } else {
-                        self.errorMessage = displayDesc
+                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
                     }
                 }
             }
@@ -4185,7 +4213,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// into agentHistory so the model knows to pick up where it left off.
     func resume() {
         guard !isProcessing, canResume else { return }
-        guard let lastMsg = messages.last, lastMsg.role == .assistant else { return }
+        guard let lastMsg = messages.last else { return }
+
+        // [T-ios-orphan-user-tail GH#262/#263] A tail of "user turn with no
+        // reply at all" (process died before assistant content reached the
+        // store) needs a different resume path — there is nothing partial to
+        // continue, so we start a fresh assistant turn instead.
+        if lastMsg.role == .user {
+            resumeUnansweredUserTurn()
+            return
+        }
+        guard lastMsg.role == .assistant else { return }
 
         // [T-perf-estimate-incremental] Do NOT invalidate the estimate cache
         // here. The incremental cache handles the resume case (agentHistory
@@ -4324,7 +4362,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                             else if case .running = block.toolStatus { block.toolStatus = .cancelled }
                         }
                     } else {
-                        self.errorMessage = displayDesc
+                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
                     }
                 }
             }
@@ -4337,6 +4375,112 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
             await self.drainQueuedPrompts()
             logger.info("🔄SESSION [vm=\(self.vmInstanceId)] resume DONE session=\(self.sessionId ?? "nil")")
+            self.playCompletionHaptic()
+            self.isProcessing = false
+            self.endBackgroundProcessing()
+        }
+    }
+
+    /// [T-ios-orphan-user-tail GH#262/#263] Ask for the reply to a user turn
+    /// that never got one.
+    ///
+    /// Reached only from `resume()`, and only for the tail shape described in
+    /// `recheckCanResumeFromHistory` — the user message was persisted, then the
+    /// process died (backgrounded app reclaimed by iOS) before any assistant
+    /// content reached the store. There is no partial reply to continue, so
+    /// this deliberately does NOT reuse resume()'s machinery:
+    ///
+    ///   * no `<system-reminder>` "the user stopped the previous response" turn
+    ///     is injected. That text describes a USER cancelling mid-reply; here
+    ///     the reply never began, and telling the model otherwise would make it
+    ///     apologise for or "pick up" something that does not exist. It is also
+    ///     unnecessary — agentHistory already ends with a user turn, which is
+    ///     exactly the shape the API expects.
+    ///   * `resumingAt` is nil, so runAgentLoop appends a FRESH assistant row
+    ///     rather than resuming into one (there is none to resume into).
+    ///
+    /// The result is that Resume on this session means "answer my last
+    /// message", which is what the user is actually asking for.
+    private func resumeUnansweredUserTurn() {
+        guard let lastUser = messages.last, lastUser.role == .user else { return }
+        logger.info("[OrphanTail] resume on unanswered user turn — requesting a fresh reply session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count)")
+
+        // Same origin marker as retry()/resume(): this turn was started by the
+        // user re-running an old message, so the auto-focus observer must not
+        // treat its completion as "a reply arrived". [T-ios-retry-keyboard]
+        turnStartedByRetry = true
+
+        canResume = false
+        userDidCancel = false
+        errorMessage = nil
+        // Nothing partial to preserve, so the resume()/retry() block-trimming
+        // has no counterpart here: the new reply starts from an empty row.
+        committedBlockCount = 0
+        isProcessing = true
+        isNearBottom = true
+        forceScrollToBottom.send()
+
+        ensureKernelBooted()
+        beginBackgroundProcessing()
+
+        currentTask = Task { [weak self] in
+            guard let self else { return }
+
+            while self.kernelStatus == .booting {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if case .failed(let msg) = self.kernelStatus {
+                self.errorMessage = "Kernel not available: \(msg)"
+                self.isProcessing = false
+                self.endBackgroundProcessing()
+                return
+            }
+
+            let sid = self.sessionId ?? "unknown"
+            let concurrency = SessionConcurrencyManager.shared
+            self.isSuspended = concurrency.runningSessions.count >= concurrency.maxConcurrent
+            do {
+                try await concurrency.acquireSlot(sessionId: sid)
+                self.isSuspended = false
+            } catch {
+                self.isSuspended = false
+                self.isProcessing = false
+                self.endBackgroundProcessing()
+                return
+            }
+            defer { concurrency.releaseSlot(sessionId: sid) }
+
+            do {
+                try await self.runAgentLoop()
+            } catch is CancellationError {
+                logger.info("Agent loop cancelled (orphan-tail resume)")
+                self.handleUserCancelledCleanup()
+            } catch {
+                let rawDesc = String(describing: error)
+                logger.error("Agent loop error (orphan-tail resume): \(rawDesc)")
+                if self.userDidCancel {
+                    self.handleUserCancelledCleanup()
+                } else {
+                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
+                    // runAgentLoop appended the assistant row, so this attaches
+                    // to the bubble; reportTurnFailure is the fallback for the
+                    // window before that append. [T-ios-error-banner-lost]
+                    if let last = self.messages.last(where: { $0.role == .assistant }) {
+                        last.error = displayDesc
+                        Task { await self.persistErrorInfo(displayDesc) }
+                        last.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
+                    } else {
+                        self.reportTurnFailure(displayDesc)
+                    }
+                }
+            }
+            if self.userDidCancel { self.handleUserCancelledCleanup() }
+            guard !Task.isCancelled else {
+                logger.info("🔄SESSION [vm=\(self.vmInstanceId)] orphan-tail resume epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
+                return
+            }
+            await self.drainQueuedPrompts()
+            logger.info("🔄SESSION [vm=\(self.vmInstanceId)] orphan-tail resume DONE session=\(self.sessionId ?? "nil")")
             self.playCompletionHaptic()
             self.isProcessing = false
             self.endBackgroundProcessing()
@@ -4731,7 +4875,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                             else if case .running = block.toolStatus { block.toolStatus = .cancelled }
                         }
                     } else {
-                        self.errorMessage = displayDesc
+                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
                     }
                 }
             }
@@ -5313,7 +5457,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                         Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
                         AppLogger(category: "StreamError").error("[StreamError] → bubble path (set last.error)")
                     } else {
-                        self.errorMessage = displayDesc
+                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
                         AppLogger(category: "StreamError").error("[StreamError] → banner path (vm.errorMessage set)")
                     }
                 }
@@ -5787,6 +5931,35 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 messages.removeLast()
             }
         }
+    }
+
+    /// [T-ios-error-banner-lost] Surface a turn failure that has no assistant
+    /// bubble to attach to, in a form that SURVIVES leaving the session.
+    ///
+    /// The five error epilogues all ended with `self.errorMessage = displayDesc`
+    /// when `messages` held no assistant row — which happens whenever a request
+    /// dies before the first chunk (bad API key, refused connection, provider
+    /// 4xx). `errorMessage` is a @Published on this view model, and the view
+    /// model is a per-session @StateObject: switching sessions or letting the
+    /// scene tear down destroys it, taking the only record of the failure with
+    /// it. The user returns to a chat that looks like nothing was ever sent.
+    ///
+    /// Creating the assistant row here fixes both halves at once. It renders
+    /// through the normal inline-error path (`ChatMessageRow` draws
+    /// `inlineError` for assistant rows, and Retry hangs off the same row), and
+    /// `persistErrorInfo` now writes a carrier row when none exists, so a
+    /// reload restores it. This mirrors the shape the context-exhausted branch
+    /// in `send()` already uses.
+    ///
+    /// `errorMessage` is still set as well: it is what drives the top banner for
+    /// the current, still-live view, and clearing it is how the user dismisses
+    /// that banner. The durable copy is the addition, not a replacement.
+    private func reportTurnFailure(_ displayDesc: String) {
+        errorMessage = displayDesc
+        let carrier = ChatMessage(role: .assistant, content: "", blocks: [])
+        carrier.error = displayDesc
+        messages.append(carrier)
+        Task { await self.persistErrorInfo(displayDesc) }
     }
 
     // MARK: - Session Persistence
@@ -6332,6 +6505,54 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     compactionsThisLoop += 1
                     logger.info("[Context] In-loop near capacity — auto-compacting (\(compactionsThisLoop)/\(Self.maxInLoopCompactions)) turnCount=\(turnCount)")
                     await compactBefore(anchorId, allowDuringProcessing: true)
+
+                    // [T-ios-inloop-compact-divider-order] GH#235. Seal the
+                    // bubble this run has been writing into and continue in a
+                    // FRESH one below the divider.
+                    //
+                    // `compactBefore` inserts the divider immediately AFTER the
+                    // anchor row and greys everything up to it. In the in-loop
+                    // case the anchor resolves to `messages.last(active)` —
+                    // which is this run's own still-streaming assistant bubble.
+                    // So without this, the loop `continue`s and keeps appending
+                    // thinking / tool blocks into a bubble that now sits ABOVE
+                    // the divider and is flagged `isCompactedHistory`: new
+                    // output appears greyed out inside the "already compacted"
+                    // region, in the wrong chronological place. That is exactly
+                    // the reported symptom.
+                    //
+                    // Starting a new bubble (rather than moving the divider) is
+                    // what matches the user's mental model: everything produced
+                    // before the compaction really is pre-compaction history,
+                    // and everything after it belongs below the line. It also
+                    // keeps `compactBefore` untouched — the user-initiated
+                    // "Compact Above" path anchors on a finished message and is
+                    // already correct.
+                    //
+                    // The sealed bubble keeps whatever it had; if it never
+                    // produced anything (compaction fired before the first
+                    // block landed) it would render as an empty grey row, so
+                    // drop it in that case.
+                    if let sealedIdx = messages.firstIndex(where: { $0.id == runMsgId }) {
+                        let sealed = messages[sealedIdx]
+                        sealed.isAwaitingModelResponse = false
+                        if sealed.blocks.isEmpty && sealed.content.isEmpty {
+                            messages.remove(at: sealedIdx)
+                            logger.info("[Context] In-loop compact: dropped empty sealed bubble at \(sealedIdx)")
+                        }
+                    }
+                    let fresh = ChatMessage(role: .assistant, content: "", blocks: [])
+                    fresh.isAwaitingModelResponse = true
+                    messages.append(fresh)
+                    msgIdx = messages.count - 1
+                    runMsgId = fresh.id
+                    // Blocks already committed belong to the sealed bubble; the
+                    // fresh one starts from zero or the next round would skip
+                    // its first N blocks when syncing to agentHistory.
+                    committedBlockCount = 0
+                    self.committedBlockCount = 0
+                    logger.info("[Context] In-loop compact: continuing in fresh bubble idx=\(msgIdx) id=\(runMsgId.uuidString.prefix(8)) below the divider")
+
                     turnCount -= 1   // cancel this iteration's defer increment
                     continue
                 }
@@ -6594,6 +6815,26 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                     }
                     didInjectEmptyToolReminderThisRun = true
                     logger.error("🔁STREAM empty after tool result — injecting <system-reminder> and retrying one round")
+
+                    // [T-msgidx-oob] Re-resync before subscripting: the stream
+                    // we just consumed is a suspension point, so `messages` may
+                    // have been mutated meanwhile (iCloud inbound rebuild,
+                    // compaction sweep, user delete) and `msgIdx` gone stale.
+                    // Reproduced deterministically on device (mock provider
+                    // stalls, chat.debugRemoveMessages drops a row, provider
+                    // then returns empty): this exact subscript trapped, and the
+                    // reminder request below was never sent — matching the
+                    // field crash 1.11(15) .ips 2026-08-15 14:02, symbolicated
+                    // to this line. Same guard shape as the fallback paths below.
+                    if msgIdx < 0 || msgIdx >= messages.count || messages[msgIdx].id != runMsgId {
+                        guard let resynced = messages.firstIndex(where: { $0.id == runMsgId }) else {
+                            logger.error("🔁STREAM empty-reminder: assistant message id=\(runMsgId) vanished (count=\(messages.count)) — aborting round")
+                            throw LLMError.transientError(message: "Server returned an empty response (overloaded or upstream error)")
+                        }
+                        logger.warning("🔁STREAM empty-reminder: msgIdx resynced → \(resynced) (count=\(messages.count))")
+                        msgIdx = resynced
+                    }
+
                     let reminderStream = try await streamWithAutoRetry(
                         provider: provider,
                         messages: applyRequestImageBudget(historyWithEmptyToolResultReminder()),
