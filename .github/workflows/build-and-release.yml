@@ -308,7 +308,10 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        # v3 tries `sdkmanager tools`, which GitHub deprecated/removed, so the
+        # step always fails with "Failed to find package 'tools'" (exit 1).
+        # v4 no longer installs the legacy tools package.
+        uses: android-actions/setup-android@v4
         with:
           accept-android-sdk-licenses: true
 
