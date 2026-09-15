@@ -8,6 +8,11 @@ struct ModelGroupsView: View {
     @State private var showAddAgentModels = false
     @State private var showAddAgentGroups = false
     @State private var forceSyncToast: String?
+    /// [T-provider-group-swipe-actions] Swipe-to-edit / swipe-to-delete targets.
+    /// Edit pushes the same detail screen the row taps into; delete is held here
+    /// until the confirmation alert is answered.
+    @State private var editingGroupId: String?
+    @State private var pendingDeleteGroup: ModelGroup?
     @AppStorage("cloudSync.v2.enabled") private var iCloudSyncEnabled: Bool = false
 
     var body: some View {
@@ -39,8 +44,33 @@ struct ModelGroupsView: View {
                         } label: {
                             GroupRow(group: group)
                         }
+                        // [T-provider-group-swipe-actions] Explicit swipe
+                        // actions REPLACE the previous `.onDelete`, which gave
+                        // a swipe-to-delete with NO confirmation: a group can
+                        // be a default/voice/vision target and removing it
+                        // silently clears those pointers (see
+                        // ProviderConfigStore.removeGroup), so one careless
+                        // swipe could reconfigure routing with no undo.
+                        // Reordering is unaffected — `.onMove` stays, and UIKit
+                        // arbitrates horizontal vs vertical drags itself.
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                pendingDeleteGroup = group
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            Button {
+                                editingGroupId = group.id
+                            } label: {
+                                Label("Edit", systemImage: "pencil")
+                            }
+                            .tint(.blue)
+                        }
                     }
                     .onMove(perform: moveGroups)
+                    // Retained so the EditButton's red-minus delete still
+                    // exists; it now routes through `pendingDeleteGroup` and
+                    // therefore asks for confirmation like the swipe does.
                     .onDelete(perform: deleteGroups)
                 } header: {
                     HStack {
@@ -153,6 +183,40 @@ struct ModelGroupsView: View {
             }
         }
         .animation(.spring(response: 0.3), value: forceSyncToast)
+        // [T-provider-group-swipe-actions] Swipe-Edit reuses the row's own
+        // destination. iOS 16 target, so the hidden-link form rather than
+        // `navigationDestination(item:)` (17+).
+        .background {
+            NavigationLink(isActive: Binding(
+                get: { editingGroupId != nil },
+                set: { if !$0 { editingGroupId = nil } }
+            )) {
+                if let id = editingGroupId,
+                   store.modelGroups.contains(where: { $0.id == id }) {
+                    ModelGroupDetailView(groupId: id)
+                }
+            } label: { EmptyView() }
+            .opacity(0)
+        }
+        // Names the group and spells out the consequence the store actually
+        // has: removeGroup clears any default / voice / vision pointer aimed
+        // at it, which is not obvious from "delete a group".
+        .alert(
+            AppLocalized("Delete Group"),
+            isPresented: Binding(
+                get: { pendingDeleteGroup != nil },
+                set: { if !$0 { pendingDeleteGroup = nil } }
+            ),
+            presenting: pendingDeleteGroup
+        ) { group in
+            Button("Delete", role: .destructive) {
+                store.removeGroup(group.id)
+                pendingDeleteGroup = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDeleteGroup = nil }
+        } message: { group in
+            Text("Delete \"\(group.name)\"? Any default, voice, or vision selection pointing at this group will be cleared. The models themselves are not deleted.")
+        }
         .alert("New Group", isPresented: $showCreateGroup) {
             TextField("Group name", text: $newGroupName)
             Button("Create") { createGroup() }
@@ -175,11 +239,17 @@ struct ModelGroupsView: View {
         }
     }
 
+    /// [T-provider-group-swipe-actions] Edit-mode (red minus) deletion.
+    ///
+    /// Kept wired to `.onDelete` so the EditButton path kicks off the SAME
+    /// confirmation the swipe does, instead of deleting outright as it used to.
+    /// Only the first offset is honoured because the alert names one group;
+    /// the list has no multi-select delete, so an IndexSet here is always a
+    /// single row in practice.
     private func deleteGroups(at offsets: IndexSet) {
         let groups = store.modelGroups
-        for index in offsets {
-            store.removeGroup(groups[index].id)
-        }
+        guard let index = offsets.first, groups.indices.contains(index) else { return }
+        pendingDeleteGroup = groups[index]
     }
 
     private func moveGroups(from source: IndexSet, to destination: Int) {

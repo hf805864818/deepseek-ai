@@ -252,6 +252,17 @@ private struct InstanceRow: View {
         }
     }
 
+    /// [T-ios-provider-row-keychain] Both display properties come from ONE
+    /// cached probe, so a body pass costs zero Keychain round-trips once warm.
+    /// Invalidated exactly by `authRevision` (bumped on every credential
+    /// write/delete); the 15s TTL is only a backstop for Keychain iCloud sync,
+    /// which does not bump the revision.
+    private var credentialDisplay: ProviderRowCredentialCache.Display {
+        ProviderRowCredentialCache.shared.value(for: instance.id, revision: store.authRevision) {
+            ProviderRowCredentialCache.Display(isConfigured: isConfigured, summary: credentialSummary)
+        }
+    }
+
     private var modelCount: Int {
         store.visibleEntries(for: instance.id).count
     }
@@ -260,7 +271,7 @@ private struct InstanceRow: View {
         let _ = store.authRevision  // subscribe to OAuth state changes
         HStack(spacing: 12) {
             Circle()
-                .fill(isConfigured && instance.isEnabled ? Color.green : Color(UIColor.quaternaryLabel))
+                .fill(credentialDisplay.isConfigured && instance.isEnabled ? Color.green : Color(UIColor.quaternaryLabel))
                 .frame(width: 8, height: 8)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -273,7 +284,7 @@ private struct InstanceRow: View {
                     Text("·")
                         .font(.caption)
                         .foregroundStyle(.quaternary)
-                    Text(credentialSummary)
+                    Text(credentialDisplay.summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -336,5 +347,64 @@ private struct ShadowVoiceRow: View {
         if asr > 0 { parts.append(AppLocalized("\(asr) speech-to-text", comment: "ASR model count")) }
         if tts > 0 { parts.append(AppLocalized("\(tts) text-to-speech", comment: "TTS model count")) }
         return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - [T-ios-backup-credential-restore] ProviderRowCredentialCache
+
+/// Tiny per-instance cache for the credential dot/subtitle shown in the
+/// Providers-list rows. Without it, every body pass of `InstanceRow` does two
+/// Keychain reads (one for the dot, one for the masked subtitle), and a list
+/// re-render — any config mutation, auth bump, or even an unrelated state
+/// change — re-triggers the Keychain XPC for every visible row.
+///
+/// Keying on `authRevision` (bumped by `notifyAuthChanged` on every credential
+/// write/delete) makes invalidation exact: the UI still updates immediately after
+/// the user adds or removes a key. The TTL is only a backstop for credential
+/// changes that happen outside the app (Keychain iCloud sync).
+final class ProviderRowCredentialCache: @unchecked Sendable {
+    static let shared = ProviderRowCredentialCache()
+
+    struct Display {
+        let isConfigured: Bool
+        let summary: String
+    }
+
+    /// Backstop only — `authRevision` is the primary invalidation signal.
+    private static let ttl: TimeInterval = 15
+
+    private let lock = NSLock()
+    private var entries: [String: (value: Display, revision: UInt, at: Date)] = [:]
+
+    private init() {}
+
+    /// Drop everything. Called from the SAME places that clear
+    /// `ProviderCredentialCache`, because those events (Keychain iCloud
+    /// `view-change`, app foreground) change credentials WITHOUT bumping
+    /// `authRevision` — so the revision key alone would not notice them.
+    func invalidateAll() {
+        lock.lock()
+        entries.removeAll()
+        lock.unlock()
+    }
+
+    func value(for instanceId: String, revision: UInt, probe: () -> Display) -> Display {
+        let now = Date()
+        lock.lock()
+        if let e = entries[instanceId], e.revision == revision,
+           now.timeIntervalSince(e.at) < Self.ttl {
+            lock.unlock()
+            return e.value
+        }
+        lock.unlock()
+
+        // Probe runs OUTSIDE the lock — it does Keychain XPC and must not
+        // serialize concurrent probes for different instances.
+        let fresh = probe()
+
+        lock.lock()
+        entries[instanceId] = (fresh, revision, now)
+        lock.unlock()
+        return fresh
     }
 }

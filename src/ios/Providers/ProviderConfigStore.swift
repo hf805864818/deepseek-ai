@@ -159,6 +159,14 @@ final class ProviderConfigStore: ObservableObject {
     /// resolveCurrentEntry results. [T-new-session-hang-credential-cache]
     private(set) var configRevision: UInt = 0
 
+    /// [review B3] The on-disk config path, exposed so the backup importer can
+    /// snapshot it before a restore. Read-only accessor — the file itself is
+    /// still written exclusively through `save()`.
+    nonisolated static var configFileURLForBackup: URL {
+        let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        return library.appendingPathComponent("MinisChat/provider-config.json")
+    }
+
     private let fileURL: URL
 
     /// v3 SQLite store. Populated on first launch from `provider-config.json`
@@ -343,6 +351,11 @@ final class ProviderConfigStore: ObservableObject {
             Unmanaged.passUnretained(self).toOpaque(),
             { _, _, _, _, _ in
                 ProviderCredentialCache.shared.invalidateAll()
+                // [T-ios-provider-row-keychain-in-body] The Providers-list row cache
+                // keys on `authRevision`, which a Keychain sync does NOT bump — clear
+                // it here too or the row would show stale credential state until its
+                // own TTL lapses.
+                ProviderRowCredentialCache.shared.invalidateAll()
             },
             "com.apple.security.view-change" as CFString,
             nil,
@@ -3111,6 +3124,51 @@ enum ProviderKeychainHelper {
     private static func notifyAuthChanged(instanceId: String) {
         ProviderCredentialCache.shared.invalidate(instanceId)
         Task { @MainActor in ProviderConfigStore.shared.authRevision &+= 1 }
+    }
+
+    /// [T-ios-backup-credential-restore] Raw-bytes accessors for the structured
+    /// OAuth blob.
+    ///
+    /// The backup importer has the token as opaque JSON straight out of the
+    /// package and must not have to switch on every provider type to re-type it
+    /// (which would also silently drop any provider type added later). These
+    /// read/write the exact same Keychain item as the typed
+    /// `saveOAuthToken`/`loadOAuthToken` pair.
+    static func saveRawOAuthToken(_ data: Data, instanceId: String) {
+        let service = "com.openminis.app.provider.\(instanceId)"
+        let acct = "oauth-token"
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: acct,
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+        var syncDelete = deleteQuery
+        syncDelete[kSecAttrSynchronizable as String] = true
+        SecItemDelete(syncDelete as CFDictionary)
+        var addQuery = deleteQuery
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        addQuery[kSecAttrSynchronizable as String] = true
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status != errSecSuccess {
+            AppLogger(category: "Keychain").warning("write rawOAuthToken instanceId=\(instanceId.prefix(8)) status=\(status)")
+        }
+    }
+
+    static func loadRawOAuthToken(instanceId: String) -> Data? {
+        let service = "com.openminis.app.provider.\(instanceId)"
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "oauth-token",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
     }
 
     static func saveOAuthToken<T: Codable>(_ token: T, instanceId: String, caller: String = #function) {
