@@ -256,6 +256,19 @@ jobs:
           path: src/ios/龙虾Ai-v${{ needs.prepare.outputs.version }}.ipa
           retention-days: 30
 
+      - name: Upload dSYM for crash symbolization
+        run: |
+          # dSYM 用于把崩溃日志(.ips)主线程 198 帧符号化
+          find src/ios/DerivedData/Build/Products/Release-iphoneos -name "*.dSYM" -type d
+        shell: bash
+
+      - name: Upload dSYM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minis-dsyms
+          path: src/ios/DerivedData/Build/Products/Release-iphoneos/*.dSYM
+          retention-days: 30
+
   # === Step 3: Build Android APK ===
   build-android:
     name: Build Android APK
@@ -446,3 +459,4 @@ jobs:
             artifacts/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
           draft: false
           prerelease: false
+
