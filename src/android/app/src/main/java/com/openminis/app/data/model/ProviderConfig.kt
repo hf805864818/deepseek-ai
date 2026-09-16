@@ -208,6 +208,15 @@ data class ProviderInstance(
     val providerType: ProviderType,
     val credentialType: ProviderCredential,
     var isEnabled: Boolean = true,
+    /**
+     * [T-android-provider-iso8601-wire] Epoch millis in memory, but serialized
+     * as an ISO-8601 string. iOS `ProviderInstance.createdAt` is a `Date`
+     * decoded with `.iso8601`, so a bare epoch number made iOS's
+     * `importProviders` fail to decode the whole `provider_config.json` and
+     * report `Unreadable: 1` for the Providers category. Reads both forms, so
+     * the existing local JSON mirror and older Android backups still load.
+     */
+    @Serializable(with = com.openminis.app.backup.Iso8601MillisSerializer::class)
     val createdAt: Long = System.currentTimeMillis(),
     var customBaseURL: String? = null,
     var appendV1Suffix: Boolean = true,
@@ -356,6 +365,9 @@ data class ModelEntry(
     val isCustom: Boolean = false,
     val isHidden: Boolean = false,
     val uuid: String = UUID.randomUUID().toString(),
+    /** [T-android-provider-iso8601-wire] See ProviderInstance.createdAt — iOS
+     *  `ModelEntry.userModifiedAt` is a `Date?` decoded with `.iso8601`. */
+    @Serializable(with = com.openminis.app.backup.Iso8601MillisNullableSerializer::class)
     val userModifiedAt: Long? = null,
 ) {
     val id: String get() = uuid

@@ -120,6 +120,16 @@ android {
         unitTests.isReturnDefaultValues = true
     }
 
+    // [T-android-downgrade-compat] MigrationTestHelper loads the exported
+    // schema JSON from the TEST APK's assets, not from the project directory —
+    // without this it fails with "Cannot find the schema file in the assets
+    // folder" no matter that the files exist on disk.
+    sourceSets {
+        getByName("androidTest") {
+            assets.srcDirs("$projectDir/schemas")
+        }
+    }
+
     lint {
         // AGP 8.x ships a NonNullableMutableLiveData detector that throws
         // IncompatibleClassChangeError on Kotlin source during
@@ -133,6 +143,16 @@ android {
         checkReleaseBuilds = false
         disable += "NonNullableMutableLiveData"
     }
+}
+
+// [T-android-downgrade-compat] Room needs an explicit output directory once
+// `exportSchema = true`. The generated JSON is COMMITTED: it is what
+// MigrationTestHelper replays to prove every upgrade — and every no-op
+// downgrade — still produces the schema the entities expect. Without it the
+// migration chain has no automated check and only a real device install can
+// catch a break.
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 // [T-bash-on-demand] Keep the shared bashism rule table / test vectors as a

@@ -1353,4 +1353,6 @@
     <string name="system_permissions_a11y_restricted_shizuku_sub">Ein Tippen — hebt die Sperre auf, ohne Minis zu verlassen</string>
     <string name="system_permissions_a11y_restricted_working">Wird zugelassen…</string>
     <string name="system_permissions_a11y_restricted_failed">Fehlgeschlagen — verwenden Sie die manuellen Schritte unten</string>
+    <string name="usage_attr_unknown_session">Modell unbekannt — der Sitzungseintrag wurde gelöscht</string>
+    <string name="usage_attr_removed">Nicht mehr unter Ihren eingerichteten Anbietern</string>
 </resources>

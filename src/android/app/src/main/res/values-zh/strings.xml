@@ -1835,4 +1835,6 @@
     <string name="newer_db_title">数据来自更新的版本</string>
     <string name="newer_db_versions">当前版本支持的数据格式为 %1$d</string>
     <string name="split_no_conversation_subtitle">选择一个会话，或开始新对话</string>
+    <string name="usage_attr_unknown_session">无法确定模型 —— 会话记录已删除</string>
+    <string name="usage_attr_removed">已不在当前配置的服务商中</string>
 </resources>

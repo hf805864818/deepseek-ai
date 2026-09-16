@@ -1360,4 +1360,6 @@
     <string name="system_permissions_a11y_restricted_shizuku_sub">ワンタップ — Minis から離れずにフラグを解除します</string>
     <string name="system_permissions_a11y_restricted_working">許可しています…</string>
     <string name="system_permissions_a11y_restricted_failed">失敗しました — 下記の手順で手動で設定してください</string>
+    <string name="usage_attr_unknown_session">モデル不明 — セッションの記録が削除されています</string>
+    <string name="usage_attr_removed">設定済みのプロバイダーに含まれていません</string>
 </resources>

@@ -1110,4 +1110,6 @@
     <string name="newer_db_title">您的資料來自較新的版本</string>
     <string name="newer_db_versions">此版本支援資料格式 %1$d</string>
     <string name="split_no_conversation_subtitle">請選擇一段對話，或開始新的對話</string>
+    <string name="usage_attr_unknown_session">模型不明——該工作階段的紀錄已被刪除</string>
+    <string name="usage_attr_removed">已不在您設定的供應商之中</string>
 </resources>

@@ -16,7 +16,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         FolderEntity::class,
     ],
     version = 13,
-    exportSchema = false,
+    // [T-android-downgrade-compat] Kept ON so MigrationTestHelper and CI can
+    // validate every migration (and its downgrade counterpart) against the
+    // committed schema json. Without it the upgrade/downgrade chain has no
+    // automated check at all and only a real device install can catch a break.
+    exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun chatDao(): ChatDao

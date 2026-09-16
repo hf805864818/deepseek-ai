@@ -1969,4 +1969,6 @@
     <string name="backup_dest_row_subtitle">%1$s · /%2$s</string>
     <string name="split_no_conversation_subtitle">Select a conversation or start a new one</string>
     <string name="chat_input_placeholder_hint_5">Minis can make the Return key send or insert a newline</string>
+    <string name="usage_attr_unknown_session">Model unknown — the session record was deleted</string>
+    <string name="usage_attr_removed">No longer in your configured providers</string>
 </resources>

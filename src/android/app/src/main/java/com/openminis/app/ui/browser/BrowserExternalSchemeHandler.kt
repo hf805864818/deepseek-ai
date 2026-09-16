@@ -55,6 +55,76 @@ object BrowserExternalSchemeHandler {
     )
 
     /**
+     * [T-android-user-initiated-scheme-dispatch] Who asked for this navigation.
+     *
+     * T318 blocked unrecognized app schemes because the agent driving a
+     * headless browser could silently hurl the user into Taobao/Weibo/etc.
+     * mid-task. That reasoning holds ONLY for navigation the user did not ask
+     * for. The same handler is also wired to deliberate taps in chat, and
+     * there the block is simply wrong: the user pointed at a map link and got
+     * a Toast.
+     *
+     * The distinction is the ORIGIN of the navigation, not the scheme — an
+     * allowlist can never keep pace with new apps, which is the actual defect.
+     */
+    enum class Origin {
+        /**
+         * The user tapped something they can see: a chat-message link, or a
+         * link inside a visible in-app browser / preview WebView. Their intent
+         * is explicit, so every scheme dispatches normally.
+         */
+        USER_INITIATED,
+
+        /**
+         * The agent is driving a background/headless WebView
+         * ([com.openminis.app.browser.BrowserUseManager]) and the PAGE chose
+         * to navigate. The user is not watching and did not ask, so unknown
+         * app schemes stay blocked — this is T318's original case.
+         */
+        AGENT_BACKGROUND,
+    }
+
+    /**
+     * [T-android-user-initiated-scheme-dispatch] What [handle] will do with a
+     * scheme. Split out from [handle] so the routing decision is pure and can
+     * be unit-tested on the JVM — [handle] itself needs a `Context` and fires
+     * Toasts / `startActivity`, none of which exist in a plain JVM test.
+     */
+    internal enum class Route {
+        /** `http`/`https`/`about`/`file` — let the WebView load it. */
+        LOAD_IN_WEBVIEW,
+
+        /** `intent:` / `android-app:` — needs `Intent.parseUri`. */
+        PARSE_URI,
+
+        /** Dispatch as a plain `ACTION_VIEW`. */
+        VIEW_INTENT,
+
+        /** Swallow it and tell the user (agent-background only). */
+        BLOCK,
+    }
+
+    /**
+     * [T-android-user-initiated-scheme-dispatch] Decide how [scheme] should be
+     * routed given who asked for it.
+     *
+     * The only asymmetry between the two origins is the final fallback: a
+     * scheme nobody recognizes dispatches for [Origin.USER_INITIATED] (they
+     * tapped it on purpose) and is blocked for [Origin.AGENT_BACKGROUND] (the
+     * page decided, and the user is not even looking at it).
+     */
+    internal fun route(scheme: String?, origin: Origin): Route {
+        val s = scheme?.lowercase() ?: return Route.LOAD_IN_WEBVIEW
+        return when {
+            s in INTERNAL_SCHEMES -> Route.LOAD_IN_WEBVIEW
+            s == INTENT_SCHEME || s == ANDROID_APP_SCHEME -> Route.PARSE_URI
+            s in EXTERNAL_VIEW_SCHEMES -> Route.VIEW_INTENT
+            origin == Origin.USER_INITIATED -> Route.VIEW_INTENT
+            else -> Route.BLOCK
+        }
+    }
+
+    /**
      * Whether [url] is an external scheme that this handler would route
      * away from any in-app WebView. Used by callers (e.g. the chat-link
      * resolver) that need to decide *before* a `loadUrl` whether the

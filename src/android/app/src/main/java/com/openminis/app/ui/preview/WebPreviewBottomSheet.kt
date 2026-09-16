@@ -10,7 +10,6 @@ import android.app.Activity
 import android.view.MotionEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -65,6 +64,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.openminis.app.logging.AppLogger
+import com.openminis.app.ui.theme.ChatColors
 
 /**
  * Immersive 90%-tall bottom sheet that hosts a [WebViewHolder] for a
@@ -104,7 +104,7 @@ fun WebPreviewBottomSheet(
     val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val view = LocalView.current
-    val darkTheme = isSystemInDarkTheme()
+    val darkTheme = ChatColors.isDark
 
     LaunchedEffect(holder) {
         holder.startIfNeeded()

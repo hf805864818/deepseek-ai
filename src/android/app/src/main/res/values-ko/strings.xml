@@ -1352,4 +1352,6 @@
     <string name="system_permissions_a11y_restricted_shizuku_sub">한 번만 탭하면 Minis를 벗어나지 않고 해제됩니다</string>
     <string name="system_permissions_a11y_restricted_working">허용하는 중…</string>
     <string name="system_permissions_a11y_restricted_failed">실패했습니다 — 아래의 수동 절차를 따르세요</string>
+    <string name="usage_attr_unknown_session">모델을 알 수 없음 — 세션 기록이 삭제되었습니다</string>
+    <string name="usage_attr_removed">구성된 제공자 목록에 더 이상 없습니다</string>
 </resources>

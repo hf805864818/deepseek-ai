@@ -20,7 +20,6 @@ import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -268,6 +267,13 @@ private fun datePeriod(timestamp: Long): DatePeriod {
  * `ids` is EMPTY while collapsed, but [totalCount] keeps the real number so the
  * card can still say "5 chats".
  */
+/**
+ * [T-android-group-pause-badge-restamp] How recently a session must have
+ * ENTERED its badge state for that badge to pass through to the collapsed
+ * group card. 24h, matching iOS's `freshCornerBadgeSessionIds(within: 24*3600)`.
+ */
+private const val GROUP_BADGE_FRESH_WINDOW_MS = 24L * 60L * 60L * 1000L
+
 data class FolderGroupBlock(
     val folder: FolderEntity,
     val ids: List<String>,
@@ -278,6 +284,29 @@ data class FolderGroupBlock(
     val summaryTitle: String? = null,
     /** Newest member's category — tints the composed folder icon like iOS FolderComposedIcon. */
     val firstCategory: String? = null,
+    /**
+     * [T-android-group-pause-badge-restamp] Any member carrying a FRESH corner
+     * badge (entered within the last 24h). Rendered on the card icon ONLY while
+     * the group is collapsed — expanded members carry their own row badges, and
+     * a header copy would leave the user guessing which row it refers to.
+     * Mirrors iOS `SidebarGroup.anyPaused`.
+     *
+     * The freshness window is a GROUP-CARD filter only: session rows keep
+     * rendering their badge unfiltered at any age. It exists so a pause from
+     * days ago stops flagging its whole group forever.
+     */
+    val anyPaused: Boolean = false,
+    /**
+     * [T-android-group-running-ring] Any member currently running its agent
+     * loop. Drives the collapsed group card's SpinningRing, so a task started
+     * inside a group stays visible after the group is folded shut — otherwise
+     * collapsing the group hides the only signal that work is in flight.
+     * Mirrors iOS `SidebarGroup.anyActive` (ContentView.swift:4771).
+     *
+     * Unlike [anyPaused] there is no freshness window: "running" is live state
+     * that ends on its own, so it can never go stale.
+     */
+    val anyActive: Boolean = false,
 )
 
 /**
@@ -299,10 +328,20 @@ data class FolderGroupBlock(
  *  - Empty groups still render — a group that disappears when its last session
  *    moves out reads as data loss.
  */
-private fun partitionByFolder(
+// `internal` so the accordion invariant can be tested for real rather than by
+// matching source text — see SessionGroupAccordionTest.
+internal fun partitionByFolder(
     sessions: List<ChatSessionEntity>,
     folders: List<FolderEntity>,
     collapsedIds: Set<String>,
+    /**
+     * Session ids carrying a corner badge entered within the last 24h,
+     * snapshotted ONCE by the caller (iOS computes `freshCornerIds` the same
+     * way, once per grouping pass, rather than entering the store per member).
+     */
+    freshBadgedIds: Set<String> = emptySet(),
+    /** Ids whose agent loop is running — see [FolderGroupBlock.anyActive]. */
+    activeSessionIds: Set<String> = emptySet(),
 ): Pair<List<FolderGroupBlock>, List<ChatSessionEntity>> {
     if (folders.isEmpty()) return emptyList<FolderGroupBlock>() to sessions
 
@@ -325,10 +364,23 @@ private fun partitionByFolder(
     val ordered = members.keys.toMutableList()
     for (f in folders) if (f.id !in members) ordered.add(f.id)
 
+    // [T-android-group-accordion] At most ONE group is open at a time.
+    //
+    // `collapsedIds` stores the inverse (which groups are shut), so an empty
+    // set — a fresh install, or a device whose folders all arrived from a
+    // restore — means "nothing is collapsed", i.e. everything unfolds at once.
+    // That is the state the user reported. The toggle already enforces the
+    // accordion; this makes the invariant hold on the way IN as well, so it
+    // cannot be violated by a set that no interaction has touched yet.
+    //
+    // The survivor is the first in `ordered`, which is activity order — the
+    // most recently used group is the one worth having open.
+    val openId = ordered.firstOrNull { it !in collapsedIds }
+
     val blocks = ordered.mapNotNull { fid ->
         val folder = byId[fid] ?: return@mapNotNull null
         val m = members[fid].orEmpty()
-        val collapsed = fid in collapsedIds
+        val collapsed = fid != openId
         // Pinned members first, stable partition — the pin is a display
         // affordance inside the group, not a reason to leave it.
         val displayOrdered = m.filter { it.pinnedAt != null } + m.filter { it.pinnedAt == null }
@@ -341,6 +393,10 @@ private fun partitionByFolder(
             latestUpdatedAt = m.firstOrNull()?.updatedAt ?: folder.updatedAt,
             summaryTitle = m.firstOrNull()?.title,
             firstCategory = m.firstOrNull()?.category,
+            // Early-exiting hash lookups over the pre-built snapshot — never a
+            // per-member entry into the badge store.
+            anyPaused = freshBadgedIds.isNotEmpty() && m.any { it.id in freshBadgedIds },
+            anyActive = activeSessionIds.isNotEmpty() && m.any { it.id in activeSessionIds },
         )
     }
 
@@ -500,7 +556,7 @@ fun SessionListScreen(
     // doesn't flash the "add a provider" onboarding before the real config emits.
     val configLoaded by providerRepository.configLoaded.collectAsState()
     val scope = rememberCoroutineScope()
-    val isDark = isSystemInDarkTheme()
+    val isDark = ChatColors.isDark
 
     // [T-android-search-focus-sticky] When the user opens search but types
     // nothing (or only whitespace) and then navigates into a chat, the
@@ -555,9 +611,36 @@ fun SessionListScreen(
     // While searching, group cards are suppressed: padding a result set with
     // every non-matching group is noise, not structure.
     val showFolderBlock = !isSearchActive || searchQuery.isBlank()
-    val folderPartition = remember(sessions, folders, collapsedFolderIds, showFolderBlock) {
-        if (showFolderBlock) partitionByFolder(sessions, folders, collapsedFolderIds)
-        else emptyList<FolderGroupBlock>() to sessions
+    // [T-android-group-pause-badge-restamp] Snapshot the fresh-badge set ONCE
+    // per grouping pass (iOS does the same in computeGroupedSessionIDs). The
+    // set itself is the recomposition key: as badges age past the 24h window
+    // the set recomputed on the next ambient refresh differs and the cards
+    // re-derive — which is exactly the "picked up on the next refresh rather
+    // than by a dedicated timer" semantics iOS documents. `sessionBadges` is
+    // collected so a push/remove re-enters this block promptly.
+    // `revision` is keyed alongside the queue map because a pure RE-STAMP
+    // (badge already at the head of its queue) leaves `byId` equals-identical
+    // and is therefore conflated away — yet it can flip a card from stale to
+    // fresh. See SessionBadgeStore.revision.
+    val sessionBadges by com.openminis.app.service.SessionBadgeStore.byId.collectAsState()
+    val badgeRevision by com.openminis.app.service.SessionBadgeStore.revision.collectAsState()
+    val freshBadgedIds = remember(sessionBadges, badgeRevision) {
+        com.openminis.app.service.SessionBadgeStore
+            .freshCornerBadgeSessionIds(GROUP_BADGE_FRESH_WINDOW_MS)
+    }
+    // [T-android-group-running-ring] Live running set, so a collapsed group
+    // can show that one of its members is still working. Keyed into the
+    // partition memo — without it the blocks would keep a stale snapshot and
+    // the ring would never appear or never clear.
+    val activeSessionIds by SessionActivityTracker.activeSessions.collectAsState()
+    val folderPartition = remember(
+        sessions, folders, collapsedFolderIds, showFolderBlock, freshBadgedIds, activeSessionIds,
+    ) {
+        if (showFolderBlock) {
+            partitionByFolder(
+                sessions, folders, collapsedFolderIds, freshBadgedIds, activeSessionIds,
+            )
+        } else emptyList<FolderGroupBlock>() to sessions
     }
     val folderBlocks = folderPartition.first
     val groupedSessions = remember(folderPartition) { groupSessionsByDate(folderPartition.second) }
@@ -2029,7 +2112,7 @@ private enum class FolderSegment { LONE, TOP, MIDDLE, BOTTOM }
  */
 @Composable
 private fun folderEdgeColor(): Color =
-    if (isSystemInDarkTheme()) Color.White.copy(alpha = 0.30f)
+    if (ChatColors.isDark) Color.White.copy(alpha = 0.30f)
     else Color.Black.copy(alpha = 0.08f)
 
 @Composable

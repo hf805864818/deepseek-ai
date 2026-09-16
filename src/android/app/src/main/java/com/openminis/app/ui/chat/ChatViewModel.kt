@@ -100,6 +100,130 @@ class ChatViewModel(
     companion object {
         internal const val TAG = "ChatViewModel"
 
+        // ── [T-android-compact-runaway] Compaction budgets ──────────────
+        //
+        // Compaction had no ceiling of any kind. Its only time bound was the
+        // provider's OkHttp readTimeout (10 minutes on every provider), and
+        // the split-retry path could issue up to 1+2+4+8 = 15 SEQUENTIAL leaf
+        // calls before depth 3 stopped it. Slow-but-not-timing-out calls (a
+        // rate-limited or queued model at ~80s each) therefore added up to
+        // roughly 20 minutes of apparent hang — which matches the report.
+        //
+        // Three independent ceilings now bound it, because each catches a case
+        // the others miss: the call budget stops fan-out, the wall-clock
+        // timeout stops slow-but-few calls, and the existing depth cap stops
+        // recursion.
+
+        /**
+         * Leaf LLM calls one compaction may issue in total, across every
+         * segment. The depth-3 cap alone permits 15; this cuts the worst case
+         * to a third of that while still allowing a full first split (1+2) plus
+         * one deeper rescue.
+         */
+        internal const val MAX_COMPACT_LLM_CALLS = 6
+
+        /** Floor for the dynamic wall-clock timeout. */
+        internal const val COMPACT_TIMEOUT_BASE_MS = 90_000L
+
+        /**
+         * Added per 10k characters of transcript, so a long first compaction is
+         * not cut off by a limit tuned for a short one.
+         */
+        internal const val COMPACT_TIMEOUT_PER_10K_CHARS_MS = 30_000L
+
+        /**
+         * Hard ceiling. Deliberately under the providers' 10-minute
+         * readTimeout: past this point the run is aborted by us — with the lock
+         * released and a clear message — rather than sitting on a socket that
+         * may never answer.
+         */
+        internal const val COMPACT_TIMEOUT_MAX_MS = 300_000L
+
+        /**
+         * Wall-clock budget for compacting a transcript of [transcriptChars].
+         * Grows with input so long histories get room, capped so nothing can
+         * hang indefinitely.
+         */
+        internal fun compactTimeoutMsFor(transcriptChars: Int): Long {
+            val growth = (transcriptChars / 10_000L) * COMPACT_TIMEOUT_PER_10K_CHARS_MS
+            return (COMPACT_TIMEOUT_BASE_MS + growth).coerceAtMost(COMPACT_TIMEOUT_MAX_MS)
+        }
+
+        /**
+         * Should a failed summary attempt be retried by splitting the input in
+         * half? Pure predicate, in the companion so it is testable without an
+         * Android-bound ViewModel; [isSegmentRetryableError] delegates here.
+         *
+         * Splitting only helps when the failure was caused by the SIZE of the
+         * request. Unclassified errors still split — an over-length refusal
+         * arrives as an untyped ProviderError on most providers, and a summary
+         * built from halves beats no summary — but the classes known to be
+         * size-independent are excluded, because for those a split turns one
+         * failure into up to 15 sequential slow calls. That amplification is
+         * what produced the 15-20 minute apparent hang.
+         */
+        internal fun shouldSplitOnError(error: Throwable): Boolean {
+            if (error is CancellationException) return false
+            if (error is LLMError) {
+                return when (error) {
+                    // Never worth a smaller payload:
+                    //  - Cancelled: the user stopped it; retrying fights that.
+                    //  - NetworkError: never reached a model, size is irrelevant.
+                    //  - RateLimited (429): refusing on quota, not length —
+                    //    halving just doubles the rejected calls under backoff.
+                    //  - TransientError (5xx): server-side fault, payload
+                    //    independent; retrying smaller multiplies the outage.
+                    //  - InvalidApiKey: auth, not size.
+                    is LLMError.Cancelled,
+                    is LLMError.NetworkError,
+                    is LLMError.RateLimited,
+                    is LLMError.TransientError,
+                    is LLMError.InvalidApiKey,
+                    -> false
+                    // ProviderError / DecodingError / Unknown stay retryable:
+                    // an over-length refusal arrives as a ProviderError on most
+                    // providers, and that is the case splitting exists for.
+                    else -> true
+                }
+            }
+            // Raw OkHttp/socket failures are the Android equivalent of iOS's
+            // NSURLErrorDomain bail-out: offline / DNS / TLS / timeout, all
+            // payload-size independent.
+            if (error is java.io.IOException) return false
+            return true
+        }
+
+        /**
+         * [T-android-append-to-input-eats-draft] Join the composer's current
+         * [draft] with an appended [snippet]. Returns null when there is
+         * nothing to append (the caller then leaves the draft untouched).
+         *
+         * Trims the incoming SNIPPET only. The old code called
+         * `draft.trimEnd()` and assigned that trimmed copy back, so "Add to
+         * input" silently rewrote the user's existing draft: a deliberate
+         * trailing newline — a paragraph break they had just typed — was
+         * swallowed and replaced by the separator space. The draft is the
+         * user's own text and must come back byte-for-byte.
+         *
+         * The emptiness test still runs on a trimmed VIEW of the draft (a
+         * whitespace-only draft counts as empty, rather than producing a
+         * leading blank run), but that trimmed value drives the DECISION
+         * only — it is never assigned back. Mirrors iOS `e6c0ace6a`.
+         *
+         * Pure and side-effect free so it can be unit-tested without an
+         * Android runtime; see `AppendToInputTest`.
+         */
+        internal fun joinDraftWithSnippet(draft: String, snippet: String): String? {
+            val cleaned = snippet.trim()
+            if (cleaned.isEmpty()) return null
+            if (draft.isBlank()) return "$cleaned "
+            // Preserve the draft verbatim; only add a separator when it does
+            // not already end in whitespace. A trailing newline is already a
+            // separator, and adding a space after it would indent the new line.
+            val separator = if (draft.last().isWhitespace()) "" else " "
+            return draft + separator + cleaned + " "
+        }
+
         /**
          * [T-android-auto-grouping-injection] Strip the characters that would let
          * user-authored text escape its slot in the prompt's group list, then

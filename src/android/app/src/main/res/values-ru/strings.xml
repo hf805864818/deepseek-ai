@@ -1588,4 +1588,6 @@
     <string name="backup_dest_row_subtitle">%1$s · /%2$s</string>
     <string name="split_no_conversation_subtitle">Выберите беседу или начните новую</string>
     <string name="chat_input_placeholder_hint_5">Minis может назначить клавише ↩︎ отправку или перенос строки</string>
+    <string name="usage_attr_unknown_session">Модель неизвестна — запись сессии была удалена</string>
+    <string name="usage_attr_removed">Больше нет среди ваших настроенных провайдеров</string>
 </resources>

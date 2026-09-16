@@ -312,13 +312,26 @@ internal object ConfigBuiltins {
         // Default app prefs — Android persists most chat preferences in
         // the default SharedPreferences for the package.
         val prefs = context.getSharedPreferences("minis_settings", Context.MODE_PRIVATE)
+        // [T-android-config-prefs-mismatch] The chat prefs the SETTINGS UI owns
+        // live here, not in `minis_settings`. Hoisted above the registrations
+        // so every field can bind to the same store the UI reads.
+        val appearancePrefs = context.getSharedPreferences(
+            com.openminis.app.ui.settings.PREF_APPEARANCE,
+            Context.MODE_PRIVATE,
+        )
         r.register(
             PrefsIntCodedEnumField(
                 path = "chat.returnKey",
                 displayName = "Return key behavior",
                 description = "What the on-screen Return key does in the chat box.",
-                prefs = prefs,
-                key = "return_key_behavior",
+                // [T-android-config-prefs-mismatch] Must match
+                // AppearanceScreen.returnKeySendsMessage exactly — both the
+                // store AND the key. This field previously wrote
+                // `minis_settings/return_key_behavior`, which nothing reads,
+                // so `minis-config set chat.returnKey send` reported success
+                // while the chat box kept inserting newlines.
+                prefs = appearancePrefs,
+                key = com.openminis.app.ui.settings.KEY_RETURN_KEY_BEHAVIOR,
                 cases = listOf("newline", "send"),
                 defaultIndex = 0,
             )
@@ -328,8 +341,9 @@ internal object ConfigBuiltins {
                 path = "chat.keepScreenAwake",
                 displayName = "Keep screen awake during tasks",
                 description = "Prevents auto-lock while the agent is busy.",
-                prefs = prefs,
-                key = "keep_screen_awake_during_tasks",
+                // Same mismatch as chat.returnKey above — see that comment.
+                prefs = appearancePrefs,
+                key = com.openminis.app.ui.settings.KEY_KEEP_SCREEN_AWAKE,
                 defaultValue = false,
             )
         )
@@ -344,10 +358,6 @@ internal object ConfigBuiltins {
         // (Compose recomposes immediately, no manual cache invalidation
         // needed on Android — there is no analogue to iOS
         // FontSettings.messageBaseScale .Published cache).
-        val appearancePrefs = context.getSharedPreferences(
-            com.openminis.app.ui.settings.PREF_APPEARANCE,
-            Context.MODE_PRIVATE,
-        )
         r.register(
             PrefsBoolField(
                 path = "chat.toolPreview",

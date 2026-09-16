@@ -1243,4 +1243,6 @@
     <string name="system_permissions_a11y_restricted_shizuku_sub">Un seul appui — lève l\'indicateur sans quitter Minis</string>
     <string name="system_permissions_a11y_restricted_working">Autorisation en cours…</string>
     <string name="system_permissions_a11y_restricted_failed">Échec — suivez les étapes manuelles ci-dessous</string>
+    <string name="usage_attr_unknown_session">Modèle inconnu — l\'enregistrement de la session a été supprimé</string>
+    <string name="usage_attr_removed">Ne fait plus partie de vos fournisseurs configurés</string>
 </resources>

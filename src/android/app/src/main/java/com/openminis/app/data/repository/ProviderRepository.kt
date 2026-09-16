@@ -2142,12 +2142,36 @@ class ProviderRepository(private val context: Context) {
                     // OpenAI models endpoint; only the completion path differs.
                     ProviderType.openAI, ProviderType.openAIResponses -> OpenAIModelsApi.fetchModels(apiKey, baseURL, customUserAgent = instance.customUserAgent)
                     ProviderType.openRouter -> OpenRouterModelsApi.fetchModels(apiKey)
-                    // xAI: the OAuth model list is fixed (no /v1/models gating
-                    // call needed — XAIModelsApi exposes the spec-mandated set).
-                    // For API-key users we still call the same static list; if
-                    // xAI later exposes a dynamic /v1/models endpoint this is
-                    // the place to swap in OpenAI-compatible fetch.
-                    ProviderType.xAI -> com.openminis.app.provider.xai.XAIModelsApi.fetchModelsOAuth()
+                    // xAI GET /v1/models is live, OpenAI-compatible, and the
+                    // authoritative source once it answers. [T-provider-dynamic
+                    // -catalog-reconcile] See XAIModelsApi's doc comment for
+                    // the full history: the static list used to be pinned for
+                    // OAUTH_REFRESH because a dynamic endpoint was assumed
+                    // hypothetical. It exists and answers (401 without an
+                    // auth header, not 404), so a model shipped after the
+                    // build (GH#265: grok-4.6) finally shows up on Refresh.
+                    //
+                    // `fetchModels` treats api.x.ai as a custom base, so on
+                    // any failure it returns EMPTY rather than a wrong-vendor
+                    // guess; the `ifEmpty` fallback below then restores the
+                    // seeded catalog. That makes the live call additive — it
+                    // can enrich the list but never empty it.
+                    //
+                    // The `?:` default is load-bearing, not cosmetic: an xAI
+                    // instance added through the OAuth button carries no
+                    // customBaseURL, so `effectiveBaseURL` is null — and
+                    // `OpenAIModelsApi.buildURL(null)` resolves to
+                    // api.openai.com/v1/models. Passing the null straight
+                    // through would send an xAI token to OpenAI and, on the
+                    // official-endpoint path, fall back to `LLMModel.allOpenAI`,
+                    // i.e. show GPT models under a Grok provider. That is the
+                    // same class of bug the addInstance seeding comment already
+                    // warns about ("Refresh on Grok returns GPT-5.5").
+                    ProviderType.xAI -> OpenAIModelsApi.fetchModels(
+                        apiKey,
+                        baseURL ?: "https://api.x.ai/v1",
+                        customUserAgent = instance.customUserAgent,
+                    ).ifEmpty { com.openminis.app.provider.xai.XAIModelsApi.fetchModelsOAuth() }
                     // [T-kimi-oauth] Kimi Code: unlike Codex OAuth, the Kimi
                     // OAuth token CAN call the models endpoint — real fetch
                     // from GET /coding/v1/models (OpenAI-compatible shape).
