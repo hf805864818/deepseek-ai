@@ -2496,6 +2496,7 @@ struct AIChatView: View {
                     .font(.caption)
                     .foregroundStyle(ChatColors.secondaryText)
             }
+            .buttonStyle(.plain)
             // [T-ios-voiceover-labels] Otherwise announced as "xmark".
             .accessibilityLabel(Text("Dismiss error", comment: "VoiceOver label for the button that dismisses the error banner"))
         }
@@ -3180,6 +3181,7 @@ struct AIChatView: View {
                             .background(.ultraThinMaterial)
                             .clipShape(Capsule())
                     }
+                    .buttonStyle(.plain)
                     .padding(.top, 6)
                     .padding(.trailing, 10)
                 }

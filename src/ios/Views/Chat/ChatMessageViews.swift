@@ -395,6 +395,7 @@ struct ChatMessageRow: View {
                                         .font(.system(size: 22))
                                         .foregroundStyle(.red)
                                 }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -747,6 +748,7 @@ struct ChatMessageRow: View {
                     .background(ChatColors.primaryText.opacity(0.15))
                     .clipShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(10)
@@ -782,6 +784,7 @@ struct ChatMessageRow: View {
                     .background(Color.orange)
                     .clipShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(10)

@@ -72,6 +72,7 @@ struct InputBottomRowView: View {
             Button { showAttachmentMenu = true } label: {
                 icon
             }
+            .buttonStyle(.plain)
             .confirmationDialog("Add Attachment", isPresented: $showAttachmentMenu) {
                 Button { showCamera = true } label: { Label("Take Photo", systemImage: "camera") }
                 Button { showPhotoPicker = true } label: { Label("Choose Photos & Videos", systemImage: "photo.on.rectangle") }
@@ -99,6 +100,7 @@ struct InputBottomRowView: View {
                 .clipShape(Circle())
                 .overlay(Circle().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
     }
     
     // MARK: - Edit Exit Button
@@ -115,6 +117,7 @@ struct InputBottomRowView: View {
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
     }
     
     // MARK: - Read Aloud Toolbar Toggle
@@ -174,6 +177,7 @@ struct InputBottomRowView: View {
                     .font(.system(size: 34))
                     .foregroundStyle(ChatColors.sendButton)
             }
+            .buttonStyle(.plain)
             .keyboardShortcut(.return, modifiers: .command)
             .accessibilityLabel(Text("Add to queue", comment: "VoiceOver label for the send button while a reply is generating"))
             .accessibilityHint(Text("Queues this message to send after the current reply finishes", comment: "VoiceOver hint for the queue button"))
@@ -183,6 +187,7 @@ struct InputBottomRowView: View {
                     .font(.system(size: 34))
                     .foregroundStyle(.red)
             }
+            .buttonStyle(.plain)
             .accessibilityLabel(Text("Stop generating", comment: "VoiceOver label for the stop button"))
             .accessibilityHint(Text("Stops the reply that is being generated", comment: "VoiceOver hint for the stop button"))
         } else {
@@ -191,6 +196,7 @@ struct InputBottomRowView: View {
                     .font(.system(size: 34))
                     .foregroundStyle(canSend ? ChatColors.sendButton : ChatColors.sendButtonDisabled)
             }
+            .buttonStyle(.plain)
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(!canSend)
             .accessibilityLabel(Text("Send message", comment: "VoiceOver label for the send button"))

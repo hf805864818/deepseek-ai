@@ -287,6 +287,7 @@ private struct MemoryContentView: View {
                         } label: {
                             Image(systemName: "pencil")
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -385,12 +386,14 @@ private struct MemoryWriteDetailView: View {
                         } label: {
                             Image(systemName: "pencil")
                         }
+                        .buttonStyle(.plain)
                     }
                     Button {
                         showRevokeAlert = true
                     } label: {
                         Image(systemName: "arrow.uturn.backward")
                     }
+                    .buttonStyle(.plain)
                     .disabled(item.writtenContent == nil)
                 }
             }

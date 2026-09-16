@@ -84,6 +84,7 @@ struct MessagesAreaView: View {
                         } label: {
                             scrollFloatingButtonLabel("arrow.up.to.line")
                         }
+                        .buttonStyle(.plain)
                         .transition(.opacity.combined(with: .scale(scale: 0.8)))
                     }
                     Button {
@@ -91,6 +92,7 @@ struct MessagesAreaView: View {
                     } label: {
                         scrollFloatingButtonLabel("chevron.down")
                     }
+                    .buttonStyle(.plain)
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
                 .padding(.trailing, 4)

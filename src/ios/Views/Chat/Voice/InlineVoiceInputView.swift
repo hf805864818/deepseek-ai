@@ -721,6 +721,7 @@ struct InlineVoiceInputView: View {
                 .background(Circle().fill(ChatColors.inputIconBg))
                 .overlay(Circle().strokeBorder(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
         .accessibilityLabel(expanded
             ? Text("Collapse voice panel", comment: "Voice panel collapse")
             : Text("Expand voice panel", comment: "Voice panel expand"))
@@ -883,6 +884,7 @@ struct InlineVoiceInputView: View {
             .padding(.vertical, 4)
             .background(Capsule().fill(Color.secondary.opacity(0.1)))
         }
+        .buttonStyle(.plain)
     }
 
     /// Recognition-language switcher (options from the system's preferred locales).
@@ -968,6 +970,7 @@ struct InlineVoiceInputView: View {
             .background(Circle().fill(ChatColors.inputIconBg))
             .overlay(Circle().strokeBorder(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
+        .buttonStyle(.plain)
         .disabled(isCorrecting)
         .accessibilityLabel(Text("Correct transcript with AI", comment: "Voice manual-correction button"))
         .alert(AppLocalized("Improve voice corrections?",

@@ -591,6 +591,7 @@ private struct BridgedAssistantFooterV3: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(ChatColors.primaryText.opacity(0.15)).clipShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(10).frame(maxWidth: .infinity, alignment: .leading)
@@ -614,6 +615,7 @@ private struct BridgedAssistantFooterV3: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Color.orange).clipShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(10).frame(maxWidth: .infinity, alignment: .leading)

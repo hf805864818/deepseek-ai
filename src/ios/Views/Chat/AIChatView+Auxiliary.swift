@@ -265,6 +265,7 @@ struct SessionLockGateOverlay: View {
                         .background(.tint, in: Capsule())
                         .foregroundStyle(.white)
                 }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 32)
         }
@@ -519,6 +520,7 @@ struct CompactSummarySheet: View {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.secondary)
                     }
+                    .buttonStyle(.plain)
                 }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
@@ -529,6 +531,7 @@ struct CompactSummarySheet: View {
                         Image(systemName: copied ? "checkmark.circle.fill" : "doc.on.doc.fill")
                             .foregroundStyle(copied ? .green : .secondary)
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .alert("Revert this compact?", isPresented: $showRevertConfirm) {
