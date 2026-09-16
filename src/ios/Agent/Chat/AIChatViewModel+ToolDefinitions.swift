@@ -202,9 +202,10 @@ extension AIChatViewModel {
                     "prompt": AgentToolParam(type: .string, description: "The full instruction for the subagent. Include all context the subagent needs — it does NOT share your conversation history. Specify: what to do, what files to read, what to check, and what format to return results in."),
                     "max_tool_calls": AgentToolParam(type: .integer, description: "Maximum tool calls the subagent can make (default: 10). Each tool call counts toward this limit."),
                     "allowed_tools": AgentToolParam(type: .string, description: "Comma-separated list of tools the subagent is allowed to use (e.g. 'file_read,code_search,shell_execute'). If omitted, the subagent gets access to all tools except task_dispatch (no recursive subagents)."),
+                    "subagent_type": AgentToolParam(type: .string, description: "Optional. The specialized role for the subagent: 'general', 'research', 'analyze', 'implement', or 'fix'. Choose 'research' to gather/read/search and report findings, 'analyze' to compare/assess and flag risks, 'implement' to make code edits, 'fix' to diagnose a root cause and patch. Defaults to 'general'.", enumValues: ["general", "research", "analyze", "implement", "fix"]),
                 ],
                 required: ["tool_title", "task_description", "prompt"],
-                propertyOrdering: ["tool_title", "task_description", "prompt", "max_tool_calls", "allowed_tools"]
+                propertyOrdering: ["tool_title", "task_description", "prompt", "max_tool_calls", "allowed_tools", "subagent_type"]
             ))
         }
 

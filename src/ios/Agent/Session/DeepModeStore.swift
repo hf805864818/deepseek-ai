@@ -45,7 +45,7 @@ enum DeepModeStore {
     alwaysApply: true
     description: "Consult available skills first"
     ---
-    2. CONSULT SKILLS FIRST — check <available_skills> above and follow any matching skill's workflow before improvising a process.
+    2. CONSULT SKILLS FIRST — When the user asks you to perform a task, you MUST first check <available_skills>. If any skill matches the task intent, invoke it IMMEDIATELY as your first action. Do NOT improvise a process when a matching skill exists for the task type. Only proceed without a skill if no match is found.
 
     ---
     id: core-execute-transparently

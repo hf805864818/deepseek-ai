@@ -983,6 +983,11 @@ extension AIChatViewModel {
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty }
 
+                // [T-subagent-type] Phase C C3: optional typed role for the
+                // subagent. Unknown/missing values fall back to .general.
+                let typeRaw = (tu.args["subagent_type"] as? String)?.lowercased()
+                let subagentType = SubagentType(rawValue: typeRaw ?? "") ?? .general
+
                 if subPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     toolOutput = "Error: 'prompt' parameter is required. Provide full instructions for the subagent."
                     toolSuccess = false
@@ -1004,7 +1009,8 @@ extension AIChatViewModel {
                     taskDescription: taskDesc,
                     prompt: subPrompt,
                     maxToolCalls: maxCalls,
-                    allowedTools: allowedTools
+                    allowedTools: allowedTools,
+                    subagentType: subagentType
                 )
                 activeSubagents.append(subagent)
 

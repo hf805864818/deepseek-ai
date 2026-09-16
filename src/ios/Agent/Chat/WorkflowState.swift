@@ -40,11 +40,16 @@ struct WorkflowStep: Identifiable, Equatable {
     let id: Int
     let title: String
     var status: WorkflowStepStatus
+    /// [T-deep-mode-parallel-plan] True when the plan step carried a
+    /// [PARALLEL] tag, marking it as independent and dispatchable via
+    /// task_dispatch. Purely informational for the step tracker UI.
+    let isParallel: Bool
 
-    init(id: Int, title: String, status: WorkflowStepStatus = .pending) {
+    init(id: Int, title: String, status: WorkflowStepStatus = .pending, isParallel: Bool = false) {
         self.id = id
         self.title = title
         self.status = status
+        self.isParallel = isParallel
     }
 }
 
@@ -79,10 +84,22 @@ enum WorkflowPlanParser {
             guard !line.isEmpty else { continue }
             guard let title = stepTitle(fromLine: line) else { continue }
 
-            let key = title.lowercased()
-            guard !seen.contains(key) else { continue }
-            seen.insert(key)
-            steps.append(WorkflowStep(id: steps.count + 1, title: title))
+            // [T-deep-mode-parallel-plan] Detect and surface [PARALLEL] tags
+            // so the UI can badge steps that the plan marked as independent.
+            // Strip the tag from the displayed title for cleanliness.
+            let isParallel = title.range(of: "[PARALLEL]", options: .caseInsensitive) != nil
+            var cleanTitle = title
+            if isParallel {
+                cleanTitle = cleanTitle
+                    .replacingOccurrences(of: "[PARALLEL]", with: "", options: .caseInsensitive)
+                    .replacingOccurrences(of: "[parallel]", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            let cleanKey = cleanTitle.lowercased()
+            guard !seen.contains(cleanKey) else { continue }
+            seen.insert(cleanKey)
+            steps.append(WorkflowStep(id: steps.count + 1, title: cleanTitle, isParallel: isParallel))
         }
         return steps
     }

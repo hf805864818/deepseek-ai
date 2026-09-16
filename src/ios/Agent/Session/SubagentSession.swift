@@ -30,6 +30,36 @@ enum SubagentStatus: String, Codable, Equatable {
     case cancelled
 }
 
+/// [T-subagent-type] Phase C C1: The specialized role a subagent is asked to
+/// perform. The parent's `task_dispatch` call names a type; the subagent then
+/// receives a typed system-prompt hint that tunes its tool emphasis and the
+/// shape of its returned summary. Total-switch safe: only ever referenced from
+/// the `task_dispatch` branch, which is reachable only when deepModeEnabled.
+enum SubagentType: String, Codable, Equatable, CaseIterable {
+    case general
+    case research
+    case analyze
+    case implement
+    case fix
+
+    /// A short system-prompt hint injected into the subagent's system prompt,
+    /// telling it how to behave and what shape of output to return.
+    var systemPromptHint: String {
+        switch self {
+        case .general:
+            return "You are a GENERAL-PURPOSE subagent. Adapt your approach to the task: gather what you need, do the work, and return a concise, structured summary."
+        case .research:
+            return "You are a RESEARCH subagent. Prioritize reading files, searching the codebase, and gathering factual evidence. Return findings as a concise bulleted list with source references (file paths), not open-ended prose."
+        case .analyze:
+            return "You are an ANALYSIS subagent. Break the subject into parts, compare options, weigh trade-offs, and flag risks. Return a structured assessment with clear conclusions, not just a description."
+        case .implement:
+            return "You are an IMPLEMENTATION subagent. Prioritize making concrete file edits. After editing, verify your changes (read back / run) before summarizing. Return a short summary of files changed and what each change does."
+        case .fix:
+            return "You are a FIX subagent. Prioritize diagnosing the ROOT CAUSE before patching. Apply a targeted fix, then verify it resolves the issue. Return a summary of the root cause, the fix, and how you verified it."
+        }
+    }
+}
+
 /// A subagent session — an independent mini agent loop.
 @MainActor
 final class SubagentSession: ObservableObject, Identifiable {
@@ -38,6 +68,8 @@ final class SubagentSession: ObservableObject, Identifiable {
     let prompt: String
     let maxToolCalls: Int
     let allowedTools: [String]?
+    /// [T-subagent-type] Phase C C1: the typed role of this subagent.
+    let subagentType: SubagentType
     let createdAt: Date
 
     @Published var status: SubagentStatus = .pending
@@ -50,11 +82,12 @@ final class SubagentSession: ObservableObject, Identifiable {
     /// Whether this session has finished (completed, failed, or cancelled).
     private(set) var isFinished: Bool = false
 
-    init(taskDescription: String, prompt: String, maxToolCalls: Int = 10, allowedTools: [String]? = nil) {
+    init(taskDescription: String, prompt: String, maxToolCalls: Int = 10, allowedTools: [String]? = nil, subagentType: SubagentType = .general) {
         self.taskDescription = taskDescription
         self.prompt = prompt
         self.maxToolCalls = max(1, min(maxToolCalls, 30))
         self.allowedTools = allowedTools
+        self.subagentType = subagentType
         self.createdAt = Date()
     }
 
@@ -93,7 +126,10 @@ final class SubagentSession: ObservableObject, Identifiable {
         // limited tool budget. This encourages concise, focused execution
         // rather than open-ended exploration.
         let toolBudgetHint = "You are operating as a subagent with a BOUNDED tool budget of \(maxToolCalls) tool calls. Be efficient and focused — prioritize the most important actions first. When you have enough information, provide a clear summary of your findings instead of continuing to explore."
-        let subagentSystemPrompt = systemPrompt + "\n\n" + toolBudgetHint
+        // [T-subagent-type] Phase C C3: append the typed role hint so the
+        // subagent knows its specialization and the expected output shape.
+        let typeHint = "\n\n" + subagentType.systemPromptHint
+        let subagentSystemPrompt = systemPrompt + "\n\n" + toolBudgetHint + typeHint
 
         // Build the initial user message with the prompt.
         let userMsg = AgentMessage(role: .user, parts: [.text(prompt)])
