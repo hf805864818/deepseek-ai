@@ -1,6 +1,12 @@
 import Foundation
 import Combine
 
+/// [T-ios-badge-diag] Diagnostics for the badge/freshness path. Every write to
+/// a badge timestamp is traceable by `grep '\[BadgeStamp\]'`, so the next "why
+/// is this badge stale/fresh" question is answered from the log instead of from
+/// inference.
+private let logger = AppLogger(category: "SessionBadgeStore")
+
 /// A transient, prioritized status that can be shown as a small corner badge on
 /// a session's list-cell icon. Ordered, head-of-queue wins.
 ///
@@ -256,6 +262,70 @@ final class SessionBadgeStore: ObservableObject {
         case repair
         /// DEBUG injection from the debug RPC.
         case debugInject
+    }
+
+    /// Compact, greppable timestamp rendering (`nil` stays visible as "none").
+    private static func stampDesc(_ date: Date?) -> String {
+        guard let date else { return "none" }
+        return String(format: "%.0f", date.timeIntervalSince1970)
+    }
+
+    /// How long ago a stamp was, in hours — the number that actually matters
+    /// against the 24h window.
+    private static func ageDesc(_ date: Date?) -> String {
+        guard let date else { return "n/a" }
+        return String(format: "%.1fh", -date.timeIntervalSinceNow / 3600)
+    }
+
+    /// [T-ios-group-pause-badge-reconcile-stamp] Correct `.paused` stamps that
+    /// earlier builds wrote as "now" for sessions that had actually been
+    /// interrupted long before.
+    ///
+    /// Why a repair is needed at all: the stamp is persisted, so fixing the
+    /// writers only stops NEW pollution — every install that already ran a
+    /// build between the window shipping (2026-08-02) and this fix still holds
+    /// stamps saying a days-old pause happened moments ago, and the group card
+    /// reads those.
+    ///
+    /// Strategy — trust the DB, never guess: a stamp is rewritten ONLY when the
+    /// session's interrupted tail is demonstrably older than the stamp claims.
+    /// The tail date is the real entry time, so "stamp newer than tail" can only
+    /// mean the stamp was minted by a re-detect/reconcile rather than by the
+    /// interruption itself. A tolerance absorbs the ordinary case where the push
+    /// legitimately lands a moment after the message is written.
+    ///
+    /// Deliberately NOT "wipe everything unknown": that would silence genuinely
+    /// fresh badges too (a real interruption 10 minutes ago), trading a
+    /// false-positive for a false-negative. Sessions absent from `entryDates`
+    /// (no longer interrupted) are left alone — reconcile's removal pass owns
+    /// those. Runs once per launch and is idempotent: after the first pass the
+    /// stamps already match the tails, so nothing changes on later passes.
+    func repairPollutedPausedStamps(entryDates: [String: Date]) {
+        /// A push racing its own message write can land slightly after it.
+        /// Anything beyond this gap is a re-stamp, not the original entry.
+        let tolerance: TimeInterval = 5 * 60
+        var repaired = 0
+        var examined = 0
+        var maxShiftHours: Double = 0
+        for (sid, tailDate) in entryDates {
+            guard let stamped = badgeTimestamps[sid]?[.paused] else { continue }
+            examined += 1
+            guard stamped > tailDate.addingTimeInterval(tolerance) else { continue }
+            let shiftHours = stamped.timeIntervalSince(tailDate) / 3600
+            maxShiftHours = max(maxShiftHours, shiftHours)
+            logger.info(
+                "[BadgeRepair] fix sid=\(sid.prefix(8)) " +
+                "wasStamped=\(Self.stampDesc(stamped)) (age \(Self.ageDesc(stamped))) → " +
+                "tail=\(Self.stampDesc(tailDate)) (age \(Self.ageDesc(tailDate))) " +
+                "shift=\(String(format: "%.1f", shiftHours))h")
+            badgeTimestamps[sid, default: [:]][.paused] = tailDate
+            repaired += 1
+        }
+        if repaired > 0 { persist() }
+        logger.info(
+            "[BadgeRepair] summary examined=\(examined) repaired=\(repaired) " +
+            "maxShift=\(String(format: "%.1f", maxShiftHours))h " +
+            "tailDatesAvailable=\(entryDates.count)")
     }
 
     /// Remove a session's entire queue (e.g. when the session is deleted).

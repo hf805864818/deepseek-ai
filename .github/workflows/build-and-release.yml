@@ -269,6 +269,24 @@ jobs:
           path: src/ios/DerivedData/Build/Products/Release-iphoneos/*.dSYM
           retention-days: 30
 
+      - name: Build MinisTests bundle (compile-only verification)
+        # Phase-3 merged the upstream unit tests into MinisTests/. The release
+        # IPA build uses generic/platform=iOS and does not touch the unit-test
+        # target, so compiling the test bundle here is the only gate that
+        # catches symbols the tests reference but the merged code lacks. Uses
+        # build-for-testing (compiles all test bundles without running them) so
+        # this stays a pure compile gate and does not slow down the release.
+        run: |
+          cd src/ios
+          xcodebuild -project Minis.xcodeproj -scheme Minis \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath ./TestDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build-for-testing 2>&1 | tail -80
+
   # === Step 3: Build Android APK ===
   build-android:
     name: Build Android APK

@@ -179,6 +179,44 @@ private let logger = AppLogger(category: "ModelUseOffload")
         return result
     }
 
+    // MARK: - Transient Retry
+
+    /// Bounded exponential backoff for `Minis.LLMError.transientError`
+    /// (Gemini 500/502/503/504/529 etc.), so the CLI behaves like a
+    /// well-configured client instead of surfacing a vendor 503 to the caller.
+    ///
+    /// Only `LLMError.transientError` is retried; any other error (including a
+    /// 400 `providerError`) fails fast on the first attempt. `canRetry` lets the
+    /// streaming path veto retries once output bytes have already been emitted
+    /// to the caller's fd (a retry there would duplicate visible text; transient
+    /// failures at that point surface immediately instead).
+    ///
+    /// Delays are 2s, 4s, 8s, 16s, 32s (maxRetries=5 → up to 6 attempts,
+    /// ~62s of total waiting).
+    static func withTransientRetry<T>(
+        label: String,
+        maxRetries: Int = 5,
+        initialDelaySeconds: Double = 2,
+        canRetry: @escaping () -> Bool = { true },
+        sleeper: (UInt64) async -> Void = { try? await Task.sleep(nanoseconds: $0) },
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        var attempt = 0
+        while true {
+            do {
+                return try await operation()
+            } catch let error as LLMError {
+                guard case .transientError(let message) = error,
+                      attempt < maxRetries,
+                      canRetry() else { throw error }
+                attempt += 1
+                let delaySeconds = initialDelaySeconds * pow(2.0, Double(attempt - 1))
+                logger.warning("[ModelUseRetry] \(label): transient provider error — retry \(attempt)/\(maxRetries) in \(Int(delaySeconds))s: \(message.prefix(200))")
+                await sleeper(UInt64(delaySeconds * 1_000_000_000))
+            }
+        }
+    }
+
     // MARK: - Run Model
 
     @objc public static func runModel(idOrName modelIdOrName: String,

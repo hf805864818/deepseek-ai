@@ -108,7 +108,7 @@ final class ShareCoordinator: ObservableObject {
         let share: PendingShare
         let bufferedAt: Date
         /// Session this buffer is addressed to. nil = "any session" (cold launch).
-        let targetSessionId: String?
+        var targetSessionId: String?
         /// Draft this buffer is addressed to. nil = "any draft" (cold launch).
         let targetDraftId: String?
     }
@@ -159,24 +159,28 @@ final class ShareCoordinator: ObservableObject {
         shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) targetSession=\(sessionId ?? "nil") targetDraft=\(draftId ?? "nil") at \(Date())")
     }
 
-    /// Returns true when the pending buffer targets the given session/draft,
-    /// or when no target is stamped on the buffer (cold launch — any session
-    /// may consume it).
+    /// [T-share-routes-to-background-session] Name the session this buffered
+    /// share belongs to. Called by ContentView immediately after it decides
+    /// (and requests navigation to) the destination, so the injector can tell
+    /// "this share is mine" from "this share is for a chat I am not".
+    func setBufferTarget(_ sessionId: String) {
+        guard pendingShareBuffer != nil else { return }
+        pendingShareBuffer?.targetSessionId = sessionId
+        shareLog.info("[Share] setBufferTarget: \(sessionId)")
+    }
+
+    /// Whether the buffered share is addressed to `sessionId` (or to nobody in
+    /// particular, which is the cold-launch case the launch flow owns).
     func bufferTargets(_ sessionId: String?, draftId: String?) -> Bool {
-        guard let buf = pendingShareBuffer else { return false }
-        // If buffer has no target stamp, it passes for any caller.
-        if buf.targetSessionId == nil && buf.targetDraftId == nil {
-            return true
-        }
-        // If a session target is set, it must match.
-        if let targetSession = buf.targetSessionId, targetSession != sessionId {
-            return false
-        }
-        // If a draft target is set, it must match.
-        if let targetDraft = buf.targetDraftId, targetDraft != draftId {
-            return false
-        }
-        return true
+        guard let target = pendingShareBuffer?.targetSessionId else { return true }
+        // A draft chat is addressed BOTH ways: the navigation stack (and hence
+        // the recorded target) holds its `__new__…` id, while the view itself
+        // reports `sessionId = nil, draftId = __new__…` before the first send
+        // and `sessionId = <real id>, draftId = __new__…` after it. Matching
+        // either identity keeps a share aimed at the draft the user is looking
+        // at from being refused by that very draft once it acquires a real id
+        // mid-flight.
+        return target == sessionId || target == draftId
     }
 
     /// Consume the buffer. Returns nil (and cleans up) if expired or empty.
