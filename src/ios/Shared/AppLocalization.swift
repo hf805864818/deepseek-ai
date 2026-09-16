@@ -43,6 +43,29 @@
 
 import Foundation
 
+// MARK: - Format specifier detection
+
+/// Detects whether a string contains unsubstituted `printf`-style format
+/// specifiers of any common variant.
+///
+/// Covers plain (`%lld`), positional (`%1$lld`), width/precision (`%.1f`,
+/// `%3$@`) and length-modifier forms (`%zd`, `%tu`) so the hybrid fallback
+/// triggers for every interpolated string, not just the single-`lld` case.
+/// Translators routinely reorder arguments with `%1$… / %2$…` when the
+/// target-language word order differs from English — a naive
+/// `contains("%lld")` misses those entirely, which is why the first fix
+/// (commit 439ca80) only partially worked.
+private func hasUnsubstitutedFormatSpecifiers(_ string: String) -> Bool {
+    // %  →  (positional index like "1$")?  →  (width)?  →  (precision like ".2")?
+    //    →  (length like ll / l / z / t)?  →  (conversion: @ d i u f e g x c p s …)
+    let pattern = "%(?:[0-9]+\\$)?[0-9]*(?:\\.[0-9]+)?(?:ll|l|z|t|h|j)?[@dfiufegxcpsOX]"
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+        return false
+    }
+    let range = NSRange(string.startIndex..., in: string)
+    return regex.firstMatch(in: string, range: range) != nil
+}
+
 /// The bundle localized lookups should read from.
 ///
 /// Mirrors `Bundle.main.languageBundle` (set by `Bundle.setLanguage(_:)`), so
@@ -87,20 +110,27 @@ enum AppBundle {
 ///     the String Catalog continue to see it.
 ///
 /// [T-ios-lld-bundle-substitution] `String(localized:bundle:)` retrieves the
-/// correct translation for the override bundle but does NOT substitute `%lld`
-/// interpolation arguments at runtime (the translated format string is
-/// returned verbatim with `%lld` placeholders intact). The no-bundle form
-/// `String(localized:)` DOES substitute `%lld` correctly because it resolves
-/// through Foundation's native path. So we use the explicit-bundle form first
-/// (for language correctness), then fall back to the no-bundle form when `%lld`
-/// is detected in the result. This means interpolated strings (timestamps,
-/// model counts, token counts, etc.) render in the system language rather than
-/// the in-app override — but showing "3 小时前" is strictly better than showing
+/// correct translation for the override bundle but does NOT substitute format
+/// specifiers (`%lld`, `%d`, `%@`, `%.1f`, …) at runtime — the translated
+/// format string is returned verbatim with placeholders intact. The no-bundle
+/// form `String(localized:)` DOES substitute them correctly because it
+/// resolves through Foundation's native path. So we use the explicit-bundle
+/// form first (for language correctness), then fall back to the no-bundle
+/// form when any unsubstituted format specifier is detected in the result.
+/// This means interpolated strings (timestamps, model counts, token counts,
+/// file sizes, etc.) render in the system language rather than the in-app
+/// override — but showing "3 小时前" is strictly better than showing
 /// "%lld 小时前". Non-interpolated strings are unaffected and still honour the
 /// in-app language setting.
+///
+/// Detection uses a regex (not `contains("%lld")`) because translators
+/// routinely reorder arguments with positional forms like `%1$lld / %2$@`
+/// when the target-language word order differs from English. A literal
+/// `%lld` check missed those entirely — that was the gap in the first fix
+/// (commit 439ca80).
 func AppLocalized(_ key: String.LocalizationValue, comment: StaticString? = nil) -> String {
     let result = String(localized: key, bundle: AppBundle.current, comment: comment)
-    if result.contains("%lld") {
+    if hasUnsubstitutedFormatSpecifiers(result) {
         return String(localized: key, comment: comment)
     }
     return result
@@ -118,6 +148,12 @@ func AppLocalized(_ key: String.LocalizationValue, comment: StaticString? = nil)
 /// be re-pointed the way a literal key can. Resolve it as-is — extracting the
 /// `String.LocalizationValue` (the key) and re-using the literal-key path so
 /// the in-app override still applies to the active bundle.
+///
+/// Same hybrid fallback as the literal-key overload: `Bundle.localizedString`
+/// returns the translated format string verbatim without substituting `%lld`
+/// / `%d` / `%@` / positional variants, so if we detect any unsubstituted
+/// format specifier we fall back to `String(localized:)` which goes through
+/// Foundation's native path and does the substitution correctly.
 func AppLocalized(_ resource: LocalizedStringResource) -> String {
     // LocalizedStringResource.key is a plain String on the current SDK (it was
     // String.LocalizationValue on older ones), so plumbing it through
@@ -126,5 +162,11 @@ func AppLocalized(_ resource: LocalizedStringResource) -> String {
     // language-override swizzle already patches — `AppBundle.current` +
     // `overrideLocalizedString` honor the in-app language and need no generic
     // key-typed re-construction.
-    AppBundle.current.localizedString(forKey: resource.key, value: resource.key, table: nil)
+    let result = AppBundle.current.localizedString(
+        forKey: resource.key, value: resource.key, table: nil
+    )
+    if hasUnsubstitutedFormatSpecifiers(result) {
+        return String(localized: resource)
+    }
+    return result
 }
