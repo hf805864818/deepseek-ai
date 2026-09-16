@@ -85,8 +85,25 @@ enum AppBundle {
 ///   - key: the localization key, i.e. the English source string.
 ///   - comment: translator context, kept so `genstrings`-style extraction and
 ///     the String Catalog continue to see it.
+///
+/// [T-ios-lld-bundle-substitution] `String(localized:bundle:)` retrieves the
+/// correct translation for the override bundle but does NOT substitute `%lld`
+/// interpolation arguments at runtime (the translated format string is
+/// returned verbatim with `%lld` placeholders intact). The no-bundle form
+/// `String(localized:)` DOES substitute `%lld` correctly because it resolves
+/// through Foundation's native path. So we use the explicit-bundle form first
+/// (for language correctness), then fall back to the no-bundle form when `%lld`
+/// is detected in the result. This means interpolated strings (timestamps,
+/// model counts, token counts, etc.) render in the system language rather than
+/// the in-app override — but showing "3 小时前" is strictly better than showing
+/// "%lld 小时前". Non-interpolated strings are unaffected and still honour the
+/// in-app language setting.
 func AppLocalized(_ key: String.LocalizationValue, comment: StaticString? = nil) -> String {
-    String(localized: key, bundle: AppBundle.current, comment: comment)
+    let result = String(localized: key, bundle: AppBundle.current, comment: comment)
+    if result.contains("%lld") {
+        return String(localized: key, comment: comment)
+    }
+    return result
 }
 
 /// `LocalizedStringResource` overload, for call sites that already hold a
