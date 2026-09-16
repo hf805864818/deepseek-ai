@@ -181,6 +181,16 @@ final class MCPOAuthController: NSObject, ObservableObject {
         var expiresAt: TimeInterval
     }
 
+    /// [T-ios-backup-credential-restore] Write tokens back from a backup.
+    ///
+    /// Narrow entry point so the importer doesn't need `keychainSet` (private)
+    /// widened for everyone. Takes the already-decoded blob so the importer
+    /// never has to know this type's storage layout.
+    static func restoreTokens(_ tokens: StoredTokens, server: String) {
+        guard let data = try? JSONEncoder().encode(tokens) else { return }
+        keychainSet(data, account: "\(server)#tokens")
+    }
+
     static func tokens(server: String) -> StoredTokens? {
         guard let data = keychainGet(account: "\(server)#tokens") else { return nil }
         return try? JSONDecoder().decode(StoredTokens.self, from: data)
