@@ -36,8 +36,8 @@ android {
         applicationId = "com.openminis.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 241
-        versionName = "1.0.209"
+        versionCode = 242
+        versionName = "1.0.210"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
