@@ -3607,16 +3607,28 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         userDidCancel = false
         // [T-deep-mode-plan-gate] Any fresh user send supersedes a pending plan.
         planGateState = .idle
-        // [T-deep-mode-workflow] A fresh user send also ends any in-flight
-        // workflow; confirmPlan() re-enters `.executing` right after send()
-        // returns, so the confirm path is unaffected.
-        resetWorkflow()
-        // [T-deep-mode-goal-runner] A fresh user send also restarts the
-        // auto-continuation budget — each new prompt may chain up to
-        // GoalRunner.maxAutoRounds rounds again.
-        goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-        // [T-deep-mode-strip-sentinel] A fresh send owns a fresh sentinel decision.
-        pendingGoalSentinel = nil
+        // [T-deep-mode-session-workflow] Session-scoped workflow: a fresh task
+        // (.idle) resets the workflow + auto-continuation budgets on send. When
+        // a workflow is already in flight (.executing) or under review
+        // (.verifying), a new user message is treated as an INTERJECTION merged
+        // into the current session workflow — phase, steps, verify budget and
+        // goal budget are preserved, so "pause / interject / continue the same
+        // task" keeps its progress capsule. Total-switch safe: read below; when
+        // deep mode is off the phase is always .idle, so the reset proceeds.
+        let inFlightWorkflow = (deepModeEnabled &&
+            (workflowPhase == .executing || workflowPhase == .verifying))
+        if !inFlightWorkflow {
+            // [T-deep-mode-workflow] A fresh user send also ends any in-flight
+            // workflow; confirmPlan() re-enters `.executing` right after send()
+            // returns, so the confirm path is unaffected.
+            resetWorkflow()
+            // [T-deep-mode-goal-runner] A fresh user send also restarts the
+            // auto-continuation budget — each new prompt may chain up to
+            // GoalRunner.maxAutoRounds rounds again.
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            // [T-deep-mode-strip-sentinel] A fresh send owns a fresh sentinel decision.
+            pendingGoalSentinel = nil
+        }
         // [T-deep-mode-clarify-gate] Phase 2: a fresh user send also clears the
         // clarification gate. If the user typed something new while the gate
         // was open, treat it as a fresh start rather than a clarification reply.

@@ -6035,22 +6035,37 @@ class ChatViewModel(
      */
     private fun sendMessage(text: String, skipContextCheck: Boolean) {
         val trimmed = text.trim()
-        // [T-deep-mode-goal-runner] Reset GoalRunner rounds on every fresh
-        // user message. Auto-continuation rounds only count within one user
-        // prompt's agent loop.
-        goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
-        pendingGoalSentinel = null
-        // Reset VerifyGate state on fresh user message
-        verifyPhase = VerifyPhase.IDLE
-        verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
-        pendingVerifySentinel = null
-        // Reset PlanGate on fresh user message
+        // [T-deep-mode-session-workflow] Session-scoped workflow: only a fresh
+        // task (.idle) resets the workflow-affine budgets (goal/verify/
+        // retrospective). When a workflow is already in flight (.executing) or
+        // under review (.verifying), a new user message is an INTERJECTION
+        // merged into the current session workflow — goal & verify context is
+        // preserved so "pause / interject / continue the same task" keeps its
+        // progress capsule. Total-switch safe: the phase is .IDLE when deep
+        // mode is off, so the reset always proceeds here.
+        val inFlightWorkflow =
+            _deepModeEnabled.value &&
+                (_workflowPhase.value == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.VERIFYING)
+        if (!inFlightWorkflow) {
+            // [T-deep-mode-goal-runner] Reset GoalRunner rounds on every fresh
+            // user message. Auto-continuation rounds only count within one user
+            // prompt's agent loop.
+            goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
+            pendingGoalSentinel = null
+            // Reset VerifyGate state on fresh user message
+            verifyPhase = VerifyPhase.IDLE
+            verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
+            pendingVerifySentinel = null
+            // Reset C7 retrospective on fresh user message
+            retrospectiveHasRun = false
+            isRetrospectiveRunning = false
+        }
+        // Reset PlanGate on fresh user message (always) — a new message
+        // supersedes a stale pending plan.
         _planGateState.value = com.openminis.app.agent.PlanGate.State.IDLE
         pendingPlanText = null
-        // Reset C7 retrospective on fresh user message
-        retrospectiveHasRun = false
-        isRetrospectiveRunning = false
-        // Reset C9 cognitive load on fresh user message
+        // Reset C9 cognitive load on fresh user message (per-runAgentLoop state)
         totalToolCallsInLoop = 0
         verifyFailures = 0
         lastModelLoadSignal = null
@@ -8293,7 +8308,16 @@ class ChatViewModel(
                 // plan (no tool calls, contains ```plan marker), pause for
                 // user approval instead of continuing. Fail-safe: if no plan
                 // detected, proceed normally (degrades to pre-gate behavior).
-                if (deepModeOn && turn == 0 && accumulatedText.isNotBlank()) {
+                // [T-deep-mode-session-workflow] Plan gate only applies to a
+                // fresh task (idle/planning). When a workflow is already in
+                // flight (.executing) or under review (.verifying), a plan-only
+                // reply mid-interjection must NOT yank the state machine back
+                // to .planning and swap the live step tracker for a confirm
+                // bar — treat it as per the workflow phase. Mirrors iOS.
+                val gateEligiblePhase =
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.IDLE ||
+                        _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.PLANNING
+                if (deepModeOn && turn == 0 && gateEligiblePhase && accumulatedText.isNotBlank()) {
                     val plan = com.openminis.app.agent.PlanGate.detectPlan(
                         text = accumulatedText,
                         hasToolCalls = allToolBlocks.any { it.kind == "tool_use" },
