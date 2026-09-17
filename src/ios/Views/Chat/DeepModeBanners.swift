@@ -182,8 +182,14 @@ struct DeepModeWorkflowBanner: View {
 struct FloatingWorkflowCapsule: View {
     let phase: WorkflowPhase
     let steps: [WorkflowStep]
+    /// [T-deep-mode-session-workflow] P2b: true while an agent round is
+    /// actively executing (the VM's `workflowBusy`, gated on the master switch
+    /// up the tree). Drives a gentle pulse on the collapsed chip so a long
+    /// high-cost tool call does not read as a frozen "0/x".
+    var busy: Bool = false
 
     @State private var isExpanded = false
+    @State private var pulsing = false
 
     private var doneCount: Int { steps.filter { $0.status == .done }.count }
     private var allDone: Bool { !steps.isEmpty && steps.allSatisfy { $0.status == .done } }
@@ -200,7 +206,26 @@ struct FloatingWorkflowCapsule: View {
         .onChange(of: allDone) { done in
             if done { withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded = false } }
         }
+        // [T-deep-mode-session-workflow] P2b: start/stop the activity pulse in
+        // sync with the master-switch-gated busy signal.
+        .onAppear { syncPulse(busy) }
+        .onChange(of: busy) { syncPulse($0) }
     }
+
+    /// Drive the pulse only while work is genuinely in flight; otherwise settle.
+    private func syncPulse(_ b: Bool) {
+        if b {
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                pulsing = true
+            }
+        } else {
+            withAnimation(.easeInOut(duration: 0.2)) { pulsing = false }
+        }
+    }
+
+    /// Scale applied to the activity glyph when busy — a subtle breathing pulse.
+    private var glyphScale: CGFloat { pulsing ? 1.18 : 1.0 }
+    private var glyphOpacity: Double { pulsing ? 0.7 : 1.0 }
 
     private var collapsedChip: some View {
         Button {
@@ -210,6 +235,8 @@ struct FloatingWorkflowCapsule: View {
                 Image(systemName: allDone ? "checkmark.circle.fill" : phase.symbolName)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.accentColor)
+                    .scaleEffect(glyphScale)
+                    .opacity(glyphOpacity)
                 Text("\(doneCount)/\(steps.count)")
                     .font(.caption2.monospacedDigit().weight(.semibold))
                     .foregroundColor(ChatColors.primaryText)

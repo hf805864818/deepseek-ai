@@ -956,7 +956,8 @@ struct AIChatView: View {
                            (vm.workflowPhase == .executing || vm.workflowPhase == .verifying),
                            !vm.workflowSteps.isEmpty {
                             FloatingWorkflowCapsule(phase: vm.workflowPhase,
-                                                    steps: vm.workflowSteps)
+                                                    steps: vm.workflowSteps,
+                                                    busy: vm.workflowBusy)
                                 .padding(.top, 96)
                                 .padding(.trailing, 10)
                                 .transition(.move(edge: .trailing).combined(with: .opacity))

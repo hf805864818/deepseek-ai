@@ -1,6 +1,11 @@
 package com.openminis.app.ui.chat
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -42,7 +47,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -631,6 +638,33 @@ fun FloatingWorkflowCapsule(
     val workflowPhase by viewModel.workflowPhase.collectAsState()
     val workflowSteps by viewModel.workflowSteps.collectAsState()
 
+    // [T-deep-mode-session-workflow] P2b: activity pulse. While the agent loop
+    // is actively executing (a long shell/file tool call), blink the collapsed
+    // chip's glyph so a heavy step does not read as a frozen "0/x". The busy
+    // flag is gated on the master switch (workflowBusy). Total-switch safe.
+    val workflowBusy by viewModel.workflowBusy.collectAsState()
+    val busyPulse = rememberInfiniteTransition(label = "workflowBusyPulse")
+    val busyScale by busyPulse.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.18f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 800),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "busyPulseScale",
+    )
+    val busyAlpha by busyPulse.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.7f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 800),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "busyPulseAlpha",
+    )
+    val glyphScale = if (workflowBusy) busyScale else 1f
+    val glyphAlpha = if (workflowBusy) busyAlpha else 1f
+
     val isVisible = deepModeEnabled &&
         (workflowPhase == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
             workflowPhase == com.openminis.app.agent.WorkflowPhase.VERIFYING) &&
@@ -721,7 +755,11 @@ fun FloatingWorkflowCapsule(
                         imageVector = if (allDone) Icons.Default.CheckCircle else workflowPhaseIcon(workflowPhase),
                         contentDescription = null,
                         tint = phaseAccent,
-                        modifier = Modifier.size(12.dp),
+                        // [T-deep-mode-session-workflow] P2b: breathing pulse while busy.
+                        modifier = Modifier
+                            .size(12.dp)
+                            .scale(glyphScale)
+                            .alpha(glyphAlpha),
                     )
                     Text(
                         text = "$doneCount/${workflowSteps.size}",
