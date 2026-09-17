@@ -20,6 +20,7 @@ object DeepModePrefs {
     private const val PREFS = "minis_deepmode_prefs"
     private const val KEY_GLOBAL_ENABLED = "deepmode.global.enabled"
     private const val KEY_GLOBAL_LEVEL = "deepmode.global.level"
+    private const val KEY_GLOBAL_KEEP_SESSION_WORKFLOW = "deepmode.global.keepSessionWorkflow"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -29,6 +30,22 @@ object DeepModePrefs {
 
     fun setGlobalEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_GLOBAL_ENABLED, enabled).apply()
+    }
+
+    /**
+     * [T-deep-mode-session-workflow] P2: Rollback switch for session-scoped
+     * workflow. Defaults to true (absent/no key == session behavior ON).
+     * When false, the client falls back to the LEGACY "per-request workflow"
+     * behavior: every send resets phase/steps and pause/resume no longer
+     * preserves a workflow snapshot. This is a configuration-layer kill-switch /
+     * grayscale lever, per refactor plan item 5. Always ANDed with the master
+     * switch in ChatViewModel.sessionWorkflowEnabled, so it can never widen scope.
+     */
+    fun keepSessionWorkflow(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_GLOBAL_KEEP_SESSION_WORKFLOW, true)
+
+    fun setKeepSessionWorkflow(context: Context, keep: Boolean) {
+        prefs(context).edit().putBoolean(KEY_GLOBAL_KEEP_SESSION_WORKFLOW, keep).apply()
     }
 
     fun globalLevel(context: Context): DeepModeLevel =

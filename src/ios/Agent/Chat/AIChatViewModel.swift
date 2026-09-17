@@ -1003,6 +1003,53 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// as a live progress list. Empty unless a plan is active. In-memory only.
     @Published var workflowSteps: [WorkflowStep] = []
 
+    /// [T-deep-mode-session-workflow] P2: Rollback switch for session-scoped
+    /// workflow. Default ON.
+    ///
+    /// When ON, an in-flight workflow (.executing/.verifying) survives
+    /// interjections and pause/resume — the P0/P1 session behavior and its
+    /// progress capsule. When OFF, the client falls back to the LEGACY
+    /// "per-request workflow" behavior: every user send resets phase/steps, no
+    /// snapshot is saved on pause, and nothing is restored on resume (the
+    /// pre-refactor semantics). This is a configuration-layer kill-switch /
+    /// grayscale lever, per refactor plan item 5. The default is read
+    /// true-when-absent so a fresh install keeps the new behavior; the toggle
+    /// is persisted in UserDefaults.
+    @Published var keepSessionWorkflow: Bool = {
+        let d = UserDefaults.standard
+        // Absent key == never set == default to session-scoped behavior (ON).
+        return d.object(forKey: "deepMode.keepSessionWorkflow") == nil
+            ? true
+            : d.bool(forKey: "deepMode.keepSessionWorkflow")
+    }() {
+        didSet {
+            UserDefaults.standard.set(keepSessionWorkflow, forKey: "deepMode.keepSessionWorkflow")
+        }
+    }
+
+    /// [T-deep-mode-session-workflow] P2: Active workflow gating = total deep
+    /// switch AND the session-workflow rollback switch.
+    ///
+    /// `deepModeEnabled` is the master switch; `keepSessionWorkflow` lets the
+    /// operator disable the session behavior independently (Fallback mode).
+    /// Both must hold for the session-scoped path (interjection preservation,
+    /// pause snapshot / resume restore, and the activity indicator) to apply.
+    /// Total-switch safe: when the master switch is off this is always false,
+    /// so every affected path degrades to the pre-refactor behavior.
+    private var sessionWorkflowEnabled: Bool {
+        deepModeEnabled && keepSessionWorkflow
+    }
+
+    /// [T-deep-mode-session-workflow] P2: Activity indicator for the progress
+    /// capsule. True while the agent loop (a "round") is actively executing —
+    /// model reasoning or tool calls such as shell/file — and false when the
+    /// turn settles into an idle/awaiting state. The UI can render a
+    /// pulse/small-spin on the capsule while this is true so a long-running
+    /// shell call does not look like a frozen "0/x". Set to false immediately
+    /// on round exit via `defer`. Gated so it never flickers outside an active
+    /// session workflow.
+    @Published var workflowBusy: Bool = false
+
     /// [T-deep-mode-workflow] Pending one-shot task that fades the completed
     /// tracker out after a short all-green "完成过渡". Cancelled on master-switch
     /// teardown so a disabled deep mode never lets a stray delay mutate state.
@@ -3669,7 +3716,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // goal budget are preserved, so "pause / interject / continue the same
         // task" keeps its progress capsule. Total-switch safe: read below; when
         // deep mode is off the phase is always .idle, so the reset proceeds.
-        let inFlightWorkflow = (deepModeEnabled &&
+        // [T-deep-mode-session-workflow] P2: also honor the keepSessionWorkflow
+        // rollback switch — when it is OFF, inFlightWorkflow is always false here
+        // and every send resets (legacy per-request workflow behavior).
+        let inFlightWorkflow = (sessionWorkflowEnabled &&
             (workflowPhase == .executing || workflowPhase == .verifying))
         if !inFlightWorkflow {
             // [T-deep-mode-workflow] A fresh user send also ends any in-flight
@@ -4378,15 +4428,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // non-nil after the switch-off, we must NOT restore workflow UI state
         // (phase / steps / verifyRoundsLeft) that contradicts a disabled
         // deep mode. That would violate the total-switch contract.
-        if let saved = savedWorkflowState, deepModeEnabled {
+        // [T-deep-mode-session-workflow] P2: restore only when session-scoped
+        // workflow is active. The guard on deepModeEnabled stays (if the master
+        // switch was turned off while paused, deepModeDidDisableCleanup already
+        // cleared savedWorkflowState); adding keepSessionWorkflow means in
+        // Fallback mode (rollback switch off) we never re-materialize a workflow
+        // the legacy behavior would not have.
+        if let saved = savedWorkflowState, sessionWorkflowEnabled {
             logger.info("[WorkflowLog] resume() - using saved state, skipping re-evaluation")
             workflowPhase = saved.phase
             workflowSteps = saved.steps
             verifyRoundsLeft = saved.verifyRoundsLeft
             savedWorkflowState = nil
         } else if savedWorkflowState != nil {
-            // Deep mode was turned off while we had saved state — discard it.
-            logger.info("[WorkflowLog] resume() - discarding saved workflow state (deep mode off)")
+            // Session workflow is off (deep mode disabled or rollback switch
+            // off) while we had saved state — discard it.
+            logger.info("[WorkflowLog] resume() - discarding saved workflow state (session workflow off)")
             savedWorkflowState = nil
         }
 
@@ -5340,7 +5397,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         logger.info("⏹️ cancel() START session=\(self.sessionId ?? "nil") isProcessing=\(self.isProcessing) lastRole=\(lastRole) lastBlocks=\(lastBlocks) currentTask=\(self.currentTask != nil)")
         dumpCandidateState("cancel-START")
         // [T-deep-mode-resume-opt] Save workflow state before cancel for fast resume
-        if deepModeEnabled && workflowPhase != .idle {
+        // [T-deep-mode-session-workflow] P2: only save the session snapshot when
+        // session-scoped workflow is active (master switch AND keepSessionWorkflow).
+        // In Fallback mode (keepSessionWorkflow off) we keep the legacy behavior:
+        // a pause does not preserve any workflow that a later resume would restore.
+        if sessionWorkflowEnabled && workflowPhase != .idle {
             savedWorkflowState = (workflowPhase, workflowSteps, verifyRoundsLeft)
             logger.info("[WorkflowLog] cancel() - saved workflow state phase=\(workflowPhase) steps=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
         }
@@ -6169,6 +6230,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         defer { AppLogger(category: "RoundMarker").warning("══════════════ ROUND END \(_diagRound) ════════════════ vm=\(self.vmInstanceId) session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(_cachedEstimateTokens ?? -1) tokens") }
         logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop START session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) resuming=\(existingMsgIdx != nil)")
         defer { logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop END session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(_cachedEstimateTokens ?? -1) tokens") }
+        // [T-deep-mode-session-workflow] P2: activity indicator. Reflect "a
+        // round is actively executing" so the progress capsule can pulse during
+        // long model reasoning or high-cost tool calls (shell/file) instead of
+        // looking like a frozen "0/x". Cleared on every exit path via defer, so
+        // it can never stay stuck true. Gated by sessionWorkflowEnabled so a
+        // non-deep / rollback-off session never flips it.
+        workflowBusy = sessionWorkflowEnabled
+        defer { workflowBusy = false }
 
         let loopSetupStart = CFAbsoluteTimeGetCurrent()
         let t0 = CFAbsoluteTimeGetCurrent()

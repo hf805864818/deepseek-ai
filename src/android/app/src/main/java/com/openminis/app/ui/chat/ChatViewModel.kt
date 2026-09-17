@@ -1219,6 +1219,49 @@ class ChatViewModel(
     val deepModeLevel: StateFlow<com.openminis.app.agent.DeepModeLevel> = _deepModeLevel.asStateFlow()
 
     /**
+     * [T-deep-mode-session-workflow] P2: Rollback switch for session-scoped
+     * workflow (default ON). Seeded from DeepModePrefs and toggled via
+     * setKeepSessionWorkflow. When OFF the client falls back to the LEGACY
+     * "per-request workflow" behavior (send resets phase/steps, pause no longer
+     * preserves a snapshot, resume nothing to restore) — a config-layer
+     * kill-switch / grayscale lever per refactor plan item 5. Never widens
+     * scope: always ANDed with _deepModeEnabled via [sessionWorkflowEnabled].
+     */
+    internal val _keepSessionWorkflow =
+        MutableStateFlow(com.openminis.app.data.DeepModePrefs.keepSessionWorkflow(context))
+    val keepSessionWorkflow: StateFlow<Boolean> = _keepSessionWorkflow.asStateFlow()
+
+    /**
+     * [T-deep-mode-session-workflow] P2: persist the rollback switch to
+     * DeepModePrefs so it survives restarts.
+     */
+    fun setKeepSessionWorkflow(keep: Boolean) {
+        _keepSessionWorkflow.value = keep
+        com.openminis.app.data.DeepModePrefs.setKeepSessionWorkflow(context, keep)
+    }
+
+    /**
+     * [T-deep-mode-session-workflow] P2: active session-workflow gating =
+     * master switch AND rollback switch. Use this (instead of the raw
+     * _deepModeEnabled check) for all session-scoped paths so Fallback mode
+     * cleanly reverts to the pre-refactor behavior. Total-switch safe: when the
+     * master switch is off this is always false.
+     */
+    private val sessionWorkflowEnabled: Boolean get() =
+        _deepModeEnabled.value && _keepSessionWorkflow.value
+
+    /**
+     * [T-deep-mode-session-workflow] P2: activity indicator for the progress
+     * capsule. True while an agent loop ("round") is actively executing — model
+     * reasoning or high-cost tool calls (shell/file) — and false when the turn
+     * settles into idle/awaiting. The UI can render a pulse / small-spin here so
+     * a long shell call does not look like a frozen "0/x". Cleared on every round
+     * exit (finally). Gated by sessionWorkflowEnabled.
+     */
+    internal val _workflowBusy = MutableStateFlow(false)
+    val workflowBusy: StateFlow<Boolean> = _workflowBusy.asStateFlow()
+
+    /**
      * [T-deep-mode-goal-runner] Remaining auto-continue rounds for GoalRunner.
      * Decremented once per auto-round, reset to MAX_AUTO_ROUNDS on a fresh user
      * message. Mirrors iOS `AIChatViewModel.goalRunnerRoundsLeft`.
@@ -6066,8 +6109,12 @@ class ChatViewModel(
         // preserved so "pause / interject / continue the same task" keeps its
         // progress capsule. Total-switch safe: the phase is .IDLE when deep
         // mode is off, so the reset always proceeds here.
+        // [T-deep-mode-session-workflow] P2: also honor the keepSessionWorkflow
+        // rollback switch via sessionWorkflowEnabled — when it is OFF,
+        // inFlightWorkflow is always false here and every send resets (legacy
+        // per-request workflow behavior).
         val inFlightWorkflow =
-            _deepModeEnabled.value &&
+            sessionWorkflowEnabled &&
                 (_workflowPhase.value == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
                     _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.VERIFYING)
         if (!inFlightWorkflow) {
@@ -7186,7 +7233,30 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * [T-deep-mode-session-workflow] P2: activity-indicator wrapper around the
+     * agent loop. Flips the workflow capsule's busy pulse ON while a round is
+     * actively executing (model reasoning or high-cost tool calls such as
+     * shell/file) and guarantees it flips OFF on EVERY exit path via finally, so
+     * a long-running call never reads as a frozen "0/x" and the flag can never
+     * get stuck true. Gated by sessionWorkflowEnabled: outside an active session
+     * workflow (deep mode off, or rollback switch off) busy stays false.
+     */
     private suspend fun runAgentLoop(
+        provider: LLMProvider,
+        systemPrompt: String?,
+        fallbackProviders: List<FallbackCandidate> = emptyList(),
+        fallbackStrategy: com.openminis.app.data.model.FallbackStrategy = com.openminis.app.data.model.FallbackStrategy.default,
+    ) {
+        _workflowBusy.value = sessionWorkflowEnabled
+        try {
+            runAgentLoopImpl(provider, systemPrompt, fallbackProviders, fallbackStrategy)
+        } finally {
+            _workflowBusy.value = false
+        }
+    }
+
+    private suspend fun runAgentLoopImpl(
         provider: LLMProvider,
         systemPrompt: String?,
         fallbackProviders: List<FallbackCandidate> = emptyList(),
@@ -12159,9 +12229,13 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
         // workflow BEFORE handleUserCancelledCleanup runs, so a Stop → resume
         // round-trip restores the same session workflow (phase / steps /
         // verify budget) instead of resetting to idle. Total-switch safe: only
-        // saved when deep mode is on and a workflow is actually in flight, and
+        // saved when session workflow is active (master switch AND
+        // keepSessionWorkflow) and a workflow is actually in flight, and
         // cleared by the toggle-off cleanup. Mirrors iOS cancel().
-        if (_deepModeEnabled.value &&
+        // [T-deep-mode-session-workflow] P2: also honor the rollback switch —
+        // in Fallback mode (keepSessionWorkflow off) we do NOT preserve any
+        // workflow that a later resume would restore (legacy behavior).
+        if (sessionWorkflowEnabled &&
             _workflowPhase.value != com.openminis.app.agent.WorkflowPhase.IDLE
         ) {
             savedWorkflowState = SavedWorkflowSnapshot(
@@ -12494,10 +12568,13 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
         // [T-deep-mode-session-workflow] Android P0: restore a paused workflow
         // snapshot saved on Stop so resume continues the SAME session workflow
         // (phase / steps / verify budget) instead of resetting to idle. Mirrors
-        // iOS resume(). Total-switch safe: only restored when deep mode is on;
-        // the toggle-off cleanup nulls the snapshot so a resume can never
-        // resurrect workflow UI contradicting a disabled deep mode.
-        if (_deepModeEnabled.value && savedWorkflowState != null) {
+        // iOS resume(). Total-switch safe: only restored when session workflow
+        // is active; the toggle-off cleanup nulls the snapshot so a resume can
+        // never resurrect workflow UI contradicting a disabled deep mode.
+        // [T-deep-mode-session-workflow] P2: also honor the rollback switch —
+        // in Fallback mode (keepSessionWorkflow off) there is nothing to restore
+        // and we would not re-materialize a workflow the legacy path never had.
+        if (sessionWorkflowEnabled && savedWorkflowState != null) {
             val saved = savedWorkflowState!!
             _workflowPhase.value = saved.phase
             _workflowSteps.value = saved.steps
