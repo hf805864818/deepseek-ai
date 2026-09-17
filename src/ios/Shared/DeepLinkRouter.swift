@@ -130,6 +130,13 @@ enum DeepLinkRouter {
         case "skills":
             coord.pendingSettingsTarget = .skills
 
+        // [T-deep-mode-phase-e] minis://settings/scheduled-tasks — jump
+        // straight to the Scheduled Tasks management screen (the LLM's
+        // "manage in Settings → Agent Runtime → Scheduled Tasks" hint links
+        // here, instead of silently landing on the Settings home).
+        case "scheduled-tasks", "scheduled_tasks", "scheduled":
+            coord.pendingSettingsTarget = .scheduledTasks
+
         // [T-mcp-oauth-deeplink] minis://settings/mcp-servers/<serverId> —
         // jump straight to the server's edit form (Authorize button). The
         // AUTH_REQUIRED error from minis-mcp-cli embeds this link. Server

@@ -7387,6 +7387,8 @@ private enum SettingsDestination: Hashable {
     // [T-mcp-oauth-deeplink]
     case mcpIntegrations
     case mcpServerDetail(serverId: String)
+    // [T-deep-mode-phase-e]
+    case scheduledTasks
 }
 
 private struct SettingsSheet: View {
@@ -7798,6 +7800,8 @@ private struct SettingsSheet: View {
                     MCPIntegrationsView()
                 case .mcpServerDetail(let serverId):
                     MCPIntegrationsView(initialEditServerId: serverId)
+                case .scheduledTasks:
+                    ScheduledTasksSettingsView()
                 }
             }
             .onAppear {
@@ -7891,6 +7895,8 @@ private struct SettingsSheet: View {
             navPath.append(SettingsDestination.mcpIntegrations)
         case .mcpServerDetail(let id):
             navPath.append(SettingsDestination.mcpServerDetail(serverId: id))
+        case .scheduledTasks:
+            navPath.append(SettingsDestination.scheduledTasks)
         }
         deepLink.pendingSettingsTarget = nil
     }

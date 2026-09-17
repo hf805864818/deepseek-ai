@@ -1202,7 +1202,7 @@ extension AIChatViewModel {
 
                 let next = ScheduledTaskItem.nextTriggerDate(task, from: Date())
                     .flatMap { Self.fmtScheduledDate($0) } ?? "n/a"
-                toolOutput = "Scheduled task created: id=\(task.id) label='\(label)' time=\(String(format: "%02d:%02d", hour, minute)) repeat=\(repeatMode) next=\(next). Manage it anytime in Settings → Agent Runtime → Scheduled Tasks."
+                toolOutput = "Scheduled task created: id=\(task.id) label='\(label)' time=\(String(format: "%02d:%02d", hour, minute)) repeat=\(repeatMode) next=\(next). Manage it anytime at [Settings → Agent Runtime → Scheduled Tasks](minis://settings/scheduled-tasks)."
                 toolSuccess = true
 
             default:

@@ -26,6 +26,9 @@ enum SettingsDeepLinkTarget: Equatable {
     /// edit form (where the Authorize button lives).
     case mcpIntegrations
     case mcpServerDetail(serverId: String)
+    /// [T-deep-mode-phase-e] Scheduled Tasks management screen
+    /// (`minis://settings/scheduled-tasks`).
+    case scheduledTasks
 }
 
 @MainActor

@@ -235,7 +235,7 @@ extension AIChatViewModel {
             // the user cannot find.
             tools.append(AgentToolDefinition(
                 name: "schedule_task",
-                description: "Create a scheduled task that automatically runs an AI action at a configured time — daily, on weekdays, or on specific days. The task's prompt runs in a fresh chat each time it fires, and results are recorded so the user can review them. Use this when the user asks to 'set a reminder / daily X / every weekday at Y / schedule X'. Parse the user's natural-language request into the structured time/repeat parameters below. Created tasks are managed in Settings → Agent Runtime → Scheduled Tasks (pause, resume, edit, delete, view runs).",
+                description: "Create a scheduled task that automatically runs an AI action at a configured time — daily, on weekdays, or on specific days. The task's prompt runs in a fresh chat each time it fires, and results are recorded so the user can review them. Use this when the user asks to 'set a reminder / daily X / every weekday at Y / schedule X'. Parse the user's natural-language request into the structured time/repeat parameters below. Created tasks are managed in [Settings → Agent Runtime → Scheduled Tasks](minis://settings/scheduled-tasks) (pause, resume, edit, delete, view runs).",
                 parameters: [
                     "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this scheduled task does, shown to the user (e.g. 'Daily 9am morning briefing', 'Weekday weather check'). Use the same language as the user."),
                     "label": AgentToolParam(type: .string, description: "A short human-readable name for the task, shown in the Scheduled Tasks list."),
