@@ -2,7 +2,7 @@ import SwiftUI
 
 /// [T-deep-mode-phase-e] List + manage scheduled tasks (iOS).
 ///
-/// Entry point from Settings → Agent Runtime → 定时任务. Mirrors the
+/// Entry point from Settings → Agent Runtime → Scheduled Tasks. Mirrors the
 /// Android `ui/scheduled/ScheduledTasksScreen`: list rows with enable/disable,
 /// tap to edit, swipe/keyboard delete, and a detail/run-records view. This is
 /// the "已建任务管理"常驻 surface — it stays reachable regardless of the
@@ -21,9 +21,9 @@ struct ScheduledTasksSettingsView: View {
                         Image(systemName: "clock.badge.questionmark")
                             .font(.system(size: 38))
                             .foregroundStyle(.secondary)
-                        Text("暂无定时任务")
+                        Text("No Scheduled Tasks")
                             .font(.headline)
-                        Text("在深度龙虾AI里让它设置重复任务，例如「每天 9 点生成日报」，任务会显示在这里并自动运行。")
+                        Text("Ask the AI in deep mode to set a repeating task, e.g. \"每天 9 点生成日报\". Tasks appear here and run automatically.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -41,14 +41,14 @@ struct ScheduledTasksSettingsView: View {
                                 Button(role: .destructive) {
                                     scheduler.delete(task.id)
                                 } label: {
-                                    Label("删除", systemImage: "trash")
+                                    Label("Delete", systemImage: "trash")
                                 }
                             }
                         #endif
                     }
                 }
             }
-            .navigationTitle("定时任务")
+            .navigationTitle("Scheduled Tasks")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
@@ -56,7 +56,7 @@ struct ScheduledTasksSettingsView: View {
                         editingTask = nil
                         showingEditor = true
                     } label: {
-                        Label("新建", systemImage: "plus")
+                        Label("New", systemImage: "plus")
                     }
                 }
             }
@@ -106,11 +106,11 @@ private struct ScheduledTaskRow: View {
                 Text(scheduleDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("下次运行：\(nextText)")
+                Text("Next: \(nextText)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 if let stamp = task.lastFiredAt {
-                    Text("上次运行 \(Date(timeIntervalSince1970: stamp).formatted(date: .abbreviated, time: .shortened))")
+                    Text("Last ran \(Date(timeIntervalSince1970: stamp).formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -160,21 +160,21 @@ struct ScheduledTaskEditorView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("名称") { TextField("例如：每日早报", text: $label) }
-                Section("指令") {
+                Section("Label") { TextField("e.g. 每日早报", text: $label) }
+                Section("Prompt") {
                     TextEditor(text: $prompt)
                         .frame(minHeight: 90)
-                    Text("每次都会开启一个新会话执行。")
+                    Text("Runs in a fresh chat each time.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Section("时间") { DatePicker("运行时间", selection: $time, displayedComponents: .hourAndMinute) }
-                Section("重复") {
-                    Picker("重复", selection: $repeatMode) {
-                        Text("仅一次").tag("once")
-                        Text("每天").tag("daily")
-                        Text("工作日（周一至周五）").tag("weekdays")
-                        Text("自定义日期").tag("custom")
+                Section("Time") { DatePicker("Run at", selection: $time, displayedComponents: .hourAndMinute) }
+                Section("Repeat") {
+                    Picker("Repeat", selection: $repeatMode) {
+                        Text("Once").tag("once")
+                        Text("Daily").tag("daily")
+                        Text("Weekdays (Mon-Fri)").tag("weekdays")
+                        Text("Custom days").tag("custom")
                     }
                     if repeatMode == "custom" {
                         HStack(spacing: 6) {
@@ -185,14 +185,14 @@ struct ScheduledTaskEditorView: View {
                     }
                 }
             }
-            .navigationTitle(task == nil ? "新建定时任务" : "编辑定时任务")
+            .navigationTitle(task == nil ? "New Scheduled Task" : "Edit Scheduled Task")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
+                    Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") { save() }
+                    Button("Save") { save() }
                 }
             }
             .onAppear {
@@ -205,10 +205,10 @@ struct ScheduledTaskEditorView: View {
                     customDays = Set(task.customDays)
                 }
             }
-            .alert("信息不完整", isPresented: $showError) {
-                Button("好", role: .cancel) {}
+            .alert("Missing Info", isPresented: $showError) {
+                Button("OK", role: .cancel) {}
             } message: {
-                Text("名称和指令为必填项。")
+                Text("Label and prompt are required.")
             }
         }
     }
