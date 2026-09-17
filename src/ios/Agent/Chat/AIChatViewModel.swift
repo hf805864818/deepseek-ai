@@ -998,7 +998,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// [T-deep-mode-resume-opt] Saved state for fast resume after pause.
     /// When user pauses during workflow, we save the current state here.
     /// On resume, we skip re-evaluation and directly restore the saved state.
-    private var savedWorkflowState: (phase: WorkflowPhase, steps: [WorkflowStep], verifyRoundsLeft: Int)? = nil
+    private var savedWorkflowState: (phase: WorkflowPhase, steps: [WorkflowStep], verifyRoundsLeft: Int, goalRunnerRoundsLeft: Int)? = nil
     /// [T-deep-mode-workflow] Parsed plan steps for the current workflow, shown
     /// as a live progress list. Empty unless a plan is active. In-memory only.
     @Published var workflowSteps: [WorkflowStep] = []
@@ -1024,6 +1024,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     }() {
         didSet {
             UserDefaults.standard.set(keepSessionWorkflow, forKey: "deepMode.keepSessionWorkflow")
+            // [T-deep-mode-session-workflow] Audit H1: turning the rollback
+            // switch OFF mid-workflow must destroy the pending session state,
+            // otherwise phase/steps/snapshot/busy linger and the capsule keeps
+            // rendering (the master switch is still on). resetWorkflow() also
+            // clears savedWorkflowState and the round/verify budgets, so this
+            // becomes a graceful, residue-free exit to the LEGACY behavior.
+            if !keepSessionWorkflow {
+                resetWorkflow()
+                workflowBusy = false
+            }
         }
     }
 
@@ -1036,7 +1046,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// pause snapshot / resume restore, and the activity indicator) to apply.
     /// Total-switch safe: when the master switch is off this is always false,
     /// so every affected path degrades to the pre-refactor behavior.
-    private var sessionWorkflowEnabled: Bool {
+    /// Internal (not private) so the progress-capsule view can gate on it.
+    var sessionWorkflowEnabled: Bool {
         deepModeEnabled && keepSessionWorkflow
     }
 
@@ -1230,6 +1241,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // (Was previously only done in beginExecution(); resetWorkflow is the
         // canonical "return to idle" entry point so it should own this cleanup.)
         workflowFinishTask?.cancel()
+        // [T-deep-mode-workflow] Audit M2: defensively clear the activity
+        // indicator here too — this is the canonical "return to idle" entry
+        // point, so it must not leave a stale busy pulse behind.
+        workflowBusy = false
         // [T-deep-mode-resume-opt] Clear saved state on reset
         savedWorkflowState = nil
         workflowPhase = .idle
@@ -3754,6 +3769,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
             // [T-deep-mode-strip-sentinel] A fresh send owns a fresh sentinel decision.
             pendingGoalSentinel = nil
+        } else {
+            // [T-deep-mode-session-workflow] Audit L1: an interjection merges
+            // into the ACTIVE workflow, so any stale pause-chosen snapshot must
+            // not be kept around (it would restore to a pre-interjection state on
+            // a later resume). resetWorkflow() is NOT called here, so phase/steps/
+            // budgets stay intact — we only drop the now-obsolete snapshot.
+            savedWorkflowState = nil
         }
         // [T-deep-mode-clarify-gate] Phase 2: a fresh user send also clears the
         // clarification gate. If the user typed something new while the gate
@@ -4461,12 +4483,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             workflowPhase = saved.phase
             workflowSteps = saved.steps
             verifyRoundsLeft = saved.verifyRoundsLeft
+            goalRunnerRoundsLeft = saved.goalRunnerRoundsLeft
             savedWorkflowState = nil
         } else if savedWorkflowState != nil {
             // Session workflow is off (deep mode disabled or rollback switch
-            // off) while we had saved state — discard it.
+            // off) while we had saved state — discard it and reset the workflow
+            // tracker. [T-deep-mode-session-workflow] Audit H2: previously this
+            // only cleared the snapshot, leaving phase/steps/tracker alive so the
+            // capsule kept rendering in a fallback (legacy) run. resetWorkflow()
+            // is the true legacy exit — it also clears steps/phase/verify budget.
             logger.info("[WorkflowLog] resume() - discarding saved workflow state (session workflow off)")
-            savedWorkflowState = nil
+            resetWorkflow()
         }
 
         canResume = false
@@ -5424,8 +5451,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // In Fallback mode (keepSessionWorkflow off) we keep the legacy behavior:
         // a pause does not preserve any workflow that a later resume would restore.
         if sessionWorkflowEnabled && workflowPhase != .idle {
-            savedWorkflowState = (workflowPhase, workflowSteps, verifyRoundsLeft)
-            logger.info("[WorkflowLog] cancel() - saved workflow state phase=\(workflowPhase) steps=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
+            savedWorkflowState = (workflowPhase, workflowSteps, verifyRoundsLeft, goalRunnerRoundsLeft)
+            logger.info("[WorkflowLog] cancel() - saved workflow state phase=\(workflowPhase) steps=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft) goalRoundsLeft=\(goalRunnerRoundsLeft)")
         }
         // [T-ios-queued-candidate-not-onscreen] Snapshot the queue + on-screen
         // messages at Stop time, and again 500ms later, so we can see whether a

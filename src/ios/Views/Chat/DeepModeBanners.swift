@@ -203,8 +203,15 @@ struct FloatingWorkflowCapsule: View {
             collapsedChip
         }
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isExpanded)
-        .onChange(of: allDone) { done in
-            if done { withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded = false } }
+        // [T-deep-mode-session-workflow] Audit M1: auto-collapse only when the
+        // task TRULY completes (phase enters .verifying via completeWorkflow).
+        // Collapsing on `allDone` alone is wrong now that event-level progress
+        // can mark every step done mid-run (before the final nudge round ends),
+        // which would make the capsule pre-collapse while work is still running.
+        .onChange(of: phase) { newPhase in
+            if newPhase == .verifying {
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded = false }
+            }
         }
         // [T-deep-mode-session-workflow] P2b: start/stop the activity pulse in
         // sync with the master-switch-gated busy signal.

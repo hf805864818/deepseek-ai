@@ -1238,6 +1238,22 @@ class ChatViewModel(
     fun setKeepSessionWorkflow(keep: Boolean) {
         _keepSessionWorkflow.value = keep
         com.openminis.app.data.DeepModePrefs.setKeepSessionWorkflow(context, keep)
+        // [T-deep-mode-session-workflow] Audit H1 (Android): turning the rollback
+        // switch OFF mid-workflow must destroy the pending session state,
+        // otherwise phase/steps/snapshot linger and the capsule keeps rendering
+        // (the master switch is still ON). This is the residue-free exit to the
+        // LEGACY per-request behavior.
+        if (!keep) {
+            savedWorkflowState = null
+            _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+            _workflowSteps.value = emptyList()
+            _workflowBusy.value = false
+            pendingGoalSentinel = null
+            pendingVerifySentinel = null
+            verifyPhase = VerifyPhase.IDLE
+            verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
+            goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
+        }
     }
 
     /**
@@ -1943,6 +1959,9 @@ class ChatViewModel(
             // Also reset the workflow phase/steps so no progress capsule lingers.
             _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
             _workflowSteps.value = emptyList()
+            _workflowBusy.value = false
+            pendingGoalSentinel = null
+            pendingVerifySentinel = null
             _planGateState.value = com.openminis.app.agent.PlanGate.State.IDLE
             pendingPlanText = null
             _clarifyState.value = com.openminis.app.agent.ClarifyGate.State.IDLE
@@ -6161,6 +6180,13 @@ class ChatViewModel(
             // Reset C7 retrospective on fresh user message
             retrospectiveHasRun = false
             isRetrospectiveRunning = false
+        } else {
+            // [T-deep-mode-session-workflow] Audit L1 (Android): an interjection
+            // merges into the ACTIVE workflow, so any stale pause-chosen snapshot
+            // must not be kept around (it would restore a pre-interjection state
+            // on a later resume). resetWorkflow-equivalent is NOT called here, so
+            // phase/steps/budgets stay intact — we only drop the obsolete snapshot.
+            savedWorkflowState = null
         }
         // Reset PlanGate on fresh user message (always) — a new message
         // supersedes a stale pending plan.
@@ -12613,6 +12639,12 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
             )
         } else {
             savedWorkflowState = null
+            // [T-deep-mode-session-workflow] Audit H2 (Android): previously only
+            // the snapshot was discarded here, leaving phase/steps alive so the
+            // capsule kept rendering in a fallback (legacy) run. Clear the whole
+            // tracker (and the busy flag) to truly revert to legacy semantics.
+            clearWorkflowTracker()
+            _workflowBusy.value = false
         }
         // [T-android-tool-autoscroll] Start-of-turn snap. The thinking
         // placeholder is the only visible delta until the model's first

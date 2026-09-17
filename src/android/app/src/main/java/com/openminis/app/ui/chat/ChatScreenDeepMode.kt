@@ -643,29 +643,43 @@ fun FloatingWorkflowCapsule(
     // chip's glyph so a heavy step does not read as a frozen "0/x". The busy
     // flag is gated on the master switch (workflowBusy). Total-switch safe.
     val workflowBusy by viewModel.workflowBusy.collectAsState()
-    val busyPulse = rememberInfiniteTransition(label = "workflowBusyPulse")
-    val busyScale by busyPulse.animateFloat(
-        initialValue = 1f,
-        targetValue = 1.18f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "busyPulseScale",
-    )
-    val busyAlpha by busyPulse.animateFloat(
-        initialValue = 1f,
-        targetValue = 0.7f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "busyPulseAlpha",
-    )
-    val glyphScale = if (workflowBusy) busyScale else 1f
-    val glyphAlpha = if (workflowBusy) busyAlpha else 1f
+    val keepSessionWorkflow by viewModel.keepSessionWorkflow.collectAsState()
+    // Activity pulse. Run the infinite animation only while the agent loop is
+    // actually busy; when idle the transition is not composed at all, so no
+    // frames are driven (Audit L3) and the glyph renders steady at 1f/1f.
+    val busyScale: Float
+    val busyAlpha: Float
+    if (workflowBusy) {
+        val busyPulse = rememberInfiniteTransition()
+        val busyScaleAnim by busyPulse.animateFloat(
+            initialValue = 1f,
+            targetValue = 1.18f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 800),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "busyPulseScale",
+        )
+        val busyAlphaAnim by busyPulse.animateFloat(
+            initialValue = 1f,
+            targetValue = 0.7f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 800),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "busyPulseAlpha",
+        )
+        busyScale = busyScaleAnim
+        busyAlpha = busyAlphaAnim
+    } else {
+        busyScale = 1f
+        busyAlpha = 1f
+    }
+    val glyphScale = busyScale
+    val glyphAlpha = busyAlpha
 
     val isVisible = deepModeEnabled &&
+        keepSessionWorkflow &&
         (workflowPhase == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
             workflowPhase == com.openminis.app.agent.WorkflowPhase.VERIFYING) &&
         workflowSteps.isNotEmpty()
@@ -676,9 +690,14 @@ fun FloatingWorkflowCapsule(
         it.status == com.openminis.app.agent.WorkflowStepStatus.DONE
     }
 
-    // Auto-collapse once every step completes (mirrors iOS onChange(of: allDone)).
-    LaunchedEffect(allDone) {
-        if (allDone) isExpanded = false
+    // Auto-collapse once the task TRULY completes, i.e. when the workflow enters
+    // VERIFYING via completeWorkflowSteps. Do NOT collapse merely when the
+    // incremental step state is all-done (which can happen transiently mid-run
+    // due to event-level progress alongside round-boundary advances) — otherwise
+    // the capsule pre-collapses while the final nudge round is still executing
+    // (Audit M1).
+    LaunchedEffect(workflowPhase) {
+        if (workflowPhase == com.openminis.app.agent.WorkflowPhase.VERIFYING) isExpanded = false
     }
 
     AnimatedVisibility(

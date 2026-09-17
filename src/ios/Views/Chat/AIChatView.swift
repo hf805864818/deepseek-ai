@@ -952,7 +952,7 @@ struct AIChatView: View {
                     // master switch so disabling deep mode or completing the run
                     // (steps empty → phase idle) destroys it with zero residue.
                     .overlay(alignment: .topTrailing) {
-                        if vm.deepModeEnabled,
+                        if vm.sessionWorkflowEnabled,
                            (vm.workflowPhase == .executing || vm.workflowPhase == .verifying),
                            !vm.workflowSteps.isEmpty {
                             FloatingWorkflowCapsule(phase: vm.workflowPhase,
