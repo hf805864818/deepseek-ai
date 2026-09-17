@@ -2111,6 +2111,29 @@ class ChatViewModel(
         _workflowSteps.value = current
     }
 
+    /**
+     * [T-deep-mode-session-workflow] Advanced event-level progress refresh:
+     * called once per completed tool in [runAgentLoopImpl]'s tool loop so a long
+     * multi-tool step advances the capsule in near-real time instead of reading
+     * as a frozen "0/x".
+     *
+     * Triple guard — we NEVER flip the last remaining step to DONE via a tool
+     * event:
+     *  * [sessionWorkflowEnabled] (master switch AND rollback switch, so this
+     *    refinement is also a graceful lever),
+     *  * phase == EXECUTING (same guard as [advanceWorkflowStep]),
+     *  * more than one non-done step remains (if only one is left, no-op).
+     * Final completion of the last step stays owned by the done sentinel →
+     * [completeWorkflowSteps], so the VERIFYING entry is never triggered by tool
+     * events alone and GoalCompletionEvaluator cannot see a spurious all-done.
+     */
+    private fun advanceStepOnToolEvent() {
+        if (!sessionWorkflowEnabled) return
+        if (_workflowPhase.value != com.openminis.app.agent.WorkflowPhase.EXECUTING) return
+        if (_workflowSteps.value.count { it.status != com.openminis.app.agent.WorkflowStepStatus.DONE } <= 1) return
+        advanceWorkflowStep()
+    }
+
     /** Mark every step done and enter the verifying phase (task completed). */
     internal fun completeWorkflowSteps() {
         val current = _workflowSteps.value.map {
@@ -9221,6 +9244,10 @@ class ChatViewModel(
                     imageMimeType = result.imageMimeType,
                     imageLinuxPath = result.imageLinuxPath,
                 ))
+                // [T-deep-mode-session-workflow] Event-level refresh: one advance
+                // per completed tool so the capsule ticks during the round. Safe:
+                // the triple guard never finalizes the last step.
+                advanceStepOnToolEvent()
             }
 
             // Update UI with tool statuses. Mark as awaiting the next model

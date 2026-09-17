@@ -1293,6 +1293,28 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         workflowSteps = steps
     }
 
+    /// [T-deep-mode-session-workflow] Advanced event-level progress refresh.
+    /// Called once per completed tool result (in the batch stitch loop) so a
+    /// long multi-tool step advances the capsule in near-real time instead of
+    /// reading as a frozen "0/x".
+    ///
+    /// Guard guarantees we NEVER flip the last remaining step to `.done` via a
+    /// tool event:
+    ///   * `workflowPhase == .executing` (same guard as `advanceWorkflowStep`),
+    ///   * `sessionWorkflowEnabled` (master switch AND rollback switch, so this
+    ///     refinement is also a graceful lever that can be turned off),
+    ///   * more than one non-done step remains (if only one is left, this is a
+    ///     no-op).
+    /// Final completion of the last step stays owned by the `.done` sentinel →
+    /// `completeWorkflow`, so the `.verifying` entry is never triggered by tool
+    /// events alone and GoalCompletionEvaluator cannot see a spurious all-done.
+    private func advanceStepOnToolEvent() {
+        guard sessionWorkflowEnabled,
+              workflowPhase == .executing,
+              workflowSteps.filter({ $0.status != .done }).count > 1 else { return }
+        advanceWorkflowStep()
+    }
+
     /// [T-deep-mode-workflow] Clear the tracker when an execution turn stops on
     /// its own (no continuation signal, or the auto-continue cap is reached).
     /// No-op unless a workflow is actually executing, so it can't disturb the
@@ -7704,6 +7726,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // message's tool_use blocks for the next API call.
             for idx in 0..<toolEntries.count {
                 guard let outcome = outcomesByIndex[idx] else { continue }
+                // [T-deep-mode-session-workflow] Event-level refresh: one advance
+                // per completed tool so the capsule ticks during the round. Safe:
+                // guard never finalizes the last step (see advanceStepOnToolEvent).
+                advanceStepOnToolEvent()
                 toolResultParts.append(outcome.resultPart)
                 if let se = outcome.snapshotEntry {
                     pendingSnapshots[outcome.toolId] = se

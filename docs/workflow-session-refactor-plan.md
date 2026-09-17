@@ -26,7 +26,7 @@
 | P0 | 发送路径会话级门禁（in-flight 走插话并入、不做重置）；Android 补齐 `cancelStream` 保存 / `resume` 恢复，对齐 iOS `savedWorkflowState`；计划门禁仅对 idle/planning 生效 | ✅ 已交付（`750cb6f`） |
 | P1 | 新增 `GoalCompletionEvaluator`（双端），每轮结算做客户端确定性评估：所有步骤 done 且未发哨兵 → 自动收尾（防止胶囊卡/消失）；过早报 done 且步骤未完成 → 续跑兜底直至预算耗尽 | ✅ 已交付（`b5966b7`） |
 | P2a | 会话级工作流回退开关 `keepSessionWorkflow`（默认开，双端），关闭即退回旧「每请求一工作流」行为，作风险熔断/灰度 | ✅ 已交付 |
-| P2b | 进度反馈活动指示 `workflowBusy`：agent 回合执行期间胶囊图标脉冲/微旋转，消除「0/x 静止」卡死观感（已绑定 SwiftUI `FloatingWorkflowCapsule` 与 Compose `ChatScreenDeepMode`；事件级刷新作独立可选子项，未实施） | ✅ 已交付 |
+| P2b | 进度反馈：活动指示 `workflowBusy`（已绑定 SwiftUI `FloatingWorkflowCapsule` 与 Compose `ChatScreenDeepMode` 图标脉冲）＋ 事件级刷新 `advanceStepOnToolEvent`（双端每个工具完成即推进胶囊 done/total；三重守卫：`sessionWorkflowEnabled`＋`executing`＋`非 done 步骤数>1`，绝不触碰最后一步，收尾仍交 .done sentinel → completeWorkflow，不破坏 verifying 入口） | ✅ 已交付 |
 
 ## 关键文件
 
