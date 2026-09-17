@@ -48,8 +48,11 @@ private struct OffloadPermissionDialogContent: View {
                     .padding(.bottom, 16)
 
                     // Description
+                    // [T-ios-permission-localized] Runtime key so the popup
+                    // description follows the system/in-app language too
+                    // (falls back to the English key when untranslated).
                     if !request.description.isEmpty {
-                        Text(request.description)
+                        Text(LocalizedStringKey(request.description))
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)

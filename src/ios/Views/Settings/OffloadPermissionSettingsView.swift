@@ -110,14 +110,18 @@ private struct CommandPermissionRow: View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text(command.displayLabel)
-                Text(command.description)
+                // [T-ios-permission-localized] Runtime key, not a literal, so
+                // SwiftUI performs a catalog lookup and the row follows the
+                // system/in-app language. Falls back to the English key itself
+                // when the catalog lacks a translation.
+                Text(LocalizedStringKey(command.description))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Picker("", selection: $level) {
                 ForEach(OffloadPermissionLevel.allCases, id: \.self) { lvl in
-                    Text(lvl.displayName).tag(lvl)
+                    Text(LocalizedStringKey(lvl.displayName)).tag(lvl)
                 }
             }
             .pickerStyle(.menu)
