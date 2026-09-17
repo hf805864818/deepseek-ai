@@ -7482,14 +7482,14 @@ private struct SettingsSheet: View {
                     NavigationLink {
                         ScheduledTasksSettingsView()
                     } label: {
-                        Label("Scheduled Tasks", systemImage: "clock.badge")
+                        Label("定时任务", systemImage: "clock.badge")
                     }
                     // [T-deep-mode-phase-f] Spec mode toggle. Optional layer on
                     // top of plan→execute→verify; only active when BOTH the
                     // master switch and this toggle are on.
                     Toggle(isOn: $specModeEnabled) {
                         Label {
-                            Text("Spec Mode")
+                            Text("规格模式")
                         } icon: {
                             Image(systemName: "doc.text.magnifyingglass")
                         }
