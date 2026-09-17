@@ -18,7 +18,12 @@ enum PlanGate {
 
     enum State: Equatable {
         case idle
-        case awaitingApproval(planText: String)
+        /// Plan awaiting user approval. `paths` is non-empty only when the
+        /// plan is a multi-path plan (C12) — the UI then offers a Trae-style
+        /// multi-select of candidate paths before confirming. `recommendedIndex`
+        /// is the model's recommended path (1-based) and is pre-selected by
+        /// default in the floating confirm panel.
+        case awaitingApproval(planText: String, paths: [CandidatePath] = [], recommendedIndex: Int = 1)
     }
 
     /// Fenced-block marker the deep-mode fragment tells the model to wrap its

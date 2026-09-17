@@ -936,6 +936,46 @@ struct AIChatView: View {
                         // Full-screen kernel boot overlay
                         kernelBootOverlay
                     }
+                    // [T-deep-mode-floating-panel] Right-edge floating execution
+                    // capsule. Only while deep mode is on AND the workflow is
+                    // mid-execution/verification with parsed steps. Gated on the
+                    // master switch so disabling deep mode or completing the run
+                    // (steps empty → phase idle) destroys it with zero residue.
+                    .overlay(alignment: .topTrailing) {
+                        if vm.deepModeEnabled,
+                           (vm.workflowPhase == .executing || vm.workflowPhase == .verifying),
+                           !vm.workflowSteps.isEmpty {
+                            FloatingWorkflowCapsule(phase: vm.workflowPhase,
+                                                    steps: vm.workflowSteps)
+                                .padding(.top, 96)
+                                .padding(.trailing, 10)
+                                .transition(.move(edge: .trailing).combined(with: .opacity))
+                        }
+                    }
+                    // [T-deep-mode-floating-panel] Trae-style floating confirm panel
+                    // for the plan gate. Docked ABOVE the input bar (padded by
+                    // inputBarHeight) so it never covers the composer text or the
+                    // top dispatch pills. On confirm it dismisses; execution
+                    // progress is carried by FloatingWorkflowCapsule. Multi-path
+                    // plans (C12) feed the panel's Trae-style multi-select; the
+                    // user's picks flow back into the VM via the binding.
+                    .overlay(alignment: .bottom) {
+                        if vm.deepModeEnabled,
+                           case .awaitingApproval(_, let paths, let recommendedIndex) = vm.planGateState {
+                            FloatingConfirmPanel(
+                                steps: vm.workflowSteps,
+                                paths: paths,
+                                recommendedIndex: recommendedIndex,
+                                selectedPathIndexes: $vm.selectedPathIndexes,
+                                onEdit: { vm.editPlan() },
+                                onConfirm: { vm.confirmPlan() },
+                                onCancel: { vm.cancelPlan() }
+                            )
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, inputBarHeight + 8)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
                     .background(ChatColors.background)
                     .onDrop(of: [.image, .movie, .fileURL, .data], isTargeted: $isDropTargeted) { providers in
                         handleDropProviders(providers)
@@ -998,15 +1038,9 @@ struct AIChatView: View {
         DeepModeWorkflowBanner(
             deepModeEnabled: vm.deepModeEnabled,
             clarifyState: vm.clarifyState,
-            planGateState: vm.planGateState,
-            workflowPhase: vm.workflowPhase,
-            workflowSteps: vm.workflowSteps,
             activeSubagents: vm.activeSubagents,
             onCancelClarification: { vm.cancelClarification() },
-            onSkipClarification: { vm.skipClarification() },
-            onEditPlan: { vm.editPlan() },
-            onConfirmPlan: { vm.confirmPlan() },
-            onCancelPlan: { vm.cancelPlan() }
+            onSkipClarification: { vm.skipClarification() }
         )
     }
 

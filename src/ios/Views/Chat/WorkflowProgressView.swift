@@ -70,9 +70,12 @@ struct WorkflowStepsList: View {
                 .font(.caption2)
                 .foregroundColor(.accentColor)
         case .done:
+            // [T-deep-mode-floating-panel] Completed steps use a BLUE checkmark
+            // (matching: "完成一项就自动在任务前面打蓝色勾"). The blue accent
+            // makes progress read as on-task rather than settled.
             Image(systemName: "checkmark.circle.fill")
                 .font(.caption2)
-                .foregroundColor(ChatColors.success)
+                .foregroundColor(.accentColor)
         }
     }
 }

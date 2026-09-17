@@ -980,6 +980,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// confirm/edit. Only ever set while deep mode is on.
     @Published var planGateState: PlanGate.State = .idle
 
+    /// [T-deep-mode-floating-panel] Multi-path selection state for the
+    /// Trae-style floating confirm panel. Holds the user's chosen path indexes
+    /// (1-based, matching CandidatePath.index) while a multi-path plan is
+    /// awaiting approval. Empty means "use the recommended path". Reset to
+    /// empty in resetWorkflow() so it never lingers across workflows.
+    @Published var selectedPathIndexes: Set<Int> = []
+
     /// [T-deep-mode-workflow] Phase 1 explicit workflow state machine. The
     /// client owns the phase — `.planning` (plan raised), `.executing` (user
     /// confirmed) — instead of relying on the model's fuzzy plan output. Always
@@ -1065,9 +1072,35 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// After `send()` (which resets the workflow as part of its fresh-send
     /// path) re-enters the executing phase with the captured steps, so the
     /// progress tracker survives the confirm round-trip.
-    func confirmPlan() {
-        guard case .awaitingApproval(let pendingPlanText) = planGateState else { return }
-        let capturedSteps = workflowSteps
+    ///
+    /// [T-deep-mode-floating-panel] `selection` carries the user's multi-path
+    /// choice from the floating confirm panel (empty = use the recommended
+    /// path, so unchecking all is still safe). When the user picked specific
+    /// paths, the execution prompt is rebuilt to mention only those paths and
+    /// the step tracker is re-parsed from the merged selected path bodies, so
+    /// the user's choice actually drives what gets executed. Passing a value
+    /// overrides `selectedPathIndexes`; when nil, the stored property is read
+    /// (the host just calls `confirmPlan()`).
+    func confirmPlan(selection: Set<Int>? = nil) {
+        guard case .awaitingApproval(let pendingPlanText, let paths, _) = planGateState else { return }
+        let chosen = selection ?? selectedPathIndexes
+        let capturedSteps: [WorkflowStep]
+        let executionPrompt: String
+
+        if !paths.isEmpty, !chosen.isEmpty {
+            // Multi-path plan with explicit user selection: merge the bodies
+            // of the chosen paths into one execution instruction.
+            let selectedPaths = paths.filter { chosen.contains($0.index) }
+            let mergedPlan = selectedPaths.map(\.body).joined(separator: "\n\n")
+            capturedSteps = mergedPlan.isEmpty
+                ? workflowSteps
+                : WorkflowPlanParser.parseSteps(from: mergedPlan)
+            let labels = selectedPaths.map { "路径 \($0.index)（\($0.title)）" }.joined(separator: "、")
+            executionPrompt = AppLocalized("计划已确认。请严格按所选路径（\(labels)）执行，不要再输出计划，直接开始。")
+        } else {
+            capturedSteps = workflowSteps
+            executionPrompt = AppLocalized("计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
+        }
         // [T-deep-mode-cognitive-p2-c14] C14: Save the active project context
         // when a plan is confirmed, so future sessions know what the user
         // was last working on. Total-switch safe: this code path is only
@@ -1081,7 +1114,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             logger.info("[CrossSession] C14: active project context saved")
         }
         planGateState = .idle
-        inputText = AppLocalized("计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
+        selectedPathIndexes = []
+        inputText = executionPrompt
         send()
         // [T-deep-mode-workflow] `send()` can early-return before committing
         // (context near/exhausted shows a dialog, read-only mode, still
@@ -1096,8 +1130,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// a normal message. The workflow is reset — editing a plan is a return to
     /// the idle pre-task state, not an execution instruction.
     func editPlan() {
-        guard case .awaitingApproval(let planText) = planGateState else { return }
+        guard case .awaitingApproval(let planText, _, _) = planGateState else { return }
         planGateState = .idle
+        selectedPathIndexes = []
         resetWorkflow()
         inputText = planText
     }
@@ -1152,6 +1187,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         savedWorkflowState = nil
         workflowPhase = .idle
         workflowSteps = []
+        // [T-deep-mode-floating-panel] Multi-path selection is per-workflow:
+        // clear it on reset so a choice can never bleed into the next run.
+        selectedPathIndexes = []
         // [T-deep-mode-verify-gate] Phase 2: verify budget and sentinel are
         // also per-workflow; resets alongside the workflow state machine.
         verifyRoundsLeft = VerifyGate.maxVerifyRounds
@@ -7769,9 +7807,13 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 // path. Total-switch safe: deepModeEnabled is checked above.
                 let multiPathResult = MultiPathPlanner.parse(plan)
                 let planForSteps: String
+                var detectedPaths: [CandidatePath] = []
+                var detectedRecommendedIndex = 1
                 switch multiPathResult {
                 case .multiPath(let paths, let recommendedIndex):
                     let recommended = paths[recommendedIndex - 1]
+                    detectedPaths = paths
+                    detectedRecommendedIndex = recommendedIndex
                     planForSteps = MultiPathPlanner.extractRecommendedPlan(from: multiPathResult) ?? plan
                     logger.info("[MultiPath] C12: detected \(paths.count) paths, recommended #\(recommendedIndex): \(recommended.title) (risk: \(recommended.riskLevel.rawValue))")
                 case .singlePath:
@@ -7781,7 +7823,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 if workflowPhase == .idle || workflowPhase == .planning {
                     // [T-deep-mode-plan-gate] Layer B: a plan-only turn from an
                     // idle/planning workflow raises the confirm/edit bar.
-                    planGateState = .awaitingApproval(planText: plan)
+                    // [T-deep-mode-floating-panel] Carry the detected paths and
+                    // the model's recommended index so the floating confirm
+                    // panel can offer Trae-style multi-select with the
+                    // recommended path pre-selected.
+                    planGateState = .awaitingApproval(planText: plan,
+                                                      paths: detectedPaths,
+                                                      recommendedIndex: detectedRecommendedIndex)
+                    // [T-deep-mode-floating-panel] Reset the user's selection so
+                    // a prior workflow's choice can never bleed in.
+                    selectedPathIndexes = []
                     workflowPhase = .planning
                     workflowSteps = WorkflowPlanParser.parseSteps(from: planForSteps)
                 } else {
