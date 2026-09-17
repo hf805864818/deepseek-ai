@@ -42,6 +42,16 @@ struct AIChatView: View {
         )
     }
 
+    /// Binding to the multi-path plan selection. `vm` is a computed property
+    /// (derived from `cached.vm`), so `$vm` is not available — route the write
+    /// through the stable @StateObject exactly like `inputTextBinding`.
+    private var selectedPathIndexesBinding: Binding<Set<Int>> {
+        Binding(
+            get: { cached.vm.selectedPathIndexes },
+            set: { cached.vm.selectedPathIndexes = $0 }
+        )
+    }
+
     init(sessionId: String? = nil, draftId: String? = nil, remoteDeviceId: String? = nil, initialGroupId: String? = nil) {
         self.sessionId = sessionId
         self.draftId = draftId
@@ -966,7 +976,7 @@ struct AIChatView: View {
                                 steps: vm.workflowSteps,
                                 paths: paths,
                                 recommendedIndex: recommendedIndex,
-                                selectedPathIndexes: $vm.selectedPathIndexes,
+                                selectedPathIndexes: selectedPathIndexesBinding,
                                 onEdit: { vm.editPlan() },
                                 onConfirm: { vm.confirmPlan() },
                                 onCancel: { vm.cancelPlan() }
