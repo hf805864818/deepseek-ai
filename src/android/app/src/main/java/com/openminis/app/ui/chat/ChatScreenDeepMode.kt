@@ -8,7 +8,6 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CapsuleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material.icons.filled.CheckCircle
@@ -509,7 +508,7 @@ fun FloatingConfirmPanel(
                                                 modifier = Modifier
                                                     .background(
                                                         phaseAccent.copy(alpha = 0.12f),
-                                                        CapsuleShape,
+                                                        RoundedCornerShape(50),
                                                     )
                                                     .padding(horizontal = 6.dp, vertical = 2.dp),
                                             )
@@ -531,7 +530,7 @@ fun FloatingConfirmPanel(
                                                 fontWeight = FontWeight.SemiBold,
                                                 color = riskColor,
                                                 modifier = Modifier
-                                                    .background(riskColor.copy(alpha = 0.12f), CapsuleShape)
+                                                    .background(riskColor.copy(alpha = 0.12f), RoundedCornerShape(50))
                                                     .padding(horizontal = 6.dp, vertical = 2.dp),
                                             )
                                         }
@@ -582,7 +581,7 @@ fun FloatingConfirmPanel(
                         onClick = { viewModel.approvePlan() },
                         modifier = Modifier
                             .height(32.dp)
-                            .clip(CapsuleShape)
+                            .clip(RoundedCornerShape(50))
                             .background(phaseAccent)
                             .padding(horizontal = 4.dp),
                         colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
@@ -705,7 +704,7 @@ fun FloatingWorkflowCapsule(
             // Collapsed chip — always present so a tap toggles expansion.
             androidx.compose.material3.Surface(
                 onClick = { isExpanded = !isExpanded },
-                shape = CapsuleShape,
+                shape = RoundedCornerShape(50),
                 color = ChatColors.toolCapsuleBg,
                 border = androidx.compose.foundation.BorderStroke(
                     width = 1.dp,
