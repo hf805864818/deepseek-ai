@@ -28,7 +28,7 @@ struct RunScheduledTaskIntent: AppIntent {
     var taskIdOverride: String?
 
     @MainActor
-    func perform() async throws -> some IntentResult & ReturnsValue<RunScheduledTaskResult> & ProvidesDialog {
+    func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
         let id = task?.id ?? taskIdOverride ?? ""
         guard !id.isEmpty else {
             throw ScheduledTaskIntentError.noSelection
@@ -41,14 +41,10 @@ struct RunScheduledTaskIntent: AppIntent {
         // Fire-and-forget the run; the result is reported via the return value.
         _ = await ScheduledTaskPromptLauncher.launch(item)
 
-        let result = RunScheduledTaskResult(
-            taskId: item.id,
-            label: item.label,
-            prompt: item.prompt,
-            status: "Running",
-            triggeredAt: Date().timeIntervalSince1970
-        )
-        return .result(value: result, dialog: "\(item.label) started in a new chat.")
+        // `String` is the return value: it natively conforms to AppIntents'
+        // internal `_IntentValue`, so a custom `ReturnsValue<Struct>` (which
+        // would need a full `AppIntentValue` implementation) is avoided.
+        return .result(value: item.id, dialog: "\(item.label) started in a new chat.")
     }
 }
 
@@ -99,15 +95,4 @@ struct ScheduledTaskEntityQuery: EntityQuery {
     func suggestedEntities() async throws -> [ScheduledTaskEntity] {
         ScheduledTaskStore().tasks.map { .from($0) }
     }
-}
-
-/// Result payload returned by RunScheduledTaskIntent.
-/// `Codable` + `Sendable` is all that `ReturnsValue<RunScheduledTaskResult>` requires
-/// (there is no public `AppIntentResult` base protocol to conform to).
-struct RunScheduledTaskResult: Codable, Sendable {
-    let taskId: String
-    let label: String
-    let prompt: String
-    let status: String
-    let triggeredAt: Double
 }
