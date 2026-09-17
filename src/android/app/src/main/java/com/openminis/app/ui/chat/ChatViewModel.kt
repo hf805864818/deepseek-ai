@@ -1241,6 +1241,41 @@ class ChatViewModel(
     @Volatile
     private var pendingPlanText: String? = null
 
+    // [T-deep-mode-floating-panel] Multi-path selection (C12) state.
+    // When the pending plan is multi-path, these hold the candidate paths and
+    // the model's recommended index for the floating confirm panel. The user's
+    // chosen indexes live in `selectedPathIndexes` (1-based). All reset on
+    // workflow reset / deep-mode disable so nothing lingers across runs.
+
+    /** Candidate paths of a pending multi-path plan (empty = single-path). */
+    internal val _pendingPlanPaths =
+        MutableStateFlow<List<com.openminis.app.agent.MultiPathPlanner.CandidatePath>>(emptyList())
+    val pendingPlanPaths: StateFlow<List<com.openminis.app.agent.MultiPathPlanner.CandidatePath>> =
+        _pendingPlanPaths.asStateFlow()
+
+    /** Model's recommended path index for a pending multi-path plan. */
+    internal val _pendingRecommendedIndex = MutableStateFlow(1)
+    val pendingRecommendedIndex: StateFlow<Int> = _pendingRecommendedIndex.asStateFlow()
+
+    /** User's selected path indexes (1-based) on the floating panel. Empty =
+     * "use recommended path". Bound from the floating confirm panel. */
+    internal val _selectedPathIndexes = MutableStateFlow<Set<Int>>(emptySet())
+    val selectedPathIndexes: StateFlow<Set<Int>> = _selectedPathIndexes.asStateFlow()
+
+    // [T-deep-mode-floating-panel] Workflow execution tracking.
+    // Mirrors iOS WorkflowPhase/WorkflowStep so the right-edge progress capsule
+    // can render a live done/total count with per-step blue checkmarks.
+
+    internal val _workflowPhase =
+        MutableStateFlow(com.openminis.app.agent.WorkflowPhase.IDLE)
+    val workflowPhase: StateFlow<com.openminis.app.agent.WorkflowPhase> =
+        _workflowPhase.asStateFlow()
+
+    internal val _workflowSteps =
+        MutableStateFlow<List<com.openminis.app.agent.WorkflowStep>>(emptyList())
+    val workflowSteps: StateFlow<List<com.openminis.app.agent.WorkflowStep>> =
+        _workflowSteps.asStateFlow()
+
     // MARK: - ClarifyGate
     internal val _clarifyState = MutableStateFlow(com.openminis.app.agent.ClarifyGate.State.IDLE)
     val clarifyState: StateFlow<com.openminis.app.agent.ClarifyGate.State> = _clarifyState.asStateFlow()
@@ -1873,6 +1908,22 @@ class ChatViewModel(
         pendingPlanText = null
         AppLogger.info(TAG_STREAM, "PlanGate: user approved plan (${plan.length} chars)")
 
+        // [T-deep-mode-floating-panel] Merge the user-selected paths (C12) into
+        // one execution instruction. When the pending plan is multi-path AND the
+        // user explicitly selected paths, re-parse the steps from the merged
+        // selected bodies so the tracker reflects the user's actual choice.
+        val pendingPaths = _pendingPlanPaths.value
+        val chosenIndexes = _selectedPathIndexes.value
+        var executionText = plan
+        if (pendingPaths.isNotEmpty() && chosenIndexes.isNotEmpty()) {
+            val selectedPaths = pendingPaths.filter { it.index in chosenIndexes }
+            if (selectedPaths.isNotEmpty()) {
+                executionText = selectedPaths.joinToString("\n\n") { it.body }
+                _workflowSteps.value =
+                    com.openminis.app.agent.WorkflowPlanParser.parseSteps(executionText)
+            }
+        }
+
         // [T-deep-mode-cognitive-p2-c14] C14: Save active project context
         // when a plan is confirmed, so future sessions know what the user
         // was last working on.
@@ -1884,6 +1935,17 @@ class ChatViewModel(
             context, firstLine, sessionId = sessionId
         )
         invalidateSystemPromptCache() // context fragment changed
+
+        // [T-deep-mode-floating-panel] Clear the gate's selection state and
+        // enter the executing phase so the progress capsule takes over.
+        _pendingPlanPaths.value = emptyList()
+        _pendingRecommendedIndex.value = 1
+        _selectedPathIndexes.value = emptySet()
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.EXECUTING
+        if (_workflowSteps.value.isEmpty()) {
+            _workflowSteps.value = com.openminis.app.agent.WorkflowPlanParser.parseSteps(plan)
+        }
+        beginWorkflowSteps()
 
         // Resume the agent loop with an "execute the plan" system reminder
         viewModelScope.launch(Dispatchers.IO) {
@@ -1931,11 +1993,70 @@ class ChatViewModel(
         if (_planGateState.value != com.openminis.app.agent.PlanGate.State.AWAITING_APPROVAL) return
         _planGateState.value = com.openminis.app.agent.PlanGate.State.IDLE
         pendingPlanText = null
+        // [T-deep-mode-floating-panel] Clear multi-path + workflow state so the
+        // panel capsula and tracker fully reset.
+        _pendingPlanPaths.value = emptyList()
+        _pendingRecommendedIndex.value = 1
+        _selectedPathIndexes.value = emptySet()
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+        _workflowSteps.value = emptyList()
         AppLogger.info(TAG_STREAM, "PlanGate: user rejected plan")
         appendSystemInfo(
             text = "计划已取消。",
             iconKind = "close",
         )
+    }
+
+    /** Set the user's selected path indexes from the floating confirm panel. */
+    fun setSelectedPathIndexes(indexes: Set<Int>) {
+        _selectedPathIndexes.value = indexes
+    }
+
+    // [T-deep-mode-floating-panel] Workflow step advancement. Coarse but
+    // deterministic heuristic mirroring iOS `advanceWorkflowStep()`: each
+    // goal-runner auto-continue round counts as roughly one plan step. Never
+    // advances outside the executing phase and never beyond the parsed list.
+
+    /** Light up the first pending step as active (called on plan approval). */
+    internal fun beginWorkflowSteps() {
+        val current = _workflowSteps.value.toMutableList()
+        if (current.isEmpty()) return
+        val activeIdx = current.indexOfFirst { it.status == com.openminis.app.agent.WorkflowStepStatus.PENDING }
+        if (activeIdx >= 0) {
+            current[activeIdx] = current[activeIdx].copy(status = com.openminis.app.agent.WorkflowStepStatus.ACTIVE)
+            _workflowSteps.value = current
+        }
+    }
+
+    /** Mark the current active step done and promote the next pending step. */
+    internal fun advanceWorkflowStep() {
+        if (_workflowPhase.value != com.openminis.app.agent.WorkflowPhase.EXECUTING) return
+        val current = _workflowSteps.value.toMutableList()
+        if (current.isEmpty()) return
+        val activeIdx = current.indexOfFirst { it.status == com.openminis.app.agent.WorkflowStepStatus.ACTIVE }
+        if (activeIdx >= 0) {
+            current[activeIdx] = current[activeIdx].copy(status = com.openminis.app.agent.WorkflowStepStatus.DONE)
+        }
+        val nextIdx = current.indexOfFirst { it.status == com.openminis.app.agent.WorkflowStepStatus.PENDING }
+        if (nextIdx >= 0) {
+            current[nextIdx] = current[nextIdx].copy(status = com.openminis.app.agent.WorkflowStepStatus.ACTIVE)
+        }
+        _workflowSteps.value = current
+    }
+
+    /** Mark every step done and enter the verifying phase (task completed). */
+    internal fun completeWorkflowSteps() {
+        val current = _workflowSteps.value.map {
+            it.copy(status = com.openminis.app.agent.WorkflowStepStatus.DONE)
+        }
+        _workflowSteps.value = current
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.VERIFYING
+    }
+
+    /** Clear the execution tracker (workflow finished / stopped). */
+    internal fun clearWorkflowTracker() {
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+        _workflowSteps.value = emptyList()
     }
 
     /** Get the pending plan text for UI display. */
@@ -8181,7 +8302,37 @@ class ChatViewModel(
                             TAG_STREAM,
                             "PlanGate: plan detected on turn 0 — awaiting approval (${plan.length} chars)",
                         )
+                        // [T-deep-mode-floating-panel] Parse multi-path (C12)
+                        // plan so the floating confirm panel can offer a
+                        // Trae-style multi-select. Single-path plans carry an
+                        // empty path list (panel just shows the steps).
+                        val multiResult = com.openminis.app.agent.MultiPathPlanner.parse(plan)
+                        val detectedPaths: List<com.openminis.app.agent.MultiPathPlanner.CandidatePath>
+                        val detectedRecommended: Int
+                        when (multiResult) {
+                            is com.openminis.app.agent.MultiPathPlanner.Result.MultiPath -> {
+                                detectedPaths = multiResult.paths
+                                detectedRecommended = multiResult.recommendedIndex
+                            }
+                            is com.openminis.app.agent.MultiPathPlanner.Result.SinglePath -> {
+                                detectedPaths = emptyList()
+                                detectedRecommended = 1
+                            }
+                        }
                         pendingPlanText = plan
+                        _pendingPlanPaths.value = detectedPaths
+                        _pendingRecommendedIndex.value = detectedRecommended
+                        _selectedPathIndexes.value = emptySet()
+                        // Pre-select the recommended path for multi-path plans.
+                        if (detectedPaths.isNotEmpty() &&
+                            detectedPaths.any { it.index == detectedRecommended }
+                        ) {
+                            _selectedPathIndexes.value = setOf(detectedRecommended)
+                        }
+                        _workflowPhase.value =
+                            com.openminis.app.agent.WorkflowPhase.PLANNING
+                        _workflowSteps.value =
+                            com.openminis.app.agent.WorkflowPlanParser.parseSteps(plan)
                         _planGateState.value =
                             com.openminis.app.agent.PlanGate.State.AWAITING_APPROVAL
                         loopExitedNormally = true
@@ -8232,6 +8383,11 @@ class ChatViewModel(
                                         ),
                                     )
                                 )
+                                // [T-deep-mode-floating-panel] Treat this
+                                // auto-continue round as one plan step.
+                                if (_deepModeEnabled.value) {
+                                    advanceWorkflowStep()
+                                }
                                 // Continue the for-loop for another model round.
                                 continue
                             } else {
@@ -8262,6 +8418,11 @@ class ChatViewModel(
                                 TAG_STREAM,
                                 "GoalRunner: done → checking VerifyGate",
                             )
+                            // [T-deep-mode-floating-panel] All steps done & phase
+                            // → verifying (capsule flips to "复查中").
+                            if (_deepModeEnabled.value) {
+                                completeWorkflowSteps()
+                            }
                             // [T-deep-mode-verify-gate] Execution is done — start
                             // the self-verification phase if we have rounds left
                             // and haven't started yet.
@@ -8360,6 +8521,12 @@ class ChatViewModel(
                                 TAG_STREAM,
                                 "VerifyGate: passed → finishing workflow",
                             )
+                            // [T-deep-mode-floating-panel] Task verified complete:
+                            // clear the execution tracker so the progress capsule
+                            // disappears (zero residue after finish).
+                            if (_deepModeEnabled.value) {
+                                clearWorkflowTracker()
+                            }
                             // Fall through to normal break
                         }
                         com.openminis.app.agent.VerifyGate.ParseResult.FAILED -> {

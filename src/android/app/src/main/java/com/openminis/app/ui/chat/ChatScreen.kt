@@ -4180,6 +4180,18 @@ fun ChatScreen(
                     additionalObstructionDp = fabStackTopDp,
                 )
 
+                // [T-deep-mode-floating-panel] Right-edge floating execution
+                // progress capsule. Only while deep mode is on AND the workflow
+                // is mid-execution/verification with parsed steps. Gated on the
+                // master switch so disabling deep mode or completing the run
+                // (steps empty → phase idle) destroys it with zero residue.
+                FloatingWorkflowCapsule(
+                    viewModel = viewModel,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 4.dp, end = 10.dp),
+                )
+
                 // T261: tool-detail sheet hoisted out of LazyColumn item
                 // scope. Visibility driven by ViewModel state so streaming /
                 // pill-disposal / new-tool emissions can't snap it shut.
@@ -4364,8 +4376,12 @@ fun ChatScreen(
                     .padding(horizontal = 12.dp)
                     .padding(top = 2.dp, bottom = 8.dp),
             ) {
-                // [T-deep-mode-ui-plangate] Plan confirmation bar (deep mode)
-                PlanGateConfirmationBar(viewModel = viewModel)
+                // [T-deep-mode-ui-plangate] Plan confirmation panel (deep mode).
+                // Trae-style floating panel docked above the composer. Handles
+                // both single-path plans (steps list + confirm) and multi-path
+                // plans (C12) with a multi-select of candidate paths. Only
+                // visible while deep mode is on AND the gate awaits approval.
+                FloatingConfirmPanel(viewModel = viewModel)
 
                 // [T-deep-mode-ui-clarifygate] Clarification gate bar (deep mode)
                 ClarifyGateBar(viewModel = viewModel)

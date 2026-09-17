@@ -14,6 +14,13 @@ package com.openminis.app.agent
  */
 object PlanGate {
 
+    /**
+     * Plan-confirmation state. The multi-path candidate list and the
+     * recommended index for a multi-path plan (C12) are carried separately by
+     * the ChatViewModel (see `pendingPlanPaths` / `pendingRecommendedIndex`),
+     * so this stays a plain enum and every existing `==` comparison keeps
+     * working unchanged.
+     */
     enum class State {
         IDLE,
         AWAITING_APPROVAL,
