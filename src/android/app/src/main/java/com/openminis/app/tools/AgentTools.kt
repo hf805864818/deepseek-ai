@@ -1,5 +1,6 @@
 package com.openminis.app.tools
 
+import com.openminis.app.agent.SubagentType
 import com.openminis.app.browser.BrowserAction
 import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.AgentToolParam
@@ -45,6 +46,12 @@ object AgentTools {
         }
         if (deepModeEnabled) {
             add(sequentialThinkingDefinition())
+            // [T-phase5] S5: task_dispatch — subagent task delegation tool.
+            // Deep-mode-exclusive: only registered when deep mode is on, so a
+            // disabled master switch makes the tool invisible to the model and
+            // no subagent session can ever be created. Mirrors iOS deepModeEnabled
+            // gating in AIChatViewModel+ToolDefinitions.swift.
+            add(taskDispatchDefinition())
         }
     }
 
@@ -160,5 +167,26 @@ object AgentTools {
         ),
         required = listOf("tool_title", "problem"),
         propertyOrdering = listOf("tool_title", "problem", "max_steps"),
+    )
+
+    // [T-phase5] S5: Task Dispatch — subagent task delegation tool.
+    // Only registered when deepModeEnabled is on — subagent orchestration is a
+    // deep-mode-exclusive feature. Total-switch safe: when the master switch is
+    // off, this tool is invisible to the model, no subagent session can be
+    // created, and all related UI is guarded.
+    // Aligned with iOS AIChatViewModel+ToolDefinitions.swift task_dispatch.
+    private fun taskDispatchDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "task_dispatch",
+        description = "Dispatch a sub-task to an independent subagent for execution. The subagent gets its own context window, limited tool access, and a bounded number of turns. Use this to parallelize independent subtasks (e.g. 'analyze security of module A' while you work on module B). The subagent returns a result summary that you can incorporate into your analysis. Do NOT use this for sequential tasks that depend on each other — use it for genuinely independent work.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Analyze auth module security', 'Check database migration scripts'). Use the same language as the user."),
+            "task_description" to AgentToolParam("string", "A short 5-10 word description of the subtask, shown in the subagent status card."),
+            "prompt" to AgentToolParam("string", "The full instruction for the subagent. Include all context the subagent needs — it does NOT share your conversation history. Specify: what to do, what files to read, what to check, and what format to return results in."),
+            "max_tool_calls" to AgentToolParam("integer", "Maximum tool calls the subagent can make (default: 10). Each tool call counts toward this limit."),
+            "allowed_tools" to AgentToolParam("string", "Comma-separated list of tools the subagent is allowed to use (e.g. 'file_read,memory_get'). If omitted, the subagent gets access to the safe no-UI set (file_read, file_write, file_edit, read_image, memory_write, memory_get) and never task_dispatch (no recursive subagents)."),
+            "subagent_type" to AgentToolParam("string", "Optional. The specialized role for the subagent: 'general', 'research', 'analyze', 'implement', or 'fix'. Choose 'research' to gather/read/search and report findings, 'analyze' to compare/assess and flag risks, 'implement' to make code edits, 'fix' to diagnose a root cause and patch. Defaults to 'general'.", enumValues = SubagentType.enumValues),
+        ),
+        required = listOf("tool_title", "task_description", "prompt"),
+        propertyOrdering = listOf("tool_title", "task_description", "prompt", "max_tool_calls", "allowed_tools", "subagent_type"),
     )
 }

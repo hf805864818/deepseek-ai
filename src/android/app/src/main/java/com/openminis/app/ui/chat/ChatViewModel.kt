@@ -10,6 +10,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.compose.foundation.lazy.LazyListState
 import com.openminis.app.agent.Level
+import com.openminis.app.agent.SubagentType
 import com.openminis.app.agent.ToolLoopDetector
 import com.openminis.app.browser.BrowserActionInput
 import com.openminis.app.browser.BrowserTabPool
@@ -9231,6 +9232,13 @@ class ChatViewModel(
             FileEditTool.NAME -> FileEditTool.execute(argsJson, activeSessionId, context).also {
                 if (it.success) maybeReloadSkillsForPath(argsJson)
             }
+            // [T-phase5] S5: task_dispatch — delegate an independent subtask to a
+            // bounded subagent loop. Only reachable when deepModeEnabled is on
+            // (the tool is only registered under deepModeEnabled in AgentTools).
+            // Total-switch safe: if deep mode was switched off after registration,
+            // executeTaskDispatch bails out with a safe error. Mirrors iOS
+            // AIChatViewModel+ConcurrentTools.swift `case "task_dispatch"`.
+            "task_dispatch" -> executeTaskDispatch(argsJson)
             // T178: pass sessionId + context so read_image routes through
             // resolveSessionHostPath like file_read/write/edit do — without
             // these, the tool consults the global last-writer-wins
@@ -9257,6 +9265,256 @@ class ChatViewModel(
      * Vision Group IS configured, returns a hint naming [path] and steering the
      * model to call read_image — closing the loop with executeReadImageTool.
      */
+    // [T-phase5] S5: Task Dispatch — subagent orchestration.
+    // Runs an independent, bounded mini agent loop on the SAME LLM provider as
+    // the parent, with a restricted no-UI tool set and its own context window
+    // (it shares no conversation history with the parent). Mirrors
+    // iOS `SubagentSession.run()` (SubagentSession.swift).
+    //
+    // NOTE on transport: Android `LLMResponse` (returned by `sendMessage`)
+    // carries only text/stopReason/usage — it has NO tool-call channel, so a
+    // tool-using agent loop cannot be driven from it. We therefore drive the
+    // loop with `LLMProvider.streamMessage` and collect
+    // `LLMStreamChunk.ToolCallComplete` events — the exact Android analog of
+    // iOS `AgentProvider.streamAgentMessage` that SubagentSession uses.
+    //
+    // TOTAL-SWITCH SAFE: only reachable via the `task_dispatch` branch in
+    // [executeTool], which is only registered when deepModeEnabled is on.
+    private suspend fun executeTaskDispatch(argsJson: String): ToolExecutionResult {
+        // Defensive gate even though the tool is only registered in deep mode:
+        // if the master switch was turned off between registration and here,
+        // bail out safely (iOS parity).
+        if (!_deepModeEnabled.value) {
+            return ToolExecutionResult(
+                output = "Error: Deep mode was disabled after task_dispatch was registered. Cannot dispatch subagent.",
+                success = false,
+            )
+        }
+
+        val args = try {
+            JSONObject(argsJson)
+        } catch (_: Exception) {
+            return ToolExecutionResult("Error: task_dispatch received invalid JSON arguments.", false)
+        }
+
+        val prompt = args.optString("prompt").trim()
+        if (prompt.isEmpty()) {
+            return ToolExecutionResult(
+                output = "Error: 'prompt' parameter is required. Provide full instructions for the subagent.",
+                success = false,
+            )
+        }
+
+        val taskDescription = args.optString("task_description").trim().ifEmpty { "Subtask" }
+        // Bounded budget, clamped to player-safe range like iOS (max(1, min(max, 30))).
+        val maxCalls = args.optInt("max_tool_calls", 10).coerceIn(1, 30)
+        val subagentType = SubagentType.fromValue(args.optString("subagent_type").lowercase())
+        val allowedTools = args.optString("allowed_tools")
+            .split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        AppLogger.info(
+            TAG_STREAM,
+            "task_dispatch: dispatch '$taskDescription' type=${subagentType.value} maxCalls=$maxCalls allowed=$allowedTools",
+        )
+
+        val provider = currentProvider
+        if (provider == null) {
+            return ToolExecutionResult(
+                output = "Error: No model configured for subagent dispatch.",
+                success = false,
+            )
+        }
+
+        // Restricted NO-UI tool set. Even if the parent unwisely whitelists a
+        // UI tool (e.g. shell_execute), the subagent can never reach it — we
+        // always intersect with this safe set. task_dispatch is never exposed
+        // (no recursive subagents). Mirrors iOS SubagentSession.makeTools().
+        val safeToolNames = setOf(
+            FileReadTool.NAME, FileWriteTool.NAME, FileEditTool.NAME,
+            ReadImageTool.NAME, "memory_write", "memory_get",
+        )
+        val toolSet: Set<String> =
+            if (allowedTools.isNotEmpty()) safeToolNames.intersect(allowedTools.toSet())
+            else safeToolNames
+        val subagentTools = agentTools.filter { toolSet.contains(it.name) }
+
+        // Build the subagent-specific system prompt: parent context + a bounded
+        // tool-budget hint + the typed role hint (iOS SubagentSession.run()).
+        val baseParentPrompt = buildSystemPrompt()?.trim()?.takeIf { it.isNotEmpty() }
+        val toolBudgetHint =
+            "You are operating as a subagent with a BOUNDED tool budget of $maxCalls tool calls. " +
+                "Be efficient and focused — prioritize the most important actions first. When you have " +
+                "enough information, provide a clear summary of your findings instead of continuing to explore."
+        val typeHint = "\n\n" + subagentType.systemPromptHint
+        val subagentSystemPrompt =
+            (baseParentPrompt?.let { "$it\n\n" } ?: "") + toolBudgetHint + typeHint
+
+        // Fresh conversation context for the subagent — independent of the parent.
+        val history = mutableListOf<LLMMessage>()
+        history.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = prompt,
+                contentParts = listOf(AgentContentPart.Text(prompt)),
+            ),
+        )
+
+        var toolCallCount = 0
+        // Allow a couple extra turns for the final response. Mirrors iOS
+        // `maxIterations = maxToolCalls + 2`.
+        val maxIterations = maxCalls + 2
+
+        for (iteration in 0 until maxIterations) {
+            if (toolCallCount >= maxCalls) break
+
+            // One LLM turn.
+            val textSb = StringBuilder()
+            val reasoningSb = StringBuilder()
+            val toolCalls = mutableListOf<LLMStreamChunk.ToolCallComplete>()
+            try {
+                provider.streamMessage(
+                    messages = history,
+                    systemPrompt = subagentSystemPrompt,
+                    maxTokens = dynamicMaxTokens(provider, 0),
+                    tools = subagentTools,
+                    thinkingLevel = if (currentModelSupportsReasoning) _thinkingLevel.value else ThinkingLevel.OFF,
+                ).collect { chunk ->
+                    when (chunk) {
+                        is LLMStreamChunk.Text -> textSb.append(chunk.text)
+                        is LLMStreamChunk.ReasoningContent -> reasoningSb.append(chunk.content)
+                        is LLMStreamChunk.ToolCallComplete -> toolCalls.add(chunk)
+                        else -> {}
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                return ToolExecutionResult(
+                    output = "Subagent failed: ${e.message ?: e.javaClass.simpleName}",
+                    success = false,
+                )
+            }
+
+            // Append the assistant turn (text + tool-use parts) to subagent history.
+            val assistantParts = mutableListOf<AgentContentPart>()
+            if (textSb.isNotEmpty()) {
+                assistantParts.add(AgentContentPart.Text(textSb.toString()))
+            }
+            for (tc in toolCalls) {
+                assistantParts.add(
+                    AgentContentPart.ToolUse(
+                        id = tc.id, name = tc.name, input = tc.args,
+                        thoughtSignature = tc.thoughtSignature,
+                    ),
+                )
+            }
+            history.add(
+                LLMMessage(
+                    role = LLMMessage.Role.ASSISTANT,
+                    content = textSb.toString(),
+                    contentParts = assistantParts,
+                    reasoningContent = reasoningSb.toString().ifEmpty { null },
+                ),
+            )
+
+            // No tool calls → the subagent is done; return its text summary.
+            if (toolCalls.isEmpty()) {
+                val summary = textSb.toString().trim()
+                return ToolExecutionResult(
+                    output = summary.ifEmpty { "Subagent completed with no output." },
+                    success = true,
+                )
+            }
+
+            // Execute the tool calls, honoring the budget during parallel batches.
+            val resultParts = mutableListOf<AgentContentPart>()
+            for (tc in toolCalls) {
+                if (toolCallCount >= maxCalls) {
+                    resultParts.add(
+                        AgentContentPart.ToolResult(
+                            id = tc.id, name = tc.name,
+                            content = "Skipped: tool call budget exhausted ($maxCalls/$maxCalls).",
+                            isError = true,
+                        ),
+                    )
+                    continue
+                }
+                toolCallCount++
+                val r = executeSubagentTool(tc.name, tc.args.toString())
+                resultParts.add(
+                    AgentContentPart.ToolResult(
+                        id = tc.id, name = tc.name,
+                        content = r.output,
+                        isError = !r.success,
+                        imageData = r.imageData,
+                        imageMimeType = r.imageMimeType,
+                        imageLinuxPath = r.imageLinuxPath,
+                    ),
+                )
+            }
+            history.add(
+                LLMMessage(role = LLMMessage.Role.USER, content = "", contentParts = resultParts),
+            )
+        }
+
+        // We hit the tool-call budget: do one final no-tools turn for a summary.
+        val limitReminder =
+            "You have reached the maximum number of tool calls. Please provide a final summary of your findings."
+        history.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = limitReminder,
+                contentParts = listOf(AgentContentPart.Text(limitReminder)),
+            ),
+        )
+        try {
+            val summarySb = StringBuilder()
+            provider.streamMessage(
+                messages = history,
+                systemPrompt = subagentSystemPrompt,
+                maxTokens = dynamicMaxTokens(provider, 0),
+                tools = emptyList(), // No tools — force a text response.
+                thinkingLevel = ThinkingLevel.OFF,
+            ).collect { chunk ->
+                if (chunk is LLMStreamChunk.Text) summarySb.append(chunk.text)
+            }
+            val summary = summarySb.toString().trim()
+            return ToolExecutionResult(
+                output = summary.ifEmpty { "Subagent reached tool call limit with no summary." },
+                success = true,
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return ToolExecutionResult(
+                output = "Subagent failed during final summary: ${e.message ?: e.javaClass.simpleName}",
+                success = false,
+            )
+        }
+    }
+
+    /**
+     * Dispatch a single subagent tool call to the appropriate NO-UI executor.
+     * Mirrors iOS `executeSingleToolUse` restricted to the safe subagent set.
+     * Everything outside the restricted set is rejected — the subagent can
+     * never escape to UI tools (shell_execute, browser_use, …) or recurse
+     * (task_dispatch).
+     */
+    private suspend fun executeSubagentTool(name: String, argsJson: String): ToolExecutionResult = when (name) {
+        FileReadTool.NAME -> FileReadTool.execute(argsJson, activeSessionId, context)
+        FileWriteTool.NAME -> FileWriteTool.execute(argsJson, activeSessionId, context).also {
+            if (it.success) maybeReloadSkillsForPath(argsJson)
+        }
+        FileEditTool.NAME -> FileEditTool.execute(argsJson, activeSessionId, context).also {
+            if (it.success) maybeReloadSkillsForPath(argsJson)
+        }
+        ReadImageTool.NAME -> executeReadImageTool(argsJson)
+        "memory_write" -> executeMemoryWriteTool(argsJson)
+        "memory_get" -> executeMemoryGetTool(argsJson)
+        else -> ToolExecutionResult("Error: tool '$name' is not available to subagents.", false)
+    }
+
     private fun visionPlaceholderFor(path: String?): String? {
         val nativeVision = currentModel?.let {
             it.inputModalities?.map { m -> m.lowercase() }?.contains("image") == true
