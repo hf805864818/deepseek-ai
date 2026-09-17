@@ -234,7 +234,7 @@ struct FloatingWorkflowCapsule: View {
 
     private var collapsedChip: some View {
         Button {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded.wrappedValue.toggle() }
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded.toggle() }
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: allDone ? "checkmark.circle.fill" : phase.symbolName)
