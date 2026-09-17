@@ -55,7 +55,7 @@ id: core-consult-skills
 alwaysApply: true
 description: "Consult available skills first"
 ---
-2. CONSULT SKILLS FIRST — check <available_skills> above and follow any matching skill's workflow before improvising a process.
+2. CONSULT SKILLS FIRST — BEFORE starting any task, check <available_skills> above. If a listed skill matches the task, load and follow it IMMEDIATELY as your first action; do not improvise a process when a matching skill exists.
 
 ---
 id: core-execute-transparently

@@ -61,5 +61,6 @@ Rules:
 - The plan block must be the main content of the turn — no tool calls, just the plan and brief context.
 - Be specific: list concrete steps, not vague intentions.
 - For simple one-step tasks (e.g. "read this file"), skip the plan and go straight to execution.
+- When planning, identify steps that are INDEPENDENT (no dependency on each other's output) and mark them with [PARALLEL] tags. During execution, dispatch [PARALLEL] steps as concurrent subagents via task_dispatch. Sequential (dependent) steps execute in order as normal.
 """
 }

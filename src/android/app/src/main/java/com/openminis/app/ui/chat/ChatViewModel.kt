@@ -10513,6 +10513,25 @@ C5 — FAIL-THREE-TIMES RULE: If the same tool or approach fails 3 times in a ro
   3. Try the alternative approach
   4. If you can't think of a good alternative, emit <<GOAL_STATE>> need_more_context: <what you tried and what you need>
 Do NOT keep banging your head against the same wall. Creativity over brute force.
+
+"""
+            )
+
+            // C15: 子任务主动派遣（对等 iOS deepModeFragment 第12条）
+            append(
+                """
+C15 — SUBAGENT DISPATCH: You have a `task_dispatch` tool. PROACTIVELY use it when:
+  • the task contains 2+ INDEPENDENT subtasks (e.g. 'analyze module A' + 'research topic B') that do not depend on each other's output,
+  • a subtask would consume many tool calls while you can keep working on other independent parts meanwhile,
+  • the user asks for a broad multi-file investigation or parallel analysis.
+In your fenced ```plan``` block, mark parallelizable steps with [PARALLEL] tags. During execution, dispatch [PARALLEL] steps via task_dispatch, then continue working on other steps while subagents run. Remember each subagent has its OWN context window — give it ALL the context it needs in the prompt (it cannot see your history). Do NOT dispatch for sequential/dependent tasks, single-file changes, or trivial 1-2 step tasks.
+"""
+            )
+
+            // B2: 技能积累提示（对等 iOS deepModeFragment 第13条）
+            append(
+                """
+SKILL ACCUMULATION — If about the 3rd time in this session you're handling the SAME type of task (a recurring workflow: producing a docx report, generating a slide deck, the same class of code fix), that workflow is a candidate for a reusable skill. Mention it to the user in one line and offer to create one using the skill format. Do NOT propose a skill on the first or second occurrence — only when a reliable pattern has clearly emerged.
 """
             )
         }
