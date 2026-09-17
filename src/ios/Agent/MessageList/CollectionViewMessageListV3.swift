@@ -305,6 +305,7 @@ private struct BridgedAssistantBlockV3: View {
         case .browserTool: return "assistantBrowserBlock"
         case .readImageTool: return "assistantReadImageBlock"
         case .memoryTool: return "assistantMemoryBlock"
+        case .visualization: return "assistantVisualizationBlock"
         case .info: return "assistantInfoBlock"
         }
     }
@@ -3721,6 +3722,9 @@ extension CollectionViewMessageListV3 {
                 // 40→36 (-4) mid-decel; the +4 growths that motivated 40 were actually
                 // collapsed THINKING blocks (handled above with headerH = 40).
                 case .readImageTool: return 36
+                case .visualization:
+                    // Inline visual card: bounded height driven by the renderer.
+                    return max(CGFloat(RenderWidgetView.estimatedHeight(for: block.content)), 120)
                 case .info:
                     let lineCount = max(1, block.content.components(separatedBy: "\n").count)
                     return CGFloat(20 + lineCount * 16)

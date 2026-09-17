@@ -207,6 +207,46 @@ extension AIChatViewModel {
                 required: ["tool_title", "task_description", "prompt"],
                 propertyOrdering: ["tool_title", "task_description", "prompt", "max_tool_calls", "allowed_tools", "subagent_type"]
             ))
+            // [T-deep-mode-phase-d] D1: Inline visualization. Renders an SVG
+            // diagram/chart or an isolated HTML widget inline in the chat
+            // stream — it appears as an interactive visual, NOT saved as a
+            // file. Only registered in deep mode per the total switch contract:
+            // when off, the tool is invisible and the model falls back to
+            // writing plain text/markdown instead.
+            tools.append(AgentToolDefinition(
+                name: "render_widget",
+                description: "Render an inline SVG diagram or HTML widget directly in the chat, shown to the user as a visual (not saved as a file). Use for: flowcharts, architecture/sequence diagrams, comparison tables, interactive demos, and small data visualizations. The visual appears inline in the conversation. Prefer this over dumping ASCII art or long markdown when a diagram or interactive element would communicate better. For pure prose stay with normal text.",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what the visual shows, displayed as its caption/title (e.g. 'Login flow diagram', 'Framework comparison table'). Use the same language as the user."),
+                    "widget_type": AgentToolParam(type: .string, description: "Kind of widget to render: 'diagram' for flowcharts/architecture diagrams, 'chart' for data charts, 'comparison' for comparison tables, 'interactive' for HTML demos or embeddable interactive components.", enumValues: ["diagram", "chart", "comparison", "interactive"]),
+                    "content": AgentToolParam(type: .string, description: "The visual content. For diagram/chart/comparison: raw inline SVG markup. For interactive: isolated self-contained HTML (no external network assets, can use inline <script>). Keep it compact and readable; width is auto to the container."),
+                    "caption": AgentToolParam(type: .string, description: "Optional. Short caption shown below the widget."),
+                ],
+                required: ["tool_title", "widget_type", "content"],
+                propertyOrdering: ["tool_title", "widget_type", "content", "caption"]
+            ))
+            // [T-deep-mode-phase-e] E1: Scheduled automation. Creates a timed
+            // AI action that runs on a repeating schedule (daily / weekdays /
+            // custom days) from a single day-of-week rollout. Only registered
+            // in deep mode per the total switch contract — when off, the tool
+            // is invisible and the model cannot create or modify tasks. Tasks
+            // already created remain visible and manageable in Settings, so
+            // turning the switch off never leaves an orphan background task
+            // the user cannot find.
+            tools.append(AgentToolDefinition(
+                name: "schedule_task",
+                description: "Create a scheduled task that automatically runs an AI action at a configured time — daily, on weekdays, or on specific days. The task's prompt runs in a fresh chat each time it fires, and results are recorded so the user can review them. Use this when the user asks to 'set a reminder / daily X / every weekday at Y / schedule X'. Parse the user's natural-language request into the structured time/repeat parameters below. Created tasks are managed in Settings → Agent Runtime → Scheduled Tasks (pause, resume, edit, delete, view runs).",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this scheduled task does, shown to the user (e.g. 'Daily 9am morning briefing', 'Weekday weather check'). Use the same language as the user."),
+                    "label": AgentToolParam(type: .string, description: "A short human-readable name for the task, shown in the Scheduled Tasks list."),
+                    "prompt": AgentToolParam(type: .string, description: "The full instruction the agent will run each time the task fires. Be specific and self-contained — the task starts in a fresh context."),
+                    "time": AgentToolParam(type: .string, description: "The time of day to run, 24-hour HH:MM (e.g. '09:00', '14:30')."),
+                    "repeat": AgentToolParam(type: .string, description: "How often to repeat: 'once' (single run at the next occurrence of the time), 'daily' (every day), 'weekdays' (Mon-Fri), or 'custom' (specific days via 'days'). Defaults to 'once'.", enumValues: ["once", "daily", "weekdays", "custom"]),
+                    "days": AgentToolParam(type: .string, description: "Optional. Weekday names for 'custom' repeat: Sun,Mon,Tue,Wed,Thu,Fri,Sat (any case). Ignored unless repeat=custom."),
+                ],
+                required: ["tool_title", "label", "prompt", "time"],
+                propertyOrdering: ["tool_title", "label", "prompt", "time", "repeat", "days"]
+            ))
         }
 
         if includeMemoryTools {

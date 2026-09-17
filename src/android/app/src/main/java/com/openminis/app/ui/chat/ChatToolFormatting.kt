@@ -58,6 +58,7 @@ internal fun toolAccentColor(toolName: String): Color = when (toolName) {
     "browser_use" -> Color(0xFF007AFF)
     "read_image" -> Color(0xFFAF52DE)
     "memory_write", "memory_get" -> Color(0xFFFF2D55)
+    "render_widget" -> Color(0xFF5856D6)   // iOS: .indigo
     "web_search" -> Color(0xFF32ADE6)    // iOS: .cyan for search
     else -> Color(0xFF8E8E93)
 }
@@ -71,6 +72,7 @@ internal fun toolIconFor(toolName: String) = when (toolName) {
     "browser_use" -> Icons.Default.Language            // iOS: globe
     "read_image" -> Icons.Default.Image                // iOS: photo
     "memory_write", "memory_get" -> Icons.Default.Psychology // iOS: brain.head.profile
+    "render_widget" -> Icons.Default.ViewInAr         // iOS: square.dashed
     "web_search" -> Icons.Default.Search               // iOS: magnifyingglass
     else -> Icons.Default.Build
 }
@@ -85,6 +87,7 @@ internal fun toolDisplayName(toolName: String): String = when (toolName) {
     "read_image" -> "image viewer"
     "memory_write" -> "memory"
     "memory_get" -> "memory"
+    "render_widget" -> "inline visual"
     "web_search" -> "search"
     else -> toolName
 }
@@ -101,6 +104,7 @@ internal fun toolTitleLabel(toolName: String): String = when (toolName) {
     "browser_use" -> "Minis is using Browser"
     "read_image" -> "Minis is reading Image"
     "memory_write", "memory_get" -> "Minis is using Memory"
+    "render_widget" -> "Minis is rendering an inline visual"
     "web_search" -> "Minis is using Search"
     else -> "Minis is using ${toolDisplayName(toolName)}"
 }

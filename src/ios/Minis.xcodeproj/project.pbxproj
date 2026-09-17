@@ -80,6 +80,12 @@ E5IBR001 /* InputBottomRowView.swift in Sources */ = {isa = PBXBuildFile; fileRe
 E5IFW001 /* InputFieldOrWaveformView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5IFW101 /* InputFieldOrWaveformView.swift */; };
 		E5DEEP006 /* VerifyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP106 /* VerifyGate.swift */; };
 		E5DEEP007 /* ClarifyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP107 /* ClarifyGate.swift */; };
+		E5PHF0001 /* SpecGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PHF0101 /* SpecGate.swift */; };
+		E5PHD0001 /* RenderWidgetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PHD0101 /* RenderWidgetView.swift */; };
+		E5PHE0001 /* ScheduledTaskItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PHE0101 /* ScheduledTaskItem.swift */; };
+		E5PHE0002 /* ScheduledTaskScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PHE0102 /* ScheduledTaskScheduler.swift */; };
+		E5PHE0003 /* RunScheduledTaskIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PHE0103 /* RunScheduledTaskIntent.swift */; };
+		E5PHE0004 /* ScheduledTasksSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5PHE0104 /* ScheduledTasksSettingsView.swift */; };
 		E5EP0001 /* EnvProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5EP0011 /* EnvProfileStore.swift */; };
 		E5EP0002 /* EnvProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5EP0012 /* EnvProfileView.swift */; };
 		E5DEEP001 /* DeepModeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP101 /* DeepModeStore.swift */; };
@@ -713,6 +719,13 @@ E5IBR101 /* InputBottomRowView.swift */ = {isa = PBXFileReference; lastKnownFile
 E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputFieldOrWaveformView.swift; sourceTree = "<group>"; };
 		E5DEEP106 /* VerifyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerifyGate.swift; sourceTree = "<group>"; };
 		E5DEEP107 /* ClarifyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClarifyGate.swift; sourceTree = "<group>"; };
+		E5PHF0101 /* SpecGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpecGate.swift; sourceTree = "<group>"; };
+		E5PHD0101 /* RenderWidgetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderWidgetView.swift; sourceTree = "<group>"; };
+		E5PHE0101 /* ScheduledTaskItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScheduledTaskItem.swift; sourceTree = "<group>"; };
+		E5PHE0102 /* ScheduledTaskScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScheduledTaskScheduler.swift; sourceTree = "<group>"; };
+		E5PHE0103 /* RunScheduledTaskIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunScheduledTaskIntent.swift; sourceTree = "<group>"; };
+		E5PHE0104 /* ScheduledTasksSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScheduledTasksSettingsView.swift; sourceTree = "<group>"; };
+		E5PHE0010 /* Scheduled */ = {isa = PBXGroup; children = (E5PHE0101 /* ScheduledTaskItem.swift */, E5PHE0102 /* ScheduledTaskScheduler.swift */, ); path = Scheduled; sourceTree = "<group>"; };
 		E5EP0011 /* EnvProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvProfileStore.swift; sourceTree = "<group>"; };
 		E5EP0012 /* EnvProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvProfileView.swift; sourceTree = "<group>"; };
 		E5DEEP101 /* DeepModeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeStore.swift; sourceTree = "<group>"; };
@@ -1642,6 +1655,7 @@ E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKno
 				F1A00012 /* Markdown */,
 				F1A00011 /* MessageList */,
 				F1A00017 /* Offload */,
+				E5PHE0010 /* Scheduled */,
 				F1A00015 /* Session */,
 				E5BSH0100 /* Shell */,
 				F1A00018 /* Speech */,
@@ -1998,6 +2012,7 @@ E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKno
 				E5SD00019 /* ShortcutRunTracker.swift */,
 				E5T00001A /* RetryRunIntent.swift */,
 				E5T00001B /* UserMessageEntity.swift */,
+				E5PHE0103 /* RunScheduledTaskIntent.swift */,
 			);
 			path = Intents;
 			sourceTree = "<group>";
@@ -2117,6 +2132,7 @@ E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKno
 				E5DEEP104 /* WorkflowState.swift */,
 				E5DEEP106 /* VerifyGate.swift */,
 				E5DEEP107 /* ClarifyGate.swift */,
+				E5PHF0101 /* SpecGate.swift */,
 				E5COG9101 /* CognitiveLoadMonitor.swift */,
 				E5ROOT101 /* ErrorRootCauseAnalyzer.swift */,
 				E5MPATH101 /* MultiPathPlanner.swift */,
@@ -2306,6 +2322,7 @@ E5FTP101 /* FloatingToolPreviewView.swift */,
 E5IBR101 /* InputBottomRowView.swift */,
 E5IFW101 /* InputFieldOrWaveformView.swift */,
 E5SUB102 /* SubagentCard.swift */,
+E5PHD0101 /* RenderWidgetView.swift */,
 			);
 			path = Chat;
 			sourceTree = "<group>";
@@ -2344,6 +2361,7 @@ E5SUB102 /* SubagentCard.swift */,
 				E5EP0012 /* EnvProfileView.swift */,
 				916D13280F6990C9672C9EDA /* UpdateCheckRow.swift */,
 				AFBEAE0AA581446458C6B23E /* UpdateChecker.swift */,
+				E5PHE0104 /* ScheduledTasksSettingsView.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -2857,6 +2875,12 @@ E5SUB102 /* SubagentCard.swift */,
 				E5OVL001 /* ChatOverlays.swift in Sources */,
 				E5DEEP006 /* VerifyGate.swift in Sources */,
 				E5DEEP007 /* ClarifyGate.swift in Sources */,
+				E5PHF0001 /* SpecGate.swift in Sources */,
+				E5PHD0001 /* RenderWidgetView.swift in Sources */,
+				E5PHE0001 /* ScheduledTaskItem.swift in Sources */,
+				E5PHE0002 /* ScheduledTaskScheduler.swift in Sources */,
+				E5PHE0003 /* RunScheduledTaskIntent.swift in Sources */,
+				E5PHE0004 /* ScheduledTasksSettingsView.swift in Sources */,
 				GD0000000A /* GoogleDriveOAuthManager.swift in Sources */,
 				GD0000000B /* GoogleDriveAPI.swift in Sources */,
 				GD0000000C /* GoogleDriveSyncManager.swift in Sources */,

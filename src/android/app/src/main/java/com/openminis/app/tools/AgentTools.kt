@@ -52,6 +52,17 @@ object AgentTools {
             // no subagent session can ever be created. Mirrors iOS deepModeEnabled
             // gating in AIChatViewModel+ToolDefinitions.swift.
             add(taskDispatchDefinition())
+            // [T-deep-mode-phase-d] D1: Inline visualization. Renders an SVG
+            // diagram/chart or an isolated HTML widget inline in the chat stream.
+            // Deep-mode-exclusive per the total switch contract — when off, the
+            // tool is invisible and the model falls back to plain text/markdown.
+            add(renderWidgetDefinition())
+            // [T-deep-mode-phase-e] E1: schedule_task — create/schedule a
+            // recurring automation. Deep-mode-exclusive (master-switch gated):
+            // when off, the tool is invisible and the model cannot create or
+            // modify scheduled tasks. Already-created tasks remain resident and
+            // manageable from the scheduled-tasks settings UI.
+            add(scheduleTaskDefinition())
         }
     }
 
@@ -188,5 +199,45 @@ object AgentTools {
         ),
         required = listOf("tool_title", "task_description", "prompt"),
         propertyOrdering = listOf("tool_title", "task_description", "prompt", "max_tool_calls", "allowed_tools", "subagent_type"),
+    )
+
+    // [T-deep-mode-phase-d] D1: Inline visualization (render_widget).
+    // Deep-mode-exclusive tool that renders an SVG diagram/chart or an isolated
+    // HTML widget inline in the chat stream. Aligned with iOS
+    // AIChatViewModel+ToolDefinitions.swift render_widget.
+    private fun renderWidgetDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "render_widget",
+        description = "Render an inline SVG diagram or HTML widget directly in the chat, shown to the user as a visual (not saved as a file). Use for: flowcharts, architecture/sequence diagrams, comparison tables, interactive demos, and small data visualizations. The visual appears inline in the conversation. Prefer this over dumping ASCII art or long markdown when a diagram or interactive element would communicate better. For pure prose stay with normal text.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what the visual shows, displayed as its caption/title (e.g. 'Login flow diagram', 'Framework comparison table'). Use the same language as the user."),
+            "widget_type" to AgentToolParam("string", "Kind of widget to render: 'diagram' for flowcharts/architecture diagrams, 'chart' for data charts, 'comparison' for comparison tables, 'interactive' for HTML demos or embeddable interactive components.", enumValues = listOf("diagram", "chart", "comparison", "interactive")),
+            "content" to AgentToolParam("string", "The visual content. For diagram/chart/comparison: raw inline SVG markup. For interactive: isolated self-contained HTML (no external network assets, can use inline <script>). Keep it compact and readable; width is auto to the container."),
+            "caption" to AgentToolParam("string", "Optional. Short caption shown below the widget."),
+        ),
+        required = listOf("tool_title", "widget_type", "content"),
+        propertyOrdering = listOf("tool_title", "widget_type", "content", "caption"),
+    )
+
+    // [T-deep-mode-phase-e] E1: schedule_task — schedule a recurring automation.
+    // Deep-mode-exclusive: only registered when deep mode is on (the master
+    // switch gates tool exposure), so when deep mode is off the model cannot
+    // create or modify scheduled tasks. Created tasks are independent of the
+    // switch: they keep firing and remain manageable from the settings UI.
+    // Aligned with iOS tool of the same name.
+    private fun scheduleTaskDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "schedule_task",
+        description = "Create a scheduled task that automatically runs an AI action at a configured time — once or on a repeating schedule. The agent runs the action in a new or existing chat and its result is saved as a run record you can review. Use this when the user asks to 'set a reminder / daily X / schedule X / every weekday at Y'. You parse the user's natural-language request into the structured time/repeat parameters below. To manage existing tasks (pause, resume, edit, delete, view runs) the user uses the Scheduled Tasks settings UI.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this scheduled task does, shown to the user (e.g. 'Daily 9am morning briefing', 'Weekly security check'). Use the same language as the user."),
+            "label" to AgentToolParam("string", "A short human-readable name for the task, shown in the Scheduled Tasks list."),
+            "prompt" to AgentToolParam("string", "The full instruction the agent will run each time the task fires. Be specific and self-contained (the agent starts a fresh context)."),
+            "time" to AgentToolParam("string", "The time of day to run, 24-hour HH:MM (e.g. '09:00', '14:30')."),
+            "repeat" to AgentToolParam("string", "How often to repeat: 'once' (single run at the next occurrence of the time), 'daily' (every day), 'weekdays' (Mon-Fri), or 'custom' (specific days via the 'days' param). Defaults to 'once'.", enumValues = listOf("once", "daily", "weekdays", "custom")),
+            "days" to AgentToolParam("string", "Optional. Comma-separated weekday names for 'custom' repeat: Sun,Mon,Tue,Wed,Thu,Fri,Sat (any case). Ignored unless repeat=custom."),
+            "target" to AgentToolParam("string", "Optional. Where to run the action: 'new' (run in a brand-new chat, default), 'follow-up' (append to the current conversation, requires 'session_id'), or 'rerun' (included for API parity; not recommended from chat).", enumValues = listOf("new", "follow-up", "rerun"), ),
+            "session_id" to AgentToolParam("string", "Optional. Session to target when target='follow-up' or 'rerun'."),
+        ),
+        required = listOf("tool_title", "label", "prompt", "time"),
+        propertyOrdering = listOf("tool_title", "label", "prompt", "time", "repeat", "days", "target", "session_id"),
     )
 }

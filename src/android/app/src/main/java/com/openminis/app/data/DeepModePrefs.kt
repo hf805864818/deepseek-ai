@@ -21,6 +21,7 @@ object DeepModePrefs {
     private const val KEY_GLOBAL_ENABLED = "deepmode.global.enabled"
     private const val KEY_GLOBAL_LEVEL = "deepmode.global.level"
     private const val KEY_GLOBAL_KEEP_SESSION_WORKFLOW = "deepmode.global.keepSessionWorkflow"
+    private const val KEY_GLOBAL_SPEC_MODE = "deepmode.global.specMode"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -53,5 +54,18 @@ object DeepModePrefs {
 
     fun setGlobalLevel(context: Context, level: DeepModeLevel) {
         prefs(context).edit().putString(KEY_GLOBAL_LEVEL, level.rawValue).apply()
+    }
+
+    /**
+     * [T-deep-mode-spec-gate] Phase F (Spec 模式): optional per-user Spec Mode
+     * switch. Defaults to OFF. SpecGate is only entered when the master switch
+     * (isGlobalEnabled) AND this flag are both on, so PlanGate/VerifyGate flow
+     * stays untouched when Spec Mode is off (zero behavior drift).
+     */
+    fun specModeEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_GLOBAL_SPEC_MODE, false)
+
+    fun setSpecModeEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_GLOBAL_SPEC_MODE, enabled).apply()
     }
 }

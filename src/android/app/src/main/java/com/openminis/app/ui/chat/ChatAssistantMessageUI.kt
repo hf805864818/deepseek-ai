@@ -392,6 +392,17 @@ internal fun AssistantMessageView(message: ChatMessage, onRetry: (() -> Unit)? =
                 else -> {
                     // tool_use
                     ToolCallPill(block, allToolBlocks = toolPillBlocks)
+                    // [T-deep-mode-phase-d] Phase D: render_widget renders an
+                    // inline visual card directly beneath its pill (iOS parity
+                    // via RenderWidgetView). Only when the tool succeeded and
+                    // carries content; when deep mode is off no such blocks
+                    // exist (the tool is never registered).
+                    if (block.toolName == "render_widget" &&
+                        block.toolStatus == ToolBlockStatus.SUCCESS &&
+                        block.content.isNotBlank()
+                    ) {
+                        WidgetInlineCard(content = block.content)
+                    }
                 }
             }
         }

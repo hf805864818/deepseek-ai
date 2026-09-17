@@ -11,7 +11,7 @@ package com.openminis.app.agent
  * types are in-memory only and are never persisted, so toggling the master
  * switch off leaves zero residue in behavior, state, or UI.
  */
-enum class WorkflowPhase { IDLE, PLANNING, EXECUTING, VERIFYING }
+enum class WorkflowPhase { IDLE, PLANNING, EXECUTING, VERIFYING, SPEC_WRITING, SPEC_REVIEWING, APPROVED }
 
 enum class WorkflowStepStatus { PENDING, ACTIVE, DONE }
 

@@ -363,6 +363,8 @@ final class AssistantBlock: Identifiable, ObservableObject {
             return (!path.isEmpty && name != "/" && name.contains(".")) ? name : "Read image"
         case .memoryTool(let action):
             return action.isEmpty ? "Memory" : action
+        case .visualization:
+            return "Inline visualization"
         case .info:
             return ""
         }
@@ -379,6 +381,7 @@ enum AssistantBlockKind: Equatable {
     case browserTool(action: String)
     case readImageTool(path: String)
     case memoryTool(action: String)
+    case visualization
     case info
 }
 

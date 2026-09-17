@@ -987,6 +987,27 @@ struct AIChatView: View {
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
                     }
+                    // [T-deep-mode-phase-f] Spec-mode review panel. Docked above
+                    // the input bar exactly like the plan gate. Appears when Spec
+                    // mode produced docs and the workflow is paused awaiting the
+                    // user's approve / edit / reject. Total-switch safe: the host
+                    // gates on `deepModeEnabled && phase == .specReviewing`, and
+                    // resetWorkflow() clears the phase on any disable.
+                    .overlay(alignment: .bottom) {
+                        if vm.deepModeEnabled,
+                           vm.workflowPhase == .specReviewing,
+                           case .awaitingReview = vm.specGateState {
+                            SpecReviewPanel(
+                                files: vm.pendingSpecFiles,
+                                onApprove: { vm.specApprove() },
+                                onEdit: { vm.specEdit() },
+                                onReject: { vm.specReject() }
+                            )
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, inputBarHeight + 8)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
                     .background(ChatColors.background)
                     .onDrop(of: [.image, .movie, .fileURL, .data], isTargeted: $isDropTargeted) { providers in
                         handleDropProviders(providers)

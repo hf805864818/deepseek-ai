@@ -837,6 +837,9 @@ extension AIChatViewModel {
                 case .planning: phaseStr = "planning"
                 case .executing: phaseStr = "executing"
                 case .verifying: phaseStr = "verifying"
+                case .specWriting: phaseStr = "spec_writing"
+                case .specReviewing: phaseStr = "spec_reviewing"
+                case .specApproved: phaseStr = "spec_approved"
                 }
                 let currentStep = workflowSteps.first(where: { $0.status == .active })?.id ?? 0
                 let isMultiPath = pendingGoalSentinel != nil
@@ -1041,6 +1044,7 @@ extension AIChatViewModel {
                         case "browser_use": .browserTool(action: "")
                         case "read_image": .readImageTool(path: "")
                         case "memory_write", "memory_get": .memoryTool(action: toolUse.name)
+                        case "render_widget": .visualization
                         default: .shellTool(command: toolUse.name)
                         }
 
@@ -1105,6 +1109,101 @@ extension AIChatViewModel {
 
                 toolOutput = "Subagent result for '\(taskDesc)':\n\n\(result)"
                 toolSuccess = subagent.status == .completed
+
+            // [T-deep-mode-phase-d] D2: Inline visualization execution.
+            // Registered only in deep mode; if the switch was turned off
+            // between registration and execution, reject safely. Produces an
+            // inline visual in the message stream as its tool output.
+            case "render_widget":
+                guard deepModeEnabled else {
+                    toolOutput = "Error: Deep mode was disabled after render_widget was registered. Cannot render widget."
+                    toolSuccess = false
+                    break
+                }
+
+                let content = (tu.args["content"] as? String) ?? ""
+
+                if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    toolOutput = "Error: 'content' parameter is required. Provide SVG (diagram/chart/comparison) or HTML (interactive) markup."
+                    toolSuccess = false
+                    break
+                }
+
+                // The widget renders inline in the message stream. The markup
+                // (SVG or HTML) is carried as the tool result content; the UI
+                // renderer keys off the tool name `render_widget` and renders
+                // it via an inline WebView instead of treating it as text.
+                toolOutput = content
+                toolSuccess = true
+
+            // [T-deep-mode-phase-e] E2: Scheduled automation execution.
+            // Registered only in deep mode; if the switch was turned off
+            // between registration and execution, reject safely. Creates a
+            // persisted scheduled task via ScheduledTaskStore + a local
+            // notification at the next trigger (fire-and-forget deliverable;
+            // iOS cannot run a live agent loop at a wall-clock time in the
+            // background, so the notification points the user to the task).
+            case "schedule_task":
+                guard deepModeEnabled else {
+                    toolOutput = "Error: Deep mode was disabled after schedule_task was registered. Cannot create scheduled task."
+                    toolSuccess = false
+                    break
+                }
+
+                let label = (tu.args["label"] as? String) ?? ""
+                let prompt = (tu.args["prompt"] as? String) ?? ""
+                let time = (tu.args["time"] as? String) ?? ""
+
+                if label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || time.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    toolOutput = "Error: 'label', 'prompt', and 'time' (HH:MM) are all required."
+                    toolSuccess = false
+                    break
+                }
+
+                let parts = time.split(separator: ":").map { String($0).trimmingCharacters(in: .whitespaces)}
+                guard parts.count == 2, let hour = Int(parts[0]), let minute = Int(parts[1]),
+                      (0...23).contains(hour), (0...59).contains(minute) else {
+                    toolOutput = "Error: 'time' must be 24-hour HH:MM (e.g. '09:00', '14:30')."
+                    toolSuccess = false
+                    break
+                }
+
+                let repeatVal = (tu.args["repeat"] as? String) ?? "once"
+                let repeatMode: String
+                switch repeatVal.lowercased() {
+                case "daily": repeatMode = "daily"
+                case "weekdays": repeatMode = "weekdays"
+                case "custom": repeatMode = "custom"
+                default: repeatMode = "once"
+                }
+
+                var customDays: [Int] = []
+                if repeatMode == "custom" {
+                    customDays = Self.parseScheduleDays((tu.args["days"] as? String) ?? "")
+                    if customDays.isEmpty {
+                        toolOutput = "Error: repeat='custom' requires 'days' (e.g. 'Mon,Wed,Fri')."
+                        toolSuccess = false
+                        break
+                    }
+                }
+
+                let task = ScheduledTaskItem(
+                    label: label,
+                    prompt: prompt,
+                    hour: hour,
+                    minute: minute,
+                    repeatMode: repeatMode,
+                    customDays: customDays,
+                    enabled: true
+                )
+                await ScheduledTaskScheduler.shared.upsert(task)
+
+                let next = ScheduledTaskItem.nextTriggerDate(task, from: Date())
+                    .flatMap { Self.fmtScheduledDate($0) } ?? "n/a"
+                toolOutput = "Scheduled task created: id=\(task.id) label='\(label)' time=\(String(format: "%02d:%02d", hour, minute)) repeat=\(repeatMode) next=\(next). Manage it anytime in Settings → Agent Runtime → Scheduled Tasks."
+                toolSuccess = true
 
             default:
                 toolOutput = "Error: Unknown tool '\(tu.name)'"
@@ -1315,5 +1414,41 @@ extension AIChatViewModel {
             snapshotItem: snapshotItem,
             cancelled: cancelledHere
         )
+    }
+
+    // MARK: - Scheduled Task Helpers
+
+    /// [T-deep-mode-phase-e] Maps weekday names (Sun..Sat, any case) to
+    /// Calendar.dayOfWeek values (Sun=1 ... Sat=7). Unknown names are ignored.
+    static func parseScheduleDays(_ raw: String) -> [Int] {
+        let map: [String: Int] = [
+            "sun": 1, "sunday": 1,
+            "mon": 2, "monday": 2,
+            "tue": 3, "tues": 3, "tuesday": 3,
+            "wed": 4, "wednesday": 4,
+            "thu": 5, "thur": 5, "thurs": 5, "thursday": 5,
+            "fri": 6, "friday": 6,
+            "sat": 7, "saturday": 7,
+        ]
+        var seen = Set<Int>()
+        var result: [Int] = []
+        for token in raw.split(whereSeparator: { $0 == "," || $0.isWhitespace }) {
+            let key = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let day = map[key], !seen.contains(day) {
+                seen.insert(day)
+                result.append(day)
+            }
+        }
+        return result.sorted()
+    }
+
+    /// Formats a next-trigger date for the tool result string.
+    static func fmtScheduledDate(_ date: Date) -> String? {
+        let f = DateFormatter()
+        f.locale = Locale.current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        // Include weekday so day-based schedules are readable.
+        f.dateFormat = "EEE yyyy-MM-dd HH:mm"
+        return f.string(from: date)
     }
 }

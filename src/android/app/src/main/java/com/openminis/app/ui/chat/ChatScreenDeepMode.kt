@@ -270,6 +270,9 @@ private fun workflowPhaseLabel(phase: com.openminis.app.agent.WorkflowPhase): St
     com.openminis.app.agent.WorkflowPhase.PLANNING -> "规划中"
     com.openminis.app.agent.WorkflowPhase.EXECUTING -> "执行中"
     com.openminis.app.agent.WorkflowPhase.VERIFYING -> "复查中"
+    com.openminis.app.agent.WorkflowPhase.SPEC_WRITING -> "规格化中"
+    com.openminis.app.agent.WorkflowPhase.SPEC_REVIEWING -> "规格待审核"
+    com.openminis.app.agent.WorkflowPhase.APPROVED -> "已批准"
 }
 
 private fun workflowPhaseIcon(phase: com.openminis.app.agent.WorkflowPhase): ImageVector = when (phase) {
@@ -277,6 +280,9 @@ private fun workflowPhaseIcon(phase: com.openminis.app.agent.WorkflowPhase): Ima
     com.openminis.app.agent.WorkflowPhase.PLANNING -> Icons.Default.List
     com.openminis.app.agent.WorkflowPhase.EXECUTING -> Icons.Default.Settings
     com.openminis.app.agent.WorkflowPhase.VERIFYING -> Icons.Default.CheckCircle
+    com.openminis.app.agent.WorkflowPhase.SPEC_WRITING -> Icons.Default.AutoAwesome
+    com.openminis.app.agent.WorkflowPhase.SPEC_REVIEWING -> Icons.Default.List
+    com.openminis.app.agent.WorkflowPhase.APPROVED -> Icons.Default.CheckCircle
 }
 
 /// Compact vertical list of workflow steps with a per-step status glyph.
@@ -611,6 +617,228 @@ fun FloatingConfirmPanel(
     }
 }
 
+// MARK: - SpecReviewPanel
+// [T-deep-mode-spec-gate] Phase F (Spec 模式): Trae-style review panel for the
+// generated spec products (spec.md / checklist.md / tasks.md). Docked ABOVE the
+// composer like FloatingConfirmPanel, it shows the three product paths with a
+// preview link each, plus 批准 / 编辑重生成 (re-enter SPEC_WRITING, bounded to
+// 2 rounds) / 拒绝 actions that call the ViewModel's SpecGate methods.
+//
+// Total-switch safe: only rendered while deep mode is on AND the SpecGate is
+// awaiting review; disabling deep mode (or specModeEnabled) resets the gate to
+// idle, so this view never renders outside an active Spec review.
+
+@Composable
+fun SpecReviewPanel(
+    viewModel: ChatViewModel,
+    modifier: Modifier = Modifier,
+) {
+    val deepModeEnabled by viewModel.deepModeEnabled.collectAsState()
+    val specGateState by viewModel.specGateState.collectAsState()
+    val files by viewModel.pendingSpecFiles.collectAsState()
+
+    val isVisible = deepModeEnabled &&
+        specGateState == com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW
+
+    AnimatedVisibility(
+        visible = isVisible,
+        enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+        exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+        modifier = modifier,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 320.dp)
+                .background(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            ChatColors.background.copy(alpha = 0f),
+                            ChatColors.background.copy(alpha = 0.97f),
+                        ),
+                    ),
+                )
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(ChatColors.toolCapsuleBg)
+                    .border(
+                        width = 1.dp,
+                        color = ChatColors.toolBorder.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(14.dp),
+                    ),
+            ) {
+                // Header row.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        tint = phaseAccent,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "深度龙虾Ai · 规格文档已生成",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = ChatColors.primaryText,
+                        )
+                        Text(
+                            text = if (files.isEmpty()) {
+                                "未检测到产物文件，可拒绝或重新生成"
+                            } else {
+                                "共 ${files.size} 份 · 审批通过后任务完成"
+                            },
+                            fontSize = 10.sp,
+                            color = ChatColors.secondaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    TextButton(
+                        onClick = { viewModel.rejectSpec() },
+                        modifier = Modifier
+                            .size(30.dp)
+                            .padding(0.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "关闭",
+                            tint = ChatColors.secondaryText,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+
+                // Product list (scrollable when long).
+                if (files.isNotEmpty()) {
+                    androidx.compose.material3.HorizontalDivider(
+                        color = ChatColors.toolBorder.copy(alpha = 0.5f),
+                    )
+                    Column(
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 14.dp, vertical = 6.dp),
+                    ) {
+                        files.forEach { file ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(ChatColors.toolCapsuleBg.copy(alpha = 0.6f))
+                                    .border(
+                                        width = 0.5.dp,
+                                        color = ChatColors.toolBorder.copy(alpha = 0.6f),
+                                        shape = RoundedCornerShape(10.dp),
+                                    )
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.List,
+                                    contentDescription = null,
+                                    tint = phaseAccent,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = file.name,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = ChatColors.primaryText,
+                                    )
+                                    Text(
+                                        text = file.path,
+                                        fontSize = 9.sp,
+                                        color = ChatColors.secondaryText,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                TextButton(
+                                    onClick = { viewModel.previewSpecFile(file.path) },
+                                    modifier = Modifier.height(26.dp),
+                                ) {
+                                    Text(
+                                        text = "预览",
+                                        fontSize = 10.sp,
+                                        color = phaseAccent,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                androidx.compose.material3.HorizontalDivider(
+                    color = ChatColors.toolBorder.copy(alpha = 0.5f),
+                )
+
+                // Action row: edit / reject / approve.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Spacer(modifier = Modifier.weight(1f))
+                    TextButton(
+                        onClick = { viewModel.editSpec() },
+                        modifier = Modifier.height(30.dp),
+                    ) {
+                        Text(
+                            text = "编辑重生成",
+                            fontSize = 11.sp,
+                            color = ChatColors.primaryText,
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    TextButton(
+                        onClick = { viewModel.rejectSpec() },
+                        modifier = Modifier.height(30.dp),
+                    ) {
+                        Text(
+                            text = "拒绝",
+                            fontSize = 11.sp,
+                            color = ChatColors.secondaryText,
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    TextButton(
+                        onClick = { viewModel.approveSpec() },
+                        modifier = Modifier
+                            .height(32.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(phaseAccent)
+                            .padding(horizontal = 4.dp),
+                        colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                            contentColor = Color.White,
+                        ),
+                    ) {
+                        Text(
+                            text = "批准",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 private fun riskPresentation(risk: com.openminis.app.agent.MultiPathPlanner.RiskLevel): Pair<String, Color> =
     when (risk) {
         com.openminis.app.agent.MultiPathPlanner.RiskLevel.LOW -> "低风险" to Color(0xFF34C759)
@@ -681,7 +909,9 @@ fun FloatingWorkflowCapsule(
     val isVisible = deepModeEnabled &&
         keepSessionWorkflow &&
         (workflowPhase == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
-            workflowPhase == com.openminis.app.agent.WorkflowPhase.VERIFYING) &&
+            workflowPhase == com.openminis.app.agent.WorkflowPhase.VERIFYING ||
+            workflowPhase == com.openminis.app.agent.WorkflowPhase.SPEC_WRITING ||
+            workflowPhase == com.openminis.app.agent.WorkflowPhase.SPEC_REVIEWING) &&
         workflowSteps.isNotEmpty()
 
     var isExpanded by remember { mutableStateOf(false) }

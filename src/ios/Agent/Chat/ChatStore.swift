@@ -4923,6 +4923,9 @@ extension RawMessage {
                 case "memory_write", "memory_get":
                     kind = .memoryTool(action: tu.name)
                     content = tu.name == "memory_write" ? "Writing memory..." : "Reading memory..."
+                case "render_widget":
+                    kind = .visualization
+                    content = extractStringParam("content", from: tu.input)
                 default:
                     kind = .shellTool(command: tu.name)
                     content = tu.name

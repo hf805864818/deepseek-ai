@@ -486,3 +486,110 @@ struct FloatingConfirmPanel: View {
         return "确认执行（\(selectedPathIndexes.count)）"
     }
 }
+
+// MARK: - SpecReviewPanel
+
+/// [T-deep-mode-phase-f] Floating review panel for the spec documents the
+/// model produced in the spec-writing phase. Docked above the input bar like
+/// the plan gate. Offers Approve / Edit / Reject. Pure and state-free — driven
+/// entirely by the VM's `pendingSpecFiles`. Only rendered when the parent sees
+/// `deepModeEnabled && workflowPhase == .specReviewing`, so disabling the
+/// master switch / Spec mode removes it with zero residue.
+struct SpecReviewPanel: View {
+    let files: [SpecGate.SpecFile]
+    let onApprove: () -> Void
+    let onEdit: () -> Void
+    let onReject: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.caption)
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("深度龙虾Ai · 规格文档待审核")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(ChatColors.primaryText)
+                    Text("模型已将完成的成果整理为规格文档，请审阅")
+                        .font(.caption2)
+                        .foregroundColor(ChatColors.secondaryText)
+                }
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if files.isEmpty {
+                        Label("未检测到规格文档文件（path 未回显）", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    } else {
+                        ForEach(files) { file in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: "doc")
+                                    .font(.caption)
+                                    .foregroundColor(.accentColor)
+                                    .frame(width: 14)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(file.fileName)
+                                        .font(.caption)
+                                        .foregroundColor(ChatColors.primaryText)
+                                    if !(file.path).isEmpty {
+                                        Text((file.path as NSString).deletingLastPathComponent)
+                                            .font(.caption2)
+                                            .foregroundColor(ChatColors.tertiaryText)
+                                            .lineLimit(1)
+                                    }
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 200)
+
+            Divider()
+            HStack(spacing: 10) {
+                Button(action: onReject) {
+                    Text("拒绝")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(ChatColors.secondaryText)
+                        .padding(.horizontal, 8).padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+                Button(action: onEdit) {
+                    Text("修改")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 8).padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                Button(action: onApprove) {
+                    Text("批准")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Color.accentColor)
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+        .frame(maxWidth: 420)
+        .background(ChatColors.secondaryBg)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ChatColors.toolBorder, lineWidth: 0.5))
+        .shadow(color: Color.black.opacity(0.16), radius: 12, x: 0, y: 5)
+    }
+}

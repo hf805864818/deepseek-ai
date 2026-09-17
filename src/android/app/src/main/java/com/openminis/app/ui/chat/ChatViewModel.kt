@@ -81,6 +81,10 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import com.openminis.app.scheduled.ScheduledRepeatMode
+import com.openminis.app.scheduled.ScheduledTargetMode
+import com.openminis.app.scheduled.ScheduledTask
+import com.openminis.app.scheduled.ScheduledTaskManager
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
@@ -1253,6 +1257,7 @@ class ChatViewModel(
             verifyPhase = VerifyPhase.IDLE
             verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
             goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
+            resetSpecState()
         }
     }
 
@@ -1372,6 +1377,53 @@ class ChatViewModel(
 
     @Volatile
     private var pendingVerifySentinel: com.openminis.app.agent.VerifyGate.ParsedSentinel? = null
+
+    // MARK: - SpecGate (Phase F, Spec 模式)
+    /**
+     * [T-deep-mode-spec-gate] Optional SpecGate layered on top of the plan ->
+     * execute -> verify workflow. Only active when `deepModeEnabled &&
+     * specModeEnabled` (see `specEnabled()`); when off, every field here stays
+     * at its idle/default and the existing 4-state workflow is unchanged
+     * (zero drift). Mirrors iOS `SpecGate` / spec-writing phase.
+     */
+    internal val _specGateState =
+        MutableStateFlow(com.openminis.app.agent.SpecGate.State.IDLE)
+    val specGateState: StateFlow<com.openminis.app.agent.SpecGate.State> =
+        _specGateState.asStateFlow()
+
+    /** Detected spec product artifacts (spec.md / checklist.md / tasks.md) awaiting review. */
+    internal val _pendingSpecFiles =
+        MutableStateFlow<List<com.openminis.app.agent.SpecGate.SpecFile>>(emptyList())
+    val pendingSpecFiles: StateFlow<List<com.openminis.app.agent.SpecGate.SpecFile>> =
+        _pendingSpecFiles.asStateFlow()
+
+    /** Pending spec-writing turn text (kept for potential regenerates / display). */
+    @Volatile
+    private var pendingSpecText: String? = null
+
+    /** Remaining spec regeneration rounds (bounded by MAX_EDIT_ROUNDS). */
+    @Volatile
+    private var specEditRoundsLeft: Int = com.openminis.app.agent.SpecGate.MAX_EDIT_ROUNDS
+
+    /** True once the model emitted the SPEC_STATE sentinel in this workflow. */
+    @Volatile
+    private var pendingSpecSentinel = false
+
+    /**
+     * Aggregate gate for Spec Mode = master deep-mode switch AND the optional
+     * specModeEnabled switch. Total-switch safe: false whenever deep mode is off.
+     */
+    private fun specEnabled(): Boolean =
+        _deepModeEnabled.value && com.openminis.app.data.DeepModePrefs.specModeEnabled(context)
+
+    /** Reset all SpecGate state (used by every workflow / switch reset path). */
+    private fun resetSpecState() {
+        _specGateState.value = com.openminis.app.agent.SpecGate.State.IDLE
+        _pendingSpecFiles.value = emptyList()
+        pendingSpecText = null
+        specEditRoundsLeft = com.openminis.app.agent.SpecGate.MAX_EDIT_ROUNDS
+        pendingSpecSentinel = false
+    }
 
     // MARK: - C7 Post-task Retrospective
     @Volatile
@@ -1972,6 +2024,8 @@ class ChatViewModel(
             goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
             retrospectiveHasRun = false
             isRetrospectiveRunning = false
+            // [T-deep-mode-spec-gate] Phase F: clear SpecGate on master switch off.
+            resetSpecState()
             // C9 cognitive load cleanup
             _cognitiveLoadState.value = com.openminis.app.agent.CognitiveLoadState.empty
             lastModelLoadSignal = null
@@ -2096,6 +2150,174 @@ class ChatViewModel(
     /** Set the user's selected path indexes from the floating confirm panel. */
     fun setSelectedPathIndexes(indexes: Set<Int>) {
         _selectedPathIndexes.value = indexes
+    }
+
+    // MARK: - SpecGate actions (Phase F, Spec 模式)
+    /**
+     * [T-deep-mode-spec-gate] Enter the SPEC_WRITING phase (called from the
+     * VERIFYING-passed settlement when Spec Mode is on). Injects a spec-writing
+     * system reminder so the model writes spec.md / checklist.md / tasks.md and
+     * appends the `<<SPEC_STATE>>` sentinel. Total-switch safe: only reachable
+     * when specEnabled().
+     */
+    private fun beginSpecWriting() {
+        if (!specEnabled()) return
+        pendingSpecSentinel = false
+        pendingSpecText = null
+        _pendingSpecFiles.value = emptyList()
+        _specGateState.value = com.openminis.app.agent.SpecGate.State.IDLE
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.SPEC_WRITING
+        _workflowBusy.value = true
+        val specReminder = buildString {
+            append(
+                "<system-reminder>SPECIFICATION PHASE (Spec Mode): your work passed " +
+                    "verification. Before wrapping up, formalize it into three " +
+                    "documents using file_write (create_dirs=true):"
+            )
+            append("\n1. spec.md — goal, scope (in/out), feature list, acceptance criteria")
+            append("\n2. checklist.md — a checkable verification checklist")
+            append("\n3. tasks.md — task breakdown, marking independent tasks with [PARALLEL]")
+            append("\nAfter all three files are written, end your turn with exactly this line:")
+            append("\n")
+            append(com.openminis.app.agent.SpecGate.SPEC_MARKER)
+            append("\nDo NOT start new execution work — only write the specification documents.")
+            append("</system-reminder>")
+        }
+        agentHistory.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = specReminder,
+                contentParts = listOf(AgentContentPart.Text(specReminder)),
+            )
+        )
+        AppLogger.info(TAG_STREAM, "SpecGate: beginSpecWriting injected reminder")
+    }
+
+    /** User approved the spec documents — finish the workflow cleanly. */
+    fun approveSpec() {
+        if (_specGateState.value != com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) return
+        if (!specEnabled()) return
+        _specGateState.value = com.openminis.app.agent.SpecGate.State.APPROVED
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.APPROVED
+        AppLogger.info(
+            TAG_STREAM,
+            "SpecGate: user approved spec documents (${_pendingSpecFiles.value.size} files)",
+        )
+        appendSystemInfo(
+            text = "规格文档已批准，任务完成。",
+            iconKind = "check",
+        )
+        // Clear the execution tracker so the floating capsule tears down — the
+        // workflow is done (zero residue after finish).
+        if (_deepModeEnabled.value) {
+            clearWorkflowTracker()
+        }
+        resetSpecState()
+    }
+
+    /** User rejected the spec documents — cancel and wrap the workflow up. */
+    fun rejectSpec() {
+        if (_specGateState.value != com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) return
+        _specGateState.value = com.openminis.app.agent.SpecGate.State.IDLE
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+        _workflowSteps.value = emptyList()
+        _workflowBusy.value = false
+        if (_deepModeEnabled.value) {
+            clearWorkflowTracker()
+        }
+        AppLogger.info(TAG_STREAM, "SpecGate: user rejected spec documents")
+        appendSystemInfo(
+            text = "已取消规格化，未进入执行。",
+            iconKind = "close",
+        )
+        resetSpecState()
+    }
+
+    /**
+     * User requested an edit / regenerate of the spec documents — go back to
+     * SPEC_WRITING and re-run the agent loop so the model rewrites the three
+     * docs. Bounded by MAX_EDIT_ROUNDS (cannot loop forever). Mirrors the
+     * PlanGate regenerate/resume pattern.
+     */
+    fun editSpec() {
+        if (_specGateState.value != com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) return
+        if (specEditRoundsLeft <= 0) return
+        specEditRoundsLeft--
+        _specGateState.value = com.openminis.app.agent.SpecGate.State.IDLE
+        pendingSpecSentinel = false
+        pendingSpecText = null
+        _pendingSpecFiles.value = emptyList()
+        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.SPEC_WRITING
+        AppLogger.info(
+            TAG_STREAM,
+            "SpecGate: user requested edit-regenerate (roundsLeft=$specEditRoundsLeft)",
+        )
+        appendSystemInfo(
+            text = "正在按用户意见重新生成规格文档…",
+            iconKind = "auto_awesome",
+        )
+
+        // Resume the agent loop with a regenerate-spec system reminder.
+        viewModelScope.launch(Dispatchers.IO) {
+            val specRegen = buildString {
+                append(
+                    "<system-reminder>SPECIFICATION PHASE (regenerate): the user asked " +
+                        "you to edit the spec documents. Rewrite spec.md / checklist.md / " +
+                        "tasks.md with file_write, then end your turn with exactly this line:"
+                )
+                append("\n")
+                append(com.openminis.app.agent.SpecGate.SPEC_MARKER)
+                append("</system-reminder>")
+            }
+            agentHistory.add(
+                LLMMessage(
+                    role = LLMMessage.Role.USER,
+                    content = specRegen,
+                    contentParts = listOf(AgentContentPart.Text(specRegen)),
+                )
+            )
+            val provider = currentProvider ?: return@launch
+            val systemPrompt = buildSystemPrompt()
+            val fallbackProviders = buildFallbackProviders(provider)
+            val activeFallbackStrategy = run {
+                val groupId = _selectedGroupId.value
+                groupId?.let {
+                    providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy
+                } ?: com.openminis.app.data.model.FallbackStrategy.default
+            }
+            try {
+                runAgentLoop(
+                    provider = provider,
+                    systemPrompt = systemPrompt,
+                    fallbackProviders = fallbackProviders,
+                    fallbackStrategy = activeFallbackStrategy,
+                )
+            } catch (e: Exception) {
+                AppLogger.error(TAG_STREAM, "SpecGate edit-resume agent loop error: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Lightweight preview of a pending spec product file: resolve its host path
+     * and surface the head of the file as an inline info bubble. Fail-safe: on
+     * any resolution/read error it just shows the path with a friendly hint, so
+     * the review UI never crashes.
+     */
+    fun previewSpecFile(path: String) {
+        if (_specGateState.value != com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) return
+        runCatching {
+            val host = com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(sessionId, path, context)
+            val file = java.io.File(host)
+            if (file.isFile) {
+                val head = file.readText(Charsets.UTF_8).trim().take(1200)
+                appendSystemInfo(text = "规格产物预览：$path\n\n$head", iconKind = "list")
+            } else {
+                appendSystemInfo(text = "无法预览（文件不存在）：$path", iconKind = "close")
+            }
+        }.onFailure { e ->
+            appendSystemInfo(text = "无法预览规格产物：$path（${e.message ?: "未知错误"}）", iconKind = "close")
+        }
     }
 
     // [T-deep-mode-floating-panel] Workflow step advancement. Coarse but
@@ -6177,6 +6399,9 @@ class ChatViewModel(
             verifyPhase = VerifyPhase.IDLE
             verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
             pendingVerifySentinel = null
+            // [T-deep-mode-spec-gate] Phase F: fresh user message supersedes any
+            // pending SpecGate review.
+            resetSpecState()
             // Reset C7 retrospective on fresh user message
             retrospectiveHasRun = false
             isRetrospectiveRunning = false
@@ -8342,6 +8567,39 @@ class ChatViewModel(
                 pendingGoalSentinel = goalSentinel
                 pendingVerifySentinel = verifySentinel
 
+                // [T-deep-mode-spec-gate] Phase F (Spec 模式): collect the spec
+                // products from a SPEC_WRITING turn. When the model appends the
+                // `<<SPEC_STATE>>` sentinel after writing spec.md / checklist.md /
+                // tasks.md, strip the sentinel, harvest the file_write product
+                // paths, and move SPEC_WRITING → SPEC_REVIEWING (awaitingReview).
+                if (specEnabled() &&
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.SPEC_WRITING &&
+                    accumulatedText.contains(
+                        com.openminis.app.agent.SpecGate.SPEC_MARKER,
+                        ignoreCase = true,
+                    )
+                ) {
+                    com.openminis.app.agent.SpecGate.textWithoutSentinel(accumulatedText)?.let { clean ->
+                        accumulatedText = clean
+                    }
+                    val writes = allToolBlocks.mapNotNull { b ->
+                        when {
+                            b.kind == "tool_use" && b.toolName == "file_write" -> b.toolName to b.toolArgs
+                            else -> null
+                        }
+                    }
+                    val files = com.openminis.app.agent.SpecGate.detectSpecFiles(writes)
+                    pendingSpecSentinel = true
+                    pendingSpecText = accumulatedText
+                    _pendingSpecFiles.value = files
+                    _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.SPEC_REVIEWING
+                    _specGateState.value = com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW
+                    AppLogger.info(
+                        TAG_STREAM,
+                        "SpecGate: spec docs generated (${files.size} files) → awaiting review",
+                    )
+                }
+
                 withContext(Dispatchers.Main) {
                     updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
                 }
@@ -8703,6 +8961,20 @@ class ChatViewModel(
                     when (verifySentinel.result) {
                         com.openminis.app.agent.VerifyGate.ParseResult.PASSED -> {
                             verifyPhase = VerifyPhase.IDLE
+                            // [T-deep-mode-spec-gate] Phase F (Spec 模式): when the
+                            // optional Spec Mode switch is on (AND the master deep-mode
+                            // switch), verification passing settles into spec writing
+                            // instead of immediately finishing. When off, the original
+                            // retrospective + finish path below runs unchanged (zero
+                            // behavior drift).
+                            if (specEnabled()) {
+                                AppLogger.info(
+                                    TAG_STREAM,
+                                    "SpecGate: verify passed + spec mode on → entering SPEC_WRITING",
+                                )
+                                beginSpecWriting()
+                                continue
+                            }
                             // [T-deep-mode-cognitive-p1-c7] Post-task retrospective.
                             // After verification passes, run one final turn where
                             // the model reviews what happened.
@@ -8894,6 +9166,13 @@ class ChatViewModel(
                 }
 
                 loopExitedNormally = true
+                // [T-deep-mode-spec-gate] Phase F: when the spec documents are
+                // awaiting review, stop the agent loop here (no further autonomous
+                // turns) so the SpecReviewPanel takes over for the user's decision.
+                if (_specGateState.value == com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) {
+                    AppLogger.info(TAG_STREAM, "SpecGate: awaiting review → exiting agent loop")
+                    break
+                }
                 // [T-deep-mode-session-workflow] P1: if the execution turn
                 // ended with no goal sentinel at all (model forgot, or last
                 // turn had no tool call), run the client completion evaluator.
@@ -9531,6 +9810,18 @@ class ChatViewModel(
             // executeTaskDispatch bails out with a safe error. Mirrors iOS
             // AIChatViewModel+ConcurrentTools.swift `case "task_dispatch"`.
             "task_dispatch" -> executeTaskDispatch(argsJson)
+            // [T-deep-mode-phase-d] D2: Inline visualization. Produces an inline
+            // visual in the message stream. Only reachable when deepModeEnabled
+            // is on (tool only registered in deep mode). Total-switch safe: if
+            // deep mode was switched off after registration, the helper bails
+            // out with a safe error. Mirrors iOS ConcurrentTools render_widget.
+            "render_widget" -> executeRenderWidget(argsJson)
+            // [T-deep-mode-phase-e] E2: schedule_task — create a scheduled
+            // automation. Only reachable when deepModeEnabled is on (tool only
+            // registered under deepModeEnabled). Total-switch safe: if deep
+            // mode was switched off after registration, the helper bails with
+            // a safe error.
+            "schedule_task" -> executeScheduleTask(argsJson)
             // T178: pass sessionId + context so read_image routes through
             // resolveSessionHostPath like file_read/write/edit do — without
             // these, the tool consults the global last-writer-wins
@@ -9814,6 +10105,155 @@ class ChatViewModel(
         if (nativeVision) return null
         if (!com.openminis.app.tools.VisionGroupResolver.isConfigured(providerRepository, context)) return null
         return com.openminis.app.tools.VisionGroupResolver.noVisionImagePlaceholder(path)
+    }
+
+    /**
+     * [T-deep-mode-phase-e] E2: schedule_task execution.
+     *
+     * Parses the structured parameters (label / prompt / time / repeat / days /
+     * target) into a [ScheduledTask] and persists it via [ScheduledTaskManager],
+     * which registers the AlarmManager trigger. The task is independent of the
+     * deep-mode switch once created — it keeps firing and stays manageable from
+     * the Scheduled Tasks settings UI.
+     *
+     * TOTAL-SWITCH SAFE: only reachable via the schedule_task branch in
+     * [executeTool], which is only registered when deepModeEnabled is on. If the
+     * master switch was turned off between registration and execution, bail out
+     * safely (iOS parity).
+     */
+    private suspend fun executeScheduleTask(argsJson: String): ToolExecutionResult {
+        // Defensive gate even though the tool is only registered in deep mode.
+        if (!_deepModeEnabled.value) {
+            return ToolExecutionResult(
+                output = "Error: Deep mode was disabled after schedule_task was registered. Cannot create scheduled task.",
+                success = false,
+            )
+        }
+        val args = try {
+            JSONObject(argsJson)
+        } catch (_: Exception) {
+            return ToolExecutionResult("Error: schedule_task received invalid JSON arguments.", false)
+        }
+
+        val label = args.optString("label", "").trim()
+        val prompt = args.optString("prompt", "").trim()
+        val time = args.optString("time", "").trim()
+        if (label.isEmpty() || prompt.isEmpty() || time.isEmpty()) {
+            return ToolExecutionResult(
+                "Error: 'label', 'prompt', and 'time' (HH:MM) are all required.",
+                false,
+            )
+        }
+        val parsedTime = parseScheduleTime(time)
+            ?: return ToolExecutionResult("Error: 'time' must be 24-hour HH:MM (e.g. '09:00').", false)
+
+        val repeatVal = args.optString("repeat", "once").lowercase()
+        val repeat = when (repeatVal) {
+            "daily" -> ScheduledRepeatMode.DAILY
+            "weekdays" -> ScheduledRepeatMode.WEEKDAYS
+            "custom" -> ScheduledRepeatMode.CUSTOM
+            else -> ScheduledRepeatMode.ONCE
+        }
+        val customDays = if (repeat == ScheduledRepeatMode.CUSTOM) {
+            parseScheduleDays(args.optString("days", ""))
+        } else emptySet()
+        if (repeat == ScheduledRepeatMode.CUSTOM && customDays.isEmpty()) {
+            return ToolExecutionResult(
+                "Error: repeat='custom' requires 'days' (e.g. 'Mon,Wed,Fri').",
+                false,
+            )
+        }
+
+        val target = when (args.optString("target", "new").lowercase()) {
+            "follow-up", "followup" -> ScheduledTargetMode.AppendToSession(args.optString("session_id", ""))
+            "rerun" -> {
+                val sid = args.optString("session_id", "")
+                if (sid.isEmpty()) {
+                    return ToolExecutionResult("Error: target='rerun' requires 'session_id'.", false)
+                }
+                ScheduledTargetMode.RerunMessage(sid, "")
+            }
+            else -> ScheduledTargetMode.NewSession
+        }
+
+        val task = ScheduledTask(
+            label = label,
+            timeOfDayHour = parsedTime.first,
+            timeOfDayMinute = parsedTime.second,
+            repeatMode = repeat,
+            customDays = customDays,
+            prompt = prompt,
+            targetMode = target,
+        )
+        val manager = ScheduledTaskManager(context)
+        manager.create(task)
+
+        return ToolExecutionResult(
+            "Scheduled task created: id=${task.id} label='$label' time=${"%02d:%02d".format(parsedTime.first, parsedTime.second)} " +
+                "repeat=${repeat.name.lowercase()} next=${task.nextTriggerMs()?.let { fmtTrigger(it) } ?: "n/a"}",
+            true,
+        )
+    }
+
+    /** Parse "HH:MM" (24h) → (hour, minute) or null. */
+    private fun parseScheduleTime(s: String): Pair<Int, Int>? {
+        val parts = s.split(":")
+        if (parts.size != 2) return null
+        val h = parts[0].toIntOrNull()?.takeIf { it in 0..23 } ?: return null
+        val m = parts[1].toIntOrNull()?.takeIf { it in 0..59 } ?: return null
+        return h to m
+    }
+
+    /** Parse comma-separated weekday names (Sun,Mon,...) into Calendar.DAY_OF_WEEK ints. */
+    private fun parseScheduleDays(s: String): Set<Int> {
+        val map = mapOf(
+            "sun" to java.util.Calendar.SUNDAY, "mon" to java.util.Calendar.MONDAY,
+            "tue" to java.util.Calendar.TUESDAY, "wed" to java.util.Calendar.WEDNESDAY,
+            "thu" to java.util.Calendar.THURSDAY, "fri" to java.util.Calendar.FRIDAY,
+            "sat" to java.util.Calendar.SATURDAY,
+        )
+        return s.split(",").mapNotNull { map[it.trim().lowercase().take(3)] }.toSet()
+    }
+
+    /** Format a trigger epoch ms into a short local HH:mm string. */
+    private fun fmtTrigger(epochMs: Long): String {
+        return android.text.format.DateFormat.format("MM-dd HH:mm", java.util.Date(epochMs)).toString()
+    }
+
+    /**
+     * [T-deep-mode-phase-d] D2: Inline visualization (render_widget).
+     *
+     * The tool returns the raw content (inline SVG for diagram/chart/comparison,
+     * or a self-contained HTML fragment for interactive) which is carried as the
+     * tool result. The on-screen tool block renders it as an inline visual card
+     * (svgPreviewContent / RenderWidget) instead of plain text.
+     *
+     * TOTAL-SWITCH SAFE: only reachable via the render_widget branch in
+     * [executeTool], which is only registered when deepModeEnabled is on. If the
+     * master switch was turned off between registration and execution, bail out
+     * safely (iOS parity).
+     */
+    private suspend fun executeRenderWidget(argsJson: String): ToolExecutionResult {
+        // Defensive gate even though the tool is only registered in deep mode.
+        if (!_deepModeEnabled.value) {
+            return ToolExecutionResult(
+                output = "Error: Deep mode was disabled after render_widget was registered. Cannot render widget.",
+                success = false,
+            )
+        }
+        val args = try {
+            JSONObject(argsJson)
+        } catch (_: Exception) {
+            return ToolExecutionResult("Error: render_widget received invalid JSON arguments.", false)
+        }
+        val content = args.optString("content").trim()
+        if (content.isEmpty()) {
+            return ToolExecutionResult(
+                "Error: 'content' parameter is required. Provide SVG (diagram/chart/comparison) or HTML (interactive) markup.",
+                false,
+            )
+        }
+        return ToolExecutionResult(content, true)
     }
 
     /**
@@ -11084,6 +11524,20 @@ In your fenced ```plan``` block, mark parallelizable steps with [PARALLEL] tags.
 SKILL ACCUMULATION — If about the 3rd time in this session you're handling the SAME type of task (a recurring workflow: producing a docx report, generating a slide deck, the same class of code fix), that workflow is a candidate for a reusable skill. Mention it to the user in one line and offer to create one using the skill format. Do NOT propose a skill on the first or second occurrence — only when a reliable pattern has clearly emerged.
 """
             )
+
+            // D0: 可视化引导（对等 iOS deepModeFragment 第14条）
+            append(
+                """
+C16 — VISUALIZATION: You have a `render_widget` tool that renders an SVG diagram/chart or an isolated HTML widget INLINE in the chat (not saved as a file). Use it when a visual communicates better than prose: for flowcharts and architecture/sequence diagrams, comparison tables, small data charts, or interactive demos. Provide well-formed inline SVG for 'diagram'/'chart'/'comparison' and self-contained HTML (inline <script> allowed, NO external network assets) for 'interactive'. Keep it compact and readable; width auto-fits the container. Fall back to normal markdown text when prose or a table is clearer. Do NOT use render_widget for content that is better as a real saved file the user can open elsewhere.
+"""
+            )
+
+            // E0: 定时自动化引导（对等 iOS deepModeFragment 第15条）
+            append(
+                """
+C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use it when the user asks for something to run on a delay or a repeating schedule — phrases like 'set a reminder', 'daily briefing', 'every weekday at 9am', 'schedule X for tomorrow'. Parse the user's natural-language request into the structured parameters: a self-contained `prompt` describing exactly what the agent should do each run, a 24-hour `time` (HH:MM), and a `repeat` mode ('once' | 'daily' | 'weekdays' | 'custom'). Use custom + `days` (Sun,Mon,Tue,Wed,Thu,Fri,Sat) for specific weekdays. Confirm the created task (label, time, repeat, next trigger) back to the user in one line. Do NOT schedule tasks the user did not ask to schedule. Once created, tasks run independently of this session and are managed from the Scheduled Tasks settings UI.
+"""
+            )
         }
     }
 
@@ -11195,10 +11649,14 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
      */
     private var cachedDeepModeStaticFragment: String? = null
     private var cachedDeepModeStaticLevel: com.openminis.app.agent.DeepModeLevel? = null
+    // [T-deep-mode-spec-gate] Phase F: static fragment also depends on the Spec
+    // Mode switch, so the cache key carries whether it was on when built.
+    private var cachedDeepModeStaticSpec = false
 
     private fun getDeepModeStaticFragment(level: com.openminis.app.agent.DeepModeLevel): String {
+        val specOn = specEnabled()
         cachedDeepModeStaticFragment?.let { cached ->
-            if (cachedDeepModeStaticLevel == level) return cached
+            if (cachedDeepModeStaticLevel == level && cachedDeepModeStaticSpec == specOn) return cached
         }
 
         val fragment = buildString {
@@ -11211,6 +11669,13 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
             append("\n\n")
             append(com.openminis.app.agent.VerifyGate.systemPromptFragment)
             append("\n\n")
+            // [T-deep-mode-spec-gate] Phase F: Spec Mode instruction, appended only
+            // when deep mode AND specModeEnabled are both on. When off, the static
+            // fragment is byte-for-byte identical to the pre-F build (zero drift).
+            if (specOn) {
+                append(com.openminis.app.agent.SpecGate.systemPromptFragment)
+                append("\n\n")
+            }
             // C9 cognitive load sentinel (standard+)
             if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
                 append(com.openminis.app.agent.CognitiveLoadMonitor.systemPromptFragment)
@@ -11221,6 +11686,7 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
 
         cachedDeepModeStaticFragment = fragment
         cachedDeepModeStaticLevel = level
+        cachedDeepModeStaticSpec = specOn
         return fragment
     }
 
@@ -11310,6 +11776,7 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
         // Static portion cache
         cachedDeepModeStaticFragment = null
         cachedDeepModeStaticLevel = null
+        cachedDeepModeStaticSpec = false
         // Full fragment cache
         _cachedDeepModeFragment = null
         _cachedDeepModeFragmentKey = null

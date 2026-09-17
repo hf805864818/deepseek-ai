@@ -7400,6 +7400,9 @@ private struct SettingsSheet: View {
     /// applies across all sessions and can be turned off at any time to return
     /// to the default agent behavior.
     @AppStorage("deepMode.enabled") private var deepModeEnabled: Bool = false
+    /// [T-deep-mode-phase-f] Optional Spec mode layer. Only active when the
+    /// master switch is also on (SpecGate ANDs both).
+    @AppStorage("deepMode.specMode") private var specModeEnabled: Bool = false
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var navPath = NavigationPath()
@@ -7472,6 +7475,24 @@ private struct SettingsSheet: View {
                         // [T-deep-mode-workflow] Broadcast the master-switch flip so
                         // live VMs tear down Phase 1 state the instant it turns off.
                         NotificationCenter.default.post(name: .deepModeDidChange, object: nil)
+                    }
+                    // [T-deep-mode-phase-e] Scheduled Tasks entry. This is the
+                    // 已建任务管理常驻 surface: reachable even when the master
+                    // switch is off, so a scheduled task is never orphaned.
+                    NavigationLink {
+                        ScheduledTasksSettingsView()
+                    } label: {
+                        Label("Scheduled Tasks", systemImage: "clock.badge")
+                    }
+                    // [T-deep-mode-phase-f] Spec mode toggle. Optional layer on
+                    // top of plan→execute→verify; only active when BOTH the
+                    // master switch and this toggle are on.
+                    Toggle(isOn: $specModeEnabled) {
+                        Label {
+                            Text("Spec Mode")
+                        } icon: {
+                            Image(systemName: "doc.text.magnifyingglass")
+                        }
                     }
 
                     NavigationLink {

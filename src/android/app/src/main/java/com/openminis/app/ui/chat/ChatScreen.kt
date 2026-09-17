@@ -4383,6 +4383,12 @@ fun ChatScreen(
                 // visible while deep mode is on AND the gate awaits approval.
                 FloatingConfirmPanel(viewModel = viewModel)
 
+                // [T-deep-mode-spec-gate] Phase F (Spec 模式): spec review panel.
+                // Shows the generated spec product paths + preview links and
+                // 批准 / 编辑重生成 / 拒绝 actions. Only visible while deep mode
+                // is on AND the SpecGate awaits review.
+                SpecReviewPanel(viewModel = viewModel)
+
                 // [T-deep-mode-ui-clarifygate] Clarification gate bar (deep mode)
                 ClarifyGateBar(viewModel = viewModel)
 

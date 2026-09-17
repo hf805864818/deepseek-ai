@@ -1094,6 +1094,33 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// the verify-result handler at turn end.
     var pendingVerifySentinel: VerifyGate.ParseResult? = nil
 
+    // MARK: - Phase F: SpecGate
+
+    /// [T-deep-mode-phase-f] Spec-gate public state. `.awaitingReview(files:)`
+    /// drives the spec-review panel; `.approved`+ is reached when the user
+    /// approves and the workflow finishes. Always gated on
+    /// `deepModeEnabled && specModeEnabled`; memory-only, never persisted —
+    /// toggling either switch off leaves zero residue.
+    @Published var specGateState = SpecGate.State.idle
+
+    /// [T-deep-mode-phase-f] The spec artifacts produced on the latest
+    /// spec-writing turn, surfaced in the review panel. Only consulted while
+    /// Spec mode is active; cleared on reset / disable.
+    @Published var pendingSpecFiles: [SpecGate.SpecFile] = []
+
+    /// [T-deep-mode-phase-f] Whether the last spec-writing turn emitted the
+    /// SPEC_STATE sentinel. Resolved at text-capture time alongside the other
+    /// sentinels; consumed by `maybeProcessSpecResult` at turn end.
+    var pendingSpecSentinel = false
+
+    /// [T-deep-mode-phase-f] Remaining reject→regenerate edit rounds for the
+    /// current workflow. Bounded so a reject/edit loop can't run forever.
+    var specEditRoundsLeft = SpecGate.maxEditRounds
+
+    /// [T-deep-mode-phase-f] Convenience: is the Spec gate live right now?
+    /// True only when BOTH the master switch and the Spec-mode toggle are on.
+    private var specActive: Bool { SpecGate.isActive(deepModeEnabled: deepModeEnabled) }
+
     // MARK: - Phase 2: ClarifyGate
 
     /// [T-deep-mode-clarify-gate] Clarification gate state for Phase 2.
@@ -1256,6 +1283,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // also per-workflow; resets alongside the workflow state machine.
         verifyRoundsLeft = VerifyGate.maxVerifyRounds
         pendingVerifySentinel = nil
+        // [T-deep-mode-phase-f] Phase F spec state is per-workflow; clear it on
+        // reset so a prior run's review / sentinel can't bleed into the next.
+        specGateState = .idle
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        specEditRoundsLeft = SpecGate.maxEditRounds
         // [fix] Also clear the goal sentinel for consistency. While callers
         // already re-check deepModeEnabled / message errors before reading it,
         // leaving a stale sentinel across a reset is a latent hazard if a
@@ -1432,8 +1465,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         switch result {
         case .passed:
-            logger.info("[VerifyGate] verification passed — finishing workflow")
-            scheduleWorkflowFinish()
+            logger.info("[VerifyGate] verification passed")
+            // [T-deep-mode-phase-f] If Spec mode is live, verification passing
+            // no longer finishes immediately — enter the spec-writing phase so
+            // the model formalizes the work into spec docs for user review.
+            // Otherwise keep the original behavior (finish now).
+            if specActive {
+                await beginSpecWriting()
+            } else {
+                scheduleWorkflowFinish()
+            }
         case .failed(let reason):
             if verifyRoundsLeft > 0 {
                 // [T-deep-mode-s2-2] Log coupling state between VerifyGate and GoalRunner
@@ -1533,6 +1574,152 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 return
             }
             await self.maybeRunRetrospective()
+        }
+    }
+
+    // MARK: - Phase F: Spec Writing & Review flow
+
+    /// [T-deep-mode-phase-f] Enter the spec-writing phase after verification
+    /// passes (only when Spec mode is live). Injects a spec-generation prompt
+    /// and recurses into `runAgentLoop()` so the model can write spec.md /
+    /// checklist.md / tasks.md and append `<<SPEC_STATE>>`. Fail-safe: if the
+    /// gate guard fails, fall back to a normal workflow finish (zero blockage).
+    private func beginSpecWriting() async {
+        guard specActive else { scheduleWorkflowFinish(); return }
+        guard workflowPhase == .verifying else { scheduleWorkflowFinish(); return }
+        workflowPhase = .specWriting
+        pendingSpecSentinel = false
+        pendingSpecFiles = []
+        specEditRoundsLeft = SpecGate.maxEditRounds
+        logger.info("[SpecGate] Phase F — entered spec-writing")
+        let cont = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>深度模式规格化阶段：你刚刚完成执行并通过自检。现在请把已完成的成果正式化为一套规格文档。用 file_write（create_dirs=true）写出三个文件：spec.md（目标 / 范围内外 / 功能清单 / 验收标准）、checklist.md（对照验收标准的检查清单）、tasks.md（任务拆分，独立的可并行任务用 [PARALLEL] 标注）。直接基于你实际完成的工作来写，不要发明新的需求。三个文件都写完、且只用这一个回复序完成后，在回复最末尾另起一行补上：\n<<SPEC_STATE>>\n本阶段只写这三份规格文档，不要开始任何新的执行工作。</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(cont)
+        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+        do {
+            try await runAgentLoop()
+        } catch is CancellationError {
+            logger.info("[SpecGate] spec-writing cancelled")
+            handleUserCancelledCleanup()
+        } catch {
+            logger.error("[SpecGate] spec-writing error: \(String(describing: error))")
+        }
+    }
+
+    /// [T-deep-mode-phase-f] Process the end of a spec-writing turn. Called at
+    /// turn end when `workflowPhase == .specWriting`. Harvests the produced
+    /// spec files and, on the sentinel or with detected docs, pauses in
+    /// `.specReviewing` for the user's approve / edit / reject.
+    ///   • sentinel present / docs detected → enter `.specReviewing`.
+    ///   • no sentinel and no docs (or a failed / resumable turn) → fail-safe
+    ///     finish so the capsule never hangs.
+    private func maybeProcessSpecResult(afterMsgIdx msgIdx: Int) async {
+        logger.info("[WorkflowLog] maybeProcessSpecResult() - workflowPhase=\(workflowPhase)")
+        guard specActive else { return }
+        guard workflowPhase == .specWriting else { return }
+        guard messages.indices.contains(msgIdx),
+              messages[msgIdx].error == nil,
+              !canResume else {
+            scheduleSpecFinishFallback()
+            return
+        }
+
+        let detected = SpecGate.detectFiles(in: messages[msgIdx].blocks)
+        if !detected.isEmpty {
+            pendingSpecFiles = detected
+            specGateState = .awaitingReview(files: detected)
+            workflowPhase = .specReviewing
+            logger.info("[SpecGate] spec docs produced (\(detected.count)) — awaiting review")
+        } else if pendingSpecSentinel {
+            // Sentinelled but no product files captured; still let the user
+            // review the (possibly persisted) docs rather than block silently.
+            specGateState = .awaitingReview(files: [])
+            workflowPhase = .specReviewing
+            logger.info("[SpecGate] spec sentinel present but no docs detected — awaiting review")
+        } else {
+            // No sentinel and no files: the spec turn produced nothing useful.
+            logger.warning("[SpecGate] no spec docs and no sentinel — finishing (fail-safe)")
+            scheduleSpecFinishFallback()
+        }
+    }
+
+    /// [T-deep-mode-phase-f] Fail-safe finish when a spec-writing turn cannot
+    /// proceed (error, resumable, or produced nothing). Clears spec state and
+    /// finishes the workflow instead of hanging the capsule.
+    private func scheduleSpecFinishFallback() {
+        specGateState = .idle
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        scheduleWorkflowFinish()
+    }
+
+    /// [T-deep-mode-phase-f] User approved the generated spec docs. Transition
+    /// through `.specApproved` and finish the workflow.
+    func specApprove() {
+        guard specActive else { return }
+        guard workflowPhase == .specReviewing else { return }
+        specGateState = .approved
+        workflowPhase = .specApproved
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        logger.info("[SpecGate] user approved spec — finishing workflow")
+        scheduleWorkflowFinish()
+    }
+
+    /// [T-deep-mode-phase-f] User wants to edit / regenerate the spec docs.
+    /// Bounded by `specEditRoundsLeft`. Re-injects the spec prompt and
+    /// re-enters writing. When the budget is exhausted, treat as approved.
+    func specEdit() {
+        guard specActive else { return }
+        guard workflowPhase == .specReviewing else { return }
+        guard specEditRoundsLeft > 0 else { specApprove(); return }
+        specEditRoundsLeft -= 1
+        specGateState = .idle
+        pendingSpecSentinel = false
+        workflowPhase = .specWriting
+        logger.info("[SpecGate] user requested spec edit (rounds left: \(specEditRoundsLeft))")
+        Task { await injectSpecEditPromptAndRun() }
+    }
+
+    /// [T-deep-mode-phase-f] User rejected the spec / wants to abandon Spec
+    /// mode for this workflow. Finish without further execution (docs stay on
+    /// disk if they were written, but the workflow closes).
+    func specReject() {
+        guard specActive else { return }
+        guard workflowPhase == .specReviewing else { return }
+        specGateState = .idle
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        logger.info("[SpecGate] user rejected spec — finishing workflow")
+        resetWorkflow()
+    }
+
+    /// [T-deep-mode-phase-f] Inject an edit prompt for the spec docs and recurse
+    /// into `runAgentLoop()`. Reuses the same sentinel contract.
+    private func injectSpecEditPromptAndRun() async {
+        guard specActive, workflowPhase == .specWriting else {
+            scheduleWorkflowFinish()
+            return
+        }
+        let cont = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>规格文档需要修改。请根据用户刚才的修改意见，用 file_write 重新写入需要调整的 spec.md / checklist.md / tasks.md，然后在这个回复最末尾另起一行补上：\n<<SPEC_STATE>>\n（本阶段只写规格文档，不要开始新的执行工作。）</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(cont)
+        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+        do {
+            try await runAgentLoop()
+        } catch is CancellationError {
+            logger.info("[SpecGate] spec edit cancelled")
+            handleUserCancelledCleanup()
+        } catch {
+            logger.error("[SpecGate] spec edit error: \(String(describing: error))")
         }
     }
 
@@ -3241,6 +3428,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // Pure prompt addition inside deepModeFragment — fully governed by
         // the master switch (never injected when deep mode is off).
         s += "13. SKILL ACCUMULATION — If about the 3rd time in this session you're handling the SAME type of task (a recurring workflow: producing a docx report, generating a slide deck, the same class of code fix), that workflow is a candidate for a reusable skill. Mention it to the user in one line and offer to create one using the skill format. Do NOT propose a skill on the first or second occurrence — only when a reliable pattern has clearly emerged.\n"
+        // [T-deep-mode-phase-d] Phase D: Inline-visualization guidance. Teaches
+        // the model when and how to use the render_widget tool. Pure prompt
+        // addition inside deepModeFragment — governed by the master switch.
+        s += "14. VISUALIZATION — You have a `render_widget` tool that renders an SVG diagram/chart or an isolated HTML widget INLINE in the chat (not saved as a file). Use it when a visual communicates better than prose: for flowcharts and architecture/sequence diagrams, comparison tables, small data charts, or interactive demos. Provide well-formed inline SVG for 'diagram'/'chart'/'comparison' and self-contained HTML (inline <script> allowed, NO external network assets) for 'interactive'. Keep it compact and readable; width auto-fits the container. Fall back to normal markdown text when prose or a table is clearer. Do NOT use render_widget for content that is better as a real saved file the user can open elsewhere.\n"
+        // [T-deep-mode-phase-e] Phase E: Scheduled-automation guidance. Teaches
+        // the model when and how to use the schedule_task tool. Pure prompt
+        // addition inside deepModeFragment — governed by the master switch.
+        // The tool is only registered in deep mode; created tasks stay
+        // manageable in Settings regardless of the switch.
+        s += "15. SCHEDULED AUTOMATION — You have a `schedule_task` tool that creates a repeating AI action (run daily / weekdays / on specific days at a set time). Use it when the user asks to set up anything recurring: '每天 9 点生成日报', '每个工作日早上整理邮件', '每周一运行安全检查'. Parse the natural-language request into the structured arguments: a short `label`, a fully self-contained `prompt` (the task starts in a FRESH chat, so include all necessary context), a 24-hour `time` (HH:MM), and a `repeat` mode (daily / weekdays / custom + days). After creating, tell the user the next-fire time and that they can manage the task in Settings → Agent Runtime → Scheduled Tasks. The task runs on a best-effort schedule via a local notification + open-time catch-up; a missed fire is caught the next time the app is opened, never silently dropped.\n"
+        // [T-deep-mode-phase-f] Phase F: Spec-mode guidance. Injected ONLY when
+        // the Spec toggle is on (deep-mode fragment is already gated on the
+        // master switch, so `SpecGate.modeEnabled && deepModeEnabled` together
+        // gate this). Pure prompt addition — zero runtime state.
+        if SpecGate.modeEnabled {
+            s += "16. SPECIFICATION (SPEC) MODE — an OPTIONAL phase AFTER verification passes. Only activate when BOTH deep mode is on AND Spec mode is enabled (the client will already have entered the spec-writing phase and told you to start). Formalize the completed work into THREE documents with file_write (create_dirs=true): spec.md (goal / scope-in / scope-out / feature list / acceptance criteria), checklist.md (a verification checklist derived from the acceptance criteria), tasks.md (task breakdown, marking independent tasks with [PARALLEL]). Keep each document precise, structured markdown; reuse the actual work you just did — do NOT invent new requirements. At the END of your turn, after all three files are written, append exactly one line:\n  <<SPEC_STATE>>\nDo NOT start new execution work during the spec-writing phase — only write the three specification documents.\n"
+        }
         _cachedDeepModeFragment = s
         _cachedDeepModeFragmentKey = cacheKey
         return s
@@ -5952,6 +6156,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 case .browserTool: return "browser"
                 case .readImageTool: return "readImage"
                 case .memoryTool: return "memory"
+                case .visualization: return "visualization"
                 case .info: return "info"
                 }
             }()
@@ -7271,6 +7476,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 if let clean = VerifyGate.textWithoutSentinel(assistantText) {
                     assistantText = clean
                 }
+                // [T-deep-mode-phase-f] Phase F: resolve + strip the SPEC_STATE
+                // sentinel at text-capture time, same two-phase pattern. Only
+                // engages when Spec mode is active (deepMode && specModeEnabled)
+                // and we're in the spec-writing phase.
+                if workflowPhase == .specWriting {
+                    pendingSpecSentinel = SpecGate.parse(assistantText)
+                    if let clean = SpecGate.textWithoutSpecSentinel(assistantText) {
+                        assistantText = clean
+                    }
+                }
                 // [T-deep-mode-cognitive-p2-c9] C9: Parse + strip the cognitive
                 // load sentinel. The model emits `<<COGNITIVE_LOAD>> level` at
                 // the end of tool-bearing turns. The parsed signal is merged
@@ -8065,6 +8280,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // process the verify sentinel and either finish the workflow or loop
         // back to execution for a fix round. No-op in any other phase.
         await maybeProcessVerifyResult(afterMsgIdx: msgIdx)
+
+        // [T-deep-mode-phase-f] Phase F: if we are in the spec-writing phase,
+        // process any produced spec documents and pause in `.specReviewing`
+        // for the user's approve / edit / reject. No-op in any other phase.
+        await maybeProcessSpecResult(afterMsgIdx: msgIdx)
 
     }
 

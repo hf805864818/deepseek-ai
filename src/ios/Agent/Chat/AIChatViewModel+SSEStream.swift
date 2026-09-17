@@ -445,6 +445,7 @@ extension AIChatViewModel {
                     case "browser_use": .browserTool(action: "")
                     case "read_image": .readImageTool(path: "")
                     case "memory_write", "memory_get": .memoryTool(action: name)
+                    case "render_widget": .visualization
                     default: .shellTool(command: name)
                     }
                     if name == "file_write" || name == "file_edit" {

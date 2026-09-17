@@ -14,6 +14,9 @@ extension WorkflowPhase {
         case .planning: return "规划中"
         case .executing: return "执行中"
         case .verifying: return "复查中"
+        case .specWriting: return "规格化中"
+        case .specReviewing: return "规格待审核"
+        case .specApproved: return "规格已批准"
         }
     }
 
@@ -24,6 +27,9 @@ extension WorkflowPhase {
         case .planning: return "list.bullet.rectangle"
         case .executing: return "gearshape.2"
         case .verifying: return "checkmark.circle.fill"
+        case .specWriting: return "doc.text.write"
+        case .specReviewing: return "doc.text.magnifyingglass"
+        case .specApproved: return "checkmark.seal.fill"
         }
     }
 }

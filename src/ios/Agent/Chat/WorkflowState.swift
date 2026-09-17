@@ -27,6 +27,17 @@ enum WorkflowPhase: Equatable {
     /// All steps stay `.done` visually during this phase (the user sees
     /// "复查中" on an all-green list).
     case verifying
+    /// [T-deep-mode-phase-f] Spec mode: entered after verification passes
+    /// (and only when deepModeEnabled && specModeEnabled). The client injects
+    /// a spec-writing prompt; the model writes spec.md / checklist.md /
+    /// tasks.md via file_write and emits `<<SPEC_STATE>>`. In-memory only,
+    /// never persisted — off switch leaves zero residue.
+    case specWriting
+    /// [T-deep-mode-phase-f] Awaiting the user's review of the generated spec
+    /// documents (approve / edit / reject). Paused until the user acts.
+    case specReviewing
+    /// [T-deep-mode-phase-f] Spec approved — the workflow can finish.
+    case specApproved
 }
 
 enum WorkflowStepStatus: Equatable {
