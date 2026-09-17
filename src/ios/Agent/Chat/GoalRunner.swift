@@ -104,3 +104,44 @@ struct GoalRunner {
         return cleaned
     }
 }
+
+/// [T-deep-mode-session-workflow] P1: Goal completion-condition evaluator.
+///
+/// The model's `<<GOAL_STATE>>` sentinel already says *done / pending*; this
+/// adds a deterministic CLIENT-side check on top so the "每轮结算评估" stays
+/// bounded and can't be defeated by a model that over-optimistically reports
+/// `done`, or under-reports by never finishing. It evaluates a settlement
+/// snapshot and returns `passed` / `continue` / `capReached`.
+enum GoalCompletionEvaluator {
+
+    /// Deterministic verdict for one settlement round.
+    enum Verdict: Equatable {
+        /// All parsed plan steps are done (or there were none) → wrap up.
+        case passed
+        /// Work remains and auto-continue budget is not exhausted → keep going.
+        case `continue`
+        /// Work remains but the auto-continue budget is exhausted → stop.
+        case capReached
+    }
+
+    /// Evaluate a settlement snapshot. Pure function, total-switch-safe: the
+    /// caller only invokes it inside a `deepModeEnabled` path.
+    ///
+    /// - Parameters:
+    ///   - steps: the parsed workflow step list at settlement.
+    ///   - broad: when true, treat "all done OR empty" as passed. When false,
+    ///     an empty step list never passes (nothing to claim complete).
+    ///   - roundsLeft: remaining auto-continue budget after this round.
+    static func evaluate(
+        steps: [WorkflowStep],
+        broad: Bool = true,
+        roundsLeft: Int
+    ) -> Verdict {
+        if steps.isEmpty {
+            return broad ? .passed : .`continue`
+        }
+        let allDone = steps.allSatisfy { $0.status == .done }
+        if allDone { return .passed }
+        return roundsLeft > 0 ? .`continue` : .capReached
+    }
+}

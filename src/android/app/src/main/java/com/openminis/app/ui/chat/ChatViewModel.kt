@@ -1277,6 +1277,22 @@ class ChatViewModel(
     val workflowSteps: StateFlow<List<com.openminis.app.agent.WorkflowStep>> =
         _workflowSteps.asStateFlow()
 
+    // [T-deep-mode-session-workflow] Android P0: paused-workflow snapshot so a
+    // Stop → resume round-trip preserves the SAME session workflow instead of
+    // resetting to idle. Mirrors iOS `savedWorkflowState`. Total-switch safe:
+    // saved only when deep mode is on and phase != IDLE, and cleared by the
+    // deep-mode-off cleanup so nothing survives a toggle-off. A fresh user send
+    // (sendMessage) clears it via the reset path so interjections during an
+    // in-flight workflow are the ONLY thing that keeps it alive.
+    private data class SavedWorkflowSnapshot(
+        val phase: com.openminis.app.agent.WorkflowPhase,
+        val steps: List<com.openminis.app.agent.WorkflowStep>,
+        val verifyRoundsLeft: Int,
+    )
+
+    @Volatile
+    private var savedWorkflowState: SavedWorkflowSnapshot? = null
+
     // MARK: - ClarifyGate
     internal val _clarifyState = MutableStateFlow(com.openminis.app.agent.ClarifyGate.State.IDLE)
     val clarifyState: StateFlow<com.openminis.app.agent.ClarifyGate.State> = _clarifyState.asStateFlow()
@@ -1877,6 +1893,13 @@ class ChatViewModel(
         )
         // Reset gate states when deep mode is toggled off
         if (!newValue) {
+            // [T-deep-mode-session-workflow] Android P0: discard any paused
+            // workflow snapshot so a later re-enable starts from a clean idle —
+            // nothing about a stopped workflow survives the total switch off.
+            savedWorkflowState = null
+            // Also reset the workflow phase/steps so no progress capsule lingers.
+            _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+            _workflowSteps.value = emptyList()
             _planGateState.value = com.openminis.app.agent.PlanGate.State.IDLE
             pendingPlanText = null
             _clarifyState.value = com.openminis.app.agent.ClarifyGate.State.IDLE
@@ -6048,6 +6071,14 @@ class ChatViewModel(
                 (_workflowPhase.value == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
                     _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.VERIFYING)
         if (!inFlightWorkflow) {
+            // [T-deep-mode-session-workflow] Android P0: a fresh task starts
+            // from a clean session workflow — drop any paused snapshot, reset
+            // phase/steps so a previous workflow can never linger into the new
+            // task. (When in-flight, the snapshot/reset are intentionally
+            // preserved: interjections merge into the active workflow.)
+            savedWorkflowState = null
+            _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+            _workflowSteps.value = emptyList()
             // [T-deep-mode-goal-runner] Reset GoalRunner rounds on every fresh
             // user message. Auto-continuation rounds only count within one user
             // prompt's agent loop.
@@ -8439,6 +8470,54 @@ class ChatViewModel(
                             }
                         }
                         com.openminis.app.agent.GoalRunner.ParseResult.DONE -> {
+                            // [T-deep-mode-session-workflow] P1: cross-check a
+                            // `done` claim against the client-side completion
+                            // evaluator before wrapping up. If a plan is being
+                            // tracked and NOT all steps are done, don't trust a
+                            // premature `done` — nudge the model to finish the
+                            // remaining steps. Mirrors iOS. Bounded by
+                            // goalRunnerRoundsLeft so it can never loop forever.
+                            val stepsSnapshot = _workflowSteps.value
+                            if (stepsSnapshot.isNotEmpty()) {
+                                val verdict = com.openminis.app.agent.GoalCompletionEvaluator.evaluate(
+                                    steps = stepsSnapshot,
+                                    broad = false,
+                                    roundsLeft = goalRunnerRoundsLeft,
+                                )
+                                if (verdict == com.openminis.app.agent.GoalCompletionEvaluator.Verdict.CONTINUE) {
+                                    AppLogger.info(
+                                        TAG_STREAM,
+                                        "GoalRunner: done claimed but steps remain — continuing",
+                                    )
+                                    goalRunnerRoundsLeft--
+                                    advanceWorkflowStep()
+                                    val reminderText = buildString {
+                                        append(
+                                            "<system-reminder>Goal auto-continue " +
+                                                "(${com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS - goalRunnerRoundsLeft}" +
+                                                "/${com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS}): "
+                                        )
+                                        append(
+                                            "You marked the task done in your last reply, " +
+                                                "but some plan steps are still not executed. " +
+                                                "Please continue and finish the remaining steps, " +
+                                                "then end with <<GOAL_STATE>> done.</system-reminder>"
+                                        )
+                                    }
+                                    agentHistory.add(
+                                        LLMMessage(
+                                            role = LLMMessage.Role.USER,
+                                            content = reminderText,
+                                            contentParts = listOf(
+                                                AgentContentPart.Text(reminderText)
+                                            ),
+                                        )
+                                    )
+                                    continue
+                                }
+                            }
+                            // [T-deep-mode-session-workflow] P1: no custom
+                            // continue needed — trust the done and wrap up.
                             AppLogger.info(
                                 TAG_STREAM,
                                 "GoalRunner: done → checking VerifyGate",
@@ -8696,6 +8775,72 @@ class ChatViewModel(
                 }
 
                 loopExitedNormally = true
+                // [T-deep-mode-session-workflow] P1: if the execution turn
+                // ended with no goal sentinel at all (model forgot, or last
+                // turn had no tool call), run the client completion evaluator.
+                // When every parsed plan step is already done, treat the task
+                // as complete — all-green + verifying (mirror the DONE branch
+                // below so a real self-verify prompt fires) instead of leaving
+                // the capsule stuck in EXECUTING. Total-switch safe (deepModeOn).
+                if (_deepModeEnabled.value &&
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.EXECUTING &&
+                    goalSentinel == null
+                ) {
+                    val verdict = com.openminis.app.agent.GoalCompletionEvaluator.evaluate(
+                        steps = _workflowSteps.value,
+                        broad = false,
+                        roundsLeft = goalRunnerRoundsLeft,
+                    )
+                    if (verdict == com.openminis.app.agent.GoalCompletionEvaluator.Verdict.PASSED) {
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "GoalRunner: no sentinel but all steps done — completing workflow",
+                        )
+                        completeWorkflowSteps()
+                        if (verifyPhase == VerifyPhase.IDLE && verifyRoundsLeft > 0) {
+                            verifyPhase = VerifyPhase.VERIFYING
+                            val verifyReminder = buildString {
+                                append(
+                                    "<system-reminder>VERIFICATION PHASE: "
+                                )
+                                append(
+                                    "You just finished the task. Now verify " +
+                                        "your work: run tests, preview results, " +
+                                        "read back the files you changed, confirm " +
+                                        "everything works correctly. Use tools to " +
+                                        "ACTUALLY verify — do NOT just write text " +
+                                        "saying it's fine."
+                                )
+                                append(
+                                    " At the END of this turn, append one line:"
+                                )
+                                append(
+                                    "\n<<VERIFY_STATE>> passed — if everything checks out"
+                                )
+                                append(
+                                    "\n<<VERIFY_STATE>> failed: <reason + fix plan> — if you found issues"
+                                )
+                                append("</system-reminder>")
+                            }
+                            agentHistory.add(
+                                LLMMessage(
+                                    role = LLMMessage.Role.USER,
+                                    content = verifyReminder,
+                                    contentParts = listOf(
+                                        AgentContentPart.Text(verifyReminder)
+                                    ),
+                                )
+                            )
+                            continue
+                        } else {
+                            // Verify budget exhausted → go straight to done.
+                            goalSentinel = com.openminis.app.agent.GoalRunner.ParsedSentinel(
+                                com.openminis.app.agent.GoalRunner.ParseResult.DONE
+                            )
+                        }
+                        break
+                    }
+                }
                 break
             }
             AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn dispatching ${toolCalls.size} tool call(s), continuing")
@@ -12010,6 +12155,26 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
             // Mid-turn rename: sweep any lingering draft shell too.
             ExecutionCoordinator.stopCurrentCommand(sessionId)
         }
+        // [T-deep-mode-session-workflow] Android P0: snapshot the in-flight
+        // workflow BEFORE handleUserCancelledCleanup runs, so a Stop → resume
+        // round-trip restores the same session workflow (phase / steps /
+        // verify budget) instead of resetting to idle. Total-switch safe: only
+        // saved when deep mode is on and a workflow is actually in flight, and
+        // cleared by the toggle-off cleanup. Mirrors iOS cancel().
+        if (_deepModeEnabled.value &&
+            _workflowPhase.value != com.openminis.app.agent.WorkflowPhase.IDLE
+        ) {
+            savedWorkflowState = SavedWorkflowSnapshot(
+                phase = _workflowPhase.value,
+                steps = _workflowSteps.value,
+                verifyRoundsLeft = verifyRoundsLeft,
+            )
+            AppLogger.info(
+                TAG_STREAM,
+                "cancelStream: saved workflow state phase=${_workflowPhase.value} " +
+                    "steps=${_workflowSteps.value.size}",
+            )
+        }
         handleUserCancelledCleanup()
 
         // T189: iOS parity (AIChatViewModel.swift L2592-2610). If the user
@@ -12325,6 +12490,26 @@ SKILL ACCUMULATION — If about the 3rd time in this session you're handling the
         // turn-limit banner on the next reload.
         clearPersistedLastAssistantError()
         AppLogger.info(TAG, "▶️ resume: continuing partial assistant message (no new header emitted)")
+
+        // [T-deep-mode-session-workflow] Android P0: restore a paused workflow
+        // snapshot saved on Stop so resume continues the SAME session workflow
+        // (phase / steps / verify budget) instead of resetting to idle. Mirrors
+        // iOS resume(). Total-switch safe: only restored when deep mode is on;
+        // the toggle-off cleanup nulls the snapshot so a resume can never
+        // resurrect workflow UI contradicting a disabled deep mode.
+        if (_deepModeEnabled.value && savedWorkflowState != null) {
+            val saved = savedWorkflowState!!
+            _workflowPhase.value = saved.phase
+            _workflowSteps.value = saved.steps
+            verifyRoundsLeft = saved.verifyRoundsLeft
+            savedWorkflowState = null
+            AppLogger.info(
+                TAG_STREAM,
+                "resume: restored workflow state phase=${saved.phase} steps=${saved.steps.size}",
+            )
+        } else {
+            savedWorkflowState = null
+        }
         // [T-android-tool-autoscroll] Start-of-turn snap. The thinking
         // placeholder is the only visible delta until the model's first
         // token, and the auto-follow tuple won't advance until content

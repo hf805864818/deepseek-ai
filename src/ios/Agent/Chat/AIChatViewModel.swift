@@ -1579,8 +1579,24 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // [T-deep-mode-verify-gate] Phase 2: but don't clear during verifying —
             // that phase has its own lifecycle and shouldn't be wiped by the
             // absence of a goal sentinel (verify turns use the VERIFY sentinel).
+            // [T-deep-mode-session-workflow] P1: before wiping, run the client
+            // completion evaluator. If every parsed plan step is already done but
+            // the model simply forgot to emit `<<GOAL_STATE>> done`, treat the
+            // turn as complete (all-green + verifying) instead of hard-resetting
+            // to idle — this is the fix for the "capsule disappears after the
+            // last shell command" observation. Only when steps genuinely remain
+            // (or there is no plan to complete) do we reset.
             if workflowPhase != .verifying {
-                finishWorkflow()
+                let verdict = GoalCompletionEvaluator.evaluate(
+                    steps: workflowSteps,
+                    broad: false,
+                    roundsLeft: goalRunnerRoundsLeft
+                )
+                if workflowPhase == .executing, verdict == .passed {
+                    await completeWorkflow()
+                } else {
+                    finishWorkflow()
+                }
             }
             return
         }
@@ -1589,9 +1605,47 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         case .done:
             logger.info("[GoalRunner] done sentinel — resetting auto-continue budget")
             goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-            // [T-deep-mode-workflow] Task complete: show an all-green completion
-            // for a beat, then fade the tracker out (no lingering residue).
-            await completeWorkflow()
+            // [T-deep-mode-session-workflow] P1: cross-check that a `done`
+            // claim is credible. If a plan is being tracked and the client-side
+            // evaluator says NOT all steps are done, don't trust a premature
+            // `done` — nudge the model to finish the remaining steps instead of
+            // wrapping early. (Deterministic stop-when-achieved; still bounded
+            // by goalRunnerRoundsLeft so it can never loop forever.)
+            let verdict = GoalCompletionEvaluator.evaluate(
+                steps: workflowSteps,
+                broad: false,
+                roundsLeft: goalRunnerRoundsLeft
+            )
+            if workflowSteps.isEmpty {
+                // No parsed plan → trust the model's `done` and wrap up.
+                await completeWorkflow()
+            } else if verdict == .passed {
+                // [T-deep-mode-workflow] Task complete: show an all-green completion
+                // for a beat, then fade the tracker out (no lingering residue).
+                await completeWorkflow()
+            } else {
+                // Steps remain but model claims done — ask it to keep going once
+                // more rather than accepting an incomplete task. Bounded: after
+                // decrementing, if budget hit 0 we stop and finish anyway.
+                goalRunnerRoundsLeft -= 1
+                advanceWorkflowStep()
+                let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
+                logger.info("[GoalRunner] done claimed but steps remain — continue \(used)/\(GoalRunner.maxAutoRounds)")
+                let next = "你在上一条回复中标记任务已完成，但仍有计划步骤尚未执行。请继续完成剩余步骤，全部完成后以 <<GOAL_STATE>> done 结束本回合。"
+                let cont = AgentMessage(role: .user, parts: [
+                    .text("<system-reminder>深度模式自动续跑：\(next)</system-reminder>")
+                ])
+                let ci = agentHistory.count
+                agentHistory.append(cont)
+                do {
+                    try await runAgentLoop()
+                } catch is CancellationError {
+                    logger.info("[GoalRunner] auto-continue (post-done) cancelled")
+                    handleUserCancelledCleanup()
+                } catch {
+                    logger.error("[GoalRunner] auto-continue (post-done) error: \(String(describing: error))")
+                }
+            }
         // [T-deep-mode-cognitive-p2-c10] Dynamic autonomy exit: the model
         // proactively asks for user input instead of guessing. Stop the
         // auto-continuation loop, surface the reason, and wait for the user.

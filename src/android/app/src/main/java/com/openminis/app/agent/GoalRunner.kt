@@ -115,3 +115,38 @@ Important rules:
 - The hard cap is $MAX_AUTO_ROUNDS auto-continue rounds per user message. Use them wisely.
 """
 }
+
+/**
+ * [T-deep-mode-session-workflow] P1: Goal completion-condition evaluator.
+ *
+ * Adds a deterministic CLIENT-side check on top of the model's
+ * [GoalRunner.parse] sentinel so the "每轮结算评估" stays bounded and can't be
+ * defeated by a model that over-optimistically reports DONE, or never finishes.
+ * Evaluates a settlement snapshot and returns Passed / Continue / CapReached.
+ */
+object GoalCompletionEvaluator {
+
+    enum class Verdict { PASSED, CONTINUE, CAP_REACHED }
+
+    /**
+     * Evaluate a settlement snapshot. Pure function, total-switch-safe: the
+     * caller only invokes it inside a deep-mode-gated path.
+     *
+     * @param steps the parsed workflow step list at settlement.
+     * @param broad when true, treat "all done OR empty" as passed; when false,
+     *   an empty step list never passes (nothing to claim complete).
+     * @param roundsLeft remaining auto-continue budget after this round.
+     */
+    fun evaluate(
+        steps: List<com.openminis.app.agent.WorkflowStep>,
+        broad: Boolean = true,
+        roundsLeft: Int,
+    ): Verdict {
+        if (steps.isEmpty()) {
+            return if (broad) Verdict.PASSED else Verdict.CONTINUE
+        }
+        val allDone = steps.all { it.status == com.openminis.app.agent.WorkflowStepStatus.DONE }
+        if (allDone) return Verdict.PASSED
+        return if (roundsLeft > 0) Verdict.CONTINUE else Verdict.CAP_REACHED
+    }
+}
