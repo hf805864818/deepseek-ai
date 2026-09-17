@@ -31,11 +31,11 @@ struct RunScheduledTaskIntent: AppIntent {
     func perform() async throws -> some IntentResult & ReturnsValue<RunScheduledTaskResult> & ProvidesDialog {
         let id = task?.id ?? taskIdOverride ?? ""
         guard !id.isEmpty else {
-            throw IntentError.customMessage("No scheduled task selected.")
+            throw ScheduledTaskIntentError.noSelection
         }
         let store = ScheduledTaskStore()
         guard let item = store.task(id) else {
-            throw IntentError.customMessage("Scheduled task not found.")
+            throw ScheduledTaskIntentError.notFound
         }
 
         // Fire-and-forget the run; the result is reported via the return value.
@@ -49,6 +49,22 @@ struct RunScheduledTaskIntent: AppIntent {
             triggeredAt: Date().timeIntervalSince1970
         )
         return .result(value: result, dialog: "\(item.label) started in a new chat.")
+    }
+}
+
+/// User-facing error surfaced by the intent (works on iOS 16+; unlike
+/// IntentFailure.customMessage which requires iOS 17+).
+private enum ScheduledTaskIntentError: String, LocalizedError {
+    case noSelection
+    case notFound
+
+    var errorDescription: String? {
+        switch self {
+        case .noSelection:
+            return "No scheduled task selected. Pick a task or supply a Task ID."
+        case .notFound:
+            return "That scheduled task could not be found. It may have been deleted."
+        }
     }
 }
 
@@ -86,7 +102,9 @@ struct ScheduledTaskEntityQuery: EntityQuery {
 }
 
 /// Result payload returned by RunScheduledTaskIntent.
-struct RunScheduledTaskResult: AppIntentResult {
+/// `Codable` + `Sendable` is all that `ReturnsValue<RunScheduledTaskResult>` requires
+/// (there is no public `AppIntentResult` base protocol to conform to).
+struct RunScheduledTaskResult: Codable, Sendable {
     let taskId: String
     let label: String
     let prompt: String

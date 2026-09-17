@@ -53,7 +53,6 @@ internal fun WidgetInlineCard(content: String) {
                 @SuppressLint("SetJavaScriptEnabled")
                 WebView(ctx).apply {
                     settings.javaScriptEnabled = true
-                    isOpaque = false
                     setBackgroundColor(android.graphics.Color.TRANSPARENT)
                     loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
                 }

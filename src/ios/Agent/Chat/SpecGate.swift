@@ -36,13 +36,15 @@ enum SpecGate {
     /// Cap on reject→regenerate edit rounds per workflow.
     static let maxEditRounds = 2
 
+    /// The role of a produced spec artifact (also drives the output filename).
+    enum Role: String {
+        case spec = "spec"
+        case checklist = "checklist"
+        case tasks = "tasks"
+    }
+
     /// A produced spec artifact (role → filename/path).
     struct SpecFile: Equatable, Identifiable {
-        enum Role: String {
-            case spec = "spec"
-            case checklist = "checklist"
-            case tasks = "tasks"
-        }
         let role: Role
         /// Display name: spec.md / checklist.md / tasks.md
         var fileName: String {

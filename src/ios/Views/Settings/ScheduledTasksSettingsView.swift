@@ -17,11 +17,20 @@ struct ScheduledTasksSettingsView: View {
         NavigationStack(path: $path) {
             List {
                 if scheduler.store.tasks.isEmpty {
-                    ContentUnavailableView(
-                        "No Scheduled Tasks",
-                        systemImage: "clock.badge.questionmark",
-                        description: Text("Ask the AI in deep mode to set a repeating task, e.g. \"每天 9 点生成日报\". Tasks appear here and run automatically.")
-                    )
+                    VStack(spacing: 10) {
+                        Image(systemName: "clock.badge.questionmark")
+                            .font(.system(size: 38))
+                            .foregroundStyle(.secondary)
+                        Text("No Scheduled Tasks")
+                            .font(.headline)
+                        Text("Ask the AI in deep mode to set a repeating task, e.g. \"每天 9 点生成日报\". Tasks appear here and run automatically.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 44)
+                    .padding(.horizontal, 24)
                 } else {
                     ForEach(scheduler.store.tasks) { task in
                         ScheduledTaskRow(task: task)

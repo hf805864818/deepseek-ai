@@ -2308,9 +2308,8 @@ class ChatViewModel(
         if (_specGateState.value != com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) return
         runCatching {
             val host = com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(sessionId, path, context)
-            val file = java.io.File(host)
-            if (file.isFile) {
-                val head = file.readText(Charsets.UTF_8).trim().take(1200)
+            if (host != null && host.isFile) {
+                val head = host.readText(Charsets.UTF_8).trim().take(1200)
                 appendSystemInfo(text = "规格产物预览：$path\n\n$head", iconKind = "list")
             } else {
                 appendSystemInfo(text = "无法预览（文件不存在）：$path", iconKind = "close")
