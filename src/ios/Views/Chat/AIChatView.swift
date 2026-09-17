@@ -987,7 +987,7 @@ struct AIChatView: View {
                                 .padding(.trailing, 4)
                                 .frame(maxWidth: maxContentWidth ?? .infinity, alignment: .trailing)
                                 .padding(.horizontal, 12)
-                                .padding(.bottom, inputBarHeight + (hasFloatingPreview ? 80 : 12) + 56)
+                                .padding(.bottom, inputBarHeight + (hasFloatingPreview ? 80 : 12) + 136)
                                 .transition(.opacity)
                         }
                     }

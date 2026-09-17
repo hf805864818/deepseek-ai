@@ -282,7 +282,16 @@ struct FloatingWorkflowPanel: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundColor(ChatColors.secondaryText)
             }
-            WorkflowStepsList(steps: steps)
+            // Bounded + internally scrollable so a long step list stays a
+            // compact top card (keeping the popup at its original docked
+            // position) instead of growing down to the input/chip area.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    WorkflowStepsList(steps: steps)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 260)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -459,7 +468,7 @@ struct FloatingConfirmPanel: View {
                         Text(path.title)
                             .font(.caption.weight(.semibold))
                             .foregroundColor(ChatColors.primaryText)
-                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 4)
                         riskBadge(path.riskLevel)
                     }
@@ -467,7 +476,8 @@ struct FloatingConfirmPanel: View {
                         Text(path.rationale)
                             .font(.caption2)
                             .foregroundColor(ChatColors.secondaryText)
-                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
