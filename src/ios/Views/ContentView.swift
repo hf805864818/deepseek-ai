@@ -7478,14 +7478,6 @@ private struct SettingsSheet: View {
                         // live VMs tear down Phase 1 state the instant it turns off.
                         NotificationCenter.default.post(name: .deepModeDidChange, object: nil)
                     }
-                    // [T-deep-mode-phase-e] Scheduled Tasks entry. This is the
-                    // 已建任务管理常驻 surface: reachable even when the master
-                    // switch is off, so a scheduled task is never orphaned.
-                    NavigationLink {
-                        ScheduledTasksSettingsView()
-                    } label: {
-                        Label("Scheduled Tasks", systemImage: "clock.badge")
-                    }
                     // [T-deep-mode-phase-f] Spec mode toggle. Optional layer on
                     // top of plan→execute→verify; only active when BOTH the
                     // master switch and this toggle are on.
@@ -7561,6 +7553,14 @@ private struct SettingsSheet: View {
                                 .frame(width: 21, height: 21)
                                 .background(.green, in: Circle())
                         }
+                    }
+                    // [T-deep-mode-phase-e] Scheduled Tasks entry. This is the
+                    // 已建任务管理常驻 surface: reachable even when the master
+                    // switch is off, so a scheduled task is never orphaned.
+                    NavigationLink {
+                        ScheduledTasksSettingsView()
+                    } label: {
+                        Label("Scheduled Tasks", systemImage: "clock.badge")
                     }
                 }
 

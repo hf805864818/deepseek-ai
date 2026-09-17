@@ -188,21 +188,19 @@ struct FloatingWorkflowCapsule: View {
     /// high-cost tool call does not read as a frozen "0/x".
     var busy: Bool = false
 
-    @State private var isExpanded = false
+    /// [T-deep-mode-panel-anchor] The toggle chip is pinned near the download
+    /// button and stays put whether the panel is shown or hidden; the expanded
+    /// panel lives in its own `FloatingWorkflowPanel` docked at the top.
+    /// Tapping the chip flips this shared binding.
+    @Binding var isExpanded: Bool
+
     @State private var pulsing = false
 
     private var doneCount: Int { steps.filter { $0.status == .done }.count }
     private var allDone: Bool { !steps.isEmpty && steps.allSatisfy { $0.status == .done } }
 
     var body: some View {
-        HStack(spacing: 0) {
-            if isExpanded {
-                expandedPanel
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-            }
-            collapsedChip
-        }
-        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isExpanded)
+        collapsedChip
         // [T-deep-mode-session-workflow] Audit M1: auto-collapse only when the
         // task TRULY completes (phase enters .verifying via completeWorkflow).
         // Collapsing on `allDone` alone is wrong now that event-level progress
@@ -236,7 +234,7 @@ struct FloatingWorkflowCapsule: View {
 
     private var collapsedChip: some View {
         Button {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded.toggle() }
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { isExpanded.wrappedValue.toggle() }
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: allDone ? "checkmark.circle.fill" : phase.symbolName)
@@ -257,8 +255,20 @@ struct FloatingWorkflowCapsule: View {
         }
         .buttonStyle(.plain)
     }
+}
 
-    private var expandedPanel: some View {
+// MARK: - FloatingWorkflowPanel
+
+/// [T-deep-mode-panel-anchor] The expanded task-progress popup. Docked at the
+/// top (its long-standing position) by the host; independent of the toggle chip
+/// so the popup never shifts when the chip is repositioned.
+struct FloatingWorkflowPanel: View {
+    let phase: WorkflowPhase
+    let steps: [WorkflowStep]
+
+    private var doneCount: Int { steps.filter { $0.status == .done }.count }
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: phase.symbolName)
@@ -281,6 +291,16 @@ struct FloatingWorkflowCapsule: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(ChatColors.toolBorder, lineWidth: 0.5))
         .shadow(color: Color.black.opacity(0.14), radius: 10, x: 0, y: 4)
+    }
+}
+
+// MARK: - BannerHeightPreferenceKey
+
+/// [T-deep-mode-banner-height] Preference key to report the height of the deep-mode banner stack so the floating progress panel can offset below it.
+struct BannerHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

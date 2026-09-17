@@ -180,6 +180,14 @@ struct AIChatView: View {
     // [T-browser-download-ux-v2] Downloads panel + "Show in Files" locate target.
     @State private var showDownloadsPanel = false
     @State private var locateDownloadTarget: DownloadLocateTarget?
+    // [T-deep-mode-panel-anchor] Shared expand state for the workflow progress
+    // panel: the toggle chip (pinned near the download button) and the popup
+    // panel (docked at the top) stay in sync but independent.
+    @State private var workflowExpanded = false
+    // [T-deep-mode-banner-height] Measured height of the deep-mode top banner
+    // (subagent dispatch capsules). The progress panel uses it to auto-drop
+    // below the banner and never overlap it.
+    @State private var workflowBannerHeight: CGFloat = 0
     /// Total session count snapshot (persisted in DB) — used to decide
     /// whether to show the New-Chat onboarding directory grid. Only the
     /// "first-time, no sessions yet" case shows it; returning users with
@@ -946,23 +954,54 @@ struct AIChatView: View {
                         // Full-screen kernel boot overlay
                         kernelBootOverlay
                     }
-                    // [T-deep-mode-floating-panel] Right-edge floating execution
-                    // capsule. Only while deep mode is on AND the workflow is
-                    // mid-execution/verification with parsed steps. Gated on the
-                    // master switch so disabling deep mode or completing the run
-                    // (steps empty → phase idle) destroys it with zero residue.
+                    // [T-deep-mode-floating-panel] The expanded task-progress
+                    // POPUP, docked at its original top inset. Always stays put;
+                    // toggled by the chip below (never moves).
                     .overlay(alignment: .topTrailing) {
+                        if vm.sessionWorkflowEnabled,
+                           (vm.workflowPhase == .executing || vm.workflowPhase == .verifying),
+                           !vm.workflowSteps.isEmpty,
+                           workflowExpanded {
+                            FloatingWorkflowPanel(phase: vm.workflowPhase,
+                                                  steps: vm.workflowSteps)
+                                // [T-deep-mode-banner-height] Auto-drop below the
+                                // top subagent-card banner when it's shown, so the
+                                // panel never overlaps the dispatch capsules.
+                                .padding(.top, 96 + workflowBannerHeight)
+                                .padding(.trailing, 10)
+                                .transition(.move(edge: .trailing).combined(with: .opacity))
+                        }
+                    }
+                    // [T-deep-mode-panel-anchor] The COLLAPSED toggle chip, pinned
+                    // near the download button in the bottom-right floating cluster
+                    // (mirrors the download button's bottom anchor). Stays in place
+                    // whether the panel is shown or hidden.
+                    .overlay(alignment: .bottom) {
                         if vm.sessionWorkflowEnabled,
                            (vm.workflowPhase == .executing || vm.workflowPhase == .verifying),
                            !vm.workflowSteps.isEmpty {
                             FloatingWorkflowCapsule(phase: vm.workflowPhase,
                                                     steps: vm.workflowSteps,
-                                                    busy: vm.workflowBusy)
-                                .padding(.top, 96)
-                                .padding(.trailing, 10)
-                                .transition(.move(edge: .trailing).combined(with: .opacity))
+                                                    busy: vm.workflowBusy,
+                                                    isExpanded: $workflowExpanded)
+                                .padding(.trailing, 4)
+                                .frame(maxWidth: maxContentWidth ?? .infinity, alignment: .trailing)
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, inputBarHeight + (hasFloatingPreview ? 80 : 12) + 56)
+                                .transition(.opacity)
                         }
                     }
+                    // [T-deep-mode-panel-anchor] Reset the shared expand state once
+                    // the run leaves active execution/verification (completes or is
+                    // disabled), so the next run starts collapsed.
+                    .onChange(of: vm.workflowPhase) { newPhase in
+                        if newPhase != .executing && newPhase != .verifying {
+                            workflowExpanded = false
+                        }
+                    }
+                    // [T-deep-mode-banner-height] Track the top banner height so
+                    // the progress panel can drop below the subagent capsules.
+                    .onPreferenceChange(BannerHeightPreferenceKey.self) { workflowBannerHeight = $0 }
                     // [T-deep-mode-floating-panel] Trae-style floating confirm panel
                     // for the plan gate. Docked ABOVE the input bar (padded by
                     // inputBarHeight) so it never covers the composer text or the
@@ -1073,6 +1112,13 @@ struct AIChatView: View {
             activeSubagents: vm.activeSubagents,
             onCancelClarification: { vm.cancelClarification() },
             onSkipClarification: { vm.skipClarification() }
+        )
+        .background(
+            // [T-deep-mode-banner-height] Measure the banner's rendered height so
+            // the floating progress panel can drop below the subagent capsules.
+            GeometryReader { geo in
+                Color.clear.preference(key: BannerHeightPreferenceKey.self, value: geo.size.height)
+            }
         )
     }
 
