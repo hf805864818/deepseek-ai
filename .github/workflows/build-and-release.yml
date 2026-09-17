@@ -276,11 +276,16 @@ jobs:
         # catches symbols the tests reference but the merged code lacks. Uses
         # build-for-testing (compiles all test bundles without running them) so
         # this stays a pure compile gate and does not slow down the release.
+        # NOTE: destination is generic/platform=iOS (device), NOT the Simulator:
+        # deps/libs/libish_emu.a is cross-compiled for device-only arm64 and
+        # newer ld (Xcode 26.6+) hard-errors when linking a device static lib
+        # into an iOS Simulator target. Compiling the test bundle for the
+        # device matches the IPA build target and the iSH library platform.
         run: |
           cd src/ios
           xcodebuild -project Minis.xcodeproj -scheme Minis \
             -configuration Debug \
-            -destination 'generic/platform=iOS Simulator' \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath ./TestDerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
