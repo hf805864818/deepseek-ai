@@ -292,6 +292,17 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build-for-testing 2>&1 | tail -80
 
+      - name: Clean up Xcode DerivedData (free runner disk)
+        # IPA and dSYM are already uploaded as artifacts above, and the earlier
+        # build/test DerivedData dirs are no longer needed. Xcode build products
+        # routinely reach several GB; deleting them keeps the macos runner's
+        # disk from filling up on long-lived runners and avoids caching these
+        # huge dirs.
+        run: |
+          rm -rf src/ios/DerivedData src/ios/TestDerivedData
+          echo "Cleaned Xcode DerivedData. Workspace disk usage:"
+          du -sh src/ios 2>/dev/null || true
+
   # === Step 3: Build Android APK ===
   build-android:
     name: Build Android APK
@@ -451,6 +462,21 @@ jobs:
     needs: [prepare, build-ios, build-android]
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space before release upload
+        # softprops/action-gh-release stages each asset under
+        # $GITHUB_WORKSPACE in a temp dir before uploading. Preinstalled
+        # toolchains on the default ubuntu-latest runner consume most of its
+        # ~14G disk; once the IPA/APK artifacts are downloaded and staged, the
+        # temp dir creation can fail with "Error creating asset temp dir".
+        # Purge the largest unused toolchains to guarantee headroom.
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/local/lib/node_modules 2>/dev/null || true
+          echo "=== Disk after cleanup ==="
+          df -h
+
       - name: Download IPA artifact
         uses: actions/download-artifact@v4
         with:
