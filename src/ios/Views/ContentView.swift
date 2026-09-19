@@ -7405,12 +7405,6 @@ private struct SettingsSheet: View {
     /// [T-deep-mode-phase-f] Optional Spec mode layer. Only active when the
     /// master switch is also on (SpecGate ANDs both).
     @AppStorage("deepMode.specMode") private var specModeEnabled: Bool = false
-    /// [T-tool-hide] Hide tool-execution capsules (shell/file/browser/memory
-    /// runs) from the chat list. Rendering-only: agentHistory and the DB are
-    /// untouched, so the model still receives every tool call and result.
-    /// Default ON per product decision; text/thinking/visualization blocks
-    /// always stay visible.
-    @AppStorage("deepMode.hideToolCapsules") private var hideToolCapsules: Bool = true
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var navPath = NavigationPath()
@@ -7493,27 +7487,6 @@ private struct SettingsSheet: View {
                         } icon: {
                             Image(systemName: "doc.text.magnifyingglass")
                         }
-                    }
-                    // [T-tool-hide] Hide tool-execution capsules from the chat.
-                    // Rendering-only — the model still receives every tool call
-                    // and result (agentHistory is untouched). Turn off to bring
-                    // the capsules back.
-                    Toggle(isOn: $hideToolCapsules) {
-                        Label {
-                            Text("隐藏工具执行记录")
-                        } icon: {
-                            Image(systemName: "eye.slash.fill")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.white)
-                                .frame(width: 21, height: 21)
-                                .background(.orange, in: Circle())
-                        }
-                    }
-                    .onChange(of: hideToolCapsules) { _ in
-                        // [T-tool-hide] Rebuild the live message list so the
-                        // filter applies immediately (snapshot builder reads
-                        // UserDefaults live).
-                        NotificationCenter.default.post(name: .messageListNeedsResnapshot, object: nil)
                     }
 
                     NavigationLink {

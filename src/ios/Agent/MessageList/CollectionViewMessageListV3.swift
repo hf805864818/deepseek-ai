@@ -700,26 +700,6 @@ private final class AssistantHeaderCellV3: SelfSizingCell {}
 private final class AssistantBlockCellV3: SelfSizingCell {}
 private final class AssistantFooterCellV3: SelfSizingCell {}
 
-/// [T-tool-hide] Read helpers for the "隐藏工具执行记录" switch.
-/// Rendering-only: agentHistory / DB are untouched, so the model still
-/// receives every tool call and result. The default (true) matches the
-/// @AppStorage default in ChatMessageRow and ContentView when the key has
-/// never been written.
-fileprivate enum ToolCapsuleHide {
-    static var enabled: Bool {
-        (UserDefaults.standard.object(forKey: "deepMode.hideToolCapsules") as? Bool) ?? true
-    }
-    static func isToolExecutionBlock(_ block: AssistantBlock) -> Bool {
-        switch block.kind {
-        case .shellTool, .fileReadTool, .fileWriteTool, .fileEditTool,
-             .browserTool, .readImageTool, .memoryTool:
-            return true
-        case .text, .thinking, .visualization, .info:
-            return false
-        }
-    }
-}
-
 // MARK: - V3 Coordinator
 
 extension CollectionViewMessageListV3 {
@@ -2596,18 +2576,7 @@ extension CollectionViewMessageListV3 {
                     }
                 case .assistant:
                     newItems.append(.assistantHeader(message.id))
-                    // [T-tool-hide] Honor "隐藏工具执行记录": with the switch
-                    // on, tool capsules are dropped from the snapshot so no
-                    // cells are created for them (the SwiftUI ChatMessageRow
-                    // path applies the same filter via displayedBlocks).
-                    // agentHistory is untouched — the model still receives
-                    // every tool call and result. Reads UserDefaults live so a
-                    // Settings flip + .messageListNeedsResnapshot broadcast
-                    // rebuilds this immediately.
-                    let blocksToShow = ToolCapsuleHide.enabled
-                        ? message.blocks.filter { !ToolCapsuleHide.isToolExecutionBlock($0) }
-                        : message.blocks
-                    for block in blocksToShow {
+                    for block in message.blocks {
                         newItems.append(.assistantBlock(message.id, block.id))
                     }
                     // Only emit a footer cell when it will actually render

@@ -210,32 +210,6 @@ struct ChatMessageRow: View {
     /// Lifted out of ToolCapsuleView so ForEach item changes don't reset it.
     @State private var detailBlock: AssistantBlock?
 
-    /// [T-tool-hide] Master switch: hide tool-execution capsules from the chat
-    /// list. Rendering-only — agentHistory and the DB are untouched, so the
-    /// model still receives every tool call and result. Mirrors the setting in
-    /// Settings → Agent Runtime (default ON). @AppStorage drives a live update:
-    /// flipping the toggle re-renders every row immediately.
-    @AppStorage("deepMode.hideToolCapsules") private var hideToolCapsules: Bool = true
-
-    /// [T-tool-hide] The blocks to render. When the hide switch is on, tool
-    /// capsules (shell/file/browser/image/memory executions) are filtered out;
-    /// text, thinking, inline visualizations and info notes always stay visible.
-    private var displayedBlocks: [AssistantBlock] {
-        guard hideToolCapsules else { return message.blocks }
-        return message.blocks.filter { !isToolExecutionBlock($0) }
-    }
-
-    /// [T-tool-hide] True when the block renders as a tool-execution capsule.
-    private func isToolExecutionBlock(_ block: AssistantBlock) -> Bool {
-        switch block.kind {
-        case .shellTool, .fileReadTool, .fileWriteTool, .fileEditTool,
-             .browserTool, .readImageTool, .memoryTool:
-            return true
-        case .text, .thinking, .visualization, .info:
-            return false
-        }
-    }
-
     /// All text block contents joined, for "Copy All".
     private var fullReplyText: String {
         message.blocks
@@ -525,10 +499,7 @@ struct ChatMessageRow: View {
             }
             .padding(.top, 4)
 
-            // [T-tool-hide] displayedBlocks honors the "隐藏工具执行记录"
-            // switch: with it on, tool capsules are filtered out here while the
-            // underlying agentHistory keeps every tool call/result for the model.
-            ForEach(displayedBlocks) { block in
+            ForEach(message.blocks) { block in
                 AssistantBlockView(
                     block: block,
                     message: message,
