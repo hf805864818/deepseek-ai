@@ -973,9 +973,10 @@ struct AIChatView: View {
                         }
                     }
                     // [T-deep-mode-panel-anchor] The COLLAPSED toggle chip, pinned
-                    // near the download button in the bottom-right floating cluster
-                    // (mirrors the download button's bottom anchor). Stays in place
-                    // whether the panel is shown or hidden.
+                    // at the bottom-right corner just above the input bar —
+                    // BELOW the ↑↓ scroll buttons and the download button. Stays
+                    // in place whether the panel is shown or hidden, so the
+                    // confirm popup (raised higher) never overlaps it.
                     .overlay(alignment: .bottom) {
                         if vm.sessionWorkflowEnabled,
                            (vm.workflowPhase == .executing || vm.workflowPhase == .verifying),
@@ -987,7 +988,7 @@ struct AIChatView: View {
                                 .padding(.trailing, 4)
                                 .frame(maxWidth: maxContentWidth ?? .infinity, alignment: .trailing)
                                 .padding(.horizontal, 12)
-                                .padding(.bottom, inputBarHeight + (hasFloatingPreview ? 80 : 12) + 136)
+                                .padding(.bottom, inputBarHeight + 8)
                                 .transition(.opacity)
                         }
                     }
