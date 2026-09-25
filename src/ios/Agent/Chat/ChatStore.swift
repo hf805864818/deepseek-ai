@@ -473,13 +473,41 @@ struct RawMessage: Identifiable, Codable, Hashable {
     /// Diagnostics / disambiguation only; the UI never resolves through it.
     var providerInstanceId: String? = nil
 
-    /// True if this message contains only tool results (no user text).
+    /// True if this message carries tool results and no user-visible text.
     /// These are internal agent loop messages that shouldn't render as user bubbles.
+    ///
+    /// [T-ios-toolresult-reminder-ui-leak] The agent loop rides model-facing
+    /// reminders alongside tool results in the SAME user-role message:
+    ///   - deep-mode heartbeat C6 (a `<system-reminder>` every 5th tool call),
+    ///   - deep-mode uncertainty check C8 (a `<system-reminder>`),
+    ///   - the image-budget tip (a `<system-reminder>` when read_image images
+    ///     were replaced by text placeholders).
+    /// All of them are `<system-reminder>` text parts, stripped from display on
+    /// every other path. The old `allSatisfy { .toolResult }` check flipped to
+    /// false as soon as one rode along, so on session reload the row was no
+    /// longer recognized as internal, fell through to the "real user message"
+    /// branch, and rendered the raw tool output (file-edit confirmations, grep
+    /// hits, build logs) as a phantom USER bubble. Ignore reminder-only text
+    /// parts here so the row stays classified as an internal tool-result carrier.
     var isToolResultOnly: Bool {
-        role == .user && !parts.isEmpty && parts.allSatisfy {
-            if case .toolResult = $0 { return true }
-            return false
+        guard role == .user, !parts.isEmpty else { return false }
+        var hasToolResult = false
+        for part in parts {
+            switch part {
+            case .toolResult:
+                hasToolResult = true
+            case .text(let s):
+                // A text part disqualifies the row only when it carries real
+                // content beyond model-facing reminders.
+                if !Self.stripSystemReminders(s)
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return false
+                }
+            default:
+                return false
+            }
         }
+        return hasToolResult
     }
 
     /// [T-bridge-message-ui-leak] The internal assistant "bridge" row inserted
