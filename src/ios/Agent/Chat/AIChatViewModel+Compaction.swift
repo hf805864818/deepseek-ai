@@ -218,7 +218,9 @@ extension AIChatViewModel {
     /// still sees the last N user-text turns + their assistant replies + tool
     /// I/O so it can answer follow-ups that need verbatim detail (specific
     /// commands, exact strings) rather than the summary's distilled form.
-    static let compactKeepRecentUserTurns: Int = 3
+    /// [T-perf-warmup-marker] `nonisolated` so the effective-history slice can
+    /// read it from a background thread (see effectiveAgentHistorySlice).
+    nonisolated static let compactKeepRecentUserTurns: Int = 3
 
     /// Phase 2.5 self-heal: when a marker's `lastCompactedMessageId` no longer
     /// resolves in rawMessages (id orphaned by a v1→v2 sync migration or by a
@@ -312,18 +314,21 @@ extension AIChatViewModel {
     /// Used by compactAll to anchor "keep last N user turns" — we cut at the
     /// returned index, so everything strictly before it is the compacted
     /// range; from it onward stays as live inference anchors.
-    func indexOfNthFromLastUserText(_ n: Int) -> Int? {
-        indexOfNthFromLastUserText(n, upToIncluding: agentHistory.count - 1)
+    nonisolated static func indexOfNthFromLastUserText(_ n: Int, in history: [AgentMessage]) -> Int? {
+        indexOfNthFromLastUserText(n, upToIncluding: history.count - 1, in: history)
     }
 
     /// Variant that walks back from `upToIncluding` (an absolute agentHistory
     /// index) instead of the tail. Used by v2 effectiveAgentHistory to find
     /// the start of "last N user-text turns leading INTO the compact anchor."
-    func indexOfNthFromLastUserText(_ n: Int, upToIncluding endIdx: Int) -> Int? {
-        guard n > 0, endIdx >= 0, endIdx < agentHistory.count else { return nil }
+    ///
+    /// [T-perf-warmup-marker] `nonisolated` + explicit `history` so the
+    /// effective-history slice can be built off the main thread.
+    nonisolated static func indexOfNthFromLastUserText(_ n: Int, upToIncluding endIdx: Int, in history: [AgentMessage]) -> Int? {
+        guard n > 0, endIdx >= 0, endIdx < history.count else { return nil }
         var seen = 0
         for i in stride(from: endIdx, through: 0, by: -1) {
-            let msg = agentHistory[i]
+            let msg = history[i]
             guard msg.role == .user else { continue }
             let hasText = msg.parts.contains { part in
                 if case .text(let t) = part, !t.isEmpty { return true }
@@ -374,12 +379,13 @@ extension AIChatViewModel {
     /// `call_M1ate3tSzXCh3c1lr8QCsild`, priorIdx=24 landing on the tool_result
     /// whose tool_use sat at [23]. Boundaries are therefore restricted to user
     /// messages that carry NO toolResult part.
-    func walkBackUserTurnsBounded(
+    nonisolated static func walkBackUserTurnsBounded(
         anchorIdx: Int,
         maxUserTextTurns: Int,
-        maxMessages: Int
+        maxMessages: Int,
+        in history: [AgentMessage]
     ) -> WalkBackResult {
-        guard anchorIdx >= 0, anchorIdx < agentHistory.count else {
+        guard anchorIdx >= 0, anchorIdx < history.count else {
             return WalkBackResult(priorIdx: nil, userTextTurnsFound: 0, messageCount: 0, stopReason: "invalidAnchor")
         }
         var acceptedPriorIdx: Int? = nil
@@ -389,7 +395,7 @@ extension AIChatViewModel {
         // Scan strictly right-to-left. When we hit a user message, evaluate
         // "would accepting [thisUser ... anchorIdx] still fit?"
         for i in stride(from: anchorIdx, through: 0, by: -1) {
-            let msg = agentHistory[i]
+            let msg = history[i]
             guard msg.role == .user else { continue }
             // [T-ios-compact-orphan-toolcall] A user message carrying a
             // toolResult is the SECOND half of an assistant/tool round, not the
@@ -442,7 +448,7 @@ extension AIChatViewModel {
     /// Wrap a compact summary in the `<context-summary>` envelope used both
     /// by the standalone `summaryAsAgentMessage` form (legacy) and by v2's
     /// inline injection into the next user message's content array.
-    static func compactSummaryWrappedText(_ summary: String) -> String {
+    nonisolated static func compactSummaryWrappedText(_ summary: String) -> String {
         """
         <context-summary>
         The following is a summary of the earlier conversation that was compacted to save context space.
@@ -1272,7 +1278,7 @@ extension AIChatViewModel {
     /// Used by v1 markers (which still inject the summary as a standalone user
     /// turn). v2 markers prefer inline injection into the first post-anchor
     /// user message via `compactSummaryWrappedText`.
-    static func summaryAsAgentMessage(_ summary: String) -> AgentMessage {
-        AgentMessage(role: .user, parts: [.text(compactSummaryWrappedText(summary))])
+    nonisolated static func summaryAsAgentMessage(_ summary: String) -> AgentMessage {
+        AgentMessage(role: .user, parts: [.text(Self.compactSummaryWrappedText(summary))])
     }
 }

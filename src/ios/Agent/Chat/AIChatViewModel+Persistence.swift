@@ -1738,10 +1738,60 @@ extension AIChatViewModel {
         let markerSnapshot = cachedLatestMarker
 
         _historyWarmupTask = Task.detached(priority: .userInitiated) { [weak self] in
-            // Build id sets + check orphans — this is the O(n×m) heavy part
+            // [T-perf-warmup-marker] Build the effective slice + drop orphaned
+            // tool parts — the O(n×m) heavy part — entirely off the main thread.
+            //
+            // Previously this bailed out whenever a compact marker was present
+            // (`else { return }`), on the assumption that marker sessions were
+            // "already shorter". In DeepMode long conversations that assumption
+            // is exactly backwards: compaction fires *because* the session is
+            // long, and compaction also clears _cachedEffectiveHistory. So the
+            // first send after a compaction found a cold cache, the warmup
+            // declined to help, and the full O(n×m) build ran on the main
+            // thread — the 100–300ms send-path freeze seen only with DeepMode on.
+            //
+            // effectiveAgentHistorySlice is now a pure nonisolated static func
+            // (value-type inputs only), so marker sessions can use the warmup
+            // too. Same inputs → same result as the main-thread full build.
+            // Resolve the marker anchor index (cheap O(n) scan) up front — both the
+            // parity guard below and the cached tuple need it.
+            var resolvedAnchorIdx: Int? = nil
+            if let marker = markerSnapshot, marker.version >= 2,
+               let anchorId = marker.lastCompactedMessageId {
+                resolvedAnchorIdx = historySnapshot.lastIndex(where: { $0.dbMessageId == anchorId })
+            }
+
+            // [T-perf-warmup-marker-parity] Parity guard for v2 markers: the full
+            // build injects the summary INTO the first user message after the
+            // anchor. If the snapshot has no such user yet, the user message the
+            // caller is about to append would become the injection target — and
+            // the incremental path (which only appends) would miss that
+            // injection, producing a prompt that differs from a full build.
+            // Decline the warmup in that narrow case so the main thread's full
+            // build stays authoritative.
+            if let marker = markerSnapshot, marker.version >= 2, let anchorIdx = resolvedAnchorIdx,
+               !historySnapshot[(anchorIdx + 1)...].contains(where: { $0.role == .user }) {
+                return
+            }
+
+            let slice: [AgentMessage]
+            if let marker = markerSnapshot {
+                slice = Self.effectiveAgentHistorySlice(
+                    agentHistory: historySnapshot,
+                    marker: marker,
+                    logger: logger
+                )
+            } else {
+                slice = historySnapshot
+            }
+            let result = Self.dropOrphanedToolParts(slice, logger: logger)
+
+            // Id sets are collected from `result` (post orphan removal) to match
+            // the full-build path in effectiveAgentHistory(), so the cached sets
+            // are identical no matter which path populated them.
             var toolUseIds: Set<String> = []
             var toolResultIds: Set<String> = []
-            for msg in historySnapshot {
+            for msg in result {
                 for part in msg.parts {
                     switch part {
                     case .toolUse(let id, _, _): toolUseIds.insert(id)
@@ -1749,19 +1799,6 @@ extension AIChatViewModel {
                     default: break
                     }
                 }
-            }
-
-            // With no marker, effectiveAgentHistoryUncounted == identity,
-            // so the raw history is the input to dropOrphanedToolParts.
-            // Call the static function directly (pure, thread-safe).
-            let result: [AgentMessage]
-            if markerSnapshot == nil {
-                result = Self.dropOrphanedToolParts(historySnapshot, logger: logger)
-            } else {
-                // Marker present: we can't easily compute the effective slice
-                // off-main because it depends on more MainActor state. Skip
-                // the warmup — marker sessions are already shorter (compacted).
-                return
             }
 
             // Write result back to the cache on the main actor.
@@ -1787,7 +1824,7 @@ extension AIChatViewModel {
                     result: result,
                     historyCount: currentCount,
                     markerId: currentMarkerId,
-                    anchorIdx: nil,  // resolved lazily on next full build if needed
+                    anchorIdx: resolvedAnchorIdx,  // resolved off-main above
                     toolUseIds: toolUseIds,
                     toolResultIds: toolResultIds
                 )
@@ -1898,9 +1935,21 @@ extension AIChatViewModel {
         return cleaned
     }
 
-    func effectiveAgentHistoryUncounted() -> [AgentMessage] {
-        guard let marker = cachedLatestMarker else { return agentHistory }
-
+    /// [T-perf-warmup-marker] Pure, `nonisolated` slice builder — the effective
+    /// (about-to-be-sent) history for a given raw `agentHistory` + compact
+    /// `marker`. Extracted verbatim from `effectiveAgentHistoryUncounted()` so
+    /// the O(n) slice work can run on a background thread (the send-path
+    /// warmup) instead of blocking the main actor. It reads only value-type
+    /// data (history / marker) plus static constants — never MainActor state —
+    /// so it is safe to call off-main.
+    ///
+    /// The parameter is deliberately named `agentHistory` so the moved body's
+    /// references stay identical to the instance-method form it replaced.
+    nonisolated static func effectiveAgentHistorySlice(
+        agentHistory: [AgentMessage],
+        marker: CompactMarker,
+        logger: AppLogger
+    ) -> [AgentMessage] {
         // ─── v2 markers (id-only model) ────────────────────────────────
         //
         // Marker semantics:
@@ -1932,7 +1981,7 @@ extension AIChatViewModel {
                 // standalone summary message (creates the empty-context loop
                 // when paired with hot tools). Fall back to full history;
                 // the user can `revertCompact` if the marker is corrupt.
-                logger.warning("[Compact] effectiveAgentHistory v2: anchorId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(self.agentHistory.count)) — degrading to full history (no summary)")
+                logger.warning("[Compact] effectiveAgentHistory v2: anchorId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(agentHistory.count)) — degrading to full history (no summary)")
                 return agentHistory
             }
 
@@ -1946,10 +1995,11 @@ extension AIChatViewModel {
             // priorIdx is always set to a `user` message — that's what the
             // API requires for the first message in a request.
             let preAnchorCap = 100
-            let walkBack = walkBackUserTurnsBounded(
+            let walkBack = Self.walkBackUserTurnsBounded(
                 anchorIdx: anchorIdx,
                 maxUserTextTurns: Self.compactKeepRecentUserTurns,
-                maxMessages: preAnchorCap
+                maxMessages: preAnchorCap,
+                in: agentHistory
             )
             let priorIdxResolved: Int? = walkBack.priorIdx
             let priorIdx = walkBack.priorIdx ?? (anchorIdx + 1)  // empty preAnchor sentinel
@@ -2030,7 +2080,7 @@ extension AIChatViewModel {
             let postAnchorCount = postAnchor.count
             let priorIdxSource = priorIdxResolved == nil ? "fallback=0(<\(Self.compactKeepRecentUserTurns) user-text turns before anchor)" : "userTextWalkBack(N=\(Self.compactKeepRecentUserTurns))"
             let preAnchorRawCount = max(0, anchorIdx - priorIdx + 1)
-            logger.info("[CompactDiag] eAH v2 slice: priorIdx=\(priorIdx) anchorIdx=\(anchorIdx) agentHistory.count=\(self.agentHistory.count) → preAnchorRaw=\(preAnchorRawCount) preAnchorSent=\(preAnchorCountSent) postAnchor=\(postAnchorCount) summaryChars=\(marker.summary.count) priorIdxSource=\(priorIdxSource) markerId=\(marker.id.prefix(8))")
+            logger.info("[CompactDiag] eAH v2 slice: priorIdx=\(priorIdx) anchorIdx=\(anchorIdx) agentHistory.count=\(agentHistory.count) → preAnchorRaw=\(preAnchorRawCount) preAnchorSent=\(preAnchorCountSent) postAnchor=\(postAnchorCount) summaryChars=\(marker.summary.count) priorIdxSource=\(priorIdxSource) markerId=\(marker.id.prefix(8))")
             // Show the post-prune / post-alignment preAnchor absolute indices,
             // not the raw walk-back range. This way "what is actually sent"
             // matches what the log shows.
@@ -2134,16 +2184,16 @@ extension AIChatViewModel {
                 } ?? "(empty)"
                 return "[\(absoluteIdx)] role=\(m.role) dbId=\(m.dbMessageId?.prefix(8) ?? "nil") \(preview)"
             }.joined(separator: " | ")
-            logger.warning("[Compact] effectiveAgentHistory DIAG: marker.id=\(marker.id.prefix(8)) marker.lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") agentHistory.count=\(self.agentHistory.count) entriesWithDbId=\(withDbId) tail5=\(tailSlice)")
+            logger.warning("[Compact] effectiveAgentHistory DIAG: marker.id=\(marker.id.prefix(8)) marker.lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") agentHistory.count=\(agentHistory.count) entriesWithDbId=\(withDbId) tail5=\(tailSlice)")
 
-            if let nthIdx = indexOfNthFromLastUserText(Self.compactKeepRecentUserTurns) {
+            if let nthIdx = Self.indexOfNthFromLastUserText(Self.compactKeepRecentUserTurns, in: agentHistory) {
                 result.append(contentsOf: agentHistory[nthIdx...])
-                logger.warning("[Compact] effectiveAgentHistory: lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(self.agentHistory.count)); falling back to last \(Self.compactKeepRecentUserTurns) user turns (anchorIdx=\(nthIdx), kept=\(self.agentHistory.count - nthIdx))")
+                logger.warning("[Compact] effectiveAgentHistory: lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(agentHistory.count)); falling back to last \(Self.compactKeepRecentUserTurns) user turns (anchorIdx=\(nthIdx), kept=\(agentHistory.count - nthIdx))")
             } else {
                 // Not even N user-text turns available — append full history
                 // rather than risk the empty-context loop.
                 result.append(contentsOf: agentHistory)
-                logger.warning("[Compact] effectiveAgentHistory: lcmId unresolved AND <\(Self.compactKeepRecentUserTurns) user turns in agentHistory(count=\(self.agentHistory.count)); falling back to full history")
+                logger.warning("[Compact] effectiveAgentHistory: lcmId unresolved AND <\(Self.compactKeepRecentUserTurns) user turns in agentHistory(count=\(agentHistory.count)); falling back to full history")
             }
             return result
         }
@@ -2152,6 +2202,18 @@ extension AIChatViewModel {
         // return full history.
         logger.warning("[Compact] effectiveAgentHistory: marker id=\(marker.id.prefix(8)) unresolvable in agentHistory — returning full history")
         return agentHistory
+    }
+
+    /// Thin MainActor wrapper around `effectiveAgentHistorySlice`. Kept as an
+    /// instance method so existing main-thread callers are unchanged; the heavy
+    /// O(n) slice logic lives in the nonisolated static function above.
+    func effectiveAgentHistoryUncounted() -> [AgentMessage] {
+        guard let marker = cachedLatestMarker else { return agentHistory }
+        return Self.effectiveAgentHistorySlice(
+            agentHistory: agentHistory,
+            marker: marker,
+            logger: logger
+        )
     }
 
     /// Persist an agent message to DB. Returns the assigned DB row id on success,

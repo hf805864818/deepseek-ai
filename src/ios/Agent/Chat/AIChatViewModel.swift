@@ -3216,19 +3216,32 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         return ctx
     }
 
-    // [T-deep-mode-s1-1] Precompiled regexes for filename extensions — compiled once, reused every call
-    private static let pathFilenameRegexes: [NSRegularExpression] = {
-        let extensions = [
-            "swift", "py", "js", "ts", "jsx", "tsx", "java", "kt", "c", "cpp", "h",
-            "hpp", "m", "mm", "rb", "go", "rs", "php", "sh", "bash", "zsh",
-            "html", "css", "scss", "json", "yaml", "yml", "xml", "md", "markdown",
-            "sql", "plist", "xib", "storyboard", "swiftpm", "podspec",
-            "txt", "cfg", "ini", "toml", "env"
-        ]
-        return extensions.compactMap { ext -> NSRegularExpression? in
-            try? NSRegularExpression(pattern: "[\\w\\-.]+\\.\(ext)\\b", options: [.caseInsensitive])
-        }
-    }()
+    // [T-deep-mode-scope-perf] Precompiled regexes — compiled ONCE per process.
+    //
+    // Before: the bare-filename scan looped over 41 extensions and called
+    // `NSRegularExpression(pattern:)` INSIDE the loop on every invocation, then
+    // ran each of those 42 regexes over the full text. Because
+    // `buildDeepModeScopeContext()` runs this over the last 10 messages and
+    // every block inside them, one scope build performed thousands of ICU regex
+    // compilations plus thousands of full-text scans — measured as 1.2-4.5s of
+    // main-thread hang in long DeepMode sessions (HangDetector stack:
+    // extractFilePaths <- buildDeepModeScopeContext <- deepModeFragment).
+    //
+    // Now: one alternation covers all extensions, so a scan costs 2 regexes
+    // (0 compilations) instead of 42 compilations + 42 scans.
+    private static let slashPathRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"[^\s]*/[^\s]*"#, options: [])
+
+    private static let bareFilenameRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"[\w\-.]+\.(?:markdown|storyboard|swiftpm|podspec|bash|zsh|swift|tsx|jsx|scss|html|yaml|toml|json|plist|php|css|xml|yml|ini|cfg|txt|env|java|cpp|hpp|sql|xib|rb|go|rs|sh|ts|js|py|kt|mm|md|m|c|h)\b"#,
+        options: [.caseInsensitive])
+
+    /// Upper bound on how much of a single text is scanned for file paths.
+    /// DeepMode tool results routinely reach hundreds of KB; paths buried deep
+    /// in a giant log dump are useless for rule scoping, and scanning them made
+    /// the cost scale with accumulated output size — so it got worse the longer
+    /// a session ran.
+    private static let maxPathScanCharacters = 8_192
 
     /// Extract potential file paths / filenames from text using heuristics.
     /// Matches:
@@ -3239,45 +3252,43 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
         var paths: Set<String> = []
 
+        // [T-deep-mode-scope-perf] Only scan a bounded prefix. DeepMode tool
+        // results can be hundreds of KB; without this cap the cost of a scope
+        // build scaled with accumulated output size, so it degraded the longer
+        // a session ran.
+        let scanned: String
+        if text.count > Self.maxPathScanCharacters {
+            scanned = String(text.prefix(Self.maxPathScanCharacters))
+        } else {
+            scanned = text
+        }
+        guard !scanned.isEmpty else { return [] }
+
+        let nsRange = NSRange(scanned.startIndex..., in: scanned)
+
         // Pattern 1: paths with slashes (e.g. /a/b/c.swift, src/foo/bar.py)
         // Match sequences of non-whitespace that contain at least one /
         // and end with a known extension or a filename-like component.
-        let slashPattern = #"[^\s]*/[^\s]*"#
-        if let regex = try? NSRegularExpression(pattern: slashPattern, options: []) {
-            let nsRange = NSRange(text.startIndex..., in: text)
-            regex.enumerateMatches(in: text, options: [], range: nsRange) { match, _, _ in
-                guard let match = match,
-                      let range = Range(match.range, in: text) else { return }
-                var path = String(text[range])
-                // Trim trailing punctuation that's unlikely to be part of a path
-                while path.last?.isPunctuation == true && path.last != "/" && path.last != "." {
-                    path.removeLast()
-                }
-                if !path.isEmpty {
-                    paths.insert(path)
-                }
+        Self.slashPathRegex?.enumerateMatches(in: scanned, options: [], range: nsRange) { match, _, _ in
+            guard let match = match,
+                  let range = Range(match.range, in: scanned) else { return }
+            var path = String(scanned[range])
+            // Trim trailing punctuation that's unlikely to be part of a path
+            while path.last?.isPunctuation == true && path.last != "/" && path.last != "." {
+                path.removeLast()
+            }
+            if !path.isEmpty {
+                paths.insert(path)
             }
         }
 
-        // Pattern 2: bare filenames with common code extensions
-        let knownExtensions = [
-            "swift", "py", "js", "ts", "jsx", "tsx", "java", "kt", "c", "cpp", "h",
-            "hpp", "m", "mm", "rb", "go", "rs", "php", "sh", "bash", "zsh",
-            "html", "css", "scss", "json", "yaml", "yml", "xml", "md", "markdown",
-            "sql", "plist", "xib", "storyboard", "swiftpm", "podspec",
-            "txt", "cfg", "ini", "toml", "env"
-        ]
-        for ext in knownExtensions {
-            let pattern = #"[\w\-.]+\.\#(ext)\b"#
-            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
-                let nsRange = NSRange(text.startIndex..., in: text)
-                regex.enumerateMatches(in: text, options: [], range: nsRange) { match, _, _ in
-                    guard let match = match,
-                          let range = Range(match.range, in: text) else { return }
-                    let filename = String(text[range])
-                    paths.insert(filename)
-                }
-            }
+        // Pattern 2: bare filenames with common code extensions.
+        // One combined regex (see bareFilenameRegex) replaces the previous
+        // per-extension loop that recompiled 41 regexes on every call.
+        Self.bareFilenameRegex?.enumerateMatches(in: scanned, options: [], range: nsRange) { match, _, _ in
+            guard let match = match,
+                  let range = Range(match.range, in: scanned) else { return }
+            paths.insert(String(scanned[range]))
         }
 
         return Array(paths)
@@ -4106,11 +4117,16 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         currentTask = Task { [weak self] in
             guard let self else { return }
 
-            // [T-perf-history-bg-warmup] Kick off the O(n×m) history scan on a
-            // background thread NOW, so it runs in parallel with the attachment
-            // processing below. By the time runAgentLoop needs effectiveAgentHistory(),
-            // the cache should already be warm — zero main-thread blocking.
-            self.warmupEffectiveHistoryInBackground()
+            // [T-perf-warmup-at-loop] The O(n×m) effective-history warmup used to
+            // be kicked off here. It now lives at the top of runAgentLoop() — the
+            // single funnel every send path goes through (normal send, Compact &
+            // Send's queued drain, resume). Two reasons:
+            //   1. Compact & Send never calls send(), so it never got warmed up.
+            //   2. Warming up here ran BEFORE this turn's agentHistory.append, so
+            //      for compacted sessions the snapshot lacked the just-typed user
+            //      message — the summary injection target — and the result had to
+            //      be discarded. Warming up inside runAgentLoop sees the final
+            //      history and becomes an exact cache hit (zero main-thread work).
 
             // Lazily create session before persisting anything
             await self.ensureSession()
@@ -6492,6 +6508,21 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // non-deep / rollback-off session never flips it.
         workflowBusy = sessionWorkflowEnabled
         defer { workflowBusy = false }
+
+        // [T-perf-warmup-at-loop] Kick off the O(n×m) effective-history build on
+        // a background thread HERE — the single funnel every send path goes
+        // through (normal send / Compact & Send's queued drain / resume).
+        //
+        // Placement matters: by the time runAgentLoop is entered, every append to
+        // agentHistory for this turn is already done, so the warmup snapshot is
+        // the FINAL state. That is essential for compacted sessions, because
+        // effectiveAgentHistory() injects the summary into the first POST-anchor
+        // user message. The old send()-time placement ran before that user
+        // existed, produced a result that could not be reused, and was discarded
+        // by the parity guard in warmupEffectiveHistoryInBackground(). Warming up
+        // here instead yields an exact cache HIT at the effectiveAgentHistory()
+        // call in the loop below, so the main thread does zero rebuild work.
+        warmupEffectiveHistoryInBackground()
 
         let loopSetupStart = CFAbsoluteTimeGetCurrent()
         let t0 = CFAbsoluteTimeGetCurrent()
