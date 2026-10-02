@@ -166,6 +166,10 @@
     <string name="settings_section_appearance">Appearance</string>
     <string name="settings_appearance_subtitle">Theme, font size, and display</string>
     <string name="settings_section_agent_runtime">Agent Runtime</string>
+    <string name="settings_deep_mode">深度龙虾Ai</string>
+    <string name="settings_deep_mode_subtitle">开启后注入深度行为规则与认知能力</string>
+    <string name="settings_spec_mode">规格模式</string>
+    <string name="settings_spec_mode_subtitle">开启后启用 SpecGate 规格写作门控</string>
     <string name="settings_skills">Skills</string>
     <string name="settings_skills_subtitle">Manage AI agent skills and instructions</string>
     <string name="settings_memory">Memory</string>
