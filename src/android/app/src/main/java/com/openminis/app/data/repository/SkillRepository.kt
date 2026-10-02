@@ -137,6 +137,13 @@ class SkillRepository(private val context: Context) {
         runCatching { installBundledSkills() }.onFailure {
             Log.e(TAG, "installBundledSkills failed — continuing: ${it.message}", it)
         }
+        // [T-deep-mode] Back-fill the 深度龙虾Ai deep-skill pack on startup.
+        // Same GH#147 safety wrapper as installBundledSkills above: this
+        // constructor runs inline in MinisApp.onCreate before
+        // subsystemsInitialized is set, so nothing may escape here.
+        runCatching { installDeepModeSkills() }.onFailure {
+            Log.e(TAG, "installDeepModeSkills failed — continuing: ${it.message}", it)
+        }
     }
 
     // -- CRUD --
@@ -1202,6 +1209,359 @@ class SkillRepository(private val context: Context) {
                 source = ImportSource.BUNDLED,
             )
             Log.i(TAG, "Installed bundled skill: $bundledId (v$bundledVersion)")
+        }
+    }
+
+    // -- Deep Mode Skills (深度龙虾Ai 技能包) --
+    //
+    // [T-deep-mode] The bundled deep-agent skill pack, mirroring iOS
+    // SkillStore.deepSkillDefinitions. Each skill is a procedural "how to do
+    // this class of task well" playbook. Installed with ImportSource.BUNDLED
+    // so they rank first in skillPromptFragment's overflow selection AND keep
+    // the same upgrade path as skill-creator.
+    private val deepSkillDefinitions: List<Triple<String, String, String>> = listOf(
+        Triple("deep-planning", "1.0.0", """
+---
+name: deep-planning
+version: 1.0.0
+description: Break complex multi-step tasks into an explicit plan, execute it with tool calls, then self-verify the result. Use when the user's request is broad, ambiguous, or spans multiple steps (build a project, refactor, investigate, produce a multi-part deliverable).
+---
+
+# Deep Planning
+
+Turn a complex request into a plan → execute → verify loop.
+
+## When To Use
+- The task has 3+ distinct steps or spans multiple files/tools.
+- The user asked for something "end-to-end", "full", or open-ended.
+
+## Workflow
+1. State a short numbered plan (under 10 steps) before any tool call.
+2. Execute steps in order, calling tools rather than describing intent.
+3. After each milestone, sanity-check the intermediate result.
+4. On completion, re-read the final output and fix any errors.
+5. Conclude with a 2-3 sentence summary of what was done.
+
+## Notes
+- Skip the plan for trivial single-command tasks.
+- If a step blocks on missing info, ask or use available tools to obtain it rather than guessing.
+"""),
+        Triple("deep-research", "1.0.0", """
+---
+name: deep-research
+version: 1.0.0
+description: Conduct thorough evidence-based research and synthesis using web search and source retrieval. Use when the user asks to research, investigate, compare, fact-check, or verify information, especially when citations or sources are expected.
+---
+
+# Deep Research
+
+Produce a well-sourced, structured research answer instead of a shallow reply.
+
+## Workflow
+1. Clarify the question and identify the key dimensions to cover.
+2. Search with precise, distinct queries; avoid repeating near-identical searches.
+3. Prefer authoritative primary sources (official docs, vendor sites, RFCs) over secondary write-ups.
+4. Fetch full pages only when snippets are insufficient.
+5. Extract and record key facts before chaining more searches.
+6. Cite sources inline; never fabricate URLs or findings.
+7. Deliver a complete, table/header-organized summary.
+
+## Notes
+- Time-sensitive topics need a time anchor in the query.
+- If a source is unreachable, say so; do not invent its contents.
+"""),
+        Triple("deep-doc", "1.0.0", """
+---
+name: deep-doc
+version: 1.0.0
+description: Write structured documents and reports (PRDs, research reports, competitive analyses, technical proposals) with clear sections, tables, and citations. Use when the user asks for a document, report, spec, proposal, or any structured written deliverable.
+---
+
+# Deep Document Writing
+
+Write structured, professional written deliverables.
+
+## Workflow
+1. Confirm the genre (PRD, report, spec, analysis) and audience.
+2. Outline the section structure before drafting body text.
+3. Draft content section by section, keeping paragraphs tight (2-3 sentences with citations where applicable).
+4. Use Markdown tables for multi-dimension comparisons.
+5. Remove fluff: one idea per paragraph, no filler.
+6. Review for completeness against the original request.
+
+## Notes
+- Keep headers short (under 6 words) and unnumbered.
+- Cite sources inline where facts come from retrieval.
+"""),
+        Triple("deep-data", "1.0.0", """
+---
+name: deep-data
+version: 1.0.0
+description: Perform data analysis and produce charts or tables from datasets. Use when the user asks to analyze data, clean data, compute statistics, compare values, or visualize numbers.
+---
+
+# Deep Data Analysis
+
+Turn raw data into validated conclusions and visualizations.
+
+## Workflow
+1. Inspect the data first (file_read) — schema, size, sample rows.
+2. Choose the right tool for the job (a short Python script via file_write + shell_execute, or direct shell text-processing).
+3. Compute and validate numbers; cross-check totals and edge cases.
+4. Visualize with a chart or table where it aids understanding.
+5. State conclusions and any caveats (missing data, assumptions).
+
+## Notes
+- For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
+- Never fabricate values; if data is missing, say so.
+"""),
+        Triple("deep-code", "1.0.0", """
+---
+name: deep-code
+version: 1.0.0
+description: Generate, refactor, and debug code with a read-understand-change-verify discipline. Use when the user asks to write code, fix a bug, debug, refactor, or implement a feature in an existing codebase.
+---
+
+# Deep Code
+
+Produce working code by understanding context first and verifying after every change.
+
+## When To Use
+- Writing new code, or modifying/extending an existing codebase.
+- The user reports a bug, error, or unexpected behavior.
+
+## Workflow
+1. Read the relevant files first (file_read) to understand structure, dependencies, and conventions.
+2. State a short plan for the change before editing.
+3. Make small, focused edits (file_write / file_edit); avoid sweeping rewrites.
+4. After each change, verify it will compile and behaves as intended (re-read the edited region).
+5. Handle edge cases, errors, and input validation explicitly.
+
+## Notes
+- Follow the surrounding code style; do not silently change unrelated behavior.
+- If unsure about intent, ask or infer minimally rather than guessing wildly.
+"""),
+        Triple("deep-review", "1.0.0", """
+---
+name: deep-review
+version: 1.0.0
+description: Review code for correctness, bugs, security risks, performance, maintainability, and best practices, then give structured actionable feedback. Use when the user asks to review, audit, or critique code or a diff.
+---
+
+# Deep Code Review
+
+Give structured, actionable review feedback instead of vague comments.
+
+## Workflow
+1. Read the full file or diff (file_read) before judging.
+2. Assess across: correctness, security, performance, maintainability, and style.
+3. For each issue, report the specific location, the concrete problem, and a suggested fix.
+4. Separate blocking issues from suggestions/nitpicks.
+5. Summarize a prioritized action list at the end.
+
+## Notes
+- Never report an issue without pointing to the offending code.
+- Balance completeness with brevity; focus on the highest-impact findings.
+"""),
+        Triple("deep-browser", "1.0.0", """
+---
+name: deep-browser
+version: 1.0.0
+description: Drive a real web browser to navigate, fill forms, click, screenshot, and scrape content. Use when the user asks to open a website, test a web UI, extract web content, or perform multi-step browser actions.
+---
+
+# Deep Browser Automation
+
+Perform multi-step browser tasks with verification at each step.
+
+## Workflow
+1. Clarify the target page and the exact goal sequence.
+2. Navigate, then confirm the page loaded as expected (use read_image on screenshots).
+3. Fill forms, click, and interact step by step, checking results after each action.
+4. Extract or screenshot the final state.
+5. Report what happened and anything that could not be completed.
+
+## Notes
+- Hand control to the user for login, CAPTCHA, or actions requiring human judgment.
+- Prefer visible verification over assuming a click/type action succeeded.
+"""),
+        Triple("deep-shell", "1.0.0", """
+---
+name: deep-shell
+version: 1.0.0
+description: Plan and run shell commands for scripting, data processing, environment setup, and troubleshooting, with explicit safety checks. Use when the user asks to run commands, install tools, process files, or debug the environment.
+---
+
+# Deep Shell
+
+Run shell commands deliberately, with a plan and validation.
+
+## Workflow
+1. State the command and its intent before executing.
+2. Prefer non-destructive read/query commands to understand state first.
+3. Execute with shell_execute; inspect the output before the next command.
+4. Validate results and tidy up temporary files/processes when done.
+5. Summarize what changed and any warnings.
+
+## Notes
+- Confirm before destructive or irreversible commands (rm -rf, format, drop, overwrite).
+- Quote paths with spaces; avoid interactive commands unless unavoidable.
+"""),
+        Triple("deep-memory", "1.0.0", """
+---
+name: deep-memory
+version: 1.0.0
+description: Decide what user context is worth persisting and use memory tools to store and retrieve it across sessions. Use for long-term personalization: user preferences, ongoing projects, and recurring facts.
+---
+
+# Deep Memory Strategy
+
+Persist durable context so future sessions are smarter, without accumulating noise.
+
+## When To Store (memory_write)
+- Stable user preferences, recurring facts, or ongoing project context.
+- Only when the value clearly helps future requests.
+
+## When To Retrieve (memory_get)
+- Before acting on a request that depends on prior user context.
+- When the user refers to something discussed before ("as we discussed", "my project").
+
+## Rules
+- Prefer updating an existing memory over duplicating it.
+- Do not store transient or trivial details; noise degrades retrieval quality.
+- Store facts, not speculation.
+"""),
+        Triple("deep-slides", "1.0.0", """
+---
+name: deep-slides
+version: 1.0.0
+description: Produce presentation decks from a topic, outline, or document with clear page structure and one idea per slide. Use when the user asks for a presentation, slides, demo, or 汇报材料.
+---
+
+# Deep Slides
+
+Turn a topic into a clean, self-contained slide deck.
+
+## Workflow
+1. Confirm the topic, audience, and desired length.
+2. Outline pages: cover, agenda, content pages, and a summary.
+3. Write a self-contained HTML deck (file_write) with one core idea per slide.
+4. Keep visuals simple; use tables or diagrams where they clarify.
+5. Review that every page supports the main message and nothing is missing.
+
+## Notes
+- For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
+- Prefer HTML output (portable, visually rich); only use other formats when the user explicitly asks.
+"""),
+        Triple("deep-security", "1.0.0", """
+---
+name: deep-security
+version: 1.0.0
+description: Audit code for security vulnerabilities — injection, XSS, hardcoded secrets, unsafe storage, permission bypass, insecure network, dependency CVEs. Use when the user asks for a security review, vulnerability scan, or penetration test of source code.
+---
+
+# Deep Security Audit
+
+Scan code for security vulnerabilities, not just bugs.
+
+## When To Use
+- The user asks to "check security", "audit for vulnerabilities", or "is this safe".
+- Code handles user input, authentication, secrets, or network communication.
+
+## Workflow
+1. Read the full source (file_read) before judging — do not audit blindly.
+2. Scan across these vulnerability classes:
+   - Injection (SQL/Command/Path): concatenated queries, shell strings, file paths from user input.
+   - XSS: unescaped user input rendered in HTML/UI.
+   - Hardcoded secrets: API keys, tokens, passwords committed in source.
+   - Unsafe storage: plaintext passwords in UserDefaults/files, unencrypted sensitive data.
+   - Permission bypass: missing auth checks on privileged endpoints or functions.
+   - Insecure network: HTTP (not HTTPS), disabled TLS verification, unvalidated certificates.
+   - Dependency CVEs: known-vulnerable third-party libraries.
+3. For each finding, report: location (file:line), severity (Critical/High/Medium/Low), the attack scenario, and the fix.
+4. Separate critical issues (exploitable now) from informational findings.
+5. Provide a prioritized remediation list at the end.
+
+## Notes
+- Never report a vulnerability without showing the exact code location.
+- Distinguish "could be exploited" from "defensive depth" — prioritize real attack vectors.
+- Check both the code AND configuration (Info.plist, build settings, environment variables).
+"""),
+    )
+
+    /**
+     * [T-deep-mode] Install any *missing* deep-skill definitions without
+     * touching the enabled state of skills that already exist. Mirrors iOS
+     * SkillStore.installDeepModeSkills(). Called at startup so a newer pack is
+     * back-filled while preserving the user's per-skill toggles across
+     * relaunches. Newly installed skills default to enabled=true in add(), so
+     * they are corrected to the global Deep Mode toggle value afterwards.
+     */
+    private fun installDeepModeSkills() {
+        val enabled = com.openminis.app.data.DeepModePrefs.isGlobalEnabled(context)
+        for (def in deepSkillDefinitions) {
+            val name = def.first
+            val version = def.second
+            val content = def.third
+            val id = slugify(name)
+            // Idempotent: skip skills already present (any version) so the
+            // user's per-skill toggle and any local edits survive relaunches.
+            if (_skills.value.any { it.id == id }) continue
+            val parsed = parseSkillMd(content) ?: continue
+            runCatching {
+                add(
+                    name = parsed.name,
+                    description = parsed.description,
+                    body = parsed.body,
+                    version = version,
+                    source = ImportSource.BUNDLED,
+                )
+            }.onFailure {
+                Log.w(TAG, "installDeepModeSkills: failed to add $id: ${it.message}")
+            }
+            syncDeepSkillEnabled(id, enabled)
+        }
+    }
+
+    /**
+     * [T-deep-mode] Align a single deep skill's enabled flag with the global
+     * Deep Mode toggle. Install-time helper; keeps the enabled fresh-install
+     * default consistent when Deep Mode is off at first launch.
+     */
+    private fun syncDeepSkillEnabled(id: String, enabled: Boolean) {
+        val skill = _skills.value.find { it.id == id } ?: return
+        if (skill.isEnabled != enabled) {
+            setEnabled(id, enabled)
+        }
+    }
+
+    /**
+     * [T-deep-mode] Install missing deep skills AND force each skill's enabled
+     * state to the global Deep Mode toggle. Called when the toggle *changes*,
+     * so flipping it OFF→ON re-enables every deep skill (a "reset") and
+     * ON→OFF disables them all without uninstalling. Mirrors iOS
+     * SkillStore.syncDeepModeSkills().
+     */
+    fun syncDeepModeSkills() {
+        val enabled = com.openminis.app.data.DeepModePrefs.isGlobalEnabled(context)
+        for (def in deepSkillDefinitions) {
+            val id = slugify(def.first)
+            if (_skills.value.none { it.id == id }) {
+                // Missing entirely — install it, then apply the toggle state.
+                val parsed = parseSkillMd(def.third) ?: continue
+                runCatching {
+                    add(
+                        name = parsed.name,
+                        description = parsed.description,
+                        body = parsed.body,
+                        version = def.second,
+                        source = ImportSource.BUNDLED,
+                    )
+                }.onFailure {
+                    Log.w(TAG, "syncDeepModeSkills: failed to add $id: ${it.message}")
+                }
+            }
+            syncDeepSkillEnabled(id, enabled)
         }
     }
 
