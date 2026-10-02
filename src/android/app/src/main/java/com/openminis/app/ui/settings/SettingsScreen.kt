@@ -189,6 +189,35 @@ fun SettingsScreen(
 
             // -- Agent Runtime --
             SettingsSection(title = stringResource(R.string.settings_section_agent_runtime)) {
+                // [T-deep-mode-android-settings] Deep Mode + Spec Mode switches,
+                // placed above Skills to match iOS ordering.
+                val context = LocalContext.current
+                var deepModeOn by remember { mutableStateOf(com.openminis.app.data.DeepModePrefs.isGlobalEnabled(context)) }
+                var specModeOn by remember { mutableStateOf(com.openminis.app.data.DeepModePrefs.specModeEnabled(context)) }
+
+                SettingsSwitchRow(
+                    icon = Icons.Outlined.AutoAwesome,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.settings_deep_mode),
+                    subtitle = stringResource(R.string.settings_deep_mode_subtitle),
+                    checked = deepModeOn,
+                    onCheckedChange = { enabled ->
+                        deepModeOn = enabled
+                        com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, enabled)
+                    },
+                )
+                SettingsSwitchRow(
+                    icon = Icons.Outlined.Description,
+                    iconColor = Color(0xFF5856D6),
+                    title = stringResource(R.string.settings_spec_mode),
+                    subtitle = stringResource(R.string.settings_spec_mode_subtitle),
+                    checked = specModeOn,
+                    onCheckedChange = { enabled ->
+                        specModeOn = enabled
+                        com.openminis.app.data.DeepModePrefs.setSpecModeEnabled(context, enabled)
+                    },
+                    showDivider = false,
+                )
                 SettingsItem(
                     icon = Icons.Outlined.Extension,
                     iconColor = Color(0xFF007AFF),
