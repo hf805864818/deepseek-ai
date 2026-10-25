@@ -203,7 +203,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                 Spacer(Modifier.height(6.dp))
                 val isOverLimit = bodyLimitCheck.isOverLimit
                 val warnColor: Color =
-                    if (isOverLimit) Color(0xFFFF3B30)
+                    if (isOverLimit) Color(0xFFFF9500)
                     else MaterialTheme.colorScheme.onSurfaceVariant
                 val indicatorText: String = when (val c = bodyLimitCheck) {
                     is SoulBodyLimitCheck.Ok -> {
@@ -265,7 +265,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                             }
                         }
                     },
-                    enabled = loaded && !bodyLimitCheck.isOverLimit,
+                    enabled = loaded,
                     modifier = Modifier.weight(1f),
                 ) { Text(stringResource(R.string.soul_save)) }
             }

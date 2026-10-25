@@ -105,7 +105,7 @@ struct SoulSettingsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button(AppLocalized("Save")) { save() }
-                    .disabled(!isDirty || isBodyOverLimit)
+                    .disabled(!isDirty)
             }
         }
         .onAppear(perform: reload)
@@ -181,23 +181,23 @@ struct SoulSettingsView: View {
         }
     }
 
-    /// Footer under the personality editor. Renders a green count when the
-    /// body is within budget and a red over-limit message when it isn't.
-    /// Save is disabled in the over-limit branch.
+    /// Footer under the personality editor. Renders a count when the body
+    /// is within the recommended budget and an orange advisory when it
+    /// isn't. Save stays enabled either way.
     private var bodyLengthFooter: some View {
         let check = SoulStore.isOverLimit(bodyText)
         return HStack(spacing: 6) {
             if check.isOverLimit {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.orange)
             }
             switch check {
             case .ok:
                 Text(soulBodyCountText(bodyText))
                     .foregroundStyle(.secondary)
             case .overLimit(let count, let cap):
-                Text(AppLocalized("Over limit: \(count) / \(cap) tokens. Each CJK character and each Latin word counts as one."))
-                    .foregroundStyle(.red)
+                Text(AppLocalized("Over the recommended length: \(count) / \(cap) tokens. Each CJK character and each Latin word counts as one. It will still be saved."))
+                    .foregroundStyle(.orange)
             }
         }
         .font(.footnote)
@@ -207,10 +207,6 @@ struct SoulSettingsView: View {
     private func soulBodyCountText(_ body: String) -> String {
         let count = SoulStore.tokenCount(body)
         return AppLocalized("\(count) / \(SoulStore.bodyTokenLimit) tokens")
-    }
-
-    private var isBodyOverLimit: Bool {
-        SoulStore.isOverLimit(bodyText).isOverLimit
     }
 
     // MARK: - Persistence
@@ -300,3 +296,4 @@ struct SoulSettingsView: View {
         var value: SoulFile = SoulFile(metadata: .default, body: "")
     }
 }
+

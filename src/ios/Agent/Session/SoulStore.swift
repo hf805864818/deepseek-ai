@@ -968,20 +968,15 @@ enum SystemPromptBuilder {
             return identityTrimmed + styleBlock(style) + "\n\n" + soulEditHint + "\n\n"
         }
 
-        // Reject (NOT truncate) bodies that exceed the language-aware
-        // limit. Truncation silently dropped half the user's text and
-        // implied that "the agent still gets your character" when in
-        // practice it was missing context. Falling back to identity-only
-        // is the safer signal: the user notices the personality isn't
-        // taking effect, opens Settings, and sees the same red over-limit
-        // warning the Save button surfaces. Write paths already reject
-        // over-limit; this branch only triggers for an on-disk file that
-        // was written before this rule existed (or via shell / another
-        // device).
+        // Bodies that exceed the recommended length are still injected —
+        // the limit is a soft hint, not a hard gate. Truncation would
+        // silently drop half the user's text; dropping the whole body
+        // would make the personality silently stop taking effect. A very
+        // long body simply consumes more of the per-request context
+        // budget, so we log a warning for diagnostics.
         let check = SoulStore.isOverLimit(trimmed)
-        guard !check.isOverLimit else {
-            Self.logger.warning("[Soul] personality body is over the language-aware limit (\(check)) — falling back to identity-only system prompt.")
-            return identityTrimmed + styleBlock(style) + "\n\n" + soulEditHint + "\n\n"
+        if check.isOverLimit {
+            Self.logger.warning("[Soul] personality body is over the recommended length (\(check)) — injecting anyway.")
         }
 
         let personality = scrubInjections(trimmed)

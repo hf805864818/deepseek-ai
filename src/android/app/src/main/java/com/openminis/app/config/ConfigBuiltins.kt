@@ -967,10 +967,11 @@ internal object ConfigBuiltins {
             ClosureField(
                 path = "soul.body",
                 displayName = "Soul personality prompt",
-                description = "Personality / voice instructions injected as a block in the system prompt. Length cap is language-aware: Chinese ≤ ${com.openminis.app.agent.SoulStore.CHINESE_CHAR_LIMIT} chars OR English ≤ ${com.openminis.app.agent.SoulStore.ENGLISH_WORD_LIMIT} words (rule picked by the majority language). The writer also rejects prompt-injection patterns (\"ignore previous instructions\" etc.) — keep this to genuine character / tone guidance.",
+                description = "Personality / voice instructions injected as a block in the system prompt. Recommended length is language-aware (advisory, not enforced): Chinese ≤ ${com.openminis.app.agent.SoulStore.CHINESE_CHAR_LIMIT} chars OR English ≤ ${com.openminis.app.agent.SoulStore.ENGLISH_WORD_LIMIT} words (rule picked by the majority language). The writer still rejects prompt-injection patterns (\"ignore previous instructions\" etc.) — keep this to genuine character / tone guidance.",
                 // No schema maxLength because either character or word
-                // count is wrong for the *other* language. Both checks
-                // (length + injection) run in the writer below.
+                // count is wrong for the *other* language. The injection
+                // check runs in the writer below; the length check is
+                // advisory only (logged, not rejected).
                 valueSchema = ConfigSchema.Str(),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
@@ -987,17 +988,14 @@ internal object ConfigBuiltins {
                             "Body contains a prompt-injection pattern (\"ignore/disregard/forget … previous/prior instructions\"). SOUL.md is for personality, not instructions to the model."
                         )
                     }
+                    // The token length is a soft hint, not a hard gate: over-limit
+                    // bodies are saved and injected, with a warning logged for
+                    // diagnostics (mirrors the Settings UI's advisory-only footer).
                     val check = com.openminis.app.agent.SoulStore.isOverLimit(raw)
-                    when (check) {
-                        is com.openminis.app.agent.SoulBodyLimitCheck.Ok -> Unit
-                        is com.openminis.app.agent.SoulBodyLimitCheck.OverLimitChinese ->
-                            throw ConfigError.InvalidValue(
-                                "Over limit: ${check.chars} Chinese chars exceeds cap of ${check.cap}. Either trim to ≤ ${check.cap} chars, or rewrite mostly in English to use the ≤ ${com.openminis.app.agent.SoulStore.ENGLISH_WORD_LIMIT}-word cap."
-                            )
-                        is com.openminis.app.agent.SoulBodyLimitCheck.OverLimitEnglish ->
-                            throw ConfigError.InvalidValue(
-                                "Over limit: ${check.words} English words exceeds cap of ${check.cap}. Either trim to ≤ ${check.cap} words, or rewrite mostly in Chinese to use the ≤ ${com.openminis.app.agent.SoulStore.CHINESE_CHAR_LIMIT}-char cap."
-                            )
+                    if (check.isOverLimit) {
+                        com.openminis.app.logging.AppLogger.warning(
+                            "MinisConfig", "soul.body is over the recommended length ($check) — saving anyway."
+                        )
                     }
                     val cur = loadCurrent()
                     saveCurrent(cur.copy(body = raw))

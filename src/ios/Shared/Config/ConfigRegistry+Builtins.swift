@@ -141,29 +141,30 @@ extension ConfigRegistry {
         ))
 
         // Personality body. The Settings UI calls this the "Personality
-        // Prompt" — same field, different surface. Length cap is a unified
-        // 2000-token budget (CJK glyphs + CJK punctuation count one each;
-        // Latin words count one each) enforced via SoulStore.isOverLimit;
-        // the schema does not carry a byte-level maxLength because a fixed
-        // char count would be wrong for non-ASCII text. SoulMDParser
-        // injection scrubbing also runs at prompt-build time
-        // (SystemPromptBuilder.identitySection), so a stored body with an
-        // "ignore previous instructions" line still won't reach the model
-        // — but we leave it on disk verbatim so the user can see and fix it.
+        // Prompt" — same field, different surface. Length is a unified
+        // 2000-token recommendation (CJK glyphs + CJK punctuation count one
+        // each; Latin words count one each) surfaced via SoulStore.isOverLimit
+        // as an advisory hint rather than a hard gate; the schema does not
+        // carry a byte-level maxLength because a fixed char count would be
+        // wrong for non-ASCII text. SoulMDParser injection scrubbing also
+        // runs at prompt-build time (SystemPromptBuilder.identitySection), so
+        // a stored body with an "ignore previous instructions" line still
+        // won't reach the model — but we leave it on disk verbatim so the
+        // user can see and fix it.
         r.register(ClosureField(
             path: "soul.body",
             displayName: "Soul personality body",
-            description: "Markdown body of SOUL.md — your character and voice. NOT the place for the \"You are X\" identity line (the app owns that template); write only personality / stance / tone guidance. Length cap: 2000 tokens total. CJK glyphs and CJK punctuation count one each; non-CJK text counts whitespace-delimited words. Mixed-language bodies add both kinds together.",
+            description: "Markdown body of SOUL.md — your character and voice. NOT the place for the \"You are X\" identity line (the app owns that template); write only personality / stance / tone guidance. Recommended length: 2000 tokens total (advisory, not enforced). CJK glyphs and CJK punctuation count one each; non-CJK text counts whitespace-delimited words. Mixed-language bodies add both kinds together.",
             valueSchema: .string(maxLength: nil),
             risk: .normal, revertable: true,
             reader: { .string(currentFile().body) },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
-                switch SoulStore.isOverLimit(s) {
-                case .ok:
-                    break
-                case .overLimit(let count, let cap):
-                    throw ConfigError.invalidValue("Over limit: \(count) tokens exceeds cap of \(cap). Trim the body — each CJK character and each Latin word counts as one token.")
+                // The token length is a soft hint, not a hard gate: over-limit
+                // bodies are saved and injected, with a warning logged for
+                // diagnostics (mirrors the Settings UI's advisory-only footer).
+                if case .overLimit(let count, let cap) = SoulStore.isOverLimit(s) {
+                    AppLogger(category: "MinisConfig").warning("[MinisConfig] soul.body is over the recommended length (\(count)/\(cap)); saving anyway.")
                 }
                 var file = currentFile()
                 file.body = s
