@@ -6354,6 +6354,26 @@ class ChatViewModel(
 
     fun sendMessage(text: String) = sendMessage(text, skipContextCheck = false)
 
+    // [fork-submit-outcome] Degraded adaptation: fork's sendMessage returns
+    // Unit (source's richer funnel returns this). Sent is returned for the
+    // basic headless case; Queued/Compacting/Rejected need source's full
+    // sendMessage rewrite (follow-up, not compile-blocking).
+    sealed class SubmitOutcome {
+        object Sent : SubmitOutcome()
+        object Queued : SubmitOutcome()
+        object Compacting : SubmitOutcome()
+        data class Rejected(val reason: String) : SubmitOutcome()
+    }
+
+    internal fun submitPrompt(
+        text: String,
+        prefill: List<com.openminis.app.scheduled.PrefilledToolCall> = emptyList(),
+        attachments: List<InputAttachment> = emptyList(),
+    ): SubmitOutcome {
+        sendMessage(text)
+        return SubmitOutcome.Sent
+    }
+
     /**
      * @param skipContextCheck set by the pre-send context dialog's own actions,
      *   which have already made the compact decision. Without it the re-entrant
