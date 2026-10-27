@@ -49,6 +49,15 @@ android {
             "\"${customizationValue("ANTHROPIC_OAUTH_IDENTIFIER_PROMPT")}\""
         )
 
+        // DEV_TOOLS gates on-device developer tooling (false in release).
+        buildConfigField("boolean", "DEV_TOOLS", "false")
+        // In-app update: point at the fork's own GitHub Releases.
+        buildConfigField("String", "RELEASE_REPO", "\"hf805864818/deepseek-ai\"")
+        buildConfigField("String", "UPDATE_CHANNEL", "\"stable\"")
+        buildConfigField("boolean", "SELF_UPDATE", "true")
+        buildConfigField("boolean", "AUTO_UPDATE_CHECK", "true")
+        buildConfigField("boolean", "IN_APP_INSTALL", "true")
+
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -81,6 +90,9 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            buildConfigField("boolean", "DEV_TOOLS", "true")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(
