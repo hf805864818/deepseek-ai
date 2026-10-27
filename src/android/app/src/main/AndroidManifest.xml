@@ -568,5 +568,129 @@
                 android:resource="@xml/minis_accessibility_service" />
         </service>
 
+        <service
+            android:name=".service.BackupForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- [T-oauth-wait-fgs] Keeps the process out of the cached-apps
+             freezer while an OAuth sign-in waits for its localhost redirect
+             (the browser is on top, so Minis is a background process). Runs
+             only between OAuthCallbackServer start and stop, capped at 5 min
+             per flow; dataSync, same permission as the backup service. -->
+        <service
+            android:name=".service.OAuthWaitService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Alarm broadcast receiver (also handles BOOT_COMPLETED and
+             MY_PACKAGE_REPLACED for re-scheduling). [T-android-alarm-reschedule-on-restart]
+             AlarmManager drops pending alarms on reboot AND whenever the app is
+             force-stopped or replaced; an app update is the second case, and it
+             sends MY_PACKAGE_REPLACED rather than BOOT_COMPLETED. Without this
+             filter every update silently stopped the user's scheduled tasks
+             until the next reboot. -->
+        <receiver
+            android:name=".offload.AlarmReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Delivered to THIS app only, when its own package is
+                     replaced; no data filter needed. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Scheduled notification receiver — fires `android-notification schedule`
+             alarms so the deferred notification posts at the requested time. -->
+        <receiver
+            android:name=".offload.ScheduledNotificationReceiver"
+            android:exported="false" />
+
+        <!-- [T-android-scheduled-tasks-design] AlarmManager target for
+             user-defined scheduled tasks (Settings → home top-right
+             schedule icon). The receiver dispatches to ScheduledAgentRunner
+             which drives the agent loop headlessly. -->
+        <receiver
+            android:name=".scheduled.ScheduledTaskAlarmReceiver"
+            android:exported="false" />
+
+        <!-- [T-android-user-ask-notify] Answers given in a user_ask notification
+             (option buttons, Allow / Cancel, the "Other…" text reply). -->
+        <receiver
+            android:name=".notification.UserAskNotificationReceiver"
+            android:exported="false" />
+
+        <!-- Notification listener — lets android-notification read active notifications.
+             User must enable this manually in Settings → Notifications → Device &
+             app notifications → Notification access. -->
+        <service
+            android:name=".offload.MinisNotificationListenerService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    <service
+            android:name=".service.OAuthWaitService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Alarm broadcast receiver (also handles BOOT_COMPLETED and
+             MY_PACKAGE_REPLACED for re-scheduling). [T-android-alarm-reschedule-on-restart]
+             AlarmManager drops pending alarms on reboot AND whenever the app is
+             force-stopped or replaced; an app update is the second case, and it
+             sends MY_PACKAGE_REPLACED rather than BOOT_COMPLETED. Without this
+             filter every update silently stopped the user's scheduled tasks
+             until the next reboot. -->
+        <receiver
+            android:name=".offload.AlarmReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Delivered to THIS app only, when its own package is
+                     replaced; no data filter needed. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Scheduled notification receiver — fires `android-notification schedule`
+             alarms so the deferred notification posts at the requested time. -->
+        <receiver
+            android:name=".offload.ScheduledNotificationReceiver"
+            android:exported="false" />
+
+        <!-- [T-android-scheduled-tasks-design] AlarmManager target for
+             user-defined scheduled tasks (Settings → home top-right
+             schedule icon). The receiver dispatches to ScheduledAgentRunner
+             which drives the agent loop headlessly. -->
+        <receiver
+            android:name=".scheduled.ScheduledTaskAlarmReceiver"
+            android:exported="false" />
+
+        <!-- [T-android-user-ask-notify] Answers given in a user_ask notification
+             (option buttons, Allow / Cancel, the "Other…" text reply). -->
+        <receiver
+            android:name=".notification.UserAskNotificationReceiver"
+            android:exported="false" />
+
+        <!-- Notification listener — lets android-notification read active notifications.
+             User must enable this manually in Settings → Notifications → Device &
+             app notifications → Notification access. -->
+        <service
+            android:name=".offload.MinisNotificationListenerService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    <receiver
+            android:name=".notification.UserAskNotificationReceiver"
+            android:exported="false" />
     </application>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 </manifest>
