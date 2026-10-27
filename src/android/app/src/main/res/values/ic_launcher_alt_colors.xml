@@ -6,4 +6,6 @@
          choices the user can pin in Settings → Appearance → App Icon. -->
     <color name="ic_launcher_bg_force_light">#EFF2F6</color>
     <color name="ic_launcher_bg_force_dark">#2C3034</color>
+    <color name="ic_launcher_bg_legacy_light">#AC2B01</color>
+    <color name="ic_launcher_bg_legacy_dark">#4046A6</color>
 </resources>
