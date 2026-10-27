@@ -1928,6 +1928,11 @@ Scan code for security vulnerabilities, not just bugs.
             }
         }
     }
+
+    fun requestReload(reason: String, force: Boolean = false) {
+            if (force) forceReloadPending.set(true)
+            reloadRequests.trySend(reason)
+        }
 }
 
 // Bundled skill-creator content (matches iOS SkillStore.skillCreatorContent)

@@ -13507,3 +13507,92 @@ C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use i
         }
     }
 }
+
+object ChatPartsJson {
+    fun escapeJson(text: String): String {
+        val sb = StringBuilder("\"")
+        for (c in text) {
+            when (c) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> {
+                    if (c.code < 0x20) sb.append("\\u%04x".format(c.code))
+                    else sb.append(c)
+                }
+            }
+        }
+        sb.append("\"")
+        return sb.toString()
+    }
+
+    fun buildUserPartsJson(
+        text: String,
+        mediaRefPartsJson: List<String>,
+        // [T-android-retry-attachment-loss] The <user-attached-files> XML
+        // inventory (non-image file paths/sizes the model uses to `cat` the
+        // file). iOS persists this same XML as a trailing text part so it
+        // round-trips through retry / rerun / session-reload unchanged — the
+        // model keeps seeing the /var/minis/attachments/uploads/... paths.
+        // Android previously only added it to the in-memory agentHistory and
+        // never persisted it, so a retry silently dropped the file inventory.
+        // Persist it here as a text part (iOS parity); toLLMMessage restores
+        // it via the plain "text" case with zero special-casing.
+        attachedFilesXml: String? = null,
+        /**
+         * [T-android-paste-mediaref] Pre-split body parts from
+         * [buildPastedParts], used INSTEAD of the single `text` part when the
+         * message contained `[Pasted#N]` markers. Already an interleaved
+         * text/mediaRef sequence, so it is spliced in at the position the plain
+         * text part would have occupied — order is what keeps the pasted block
+         * where the user put it, between the words around it.
+         */
+        bodyPartsJson: List<String>? = null,
+    ): String {
+        val parts = mutableListOf<String>()
+        if (bodyPartsJson != null) {
+            parts.addAll(bodyPartsJson)
+        } else if (text.isNotEmpty() || mediaRefPartsJson.isEmpty()) {
+            parts.add("""{"type":"text","value":${escapeJson(text)}}""")
+        }
+        parts.addAll(mediaRefPartsJson)
+        attachedFilesXml?.let { parts.add("""{"type":"text","value":${escapeJson(it)}}""") }
+        return parts.joinToString(prefix = "[", postfix = "]", separator = ",")
+    }
+
+    fun buildMediaRefPartJson(
+        ref: com.openminis.app.data.model.MediaRef,
+        linuxPath: String? = null,
+    ): String {
+        val value = JSONObject()
+            .put("id", ref.id)
+            .put("relativePath", ref.relativePath)
+            .put("mimeType", ref.mimeType)
+        if (ref.originalFileName != null) value.put("originalFileName", ref.originalFileName)
+        // Carry the iSH-visible uploads path through persistence so that
+        // restored history can reconstruct AgentContentPart.ImageData with
+        // its original linuxPath. Restored images that miss this field
+        // (older rows written before this column existed) get linuxPath=null
+        // and fall back to spillover at budget-elide time.
+        if (linuxPath != null) value.put("linuxPath", linuxPath)
+        return JSONObject().put("type", "mediaRef").put("value", value).toString()
+    }
+
+    fun toolResultPartsJson(
+        results: List<AgentContentPart.ToolResult>,
+        durationsMs: Map<String, Long>,
+    ): String {
+        val partsJson = buildString {
+            append("[")
+            results.forEachIndexed { index, result ->
+                if (index > 0) append(",")
+                val snapshotText = escapeJson(result.content.lines().takeLast(30).joinToString("\n"))
+                append("""{"type":"toolResult","value":{"toolUseId":${escapeJson(result.id)},"name":${escapeJson(result.name)},"output":${escapeJson(result.content)},"success":${!result.isError},"snapshot":{"type":"text","text":$snapshotText${ToolDurationWire.snapshotField(durationsMs[result.id])}}}}""")
+            }
+            append("]")
+        }
+        return partsJson
+    }
+}
