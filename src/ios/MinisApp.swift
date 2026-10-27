@@ -36,7 +36,6 @@ extension Bundle {
 
     /// Sets the override language. Pass `nil` or `""` to revert to system language.
     static func setLanguage(_ code: String?) {
-        defer { AppBundle.resetCache() }
         guard let code, !code.isEmpty,
               let path = Bundle.main.path(forResource: code, ofType: "lproj"),
               let bundle = Bundle(path: path) else {
@@ -55,6 +54,10 @@ extension Notification.Name {
     static let sessionDidCreate = Notification.Name("sessionDidCreate")
     /// Posted when a session's title or messages are updated.
     static let sessionDidUpdate = Notification.Name("sessionDidUpdate")
+    /// [T-storage-session-cache] Posted after sessions were deleted outside
+    /// the sidebar (Settings › Storage). userInfo: ["ids": [String]]. The
+    /// sidebar drops the rows and closes the conversation if it was open.
+    static let sessionsDeletedElsewhere = Notification.Name("sessionsDeletedElsewhere")
     /// Posted when an agent loop ends on a VM that is not the currently-displayed one.
     /// `object` is the session ID (`String`). Allows the active VM to reload from DB.
     static let sessionAgentLoopDidEnd = Notification.Name("sessionAgentLoopDidEnd")
@@ -110,6 +113,41 @@ struct MinisApp: App {
     @State private var backgroundEntryDate: Date?
 
     init() {
+        // [T-ios-mac-uncaught-nsexception] FIRST statement in the process's own
+        // code — before any subsystem gets a chance to throw.
+        //
+        // This used to run only from CrashReporter.onAppLaunch(), which is
+        // dispatched from the scenePhase→.active handler AFTER an `await
+        // Task.yield()`. Everything before that point — the rest of this init,
+        // the entire first view-graph build, and any main-queue block enqueued
+        // during it — ran with NO uncaught-exception handler installed, so an
+        // NSException there was reported by AppKit with the reason field that
+        // the App Store crash report then strips.
+        //
+        // That window is where the two 1.13(4) macOS crashes landed: the stack
+        // bottoms out in NSApplicationMain → -[NSApplication run] with no frame
+        // of ours below `MinisApp.$main()`, i.e. a main-runloop turn during
+        // startup, not a user gesture. Installing here does not fix a throw, it
+        // makes the next one say what it was.
+        //
+        // `install` is idempotent, so the later onAppLaunch() call is a no-op.
+        CrashSignalHandler.install()
+        // [T-crash-breadcrumbs] Rotate the previous run's breadcrumbs and start
+        // this run's ring + 15 s resource sampling, before anything else runs.
+        CrashBreadcrumbs.start()
+        ResourceSampler.shared.start()
+        // [T-auto-grouping-default-on] Auto-grouping ships ON. `bool(forKey:)`
+        // returns false for an unregistered key, so the default has to be
+        // registered here rather than expressed at the (multiple) read sites —
+        // registration also leaves an explicit user choice untouched, which a
+        // read-site `?? true` would too, but only if every site remembered it.
+        //
+        // This reverses the original opt-in decision ("moves user data without
+        // being asked"). The concern is bounded: the feature only files a chat
+        // into a group the user already created, only when the model is
+        // confident, only once per chat, and never over a hand-filed session
+        // (setFolderIfUnfiled). Android defaults ON to match.
+        UserDefaults.standard.register(defaults: ["autoGroupingEnabled": true])
         // [T-voice-input-mode-preference-ios] Pin the lazy static to the real
         // launch instant.
         _ = Self.processLaunchedAt
@@ -121,10 +159,6 @@ struct MinisApp: App {
         // storm that has caused 0x8BADF00D scene-update watchdog kills on
         // markdown tables during streaming.
         NSTextContainerSetSizeGuard.install()
-        // Install the attribute:atIndex:effectiveRange: recorder so the
-        // last 10 typesetter attribute queries land in a ring buffer; the
-        // HangDetector dump path will print them when a stall fires.
-        AttributeQueryRecorder.install()
         // Enable in-app language override for String(localized:) and UIKit strings
         Bundle.enableLanguageOverride()
         let lang = UserDefaults.standard.string(forKey: "appLanguage") ?? ""
@@ -136,29 +170,54 @@ struct MinisApp: App {
         // .onAppear refresh) locks the sidebar title to the default even when the
         // user set a custom name. refreshCache() only reads the tiny SOUL.md file.
         SoulStore.refreshCache()
+        // Pre-warm KaTeX WKWebView as fallback for formulas SwiftMath can't render
+        KaTeXRenderer.shared.warmUp()
+        // Pre-warm the biometric capability probe off the main thread. The
+        // first LAContext.canEvaluatePolicy call cold-starts the
+        // LocalAuthentication XPC daemon (~500 ms); without this it would run
+        // inline on the first sessionContextMenu builder during scroll and
+        // hang a frame. (T-ios-biometric-probe-scroll-hang)
+        BiometricAuth.prewarm()
         // Clean up Live Activities left over from a previous app session (e.g. app was killed)
         AgentLiveActivityManager.shared.cleanupStaleActivities(source: "MinisApp.init")
-        // [WatchdogFix] Delay pre-warm operations until after the first frame
-        // is rendered. KaTeXRenderer.shared.warmUp() creates a WKWebView
-        // (~200-500ms) and BiometricAuth.prewarm() cold-starts the
-        // LocalAuthentication XPC daemon (~500ms). Running these synchronously
-        // in init() blocks the main thread before scene-create can complete,
-        // causing a watchdog termination (0x8BADF00D, ~19.61s budget exhausted).
-        // By yielding first with Task.yield(), we let SwiftUI commit the first
-        // frame to satisfy the scene-create watchdog, then perform pre-warm.
+        // Start screen-awake controller — it will observe running tasks
+        // + the user's opt-in flag and toggle the idle timer accordingly.
         Task { @MainActor in
-            await Task.yield()
-            // Pre-warm KaTeX WKWebView as fallback for formulas SwiftMath can't render
-            KaTeXRenderer.shared.warmUp()
-            // Pre-warm the biometric capability probe off the main thread. The
-            // first LAContext.canEvaluatePolicy call cold-starts the
-            // LocalAuthentication XPC daemon (~500 ms); without this it would run
-            // inline on the first sessionContextMenu builder during scroll and
-            // hang a frame. (T-ios-biometric-probe-scroll-hang)
-            BiometricAuth.prewarm()
-            // Start screen-awake controller — it will observe running tasks
-            // + the user's opt-in flag and toggle the idle timer accordingly.
             KeepScreenAwakeController.shared.start()
+            // [T-always-on] Black screen + per-chat lease on top of Keep Screen Awake.
+            AlwaysOnController.shared.start()
+        }
+        // [T-zombie-child-sweep] Retire sub agent sessions whose parent
+        // conversation was truncated away — see sweepZombieChildSessions for
+        // why a month-old floor is what makes this safe against sync ordering.
+        // Cold start only (this init runs once per process) and at background
+        // priority: it competes with nothing, and a zombie that survives one
+        // extra launch costs nothing.
+        Task.detached(priority: .background) {
+            // [T-ios27-scene-create-watchdog] Run the one-shot data migrations
+            // that used to sit inside ChatStore's dispatch_once (the part_flags
+            // backfill and the v1 dirty-row sweep). They are bulk UPDATE/DELETE
+            // over the whole messages / sync_dirty_records tables, and anything
+            // slow inside that once token blocks every later toucher of
+            // ChatStore.shared — including the main thread during scene
+            // creation, which is a 10 s hard kill.
+            //
+            // Ordered before the zombie sweep so the schema is fully settled
+            // before that query runs; both are idempotent and actor-serialised.
+            await ChatStore.shared.runDeferredMigrations()
+            await ChatStore.shared.sweepZombieChildSessions()
+        }
+    }
+
+    /// [T-ios-reboot-keychain-identity-rotation] The sync bootstrap, factored out
+    /// so the launch path and the protected-data-available retry call exactly the
+    /// same thing. Both engines self-guard against double-start.
+    @available(iOS 17.0, *)
+    @MainActor
+    private static func startSyncEngines() async {
+        await SyncV2Bootstrap.startIfEnabled()
+        if !SyncV2Bootstrap.shouldPauseV1() {
+            await CloudSyncEngine.shared.start()
         }
     }
 
@@ -305,10 +364,17 @@ struct MinisApp: App {
                     }
                 }
                 .onAppear {
-                    // ── P0: UI-essential — must run before first frame ──
                     // Populate ConfigRegistry once. Idempotent — every
                     // appearance after the first is a no-op.
                     ConfigRegistry.shared.registerBuiltinsIfNeeded()
+                    // Register notification delegate for shortcut task tap-to-open
+                    ShortcutNotificationDelegate.shared.register()
+                    // Register App Shortcuts with the system so Siri and Spotlight discover them
+                    if #available(iOS 17.0, *) {
+                        MinisShortcutsProvider.updateAppShortcutParameters()
+                    }
+                    // Start logging if previously enabled
+                    LoggingManager.shared.startIfEnabled()
                     // HangFix(2026-05-14) — always-on hang detector. Was
                     // previously gated to `isProcessing == true`, but the
                     // user can also hit hang while just browsing a session
@@ -317,82 +383,107 @@ struct MinisApp: App {
                     // itself is cheap (100ms poll on a background thread,
                     // observer write on each runloop hop).
                     StreamingHangLogger.shared.acquire(reason: "app-launch always-on")
-
-                    // ── P1: Deferred to next runloop after first frame ──
-                    // [WatchdogFix] These operations don't need to complete
-                    // before the first frame renders. By yielding with
-                    // Task.yield(), we let SwiftUI commit the first frame
-                    // first, then execute the remaining setup. This prevents
-                    // scene-create watchdog terminations on devices with
-                    // memory pressure or slow I/O.
-                    Task { @MainActor in
-                        await Task.yield()
-
-                        // Register notification delegate for shortcut task tap-to-open
-                        ShortcutNotificationDelegate.shared.register()
-                        // Register App Shortcuts with the system so Siri and Spotlight discover them
-                        if #available(iOS 17.0, *) {
-                            MinisShortcutsProvider.updateAppShortcutParameters()
+                    // [T-ios-backup-shared-leak] One-shot migration: an earlier
+                    // build delivered backup packages into shared/Backups/,
+                    // which is bind-mounted into the guest at /var/minis/shared
+                    // and is itself the Shared Files backup category. Move any
+                    // leftovers out of the agent-visible workspace.
+                    BackupDelivery.migrateLegacySharedBackups()
+                    // [T-ios-backup-rollback-persistence] If a restore was
+                    // killed mid-flight, put back whatever snapshot survived
+                    // and log it — previously nothing knew a restore had even
+                    // been interrupted.
+                    BackupRestoreJournal.reconcileAtLaunch()
+                    // [review I6] Remove staging trees no marker points at.
+                    // `defer` cleanup only runs when the process survives, so
+                    // an export killed mid-flight used to leave hundreds of MB
+                    // in tmp/ that nothing ever swept.
+                    BackupExportJournal.sweepAbandoned()
+                    // A run still marked .running means the app died mid
+                    // backup; without this the list shows a spinner forever
+                    // for something that will never finish.
+                    BackupHistory.shared.reconcileInterrupted()
+                    // NOTE: deliberately NOT releasing the backup keep-alive
+                    // here. It looks like useful belt-and-braces and is
+                    // actually all downside:
+                    //   - it cannot recover anything. `activated` is a static
+                    //     in memory, so a killed process zeroes it (and the
+                    //     audio session dies with the process anyway) — on the
+                    //     next launch the call is a no-op;
+                    //   - the ONLY state in which it would do something is when
+                    //     a backup is genuinely running, and .onAppear has no
+                    //     once-guard, so a root-view rebuild would cut the
+                    //     session of a live backup and leave it ~30s of
+                    //     beginBackgroundTask before iOS suspends it.
+                    // Ownership is enforced where it belongs, by the run token
+                    // in BackupRunController.finished(token:).
+                    // Migrate legacy provider config on first launch after upgrade
+                    ProviderMigration.migrateIfNeeded(store: ProviderConfigStore.shared)
+                    // Refresh model lists once per day to keep them current
+                    ProviderConfigStore.shared.refreshAllModelsIfNeeded()
+                    // [T-mimo-shadow-voice] One-time upgrade fix: force-refresh
+                    // mixed-modality providers (MiMo/DashScope) mis-classified by
+                    // the old voice-only whitelist, so their text models + shadow
+                    // voice rows recover promptly without waiting for a natural refresh.
+                    ProviderConfigStore.shared.migrateVoiceModalityIfNeeded()
+                    // [T-tools-granular-switches] Carry the one-round master
+                    // Tools switch forward into the per-tool Agents switch.
+                    AgentToolSwitch.migrateLegacyIfNeeded()
+                    // For existing users with no model groups, create a default group silently
+                    Task { await ProviderConfigStore.shared.createDefaultGroupIfNeeded() }
+                    shareLog.info("[Share] onAppear — checking for pending share")
+                    shareCoordinator.checkForPendingShare()
+                    // Set up background keep-alive manager
+                    BackgroundKeepAliveManager.shared.setup()
+                    // Monitor network changes to keep iSH DNS up to date
+                    NetworkMonitor.shared.start()
+                    // [T-provider-quota] Foreground-only upstream quota refresh.
+                    QuotaStore.shared.start()
+                    // Register FileProvider domain for shared files
+                    Self.registerFileProviderDomain()
+                    // Migrate legacy shared dir to App Group container
+                    Self.migrateSharedDirToAppGroup()
+                    // Trace the resolved AppGroup paths so we can confirm the
+                    // main app, FileProvider extension, and iSH bind mount all
+                    // agree on which directory holds the user's shared files.
+                    Self.logFPSyncTracePaths()
+                    // Start watching shared/skills/memory subtrees so iSH writes
+                    // and FileBrowserView mutations propagate to the Files app.
+                    AppGroupChangeWatcher.shared.start()
+                    // Activate security scopes for user-mounted external folders
+                    // (e.g. Obsidian vault in iCloud Drive). Held for app lifetime.
+                    MountedFoldersManager.shared.activateAll()
+                    // Create /var/minis/mounts/<name> symlinks in the fakefs now
+                    // that the rootfs exists and mounts are active.
+                    AIChatViewModel.refreshMountedFolderSymlinks()
+                    // Start iCloud sync engine. v2 takes precedence when its
+                    // feature flag is on (see SyncV2Bootstrap); v1 stays
+                    // paused while v2 is active. When v2 is off, v1 boots
+                    // exactly as before.
+                    if #available(iOS 17.0, *) {
+                        Task { @MainActor in
+                            await Self.startSyncEngines()
                         }
-                        // Start logging if previously enabled
-                        LoggingManager.shared.startIfEnabled()
-                        // Migrate legacy provider config on first launch after upgrade
-                        ProviderMigration.migrateIfNeeded(store: ProviderConfigStore.shared)
-                        // Refresh model lists once per day to keep them current
-                        ProviderConfigStore.shared.refreshAllModelsIfNeeded()
-                        // [T-mimo-shadow-voice] One-time upgrade fix: force-refresh
-                        // mixed-modality providers (MiMo/DashScope) mis-classified by
-                        // the old voice-only whitelist, so their text models + shadow
-                        // voice rows recover promptly without waiting for a natural refresh.
-                        ProviderConfigStore.shared.migrateVoiceModalityIfNeeded()
-                        // For existing users with no model groups, create a default group silently
-                        Task { await ProviderConfigStore.shared.createDefaultGroupIfNeeded() }
-                        shareLog.info("[Share] onAppear — checking for pending share")
-                        shareCoordinator.checkForPendingShare()
-                        // Set up background keep-alive manager
-                        BackgroundKeepAliveManager.shared.setup()
-                        // Monitor network changes to keep iSH DNS up to date
-                        NetworkMonitor.shared.start()
-                    }
-
-                    // ── P2: Background thread — file system & sync ──
-                    // [WatchdogFix] FileProvider registration, directory
-                    // migration, and iCloud sync startup are I/O-heavy and
-                    // don't affect first-frame rendering. Move them off the
-                    // main actor entirely to avoid blocking scene-create.
-                    Task.detached(priority: .utility) {
-                        await MainActor.run {
-                            // Register FileProvider domain for shared files
-                            Self.registerFileProviderDomain()
-                            // Migrate legacy shared dir to App Group container
-                            Self.migrateSharedDirToAppGroup()
-                            // Trace the resolved AppGroup paths so we can confirm the
-                            // main app, FileProvider extension, and iSH bind mount all
-                            // agree on which directory holds the user's shared files.
-                            Self.logFPSyncTracePaths()
-                            // Start watching shared/skills/memory subtrees so iSH writes
-                            // and FileBrowserView mutations propagate to the Files app.
-                            AppGroupChangeWatcher.shared.start()
-                            // Activate security scopes for user-mounted external folders
-                            // (e.g. Obsidian vault in iCloud Drive). Held for app lifetime.
-                            MountedFoldersManager.shared.activateAll()
-                            // Create /var/minis/mounts/<name> symlinks in the fakefs now
-                            // that the rootfs exists and mounts are active.
-                            AIChatViewModel.refreshMountedFolderSymlinks()
-                        }
-
-                        // Start iCloud sync engine. v2 takes precedence when its
-                        // feature flag is on (see SyncV2Bootstrap); v1 stays
-                        // paused while v2 is active. When v2 is off, v1 boots
-                        // exactly as before.
-                        if #available(iOS 17.0, *) {
-                            await MainActor.run {
-                                Task { @MainActor in
-                                    await SyncV2Bootstrap.startIfEnabled()
-                                    if !SyncV2Bootstrap.shouldPauseV1() {
-                                        await CloudSyncEngine.shared.start()
-                                    }
-                                }
+                        // [T-ios-reboot-keychain-identity-rotation] Retry once
+                        // protected data unlocks.
+                        //
+                        // This `.onAppear` fires when the root view MOUNTS, not on
+                        // every foreground, so it is a one-shot. Both sync
+                        // bootstraps now bail when the device identity is
+                        // provisional (Keychain unreadable on a pre-first-unlock
+                        // reboot relaunch) — without this observer that bail would
+                        // trade a corrupted zone for no sync at all until the user
+                        // force-quit the app.
+                        //
+                        // Both entry points are idempotent (`syncEngine == nil`
+                        // guard in v1; v2's own start flag), so an extra call on a
+                        // healthy launch is a no-op.
+                        NotificationCenter.default.addObserver(
+                            forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+                            object: nil, queue: .main
+                        ) { _ in
+                            Task { @MainActor in
+                                await Self.startSyncEngines()
                             }
                         }
                     }
@@ -432,6 +523,10 @@ struct MinisApp: App {
             // while suspended. Clear the credential cache once on resume so the
             // first resolve re-reads truth.
             ProviderCredentialCache.shared.invalidateAll()
+            // [T-ios-provider-row-keychain-in-body] Same backstop for the
+            // Providers-list row cache — foreground resume can follow a
+            // credential change that never bumped `authRevision`.
+            ProviderRowCredentialCache.shared.invalidateAll()
 
             // Unified audio re-assertion on foreground return: stop the background
             // keep-alive track and re-apply the correct session category for the
@@ -455,6 +550,11 @@ struct MinisApp: App {
                 SessionLockStore.shared.evaluateAppLock()
 
                 CrashReporter.shared.onAppLaunch()
+                // [T-resource-diag] Start the 60s port/resource sampler. Cheap
+                // and off the main queue; see ResourceDiagnostics.
+                ResourceDiagnostics.start()
+                // [T-perf-cpu-probe] Periodic flush of the CPU buckets.
+                PerfProbe.start()
                 CrashReporter.shared.updateMarkerPhase(phase: "active")
 
                 _ = SessionBadgeStore.shared
@@ -464,23 +564,35 @@ struct MinisApp: App {
                 // SIGKILL) never runs it, so the badge would be missing after
                 // restart. The persisted message tail is the durable source of
                 // truth — scan it on the actor, reconcile on the main actor.
-                let interruptedSessionsWithDates = await ChatStore.shared.interruptedSessionsWithTailDate()
+                // [T-ios-group-pause-badge-reconcile-stamp] Carry each tail's
+                // own date so a restored marker is stamped with WHEN the
+                // session was interrupted, not with "now".
+                let interruptedWithDates = await ChatStore.shared.interruptedSessionsWithTailDate()
+                let interruptedSessions = Set(interruptedWithDates.keys)
                 // Exclude sessions that are actively streaming RIGHT NOW: a
                 // resumed/running session's DB tail still looks "interrupted"
                 // (mid-loop shape), but it is executing, not paused — flagging it
                 // would surface a ⏸ badge on a live, spinning session. Active ⇒
                 // never paused. (Mirrors the Android foreground reconcile.)
                 let activeNow = SessionActivityTracker.shared.activeSessions
-                let filteredIds = Set(interruptedSessionsWithDates.keys).subtracting(activeNow)
-                let filteredDates = filteredIds.reduce(into: [String: Date]()) { $0[$1] = interruptedSessionsWithDates[$1] }
-                SessionBadgeStore.shared.reconcileInterruptedSessions(filteredIds, entryDates: filteredDates, trigger: "foreground")
+                // [T-ios-group-pause-badge-reconcile-stamp] One-time repair of
+                // stamps already polluted on existing installs, then reconcile.
+                // Order matters: repair first so a corrected stamp is in place
+                // before reconcile decides whether one "survives".
+                SessionBadgeStore.shared.repairPollutedPausedStamps(entryDates: interruptedWithDates)
+                SessionBadgeStore.shared.reconcileInterruptedSessions(
+                    interruptedSessions.subtracting(activeNow),
+                    entryDates: interruptedWithDates,
+                    trigger: "launch-or-foreground")
                 ISHKernel.shared.refreshDns()
 
                 #if DEBUG
                 debugServer.restartIfDead(port: 8321)
                 #endif
 
-                try? await UNUserNotificationCenter.current().setBadgeCount(0)
+                // [T-mac-dock-badge] Back in the app: notifications posted while
+                // away are seen; the badge keeps only the running-task count.
+                BackgroundKeepAliveManager.shared.clearUnseenBadge()
                 BackgroundInterruptionTracker.shared.checkOnForeground()
                 // [T-shortcuts-diag-and-pending] Scan for AppIntent runs that
                 // were marked pending but never cleared (i.e. the process was
@@ -498,7 +610,17 @@ struct MinisApp: App {
                 // Activity is lingering (soft-finished, awaiting the user), the
                 // user is now back in the app — dismiss it.
                 AgentLiveActivityManager.shared.dismissFinishedActivityOnForeground()
-                SkillStore.shared.reload()
+                // [T-ios-listsessions-perf] Deferred off the first-frame
+                // critical path. SkillStore.reload() → loadSkills() is a
+                // synchronous @MainActor SQLite query PLUS one filesystem read
+                // of SKILL.md per installed skill, and scenePhase becomes
+                // .active while the launch frame is still being built — it
+                // showed up inside the 1.14 s and 0.52 s launch hangs in the
+                // CPU Profiler trace. Nothing drawn in the first frame reads
+                // `skills`: the slash-command menu and the prompt fragment both
+                // consult it later, on demand. A main-queue async hop lets the
+                // frame commit first, then reloads.
+                DispatchQueue.main.async { SkillStore.shared.reload() }
 
                 if #available(iOS 17.0, *) {
                     SkillFilesystemNotifier.shared.drainIfDirtyAsync(reason: "scenePhase active")
@@ -540,6 +662,19 @@ struct MinisApp: App {
             if #available(iOS 17.0, *) {
                 Task { @MainActor in
                     if SyncV2Bootstrap.shouldPauseV1() {
+                        // [T-icloud-device-heartbeat] Re-announce this device on
+                        // every foreground resume so peers see a fresh lastSeen.
+                        // The record was previously written ONCE per process
+                        // lifetime (V2 startup); a Mac app left open for days
+                        // never refreshed it and read as "last seen N days ago".
+                        if !DeviceIdentity.isProvisional {
+                            await ChatStore.shared.markDirty(recordType: "SyncDeviceV2", recordId: DeviceIdentity.deviceId)
+                        }
+                        // [T-copilot-models-refresh-window] Re-check the model-list
+                        // refresh window on every return to the foreground, so a
+                        // model a provider enabled while the app sat open appears
+                        // without waiting for the next cold launch.
+                        ProviderConfigStore.shared.refreshAllModelsIfNeeded()
                         await SyncCore.shared.fetchNow(trigger: .foregroundTimer)
                         await SyncCore.shared.sendNow(trigger: .foregroundTimer)
                     } else {
@@ -578,9 +713,9 @@ struct MinisApp: App {
                 SkillFilesystemNotifier.shared.drainIfDirtyAsync(reason: "scenePhase background")
             }
             // [T-config-audit-wal-loss] The config-audit DB runs in WAL mode and
-            // nothing else checkpoints it (it lives in its own file, deliberately
-            // outside minis.db). Without a checkpoint here a jetsam can drop
-            // history that only ever reached the -wal sidecar.
+            // is NOT covered by ICloudBackupManager's checkpointing (it lives in
+            // its own file, deliberately outside minis.db). Without a checkpoint
+            // a jetsam can drop history that only ever reached the -wal sidecar.
             // Cheap and synchronous — this is the last reliable moment to do it.
             ConfigAuditLog.shared.checkpoint()
             // "Lock on exit" mode — drop every cached unlock
@@ -627,7 +762,97 @@ struct MinisApp: App {
     private static let fileProviderResetGeneration = 3
     private static let fileProviderResetKey = "fileProviderResetGeneration"
 
+    // MARK: FP launch-failure correlation trace
+
+    /// [T-ios-fp-mac-bootcrash] Append one line to the FP extension's trace file
+    /// (`AppGroup/MinisConfig/fp-sync-trace.log`, same format as FPSyncTraceLog)
+    /// when the installed bundle changes. The FP appex intermittently dies
+    /// pre-main on Macs (SIGILL at DYLD-STUB$$NSExtensionMain, TestFlight
+    /// D8_ZguC2Ikr7Wl0fRI7Ubn) — those launches can never log, so the working
+    /// theory (fileproviderd launching the appex mid-update while the bundle is
+    /// being replaced) can only be confirmed by ordering three timestamps in one
+    /// file: this app-updated marker, the .crash time, and the appex's next
+    /// successful init (which stamps its executable mtime). FPSyncTraceLog is
+    /// compiled into the appex target only, so this is a minimal local append —
+    /// deliberately not a pbxproj membership change.
+    private static func logAppUpdateMarkerForFPTrace() {
+        let fm = FileManager.default
+        let bundle = Bundle.main
+        let ver = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        var execStamp = "?"
+        if let execURL = bundle.executableURL,
+           let mod = (try? fm.attributesOfItem(atPath: execURL.path))?[.modificationDate] as? Date {
+            execStamp = ISO8601DateFormatter().string(from: mod)
+        }
+        let current = "\(ver)(\(build)) exec=\(execStamp)"
+        let key = "fpTraceLastSeenBundleStamp"
+        let previous = UserDefaults.standard.string(forKey: key)
+        guard previous != current else { return }
+        UserDefaults.standard.set(current, forKey: key)
+
+        guard let container = fm.containerURL(forSecurityApplicationGroupIdentifier: "group.com.openminis.app") else { return }
+        let dir = container.appendingPathComponent("MinisConfig", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("fp-sync-trace.log")
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        let onMac = ProcessInfo.processInfo.isiOSAppOnMac
+        let line = "[\(fmt.string(from: Date()))] [FPSyncTrace] app-updated old=\(previous ?? "none") new=\(current) mac=\(onMac)\n"
+        if let data = line.data(using: .utf8) {
+            if fm.fileExists(atPath: url.path), let h = try? FileHandle(forWritingTo: url) {
+                defer { try? h.close() }
+                _ = try? h.seekToEnd()
+                try? h.write(contentsOf: data)
+            } else {
+                try? data.write(to: url)
+            }
+        }
+        lifecycleLog.info("[FPSyncTrace] app-updated old=\(previous ?? "none") new=\(current) mac=\(onMac)")
+    }
+
     private static func registerFileProviderDomain() {
+        logAppUpdateMarkerForFPTrace()
+
+        // [T-ios-fp-mac-bootcrash] Circuit breaker, NOT a blanket disable.
+        //
+        // On Macs running the iPhone build the appex can die pre-main (SIGILL
+        // at DYLD-STUB$$NSExtensionMain, nothing of ours executing) and
+        // fileproviderd relaunches it in a tight loop. A registered domain is
+        // the only reason it tries, so the only possible defence lives here.
+        //
+        // The blunt version of this — never register on Mac — shipped as
+        // c4669fca4 and was reverted (90803ceb3) for a good reason: Finder
+        // browsing works between bursts, so the extension boots most of the
+        // time and withholding the domain outright would disable a working
+        // feature to silence a crash report. So withhold only for a machine
+        // that has demonstrably failed to boot the appex several launches in a
+        // row, scoped to this executable generation. See FileProviderBootHealth
+        // for the full rationale and the self-healing properties.
+        if FileProviderBootHealth.shouldWithholdRegistration() {
+            lifecycleLog.warning("[FileProvider] withholding domain registration — appex failed to boot \(FileProviderBootHealth.tripThreshold)x in a row on this build (\(FileProviderBootHealth.describe())); removing any existing domain so fileproviderd stops relaunching it")
+            NSFileProviderManager.getDomainsWithCompletionHandler { domains, _ in
+                guard !domains.isEmpty else { return }
+                for d in domains {
+                    // Plain remove(_:) unregisters only — it does not touch the
+                    // App Group data the user's files actually live in.
+                    NSFileProviderManager.remove(d) { err in
+                        if let err {
+                            lifecycleLog.warning("[FileProvider] breaker deregister of \(d.identifier.rawValue) failed: \(err.localizedDescription)")
+                        }
+                    }
+                }
+            }
+            return
+        }
+        // Count this attempt. The appex clears it the moment it boots, so this
+        // only accumulates while launches are actually failing.
+        let pending = FileProviderBootHealth.noteRegistrationAttempt()
+        if pending > 1 {
+            lifecycleLog.warning("[FileProvider] appex has not reported a successful boot since \(pending) registration(s) on this build")
+        }
+
         let root = AIChatViewModel.minisAppGroupRoot
         let fm = FileManager.default
         // Ensure all three subdirectories exist.
