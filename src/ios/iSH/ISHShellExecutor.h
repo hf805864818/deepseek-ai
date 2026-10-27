@@ -121,6 +121,48 @@ typedef void (^ISHShellCompletionCallback)(ISHShellExecutionResult *result);
 /// @param pid Guest process PID — its pgid is used to find the group
 + (void)killProcessGroup:(int)pid;
 
+/// Finish a timed-out command's bookkeeping without waiting to be told the
+/// process died.
+///
+/// [T-ish-shell-timeout-leak] Call this from EVERY timeout path, right after
+/// killProcessGroup:. Teardown used to be driven solely by
+/// ISHProcessExitedNotification, which does not arrive for a task already
+/// reaped as a zombie — the context then stayed registered forever and its two
+/// reader threads polled a dead pipe for the life of the process. Around thirty
+/// such timeouts exhaust the concurrent queue's worker pool, after which no
+/// shell command runs at all and only a device restart recovers.
+///
+/// Safe to call when the command actually did exit in time, or more than once:
+/// the context finalises at most once, and an unknown pid is ignored. So a
+/// timeout racing a normal exit cannot double-invoke a completion callback.
+///
+/// @param pid Guest process PID whose context should be released
++ (void)finalizeTimedOutPid:(int)pid;
+
+/// Snapshot of the leak-guard counters, e.g.
+/// `activeExecutions=0 liveReaders=0 sweptContexts=0`.
+///
+/// `liveReaders` is the number that matters: it should return to 0 shortly
+/// after every command ends. A value that only climbs is this leak recurring.
++ (NSString *)leakGuardStatus;
+
+/// [T-shell-utf8-partial-lead] Decode the bytes a guest process wrote, as the
+/// stdout/stderr reader does. `pending` holds bytes read but not yet decoded;
+/// the decodable prefix is removed from it and returned as text, and an
+/// incomplete multi-byte sequence at the end stays in `pending` for the next
+/// read (unless `isFinal`, at EOF, where everything is flushed).
+///
+/// UTF-8 is decoded per character, never by switching the whole chunk's
+/// encoding: up to 3 orphan continuation bytes at the start (output that
+/// begins mid-character, e.g. `tail -c` / `head -c` / `dd` / `cut -b` on
+/// UTF-8 text) are dropped, and any other invalid byte becomes U+FFFD. Only a
+/// chunk that is clearly not UTF-8 (more than a quarter of its bytes invalid,
+/// i.e. binary such as `cat` of an executable) is decoded as Latin-1, which is
+/// how all non-UTF-8 output was shown before.
+///
+/// Pure: no iSH state, safe to call from tests.
++ (NSString *)decodeShellOutputFromPending:(NSMutableData *)pending isFinal:(BOOL)isFinal;
+
 @end
 
 NS_ASSUME_NONNULL_END

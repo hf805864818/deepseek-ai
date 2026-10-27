@@ -107,10 +107,19 @@ final class ShareCoordinator: ObservableObject {
     struct PendingShareBuffer {
         let share: PendingShare
         let bufferedAt: Date
-        /// Session this buffer is addressed to. nil = "any session" (cold launch).
+        /// [T-share-routes-to-background-session] The session this share is
+        /// FOR. Set by ContentView the moment it decides where the share goes
+        /// (always a freshly minted draft id today). `nil` only for a buffer
+        /// stored before any routing decision — the cold-launch path, where
+        /// the launch flow picks the destination.
+        ///
+        /// Without it, `AIChatView.onChange(bufferVersion)` injected into
+        /// whatever chat happened to be mounted: on 2026-08-18 23:55:42 a
+        /// second share landed in session 87B79110, a DIFFERENT conversation
+        /// that was mid-agent-run in the background, because that view was
+        /// simply the one on screen. The attachment appeared in a busy
+        /// session's composer with no way for the user to tell why.
         var targetSessionId: String?
-        /// Draft this buffer is addressed to. nil = "any draft" (cold launch).
-        let targetDraftId: String?
     }
 
     /// Written by processPendingShare() in ContentView, consumed once by AIChatView.
@@ -129,34 +138,24 @@ final class ShareCoordinator: ObservableObject {
     /// attachment file names are UUID-suffixed so distinct files never
     /// collide, while a doubled delivery of the same record stays single.
     /// bufferedAt renews so the merged buffer gets a fresh TTL window.
-    func storeBuffer(_ share: PendingShare, sessionId: String? = nil, draftId: String? = nil) {
+    func storeBuffer(_ share: PendingShare) {
         if let existing = pendingShareBuffer {
             var merged = existing.share.items
             for item in share.items where !merged.contains(where: { $0.kind == item.kind && $0.value == item.value }) {
                 merged.append(item)
             }
             let mergedShare = PendingShare(items: merged, timestamp: share.timestamp)
-            // Merge: inherit the more specific target (new non-nil wins over old nil).
-            let mergedSessionId = sessionId ?? existing.targetSessionId
-            let mergedDraftId = draftId ?? existing.targetDraftId
-            pendingShareBuffer = PendingShareBuffer(
-                share: mergedShare,
-                bufferedAt: Date(),
-                targetSessionId: mergedSessionId,
-                targetDraftId: mergedDraftId
-            )
+            // Keep the existing target: a merge means the first share's
+            // destination has already been decided (and possibly navigated to).
+            pendingShareBuffer = PendingShareBuffer(share: mergedShare, bufferedAt: Date(),
+                                                    targetSessionId: existing.targetSessionId)
             bufferVersion += 1
-            shareLog.info("[Share] storeBuffer: MERGED \(existing.share.items.count) existing + \(share.items.count) new → \(merged.count) items (v\(bufferVersion)) targetSession=\(mergedSessionId ?? "nil") targetDraft=\(mergedDraftId ?? "nil")")
+            shareLog.info("[Share] storeBuffer: MERGED \(existing.share.items.count) existing + \(share.items.count) new → \(merged.count) items (v\(bufferVersion)) target=\(existing.targetSessionId ?? "nil")")
             return
         }
-        pendingShareBuffer = PendingShareBuffer(
-            share: share,
-            bufferedAt: Date(),
-            targetSessionId: sessionId,
-            targetDraftId: draftId
-        )
+        pendingShareBuffer = PendingShareBuffer(share: share, bufferedAt: Date(), targetSessionId: nil)
         bufferVersion += 1
-        shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) targetSession=\(sessionId ?? "nil") targetDraft=\(draftId ?? "nil") at \(Date())")
+        shareLog.info("[Share] storeBuffer: \(share.items.count) items buffered (v\(bufferVersion)) at \(Date())")
     }
 
     /// [T-share-routes-to-background-session] Name the session this buffered
@@ -179,7 +178,7 @@ final class ShareCoordinator: ObservableObject {
         // and `sessionId = <real id>, draftId = __new__…` after it. Matching
         // either identity keeps a share aimed at the draft the user is looking
         // at from being refused by that very draft once it acquires a real id
-        // mid-flight.
+        // mid-flight — the A231F9 shape in the 2026-08-18 log.
         return target == sessionId || target == draftId
     }
 

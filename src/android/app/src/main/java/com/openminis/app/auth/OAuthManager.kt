@@ -22,12 +22,29 @@ abstract class OAuthManager(
     protected val context: Context,
     protected val instanceId: String,
 ) {
+    /**
+     * [FEAT-261021-16] The instance's Settings > Network tag: sign-in, token
+     * refresh and the account calls around them take the same route as the
+     * provider's chat requests (an instance without a route of its own
+     * follows the default route).
+     */
+    protected val netTag: String get() = com.openminis.app.network.NetworkRuntime.providerTag(instanceId)
+
+    /** [baseHttpClient], routed by [netTag]; the same object when nothing is configured. */
+    protected val httpClient: OkHttpClient get() = com.openminis.app.network.NetworkHttp.client(netTag, baseHttpClient)
+
     companion object {
         private const val TAG = "OAuthManager"
         private const val KEY_MANUAL_BEARER = "manual_bearer_token"
 
+        /** OAuth `error` codes that mean the refresh token itself is dead. */
+        val DEFAULT_FATAL_REFRESH_CODES = setOf(
+            "invalid_grant", "invalid_token", "invalid_request",
+            "unauthorized_client", "refresh_token_reused",
+        )
+
         /** Shared OkHttp client for all OAuth HTTP requests (respects system proxy). */
-        internal val httpClient = OkHttpClient.Builder()
+        internal val baseHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .build()
@@ -35,7 +52,8 @@ abstract class OAuthManager(
         /**
          * [T-android-oauth-log-redaction] Make an HTTP body safe to log:
          * masks the VALUES of known credential fields (access_token,
-         * refresh_token, id_token, api_key/key, client_secret, device_code)
+         * refresh_token, id_token, api_key/key, client_secret, device_code,
+         * user_code, code_verifier)
          * and truncates to a diagnostic-sized prefix. OAuth failure bodies
          * are usually just {"error":"invalid_grant"} — but some IdPs echo
          * request material, and a malformed SUCCESS body reaching an error
@@ -44,9 +62,90 @@ abstract class OAuthManager(
          */
         fun sanitizeBody(body: String, maxLen: Int = 300): String {
             val masked = Regex(
-                "\"(access_token|refresh_token|id_token|api_key|key|client_secret|device_code)\"\\s*:\\s*\"[^\"]*\"",
+                // [T-android-oauth-log-redact] + user_code / code_verifier (not bare "code": error bodies use it for error codes).
+                "\"(access_token|refresh_token|id_token|api_key|key|client_secret|device_code|user_code|code_verifier)\"\\s*:\\s*\"[^\"]*\"",
             ).replace(body) { m -> "\"${m.groupValues[1]}\":\"***\"" }
             return if (masked.length <= maxLen) masked else masked.take(maxLen) + "…(${masked.length} chars)"
+        }
+
+        /**
+         * [T-android-group-resolve-skip-uncredentialed] Whether ANY OAuth
+         * credential is stored for [instanceId] — either a token bundle from a
+         * completed login or a user-pasted manual bearer.
+         *
+         * Static on purpose. Callers (notably provider routing) need a cheap
+         * synchronous yes/no and must not depend on [forInstance], which
+         * deliberately omits some provider types (gemini) and would report
+         * those as uncredentialed. Token storage is keyed purely by instance
+         * id, so reading the prefs directly is both correct and complete.
+         *
+         * Presence only — this does NOT validate or refresh the token. An
+         * expired token still counts as a credential so routing keeps the
+         * provider and the request path performs the refresh, matching iOS
+         * `hasAnyCredential`.
+         */
+        fun hasStoredCredential(context: Context, instanceId: String): Boolean {
+            val prefs = com.openminis.app.util.EncryptedPrefsFactory
+                .safeCreate(context, "oauth_prefs")
+            if (!prefs.getString("oauth_tokens_$instanceId", null).isNullOrEmpty()) return true
+            return !prefs.getString("oauth_${KEY_MANUAL_BEARER}_$instanceId", null).isNullOrEmpty()
+        }
+
+        /**
+         * [T-oauth-keep-credentials] Whether this instance's stored OAuth token
+         * bundle is the one a refresh was rejected with. Automatic paths never
+         * delete credentials any more; they set this mark instead, the UI shows
+         * the instance red, and routing treats it as uncredentialed. Only an
+         * explicit Sign Out deletes the bundle.
+         *
+         * The mark is a SHA-256 fingerprint of the rejected bundle, never the
+         * credential, and it only applies while that exact bundle is stored, so
+         * a new login (or a restored backup) lapses it with no explicit clear.
+         * A stored manual bearer overrides it: that credential is still usable.
+         * Static for the same reason as [hasStoredCredential].
+         */
+        fun needsReauth(context: Context, instanceId: String): Boolean {
+            val prefs = com.openminis.app.util.EncryptedPrefsFactory
+                .safeCreate(context, "oauth_prefs")
+            val mark = prefs.getString(needsReauthKey(instanceId), null) ?: return false
+            val blob = prefs.getString("oauth_tokens_$instanceId", null) ?: return false
+            if (tokenFingerprint(blob) != mark) return false
+            // A manual bearer never refreshes and stands in for the bundle.
+            return prefs.getString("oauth_${KEY_MANUAL_BEARER}_$instanceId", null).isNullOrEmpty()
+        }
+
+        private fun needsReauthKey(instanceId: String) = "oauth_needs_reauth_$instanceId"
+
+        private fun tokenFingerprint(blob: String): String =
+            MessageDigest.getInstance("SHA-256").digest(blob.toByteArray())
+                .joinToString("") { "%02x".format(it) }
+
+        /**
+         * The token bundle to save after a refresh: the [response], plus what
+         * it left out that the stored bundle had. The refresh token may not
+         * come back on every refresh. [T-codex-account-id-refresh] Nor may the
+         * id_token, which an OpenAI sign-in made before its account id was
+         * stored needs to backfill it (GH #447): saving the response alone
+         * dropped it for good.
+         */
+        internal fun refreshedTokens(stored: JSONObject, response: JSONObject, usedRefreshToken: String): JSONObject {
+            if (!response.has("refresh_token")) response.put("refresh_token", usedRefreshToken)
+            val idToken = stored.optString("id_token", "")
+            if (response.optString("id_token", "").isEmpty() && idToken.isNotEmpty()) response.put("id_token", idToken)
+            return response
+        }
+
+        /**
+         * [T-oauth-keep-credentials] Structured "the token endpoint rejected
+         * this refresh token" test, iOS `OAuthRefreshErrorClassifier` parity:
+         * an auth-rejection status, or an exact OAuth `error` code from the
+         * JSON body. No substring matching — a body that merely mentions
+         * `refresh_token` (e.g. `refresh_token_expiry_ms`) is not a rejection.
+         */
+        fun isRefreshRejected(status: Int, body: String, fatalErrorCodes: Set<String>): Boolean {
+            if (status == 400 || status == 401 || status == 403) return true
+            val code = try { JSONObject(body).optString("error", "") } catch (_: Exception) { "" }
+            return code.lowercase() in fatalErrorCodes
         }
 
         /** Create the appropriate OAuthManager for a provider instance. */
@@ -56,6 +155,10 @@ abstract class OAuthManager(
                 com.openminis.app.data.model.ProviderType.openAI -> OpenAIOAuthManager(context, instance.id)
                 com.openminis.app.data.model.ProviderType.xAI -> XAIOAuthManager(context, instance.id)
                 com.openminis.app.data.model.ProviderType.kimiCode -> KimiOAuthManager(context, instance.id)
+                // [T-copilot-provider] Device-flow OAuth like Kimi, but the
+                // token it hands out is Copilot's short-lived session token.
+                com.openminis.app.data.model.ProviderType.githubCopilot ->
+                    CopilotOAuthManager(context, instance.id)
                 else -> null
             }
         }
@@ -139,13 +242,22 @@ abstract class OAuthManager(
 
     suspend fun startLogin(onComplete: (Boolean) -> Unit) {
         callbackServer?.stop()
-        callbackServer = OAuthCallbackServer(callbackPort) { code, state ->
+        callbackServer = OAuthCallbackServer(
+            callbackPort,
+            // [T-oauth-callback-double-resume] Denied / failed: report now.
+            onError = { err ->
+                Log.w(TAG, "OAuth callback error: ${err.error}")
+                kotlinx.coroutines.GlobalScope.launch(Dispatchers.Main) { onComplete(false) }
+            },
+        ) { code, state ->
             if (state != null && state != currentState) {
                 Log.w(TAG, "State mismatch")
                 onComplete(false)
                 return@OAuthCallbackServer
             }
             kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+                // [T-android-oauth-foreground-exchange] See OAuthForegroundGate.
+                OAuthForegroundGate.awaitForeground(TAG)
                 val success = exchangeCode(code)
                 withContext(Dispatchers.Main) { onComplete(success) }
             }
@@ -226,15 +338,15 @@ abstract class OAuthManager(
 
             if (responseCode !in 200..299) {
                 Log.e(TAG, "Token refresh failed: $responseCode")
+                if (isRefreshRejected(responseCode, responseBody, DEFAULT_FATAL_REFRESH_CODES)) {
+                    markNeedsReauth(refreshToken)
+                }
                 return@withContext false
             }
 
-            val json = JSONObject(responseBody)
-            // Preserve refresh_token if not returned
-            if (!json.has("refresh_token")) {
-                json.put("refresh_token", refreshToken)
-            }
+            val json = refreshedTokens(stored, JSONObject(responseBody), refreshToken)
             saveTokens(json)
+            onTokensRefreshed(json)
             true
         } catch (e: Exception) {
             Log.e(TAG, "Token refresh error", e)
@@ -257,17 +369,28 @@ abstract class OAuthManager(
             if (refreshToken()) {
                 return loadStoredTokens()?.optString("access_token")
             }
-            // Refresh failed — if token is already expired, clear credentials
+            // Refresh failed and the token is already expired: nothing usable
+            // to return. [T-oauth-keep-credentials] Credentials are kept — a
+            // rejected refresh was marked inside refreshToken(); a transient
+            // failure (network, 5xx) must never cost the user their login.
             if (expireAt > 0 && now >= expireAt) {
-                Log.w(TAG, "Token expired and refresh failed — clearing credentials")
-                logout()
+                Log.w(TAG, "Token expired and refresh failed — keeping credentials")
                 return null
             }
         }
         return token
     }
 
-    fun isAuthenticated(): Boolean {
+    /**
+     * Whether this instance has a usable credential.
+     *
+     * [T-android-copilot-not-connected] `open` because a subclass may persist
+     * its credential somewhere other than the shared `oauth_tokens_<id>` blob
+     * this default inspects. Copilot does exactly that (two tiers under its own
+     * keys), and while the method was final its sign-in looked like a failure
+     * to every screen that asks this question.
+     */
+    open fun isAuthenticated(): Boolean {
         if (loadManualBearerToken()?.isNotEmpty() == true) return true
         val stored = loadStoredTokens() ?: return false
         return stored.optString("access_token", "").isNotEmpty()
@@ -277,7 +400,35 @@ abstract class OAuthManager(
         getEncryptedPrefs().edit()
             .remove("oauth_tokens_$instanceId")
             .remove("oauth_${KEY_MANUAL_BEARER}_$instanceId")
+            .remove(needsReauthKey(instanceId))
             .apply()
+    }
+
+    /** See the companion [needsReauth]. */
+    fun needsReauth(): Boolean = needsReauth(context, instanceId)
+
+    /**
+     * [T-oauth-keep-credentials] Called instead of [logout] when the token
+     * endpoint rejects [staleRefreshToken]. Compare-before-mark: when the
+     * stored bundle no longer carries that refresh token, a concurrent refresh
+     * already rotated it and this rejection is stale — marking would flag a
+     * perfectly good fresh login.
+     */
+    protected fun markNeedsReauth(staleRefreshToken: String) {
+        val blob = loadOAuthString("tokens") ?: return
+        val current = try { JSONObject(blob).optString("refresh_token", "") } catch (_: Exception) { "" }
+        if (current != staleRefreshToken) {
+            Log.w(TAG, "Stale refresh rejection ignored — token already rotated; not marking")
+            return
+        }
+        getEncryptedPrefs().edit()
+            .putString(needsReauthKey(instanceId), tokenFingerprint(blob))
+            .apply()
+        Log.w(TAG, "Refresh token rejected — marked for re-login, credentials kept")
+    }
+
+    private fun clearNeedsReauth() {
+        getEncryptedPrefs().edit().remove(needsReauthKey(instanceId)).apply()
     }
 
     // Token storage
@@ -288,6 +439,7 @@ abstract class OAuthManager(
         }
         getEncryptedPrefs().edit()
             .putString("oauth_tokens_$instanceId", json.toString())
+            .remove(needsReauthKey(instanceId))
             .apply()
     }
 
@@ -298,6 +450,8 @@ abstract class OAuthManager(
 
     protected fun saveOAuthString(key: String, value: String) {
         getEncryptedPrefs().edit().putString("oauth_${key}_$instanceId", value).apply()
+        // A new token bundle supersedes any needs-re-login mark.
+        if (key == "tokens") clearNeedsReauth()
     }
 
     protected fun loadOAuthString(key: String): String? {
@@ -313,6 +467,8 @@ abstract class OAuthManager(
      */
     fun saveManualBearerToken(token: String) {
         saveOAuthString(KEY_MANUAL_BEARER, token)
+        // [T-provider-quota] A pasted token is the quota query's credential too.
+        com.openminis.app.quota.QuotaStore.credentialsChanged()
     }
 
     fun loadManualBearerToken(): String? = loadOAuthString(KEY_MANUAL_BEARER)
@@ -321,6 +477,7 @@ abstract class OAuthManager(
         getEncryptedPrefs().edit()
             .remove("oauth_${KEY_MANUAL_BEARER}_$instanceId")
             .apply()
+        com.openminis.app.quota.QuotaStore.credentialsChanged()
     }
 
     // [T-android-provider-export-oauth-token] Public export/import shims for the
@@ -345,6 +502,7 @@ abstract class OAuthManager(
         val normalized = normalizeCamelToSnake(obj)
         getEncryptedPrefs().edit()
             .putString("oauth_tokens_$instanceId", normalized.toString())
+            .remove(needsReauthKey(instanceId))
             .apply()
     }
 
@@ -398,4 +556,7 @@ abstract class OAuthManager(
         com.openminis.app.util.EncryptedPrefsFactory.safeCreate(context, "oauth_prefs")
 
     protected open suspend fun onTokensReceived(json: JSONObject) {}
+
+    /** After [refreshToken] saved [json] (already merged by [refreshedTokens]). */
+    protected open suspend fun onTokensRefreshed(json: JSONObject) {}
 }

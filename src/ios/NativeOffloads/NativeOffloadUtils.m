@@ -7,6 +7,7 @@
 
 #import "NativeOffloadUtils.h"
 #include "kernel/fs.h"
+#include "kernel/task.h"
 #include "fs/fd.h"
 #include "fs/path.h"
 #include <unistd.h>
@@ -128,6 +129,39 @@ NSString *noff_format_date(NSDate *date) {
     fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime;
     fmt.timeZone = [NSTimeZone localTimeZone];
     return [fmt stringFromDate:date];
+}
+
+// ── All-day event helpers ──  [T-calendar-all-day]
+
+BOOL noff_is_date_only_string(NSString *_Nullable str) {
+    if (str.length != 10) return NO;
+    // Positional check rather than a formatter: a formatter is lenient about
+    // trailing text and would also accept "2026-12-01" as the prefix of a
+    // datetime, which is exactly the case this must reject.
+    for (NSUInteger i = 0; i < 10; i++) {
+        unichar c = [str characterAtIndex:i];
+        if (i == 4 || i == 7) {
+            if (c != '-') return NO;
+        } else if (c < '0' || c > '9') {
+            return NO;
+        }
+    }
+    return noff_parse_date(str) != nil;
+}
+
+void noff_all_day_bounds(NSDate *start, NSDate *end,
+                         NSDate *_Nonnull *_Nonnull outStart,
+                         NSDate *_Nonnull *_Nonnull outEnd) {
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDate *startDay = [cal startOfDayForDate:start];
+    NSDate *endDay = [cal startOfDayForDate:end ?: start];
+    if ([endDay compare:startDay] == NSOrderedAscending) endDay = startDay;
+    // 23:59:59 of the last day = (next midnight) - 1s, via calendar units so a
+    // 23h/25h DST day still lands on its own last second.
+    NSDate *nextMidnight = [cal dateByAddingUnit:NSCalendarUnitDay value:1 toDate:endDay options:0];
+    NSDate *endOfDay = [nextMidnight dateByAddingTimeInterval:-1];
+    *outStart = startDay;
+    *outEnd = endOfDay ?: endDay;
 }
 
 // ── JSON output ──
@@ -347,4 +381,13 @@ BOOL noff_try_objc(void (NS_NOESCAPE ^block)(void)) {
         NSLog(@"noff_try_objc: caught ObjC exception: %@ — %@", e.name, e.reason);
         return NO;
     }
+}
+
+// ── Calling session ──
+
+uint64_t noff_current_fs_context(void) {
+    // `current` is iSH's thread-local task: on the handler's guest thread it is
+    // the task that exec'd the offloaded binary.
+    if (current == NULL || current->group == NULL) return 0;
+    return current->group->fs_context;
 }

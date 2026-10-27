@@ -10,6 +10,70 @@ extension AIChatViewModel {
 
     // MARK: - Context Window Offloading
 
+    /// Marker that opens every offload stub written into `agentHistory`.
+    ///
+    /// [T-offload-placeholder-write-guard issue #374] Shared with the write-tool
+    /// gate in +ConcurrentTools.swift, which refuses a file_write / file_edit
+    /// whose payload IS a stub: offloading rewrites a historical file_write's
+    /// `content` argument to this text, so a call re-issued from that rewritten
+    /// history would put the ~130-char placeholder on disk over the real file.
+    /// Mirrors Android `ContextOffload.OFFLOADED_PREFIX`.
+    nonisolated static let offloadedStubPrefix = "[CONTEXT OFFLOADED]"
+
+    /// [T-offload-stub-system-reminder issue #374] Marker for the current stub
+    /// format. The pruned-argument notice is now wrapped in a
+    /// `<system-reminder>` envelope carrying this tag, so the model reads it as
+    /// a meta-instruction about a REMOVED argument rather than as content it may
+    /// copy into its next call. The old plain-text form read like content
+    /// ("Content (~N tokens…) saved to: …"), which is exactly why a model
+    /// re-issuing its own earlier `file_write` pasted the placeholder back in.
+    ///
+    /// Mirrors Android `ContextOffload.SYSTEM_NOTICE_TAG`.
+    nonisolated static let offloadedStubNoticeTag = "[Minis System Notice]"
+
+    /// Envelope opener for the current stub format. Kept separate from the tag
+    /// so detection can require BOTH (a bare `<system-reminder>` is a legitimate
+    /// thing for other subsystems to emit — see the persona reminder).
+    nonisolated static let offloadedStubEnvelope = "<system-reminder>"
+
+    /// True when `value` is an offload placeholder in EITHER format.
+    ///
+    /// Both are recognised on purpose and neither branch may be dropped:
+    ///   • the `<system-reminder>` + `[Minis System Notice]` form is what the
+    ///     offloader writes now;
+    ///   • the bare `[CONTEXT OFFLOADED]` form is still present in every
+    ///     session persisted before this change, and in iCloud-synced history
+    ///     from a peer on an older build. Those stubs keep arriving for as long
+    ///     as such histories exist, so the legacy test is not transitional.
+    ///
+    /// Leading whitespace is trimmed first: a provider may prefix a newline.
+    /// The test is anchored at the start, not `contains`, so prose that merely
+    /// discusses the marker is still written normally.
+    ///
+    /// Mirrors Android `ContextOffload.isOffloadPlaceholder`.
+    nonisolated static func isOffloadedStub(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(offloadedStubPrefix) { return true }
+        return trimmed.hasPrefix(offloadedStubEnvelope)
+            && trimmed.contains(offloadedStubNoticeTag)
+    }
+
+    /// The pruned-argument notice handed to the model in place of a `file_write`
+    /// / `file_edit` payload that was moved to disk. Mirrors Android
+    /// `ContextOffload.stub`.
+    nonisolated static func offloadedStubNotice(tokens: Int, bytes: Int, linuxPath: String) -> String {
+        """
+        \(offloadedStubEnvelope)
+        \(offloadedStubNoticeTag) The original content (~\(tokens) tokens, \(bytes) bytes) \
+        of this tool argument has been pruned to save context and offloaded to: \(linuxPath)
+
+        CRITICAL: This is a placeholder notice, NOT actual file content. NEVER pass this \
+        placeholder or reuse it in subsequent file_write or file_edit calls. If you need the \
+        original content, call file_read on the offloaded path first.
+        </system-reminder>
+        """
+    }
+
     /// Save context content to disk for later retrieval via file_read.
     /// Returns the Linux-visible path where the file was saved.
     /// Derive a short unique suffix from a tool ID for use in file names.
@@ -19,7 +83,7 @@ extension AIChatViewModel {
         String(toolId.suffix(12))
     }
 
-    private func offloadContextContent(_ content: String, toolId: String, toolName: String, ext: String = "txt") -> String {
+    func offloadContextContent(_ content: String, toolId: String, toolName: String, ext: String = "txt") -> String {
         let fm = FileManager.default
         let sid = sessionId ?? "unknown"
         let persistDir = Self.minisOffloadsPersistentDir(for: sid)
@@ -131,6 +195,22 @@ extension AIChatViewModel {
         return false
     }
 
+    /// [T-offload-readback-loop] GH#343. True when `path` points into the
+    /// offload store — i.e. reading it returns content the offloader itself
+    /// wrote, not new information from the world.
+    ///
+    /// Deliberately narrower than `isPersistentMinisPath`, which also accepts
+    /// workspace / browser / attachments. Those are legitimate sources whose
+    /// results SHOULD be offloadable when they are large; only the offload
+    /// directory creates the read → offload → read cycle.
+    ///
+    /// `static` and `nonisolated` so the tool layer can call it while building
+    /// a result, off the main actor.
+    nonisolated static func isOffloadStorePath(_ path: String) -> Bool {
+        let p = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        return p.hasPrefix("/var/minis/offloads/") || p.hasPrefix("minis://offloads/")
+    }
+
     /// Extract the original accessible path of an image produced by a known
     /// tool, so the placeholder can reference it as a semantic hint (and,
     /// when the path is persistent, skip writing a snapshot copy).
@@ -188,51 +268,26 @@ extension AIChatViewModel {
     func trimOldImagesFromHistory() {
         let keep = Self.kImageContextKeepCount
 
-        // [T-perf-trim-images-skip] If agentHistory hasn't changed since the
-        // last image count, reuse the cached count. This avoids the O(n*m)
-        // first-pass traversal (iterating every message × every part to count
-        // images) on every runAgentLoop entry — the send/resume hot path.
-        // Only when agentHistory has grown do we need to recount, and even
-        // then we only need to scan the NEW messages.
-        let currentHistoryCount = agentHistory.count
-        var totalImages: Int
-
-        if _cachedImageCount >= 0 && currentHistoryCount == _cachedImageCountHistorySize {
-            totalImages = _cachedImageCount
-        } else if _cachedImageCount >= 0 && currentHistoryCount > _cachedImageCountHistorySize {
-            // Only scan the newly appended messages for additional images
-            totalImages = _cachedImageCount
-            for msg in agentHistory[_cachedImageCountHistorySize..<currentHistoryCount] {
-                for part in msg.parts {
-                    switch part {
-                    case .toolResult(_, _, _, _, let imgData, _, _, _):
-                        if imgData != nil { totalImages += 1 }
-                    case .imageData:
-                        totalImages += 1
-                    default:
-                        break
-                    }
-                }
-            }
-        } else {
-            // Full scan (first call, after compaction/offload, or history shrank)
-            totalImages = 0
-            for msg in agentHistory {
-                for part in msg.parts {
-                    switch part {
-                    case .toolResult(_, _, _, _, let imgData, _, _, _):
-                        if imgData != nil { totalImages += 1 }
-                    case .imageData:
-                        totalImages += 1
-                    default:
-                        break
-                    }
+        // First pass: index tool_use calls by id (for name + input lookup)
+        // and count total images across the history. Rehydrated messages
+        // lose the name on `.toolResult`, so the index is the canonical
+        // source of truth for tool metadata.
+        var toolCallById: [String: (name: String, input: [String: Any])] = [:]
+        var totalImages = 0
+        for msg in agentHistory {
+            for part in msg.parts {
+                switch part {
+                case .toolUse(let id, let name, let input, _):
+                    toolCallById[id] = (name: name, input: input)
+                case .toolResult(_, _, _, _, let imgData, _, _, _, _):
+                    if imgData != nil { totalImages += 1 }
+                case .imageData:
+                    totalImages += 1
+                default:
+                    break
                 }
             }
         }
-        _cachedImageCount = totalImages
-        _cachedImageCountHistorySize = currentHistoryCount
-
         guard totalImages > keep else { return }
 
         // Evict the oldest `totalImages - keep` images so the most recent
@@ -240,19 +295,6 @@ extension AIChatViewModel {
         let evictCount = totalImages - keep
         var evicted = 0
         var snapshotsWritten = 0
-
-        // [T-perf-trim-images-lazy] Build toolCallById only when eviction is
-        // actually needed (totalImages > keep). Most calls return early above
-        // without reaching here, so this dictionary is only built when there
-        // are too many images to keep.
-        var toolCallById: [String: (name: String, input: [String: Any])] = [:]
-        for msg in agentHistory {
-            for part in msg.parts {
-                if case .toolUse(let id, let name, let input) = part {
-                    toolCallById[id] = (name: name, input: input)
-                }
-            }
-        }
 
         for mi in agentHistory.indices {
             if evicted >= evictCount { break }
@@ -263,7 +305,7 @@ extension AIChatViewModel {
             for pi in parts.indices {
                 if evicted >= evictCount { break }
                 switch parts[pi] {
-                case .toolResult(let id, let name, let content, let isError, let imgData, let mime, let pageURL, _):
+                case .toolResult(let id, let name, let content, let isError, let imgData, let mime, let pageURL, _, let isReadback):
                     guard let data = imgData else { continue }
 
                     let call = toolCallById[id]
@@ -292,7 +334,9 @@ extension AIChatViewModel {
                     let newContent = content.isEmpty ? placeholder : "\(content)\n\n\(placeholder)"
                     newParts[pi] = .toolResult(
                         id: id, name: name, content: newContent,
-                        isError: isError, imageData: nil, imageMimeType: nil, pageURL: pageURL
+                        isError: isError, imageData: nil, imageMimeType: nil, pageURL: pageURL,
+                        // [T-offload-readback-loop] Carry the flag across the rebuild.
+                        imageLinuxPath: nil, isOffloadReadback: isReadback
                     )
                     mutated = true
                     evicted += 1
@@ -316,31 +360,28 @@ extension AIChatViewModel {
             }
 
             if mutated {
-                agentHistory[mi] = AgentMessage(
-                    role: agentHistory[mi].role,
-                    parts: newParts,
-                    isInterrupted: agentHistory[mi].isInterrupted,
-                    reasoningContent: agentHistory[mi].reasoningContent
-                )
+                // [T-history-rebuild-keeps-ids] Replace the parts in place.
+                // Rebuilding the message dropped `dbMessageId` and
+                // `reasoningEcho`: when the evicted image sat in the v2
+                // compaction anchor, the anchor lookup then failed and
+                // effectiveAgentHistory fell back to the FULL history (the
+                // compaction silently undone), and reasoning echo was lost.
+                agentHistory[mi].parts = newParts
             }
         }
 
         if evicted > 0 {
             logger.info("🖼️ Context image trim: evicted \(evicted) old image(s) (snapshots: \(snapshotsWritten)), kept last \(keep) (total was \(totalImages))")
-            // [T-perf-estimate-cache-correctness] Image eviction modified the
-            // content of existing messages (image bytes → text placeholders)
-            // without changing agentHistory.count. The estimate cache keys on
-            // count, so it would return stale (too-high) values. Invalidate
-            // so the next estimateContextTokens() recomputes from scratch.
-            invalidateEstimateCache()
         }
     }
 
     /// Check if context is approaching the model's window limit and offload old tool content.
     ///
     /// Uses a **subtraction method**: starts from the real `lastContextTokens` reported by the API,
-    /// and subtracts each offloaded part's token count (computed via BPETokenizer) until the
-    /// context drops to the policy's offload target. This avoids unreliable full-history estimation.
+    /// and subtracts each offloaded part's token count until the context drops to the policy's
+    /// offload target. The per-part count is ContextSizeMeter's calibrated estimate — the same
+    /// scale the context meter reports — not BPE: tokenizing every candidate on the main thread
+    /// froze the UI for 8-9 s in long chats [T-offload-scan-cache].
     /// Estimate total agentHistory token count using character-based heuristic.
     /// Uses ~3.5 chars/token for mixed English/CJK/code content (conservative).
     /// Also accounts for image data tokens (~85 tokens per 1KB of base64).
@@ -351,112 +392,62 @@ extension AIChatViewModel {
     /// what's sent; estimating against the raw log made post-compact usage
     /// look unchanged and fired the "near capacity" prompt before every send.
     func estimateContextTokens(_ caller: String = #function) -> Int {
-        // [T-perf-estimate-cache] Return cached value when agentHistory
-        // hasn't changed since the last computation. This eliminates the
-        // repeated full-history traversal + JSONSerialization on the main
-        // thread that caused UI stalls during send() and resume().
-        let currentCount = agentHistory.count
-        if let cached = _cachedEstimateTokens,
-           currentCount == _cachedEstimateHistoryCount {
-            return cached
-        }
-
-        let currentMarkerId = cachedLatestMarker?.id
-
-        // [T-perf-estimate-incremental] When agentHistory grew (new messages
-        // appended) but the compaction marker is unchanged, the effective slice
-        // only grew at the tail. Compute only the new messages' tokens and add
-        // to the cached total — O(delta) instead of O(n) full traversal.
-        //
-        // [T-perf-estimate-no-effective-slice] CRITICAL: do NOT call
-        // effectiveAgentHistory() here. That function calls
-        // dropOrphanedToolParts() which is O(n*m) — iterating every message ×
-        // every part to build toolUseIds/toolResultIds sets. Calling it on
-        // every estimateContextTokens() (even on the incremental path) would
-        // negate the entire O(delta) optimization. Instead, compute the delta
-        // directly from agentHistory — the new messages are the same objects
-        // regardless of whether they're in the effective slice or the raw
-        // history. The marker boundary only affects which OLD messages are
-        // included, not the NEW ones (which are always appended to the tail
-        // and thus always in the post-anchor section).
-        if let cached = _cachedEstimateTokens,
-           currentCount > _cachedEstimateHistoryCount,
-           _cachedEstimateMarkerId == currentMarkerId {
-            let prevCount = _cachedEstimateHistoryCount
-            var deltaChars = 0
-            var deltaImgTokens = 0
-            // Iterate only the newly appended messages from raw agentHistory
-            for msg in agentHistory[prevCount..<currentCount] {
-                for part in msg.parts {
-                    switch part {
-                    case .text(let t):
-                        deltaChars += t.count
-                    case .toolUse(_, _, let input):
-                        if let data = try? JSONSerialization.data(withJSONObject: input) {
-                            deltaChars += data.count
-                        }
-                    case .toolResult(_, _, let content, _, let imgData, _, _, _):
-                        deltaChars += content.count
-                        if let imgData = imgData {
-                            deltaImgTokens += BPETokenizer.shared.countImageTokens(imgData)
-                        }
-                    case .imageData(let data, _, _):
-                        deltaImgTokens += BPETokenizer.shared.countImageTokens(data)
-                    }
-                }
-            }
-            let deltaTokens = Int(Double(deltaChars) / 3.5) + deltaImgTokens
-            let newTotal = cached + deltaTokens
-            _cachedEstimateTokens = newTotal
-            _cachedEstimateHistoryCount = currentCount
-            _cachedEstimateSliceCount = currentCount  // raw count as proxy
-            _cachedEstimateMarkerId = currentMarkerId
-            logger.info("[CompactDiag] estimate INCR caller=\(caller) +\(currentCount - prevCount)msg delta=\(deltaTokens)tok total=\(newTotal)tok")
-            return newTotal
-        }
-
-        // [T-perf-estimate-fast-path] Full computation without the expensive
-        // per-message diagnostic logging. The old code built perMsg[] and
-        // biggest[] arrays for EVERY message on every cache miss, then logged
-        // them — O(n) string building + I/O on the main thread. Now only the
-        // total is computed; diagnostics are gated behind a debug flag.
-        //
-        // [T-perf-estimate-skip-effective] Skip effectiveAgentHistory() on the
-        // cold-cache path — it calls dropOrphanedToolParts() which is O(n*m).
-        // Token estimation does not need the exact effective slice; using the
-        // raw agentHistory slightly over-estimates (safe — only triggers
-        // compaction earlier) but avoids the heavy orphan scan on the main
-        // thread during send/resume.
-        let slice = agentHistory
         var totalChars = 0
         var imageTokens = 0
-        for msg in slice {
+        let slice = effectiveAgentHistory()
+        // DIAG: per-message breakdown so we can see EXACTLY what occupies the
+        // post-compact context. Logs every message's role + part summary +
+        // token estimate; lets us tell whether bloat comes from the injected
+        // summary, pre-anchor warm-up turns, or post-anchor tool results.
+        var perMsg: [String] = []
+        var biggest: [(kind: String, chars: Int, msgIdx: Int)] = []
+        for (idx, msg) in slice.enumerated() {
+            var msgChars = 0
+            var msgImgTok = 0
+            var partTags: [String] = []
             for part in msg.parts {
+                var partChars = 0
+                var partKind = ""
                 switch part {
                 case .text(let t):
-                    totalChars += t.count
-                case .toolUse(_, _, let input):
+                    partChars = t.count
+                    let isSummary = t.contains("<context-summary>")
+                    partKind = isSummary ? "SUMMARY" : "text"
+                case .toolUse(_, let name, let input, _):
                     if let data = try? JSONSerialization.data(withJSONObject: input) {
-                        totalChars += data.count
+                        partChars = data.count
                     }
-                case .toolResult(_, _, let content, _, let imgData, _, _, _):
-                    totalChars += content.count
+                    partKind = "tu:\(name)"
+                case .toolResult(_, _, let content, _, let imgData, _, _, _, _):
+                    partChars = content.count
                     if let imgData = imgData {
-                        imageTokens += BPETokenizer.shared.countImageTokens(imgData)
+                        let it = BPETokenizer.shared.countImageTokens(imgData)
+                        imageTokens += it
+                        msgImgTok += it
                     }
+                    partKind = "tr"
                 case .imageData(let data, _, _):
-                    imageTokens += BPETokenizer.shared.countImageTokens(data)
+                    let it = BPETokenizer.shared.countImageTokens(data)
+                    imageTokens += it
+                    msgImgTok += it
+                    partKind = "img"
+                }
+                msgChars += partChars
+                totalChars += partChars
+                partTags.append("\(partKind)=\(partChars)c")
+                if partChars >= 2000 {
+                    biggest.append((partKind, partChars, idx))
                 }
             }
+            let msgTok = Int(Double(msgChars) / 3.5) + msgImgTok
+            let dbId = msg.dbMessageId?.prefix(8) ?? "----"
+            perMsg.append("[\(idx) \(msg.role.rawValue) db=\(dbId) ~\(msgTok)tok | \(partTags.joined(separator: ","))]")
         }
         let totalTokens = Int(Double(totalChars) / 3.5) + imageTokens
-
-        // [T-perf-estimate-cache] Store result
-        _cachedEstimateTokens = totalTokens
-        _cachedEstimateHistoryCount = currentCount
-        _cachedEstimateSliceCount = slice.count
-        _cachedEstimateMarkerId = currentMarkerId
-        logger.info("[CompactDiag] estimate FULL caller=\(caller) slice=\(slice.count) total=\(totalTokens)tok (\(totalChars)chars+\(imageTokens)imgTok)")
+        biggest.sort { $0.chars > $1.chars }
+        let top = biggest.prefix(5).map { "[\($0.msgIdx)\($0.kind)=\($0.chars)c]" }.joined(separator: " ")
+        logger.verbose("[CompactDiag] estimate caller=\(caller) slice=\(slice.count) total=\(totalTokens)tok (\(totalChars)chars+\(imageTokens)imgTok) bigParts(≥2kc): \(top)")
+        logger.verbose("[CompactDiag] estimate perMsg: \(perMsg.joined(separator: " "))")
         return totalTokens
     }
 
@@ -464,8 +455,12 @@ extension AIChatViewModel {
     ///   regardless of current context usage. Used after compaction to unconditionally slim down
     ///   the kept messages.
     func offloadContextIfNeeded(model: LLMModel, lastContextTokens: Int, force: Bool = false) {
-        let contextWindow = effectiveContextWindow(for: model)
-        let policy = ContextPolicy(contextWindow: contextWindow)
+        // [T-ctx-user-cap] Build the policy the same way the capacity guards do,
+        // or a 32K user cap lands in the native small-window tier and disables
+        // offload (offloadThreshold == 0) for a model with ample room for it.
+        let resolved = resolvedContextWindow(for: model)
+        let contextWindow = resolved.window
+        let policy = ContextPolicy(contextWindow: contextWindow, isUserCap: resolved.isUserCap)
 
         // Policy disables offloading for this context window tier
         if !force && policy.offloadThreshold == 0 {
@@ -473,11 +468,18 @@ extension AIChatViewModel {
             return
         }
 
-        // When no API baseline exists (first iteration of a new message),
-        // use a fast char-based estimate to avoid sending an oversized prompt.
+        // [T-offload-scan-cache] Wall-clock of the whole call, logged at the end
+        // so a device log shows directly whether an offload still stalls.
+        let offloadStart = CFAbsoluteTimeGetCurrent()
+
+        // When no baseline is passed (the post-compact FORCE call), measure the
+        // outbound request the same way the per-iteration call does. It is the
+        // cached, calibrated meter — `estimateContextTokens()` re-counted every
+        // character of the effective history and built a per-message diagnostic
+        // string on the main thread, on the one path that also offloads the most.
         var effectiveTokens = lastContextTokens
         if lastContextTokens == 0 {
-            effectiveTokens = estimateContextTokens()
+            effectiveTokens = measureOutboundContextTokens()
             if !force {
                 if effectiveTokens < policy.offloadThreshold {
                     let remaining = contextWindow - effectiveTokens
@@ -485,7 +487,7 @@ extension AIChatViewModel {
                     return
                 }
             }
-            logger.info("Context offload: no API baseline — using char estimate: ~\(effectiveTokens) tokens")
+            logger.info("Context offload: no API baseline — using outbound measurement: ~\(effectiveTokens) tokens")
         }
 
         let pct = Int(Double(effectiveTokens) / Double(contextWindow) * 100)
@@ -518,10 +520,15 @@ extension AIChatViewModel {
 
         // Protect the last 4 messages from offloading
         let protectedCount = min(4, agentHistory.count)
-        let candidateRange = 0..<(agentHistory.count - protectedCount)
-        logger.info("  Scanning messages 0..<\(candidateRange.upperBound) (last \(protectedCount) protected)")
+        // [T-offload-scan-cache] Start after the compaction anchor: what lies
+        // before it never reaches the model (see `offloadScanStartIndex`).
+        let scanStart = min(offloadScanStartIndex(), agentHistory.count - protectedCount)
+        let candidateRange = scanStart..<(agentHistory.count - protectedCount)
+        logger.info("  Scanning messages \(candidateRange.lowerBound)..<\(candidateRange.upperBound) (last \(protectedCount) protected, \(scanStart) before the compaction anchor skipped)")
 
-        // Collect offload candidates: (messageIndex, partIndex, tokenCount, byteCount)
+        // Collect offload candidates. `tokens` is ContextSizeMeter's estimate —
+        // the same one the context meter (and so `lastContextTokens`) is built
+        // from — so ranking and the "enough freed" check need no BPE at all.
         struct OffloadCandidate {
             let msgIdx: Int
             let partIdx: Int
@@ -529,20 +536,100 @@ extension AIChatViewModel {
             let bytes: Int
             let toolId: String
             let toolName: String
+            let cacheKey: String
         }
+        let cache = offloadScanCache
+        cache.beginScan()
+        // Calibrated like `measureOutboundContextTokens`, so freed tokens are
+        // on the same scale as the usage they are subtracted from.
+        let calibrationRatio = contextCalibrationRatio(for: model.id)
 
         var candidates: [OffloadCandidate] = []
         var skippedAlreadyOffloaded = 0
         var skippedTooSmall = 0
+        /// [T-offload-readback-loop] Parts skipped because they are the
+        /// offloader's own output read back in. Counted separately from
+        /// `skippedAlreadyOffloaded` so the log distinguishes "we already
+        /// shrank this" from "this came back out of the store" — the second is
+        /// the loop, and it used to be silent.
+        var skippedOffloadReadback = 0
+        /// [T-offload-toolinput-guards issue #374] Tool-use ids that already have
+        /// a matching tool_result anywhere in history — i.e. calls that have
+        /// demonstrably finished. Only their arguments may be pruned. Collected
+        /// over the WHOLE history, not `candidateRange`, because a call inside
+        /// the range is answered by a result that often sits outside it.
+        var skippedUnanswered = 0
+        var answeredToolUseIds: Set<String> = []
+        // [T-offload-warmup-scan] The warm-up before the anchor is sent too;
+        // scan the parts of it that survive the send-time prune.
+        let warmUp = offloadWarmUpScanPlan()
+        let warmUpIndices = warmUp.indices.filter { $0 < scanStart }
+        let answeredFrom = min(warmUpIndices.first ?? scanStart, scanStart)
+        // A call in the range is answered by a result after it, so starting at
+        // the range start loses nothing.
+        for msg in agentHistory[answeredFrom...] {
+            for part in msg.parts {
+                if case .toolResult(let id, _, _, _, _, _, _, _, _) = part {
+                    answeredToolUseIds.insert(id)
+                }
+            }
+        }
 
-        for msgIdx in candidateRange {
+        if !warmUpIndices.isEmpty {
+            logger.info("  Warm-up before the anchor: scanning \(warmUpIndices.count) sent message(s) (\(warmUp.prunedToolIds.count) pruned tool id(s) skipped)")
+        }
+        for msgIdx in warmUpIndices + Array(candidateRange) {
             let msg = agentHistory[msgIdx]
+            let inWarmUp = msgIdx < scanStart
             for (partIdx, part) in msg.parts.enumerated() {
+                // [T-offload-warmup-scan] Parts the send-time prune drops from
+                // the warm-up never reach the model: offloading them would
+                // "free" nothing and replace a dropped part with a sent stub.
+                if inWarmUp {
+                    switch part {
+                    case .toolResult(let id, _, _, _, _, _, _, _, _), .toolUse(let id, _, _, _):
+                        if warmUp.prunedToolIds.contains(id) { continue }
+                    default: break
+                    }
+                }
                 switch part {
-                case .toolResult(let id, let name, let content, _, let imgData, _, _, _):
-                    // Skip already-offloaded parts
-                    if content.hasPrefix("[CONTEXT OFFLOADED]") {
+                case .toolResult(let id, let name, let content, _, let imgData, _, _, _, let isReadback):
+                    // [T-offload-scan-cache] Reuse the last verdict when the
+                    // part is unchanged; an offload rewrite changes its size
+                    // and stub flag, so a rewritten part is judged afresh.
+                    let key = "r:\(id)"
+                    let fp = OffloadScanCache.fingerprint(content: content, extraBytes: imgData?.count ?? 0,
+                                                          flag: isReadback)
+                    if let hit = cache.lookup(key, fingerprint: fp) {
+                        switch hit.verdict {
+                        case .readback: skippedOffloadReadback += 1
+                        case .alreadyOffloaded: skippedAlreadyOffloaded += 1
+                        case .tooSmall: skippedTooSmall += 1
+                        case .candidate:
+                            candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: hit.tokens, bytes: hit.bytes, toolId: id, toolName: name, cacheKey: key))
+                        }
+                        continue
+                    }
+                    // [T-offload-readback-loop] GH#343. Skip content this
+                    // offloader produced and `file_read` merely fetched back.
+                    //
+                    // The prefix test below cannot catch it: a read-back carries
+                    // the ORIGINAL payload, so it has no stub prefix and looked
+                    // like brand-new material. Offloading it wrote a second file
+                    // whose stub the model read, and round it went. Checked
+                    // first because it is the cheaper and more specific test.
+                    if isReadback {
+                        skippedOffloadReadback += 1
+                        cache.store(key, fingerprint: fp, verdict: .readback)
+                        continue
+                    }
+                    // Skip already-offloaded parts. Routed through the shared
+                    // predicate so the new <system-reminder> stub is recognised
+                    // too — a bare hasPrefix check on the legacy marker silently
+                    // stopped matching when the format changed.
+                    if Self.isOffloadedStub(content) {
                         skippedAlreadyOffloaded += 1
+                        cache.store(key, fingerprint: fp, verdict: .alreadyOffloaded)
                         continue
                     }
                     // Only offload substantial content (>500 chars) or large images (>1KB)
@@ -550,20 +637,86 @@ extension AIChatViewModel {
                     let hasLargeImage = (imgData?.count ?? 0) > 1024
                     guard hasLargeContent || hasLargeImage else {
                         skippedTooSmall += 1
+                        cache.store(key, fingerprint: fp, verdict: .tooSmall)
                         continue
                     }
 
-                    let tokens = BPETokenizer.shared.countPartTokens(part)
                     let bytes = content.utf8.count + (imgData?.count ?? 0)
-                    candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: tokens, bytes: bytes, toolId: id, toolName: name))
+                    let tokens = ContextSizeMeter.estimateTokens(part)
+                    cache.store(key, fingerprint: fp, verdict: .candidate, bytes: bytes, tokens: tokens)
+                    candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: tokens, bytes: bytes, toolId: id, toolName: name, cacheKey: key))
 
-                case .toolUse(let id, let name, let input):
+                case .toolUse(let id, let name, let input, let isOffloadedArgument):
                     // Offload large file_write/file_edit tool inputs
                     guard name == "file_write" || name == "file_edit" else { continue }
-                    if let content = input["content"] as? String, content.count > 500 {
-                        let tokens = BPETokenizer.shared.countPartTokens(part)
+
+                    // [T-offload-scan-cache] A call that has not finished is
+                    // neither offloaded NOR cached. The call's assistant message
+                    // enters history before its tools run; its results are
+                    // appended only once the whole batch completes (`agentHistory
+                    // .append(toolResultMessage)` in the tool loop), so "has a
+                    // result" is exactly "finished". Checked before any cache
+                    // access: no lookup, no store — an in-flight call's argument
+                    // is never judged, and nothing about it can go stale.
+                    // (A `.toolResult` part, by the same token, only ever exists
+                    // for a finished call, so that branch caches freely.)
+                    //
+                    // [T-offload-toolinput-guards issue #374] Pruning the
+                    // argument of a call that has no tool_result would rewrite
+                    // something still in flight. Today both offload triggers run
+                    // at the top of a loop iteration, outside the
+                    // append->dispatch window, and dispatch reads its arguments
+                    // from the freshly parsed stream rather than from history —
+                    // so this cannot bite yet. It is asserted here anyway so the
+                    // invariant is local to the scanner instead of resting on
+                    // call-site ordering a later refactor could change silently.
+                    guard answeredToolUseIds.contains(id) else {
+                        skippedUnanswered += 1
+                        continue
+                    }
+
+                    let argument = input["content"] as? String
+                    let key = "u:\(id)"
+                    let fp = OffloadScanCache.fingerprint(content: argument ?? "", extraBytes: 0,
+                                                          flag: isOffloadedArgument)
+                    if let hit = cache.lookup(key, fingerprint: fp) {
+                        switch hit.verdict {
+                        case .alreadyOffloaded: skippedAlreadyOffloaded += 1
+                        case .readback, .tooSmall: skippedTooSmall += 1
+                        case .candidate:
+                            candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: hit.tokens, bytes: hit.bytes, toolId: id, toolName: name, cacheKey: key))
+                        }
+                        continue
+                    }
+
+                    // [T-offload-toolinput-guards issue #374] The guards the
+                    // `.toolResult` branch above has always had (the "not yet
+                    // answered" one is the first check of this case, above).
+                    //
+                    // 1. Already pruned. The flag is authoritative (only the
+                    //    offloader sets it); the text test covers history
+                    //    persisted before the flag existed, and stubs arriving
+                    //    from an older peer over iCloud sync. Re-pruning one
+                    //    would write a second file whose notice replaces the
+                    //    first, losing the path to the real content.
+                    if isOffloadedArgument {
+                        skippedAlreadyOffloaded += 1
+                        cache.store(key, fingerprint: fp, verdict: .alreadyOffloaded)
+                        continue
+                    }
+                    if let content = argument, Self.isOffloadedStub(content) {
+                        skippedAlreadyOffloaded += 1
+                        cache.store(key, fingerprint: fp, verdict: .alreadyOffloaded)
+                        continue
+                    }
+
+                    if let content = argument, content.count > 500 {
                         let bytes = content.utf8.count
-                        candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: tokens, bytes: bytes, toolId: id, toolName: name))
+                        let tokens = ContextSizeMeter.estimateTokens(part)
+                        cache.store(key, fingerprint: fp, verdict: .candidate, bytes: bytes, tokens: tokens)
+                        candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: tokens, bytes: bytes, toolId: id, toolName: name, cacheKey: key))
+                    } else {
+                        cache.store(key, fingerprint: fp, verdict: .tooSmall)
                     }
 
                 case .imageData(let data, _, _):
@@ -571,8 +724,19 @@ extension AIChatViewModel {
                         skippedTooSmall += 1
                         continue
                     }
-                    let tokens = BPETokenizer.shared.countPartTokens(part)
-                    candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: tokens, bytes: data.count, toolId: "img\(msgIdx)_\(partIdx)", toolName: "image"))
+                    // Size alone decides an image's verdict; its token count
+                    // (pixel-based — the image header has to be decoded) is
+                    // what is worth caching, keyed to the message + slot.
+                    let key = "i:\(msg.dbMessageId ?? "idx\(msgIdx)"):\(partIdx)"
+                    let fp = OffloadScanCache.fingerprint(data: data)
+                    let tokens: Int
+                    if let hit = cache.lookup(key, fingerprint: fp) {
+                        tokens = hit.tokens
+                    } else {
+                        tokens = ContextSizeMeter.estimateTokens(part)
+                        cache.store(key, fingerprint: fp, verdict: .candidate, bytes: data.count, tokens: tokens)
+                    }
+                    candidates.append(OffloadCandidate(msgIdx: msgIdx, partIdx: partIdx, tokens: tokens, bytes: data.count, toolId: "img\(msgIdx)_\(partIdx)", toolName: "image", cacheKey: key))
 
                 case .text:
                     continue
@@ -580,16 +744,22 @@ extension AIChatViewModel {
             }
         }
 
-        // Sort by token count descending (offload largest first)
+        // [T-offload-scan-cache] Largest first by ESTIMATED tokens. BPE-encoding
+        // every candidate just to rank them was the whole cost of a slow
+        // offload (device log: 578 candidates, ~610k tokens on the main thread,
+        // 8-9 s, to offload the first handful). Not raw bytes either: an image
+        // is megabytes but ~1-2k tokens (pixel-based), and CJK text is 3 bytes
+        // per ~1 token, so bytes would rank both far too high.
         candidates.sort { $0.tokens > $1.tokens }
+        cache.endScan()
 
         let totalCandidateTokens = candidates.reduce(0) { $0 + $1.tokens }
-        logger.info("  Candidates: \(candidates.count) parts (~\(totalCandidateTokens) tokens total)")
-        logger.info("  Skipped: \(skippedAlreadyOffloaded) already offloaded, \(skippedTooSmall) too small")
+        logger.info("  Candidates: \(candidates.count) parts (~\(totalCandidateTokens) est. tokens) — scan cache hits=\(cache.hits) misses=\(cache.misses) entries=\(cache.count)")
+        logger.info("  Skipped: \(skippedAlreadyOffloaded) already offloaded, \(skippedOffloadReadback) offload readback, \(skippedTooSmall) too small, \(skippedUnanswered) unanswered tool calls")
         if !candidates.isEmpty {
             let top = candidates.prefix(5)
             for (i, c) in top.enumerated() {
-                logger.info("  Candidate #\(i + 1): [\(c.toolName)] id:\(c.toolId.prefix(8)) msg[\(c.msgIdx)] ~\(c.tokens) tokens (\(c.bytes) bytes)")
+                logger.info("  Candidate #\(i + 1): [\(c.toolName)] id:\(c.toolId.prefix(8)) msg[\(c.msgIdx)] ~\(c.tokens) est. tokens (\(c.bytes) bytes)")
             }
             if candidates.count > 5 {
                 logger.info("  ... and \(candidates.count - 5) more candidates")
@@ -599,14 +769,28 @@ extension AIChatViewModel {
         var offloadedCount = 0
         var freedTokens = 0
 
+        // [T-offload-scan-cache] Time budget. Each offload writes a file on
+        // the main thread (a few ms on an iPhone 8); the post-compact FORCE call
+        // offloads every eligible part, which in a long chat can be hundreds of
+        // files — enough on its own to cross a second. Stop after the budget
+        // (always taking at least one part): what is left is picked up by the
+        // next trigger, and after a compaction the context is already below
+        // the offload threshold, so nothing needs it urgently.
+        let offloadBudget: CFAbsoluteTime = 0.3
+        var stoppedByBudget = false
         for candidate in candidates {
             guard currentTokens > targetTokens else { break }
+            if offloadedCount > 0, CFAbsoluteTimeGetCurrent() - offloadStart > offloadBudget {
+                stoppedByBudget = true
+                break
+            }
 
             let part = agentHistory[candidate.msgIdx].parts[candidate.partIdx]
+            let candidateTokens = ContextSizeMeter.calibrated(candidate.tokens, ratio: calibrationRatio)
             var linuxPath = ""
 
             switch part {
-            case .toolResult(let id, let name, let content, let isError, let imgData, let imgMime, _, _):
+            case .toolResult(let id, let name, let content, let isError, let imgData, let imgMime, _, _, _):
                 // Offload text content
                 if content.count > 500 {
                     linuxPath = offloadContextContent(content, toolId: id, toolName: name)
@@ -617,45 +801,45 @@ extension AIChatViewModel {
                     if linuxPath.isEmpty { linuxPath = imgPath }
                 }
 
-                let stub = "[CONTEXT OFFLOADED] Content (~\(candidate.tokens) tokens, \(candidate.bytes) bytes) saved to: \(linuxPath)\nUse file_read tool to retrieve if needed."
+                let stub = "\(Self.offloadedStubPrefix) Content (~\(candidateTokens) tokens, \(candidate.bytes) bytes) saved to: \(linuxPath)\nUse file_read tool to retrieve if needed."
                 agentHistory[candidate.msgIdx].parts[candidate.partIdx] = .toolResult(
                     id: id, name: name, content: stub, isError: isError
                 )
 
-            case .toolUse(let id, let name, let input):
+            case .toolUse(let id, let name, let input, _):
                 if let content = input["content"] as? String {
                     linuxPath = offloadContextContent(content, toolId: id, toolName: name)
                 }
                 var newInput = input
-                newInput["content"] = "[CONTEXT OFFLOADED] Content (~\(candidate.tokens) tokens, \(candidate.bytes) bytes) saved to: \(linuxPath)\nUse file_read tool to retrieve if needed."
+                // [T-offload-stub-system-reminder issue #374] A pruned ARGUMENT
+                // gets the <system-reminder> notice, not the old content-shaped
+                // text: this value is read back by the model as its own prior
+                // call, and the old wording invited it to copy the placeholder
+                // into the next write.
+                newInput["content"] = Self.offloadedStubNotice(
+                    tokens: candidateTokens, bytes: candidate.bytes, linuxPath: linuxPath
+                )
                 agentHistory[candidate.msgIdx].parts[candidate.partIdx] = .toolUse(
-                    id: id, name: name, input: newInput
+                    id: id, name: name, input: newInput, isOffloadedArgument: true
                 )
 
             case .imageData(let data, let mime, _):
                 linuxPath = offloadContextImage(data, toolId: candidate.toolId, mimeType: mime)
-                let stub = "[CONTEXT OFFLOADED] Image (~\(candidate.tokens) tokens, \(candidate.bytes) bytes) saved to: \(linuxPath)\nUse file_read tool to retrieve if needed."
+                let stub = "\(Self.offloadedStubPrefix) Image (~\(candidateTokens) tokens, \(candidate.bytes) bytes) saved to: \(linuxPath)\nUse file_read tool to retrieve if needed."
                 agentHistory[candidate.msgIdx].parts[candidate.partIdx] = .text(stub)
 
             case .text:
                 continue
             }
 
-            currentTokens -= candidate.tokens
-            freedTokens += candidate.tokens
+            currentTokens -= candidateTokens
+            freedTokens += candidateTokens
             offloadedCount += 1
             let afterPct = Int(Double(currentTokens) / Double(contextWindow) * 100)
-            logger.info("  ✂ Offloaded #\(offloadedCount): [\(candidate.toolName)] id:\(candidate.toolId.prefix(8)) ~\(candidate.tokens) tokens (\(candidate.bytes) bytes) → \(linuxPath) [now \(currentTokens) (\(afterPct)%)]")
+            logger.info("  ✂ Offloaded #\(offloadedCount): [\(candidate.toolName)] id:\(candidate.toolId.prefix(8)) ~\(candidateTokens) tokens (\(candidate.bytes) bytes) → \(linuxPath) [now \(currentTokens) (\(afterPct)%)]")
         }
 
         if offloadedCount > 0 {
-            // [fix] Invalidate the estimate cache: offload replaced real
-            // toolResult/toolUse/text parts with stubs, so the cached token
-            // count (keyed only on agentHistory.count) is now stale. Without
-            // this, the next estimateContextTokens() returns the pre-offload
-            // (too-high) value within the same agentHistory.count.
-            invalidateEstimateCache()
-
             let afterPct = Int(Double(currentTokens) / Double(contextWindow) * 100)
             logger.info("━━━ Context Offload Complete ━━━")
             logger.info("  Parts offloaded: \(offloadedCount)")
@@ -664,45 +848,18 @@ extension AIChatViewModel {
             logger.info("  After:  \(currentTokens)/\(contextWindow) (\(afterPct)%)")
             logger.info("  Delta:  -\(beforeTokens - currentTokens) tokens (-\(pct - afterPct)pp)")
 
-            // List files in offloads/tools directory (top 20 by recency)
+            // [T-offload-scan-cache] Count only. Listing the top 20 by
+            // recency stat'ed and sorted every file in the directory (hundreds
+            // in a long chat) on the main thread, on every offload, for a log.
             let sid = sessionId ?? "unknown"
             let toolsDir = Self.minisOffloadsPersistentDir(for: sid)
                 .appendingPathComponent("tools", isDirectory: true)
-            if let files = try? FileManager.default.contentsOfDirectory(
-                at: toolsDir, includingPropertiesForKeys: [.fileSizeKey, .creationDateKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                let sorted = files.sorted { a, b in
-                    let da = (try? a.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                    let db = (try? b.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                    return da > db
-                }
-                let top20 = sorted.prefix(20)
-                var totalSize: Int64 = 0
-                logger.info("  /var/minis/offloads/tools/ — \(files.count) files (showing top \(top20.count)):")
-                for file in top20 {
-                    let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                    totalSize += Int64(size)
-                    let sizeStr: String
-                    if size >= 1_048_576 {
-                        sizeStr = String(format: "%.1fMB", Double(size) / 1_048_576)
-                    } else if size >= 1024 {
-                        sizeStr = String(format: "%.1fKB", Double(size) / 1024)
-                    } else {
-                        sizeStr = "\(size)B"
-                    }
-                    logger.info("    \(file.lastPathComponent) (\(sizeStr))")
-                }
-                let totalStr: String
-                if totalSize >= 1_048_576 {
-                    totalStr = String(format: "%.1fMB", Double(totalSize) / 1_048_576)
-                } else {
-                    totalStr = String(format: "%.1fKB", Double(totalSize) / 1024)
-                }
-                logger.info("  Total offload size: \(totalStr) across \(files.count) files")
-            }
+            let fileCount = (try? FileManager.default.contentsOfDirectory(atPath: toolsDir.path).count) ?? 0
+            logger.info("  /var/minis/offloads/tools/ — \(fileCount) files")
             logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         }
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - offloadStart) * 1000)
+        logger.info("[OffloadTiming] \(elapsedMs)ms scanned=\(candidateRange.count) candidates=\(candidates.count) offloaded=\(offloadedCount) budgetStop=\(stoppedByBudget) cacheHits=\(cache.hits) cacheMisses=\(cache.misses) force=\(force)")
     }
 
     /// Remove persistent minis data for a given session.
@@ -771,6 +928,54 @@ extension AIChatViewModel {
 
     /// Create symlinks in the fakefs data/ directory so the file browser
     /// can access minis directories without requiring the iSH kernel to be booted.
+    /// [T-minis-symlink-placeholder-dir issue #380] Remove a real directory that
+    /// is squatting where a symlink belongs, escalating until it is gone.
+    ///
+    /// `/var/minis/mcp-servers` and its siblings are symlinks into the App Group.
+    /// When a guest process wins the race and creates a plain directory there
+    /// (the guest CLI used to `mkdir -p` it unconditionally), the host's App Group
+    /// becomes unreachable from the sandbox: the app writes an OAuth bridge file
+    /// the guest can never read. Clearing the squatter is what restores the link,
+    /// so a silent failure here is not acceptable.
+    ///
+    /// Ladder, cheapest first:
+    ///   1. `removeItem` — succeeds for an empty or fully-owned directory.
+    ///   2. Delete the remaining children individually, then `rmdir`. This is the
+    ///      case a plain remove loses to: one undeletable child aborts the whole
+    ///      recursive delete, and the caller is left with a directory it believes
+    ///      it removed.
+    ///
+    /// Returns true when the path is clear (or was never there). `nonisolated` +
+    /// `static` so a test can drive it against a real temporary directory.
+    nonisolated static func forceRemovePlaceholderDirectory(
+        at path: URL, logger: AppLogger, label: String
+    ) -> Bool {
+        let fm = FileManager.default
+        if (try? fm.removeItem(at: path)) != nil { return true }
+
+        // Second pass: clear children one by one so a single stubborn entry
+        // cannot abort the whole delete, then drop the directory itself.
+        var failedChildren = 0
+        if let contents = try? fm.contentsOfDirectory(at: path, includingPropertiesForKeys: nil) {
+            for child in contents {
+                do { try fm.removeItem(at: child) } catch {
+                    failedChildren += 1
+                    logger.error("[MinisSymlink] \(label): cannot delete \(child.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+        if rmdir(path.path) == 0 {
+            logger.info("[MinisSymlink] \(label): placeholder dir cleared via rmdir after emptying it")
+            return true
+        }
+
+        // Still there. Report why, including whether children blocked it.
+        var buf = stat()
+        if lstat(path.path, &buf) != 0 { return true }   // vanished under us — fine
+        logger.error("[MinisSymlink] \(label): rmdir failed (errno=\(errno), undeletable children=\(failedChildren))")
+        return false
+    }
+
     private func ensureMinisSymlinks(for sid: String) {
         let fm = FileManager.default
         let dataPath = RootfsManager.shared.dataPath
@@ -830,7 +1035,26 @@ extension AIChatViewModel {
                     }
                 }
                 logger.info("[MinisSymlink] \(linuxDir): real dir -> persistDir migration, moved=\(moved) skipped(existing)=\(skipped)")
-                try? fm.removeItem(at: hostPath)
+
+                // [T-minis-symlink-placeholder-dir issue #380] The removal must
+                // actually succeed, or the symlink below cannot be created and the
+                // guest keeps reading a local empty directory that shadows the App
+                // Group — which is exactly how #380 presents: the host writes a
+                // bridge file the sandbox can never see.
+                //
+                // `try? removeItem` swallowed the failure, so a directory that
+                // still held un-migrated entries (a name collision above, or a file
+                // the move could not take) left a real dir in place and the next
+                // line failed too. Both errors were logged at different sites and
+                // read as unrelated.
+                //
+                // Recovery ladder: plain remove, then clear whatever survived and
+                // rmdir the now-empty directory. Anything left after that is
+                // reported loudly rather than silently degrading.
+                if !Self.forceRemovePlaceholderDirectory(at: hostPath, logger: logger, label: linuxDir) {
+                    logger.error("[MinisSymlink] \(linuxDir): could not clear placeholder dir at \(hostPath.path) — guest will keep seeing a shadowed local dir")
+                    continue
+                }
             } else if exists {
                 // Regular file — unexpected, remove
                 logger.info("[MinisSymlink] \(linuxDir): unexpected regular file at \(hostPath.path), removing")
@@ -842,7 +1066,21 @@ extension AIChatViewModel {
                 try fm.createSymbolicLink(at: hostPath, withDestinationURL: persistDir)
                 logger.info("[MinisSymlink] \(linuxDir): symlink created -> \(persistDir.path)")
             } catch {
-                logger.error("[MinisSymlink] \(linuxDir): createSymbolicLink FAILED: \(error.localizedDescription)")
+                // [issue #380] Read back what is actually there. "createSymbolicLink
+                // failed" alone does not say whether the path is now a stale dir, a
+                // file, or nothing — and that distinction is the whole diagnosis.
+                var after = stat()
+                let kind: String
+                if lstat(hostPath.path, &after) != 0 {
+                    kind = "nothing"
+                } else {
+                    switch after.st_mode & S_IFMT {
+                    case S_IFDIR: kind = "a real directory (guest is shadowed)"
+                    case S_IFLNK: kind = "a symlink"
+                    default: kind = "a regular file"
+                    }
+                }
+                logger.error("[MinisSymlink] \(linuxDir): createSymbolicLink FAILED: \(error.localizedDescription) — path now holds \(kind)")
             }
         }
 
@@ -986,4 +1224,181 @@ extension AIChatViewModel {
         return "minis://attachments/\(encoded)"
     }
 
+}
+
+// MARK: - [T-offload-scan-cache] Scan range + per-part verdict cache
+
+extension AIChatViewModel {
+    /// First raw `agentHistory` index the offload scanner needs to look at.
+    ///
+    /// Compact-v2 keeps the raw history and overlays a marker; what reaches the
+    /// model is `effectiveAgentHistory()` — a short warm-up before the anchor
+    /// (whose tool results over 1000 chars are already pruned there) plus
+    /// everything after it. Scanning from 0 walked the compacted half too
+    /// (device log: 2252 scanned vs 1104 sent), and offloading those parts
+    /// "freed" tokens that were never being sent, so the real usage barely
+    /// moved and the offload fired again minutes later.
+    ///
+    /// Mirrors `effectiveAgentHistoryUncounted`'s anchor resolution; any case it
+    /// degrades to full history (no marker, v1, unresolved anchor) returns 0 —
+    /// the previous behaviour.
+    func offloadScanStartIndex() -> Int {
+        guard let marker = cachedLatestMarker, marker.version >= 2,
+              let anchorId = marker.lastCompactedMessageId,
+              let anchorIdx = agentHistory.lastIndex(where: { $0.dbMessageId == anchorId }) else { return 0 }
+        return anchorIdx + 1
+    }
+
+    /// [T-offload-warmup-scan] Raw `agentHistory` indices of the pre-anchor
+    /// warm-up messages that `effectiveAgentHistory` actually sends, plus the
+    /// tool ids whose parts it prunes there.
+    ///
+    /// `offloadScanStartIndex` starts AFTER the anchor, but compact-v2 still
+    /// sends up to three user turns before it. That warm-up is only pruned of
+    /// tool_results over 1000 chars (and their calls): file_write arguments,
+    /// 501–1000-char results and images there were sent on every request yet
+    /// could no longer be offloaded. Mirrors effectiveAgentHistoryUncounted's
+    /// steps (walk back, prune > 1000, drop emptied messages, peel leading
+    /// non-user, drop the per-marker warm-up trim) so nothing unsent is
+    /// scanned. Empty when there is no resolvable v2 marker.
+    func offloadWarmUpScanPlan() -> (indices: [Int], prunedToolIds: Set<String>) {
+        guard let marker = cachedLatestMarker, marker.version >= 2,
+              let anchorId = marker.lastCompactedMessageId,
+              let anchorIdx = agentHistory.lastIndex(where: { $0.dbMessageId == anchorId }) else { return ([], []) }
+        let walkBack = walkBackUserTurnsBounded(anchorIdx: anchorIdx,
+                                                maxUserTextTurns: Self.compactKeepRecentUserTurns,
+                                                maxMessages: 100)
+        // [T-ctx-pin-request] A round over the cap sends only the user's
+        // request from before the anchor (see effectiveHistory).
+        if walkBack.priorIdx == nil, walkBack.stopReason == "messageCapWouldExceed",
+           let pinned = Self.lastRealUserTextIndex(in: agentHistory, upToIncluding: anchorIdx) {
+            return ([pinned], [])
+        }
+        guard let priorIdx = walkBack.priorIdx, priorIdx <= anchorIdx else { return ([], []) }
+        var pruned: Set<String> = []
+        for i in priorIdx...anchorIdx {
+            for part in agentHistory[i].parts {
+                if case .toolResult(let id, _, let content, _, _, _, _, _, _) = part, content.count > 1000 {
+                    pruned.insert(id)
+                }
+            }
+        }
+        var kept: [Int] = []
+        for i in priorIdx...anchorIdx {
+            let survives = agentHistory[i].parts.contains { part in
+                switch part {
+                case .toolUse(let id, _, _, _): return !pruned.contains(id)
+                case .toolResult(let id, _, _, _, _, _, _, _, _): return !pruned.contains(id)
+                default: return true
+                }
+            }
+            if survives { kept.append(i) }
+        }
+        while let first = kept.first, agentHistory[first].role != .user { kept.removeFirst() }
+        if let drop = warmUpDropByMarker[marker.id] {
+            kept = Array(kept.dropFirst(min(drop, kept.count)))
+        }
+        return (kept, pruned)
+    }
+}
+
+/// Per-part verdicts of the context-offload scanner, keyed by the part's own
+/// identity (`r:`/`u:` + tool-use id, `i:` + message id + slot for images —
+/// `AgentMessage` has no stable id of its own) and validated by a fingerprint
+/// of the content, so an edited or offloaded part is never answered from a
+/// stale entry. Holds verdicts, sizes and token estimates, never content.
+///
+/// A fingerprint collision (a provider reusing tool-use ids, or two same-size
+/// images) can only reuse another part's verdict/estimate for a part that
+/// looks identical in length, flags and first + last 32 bytes; the worst case
+/// is a slightly wrong estimate in the offload accounting, never lost content.
+///
+/// Memory: one entry ≈ 150 B (key string ~64 B on the heap, `Entry` ~48 B,
+/// dictionary slot overhead). The largest session seen (2257 messages) tracks
+/// ~905 parts ≈ 135 KB. `capacity` bounds it at ~600 KB per view model; past
+/// it, the least recently used entries (by scan generation) are evicted down
+/// to 3/4 of capacity. It is also emptied when the view model loads a session.
+/// Losing entries only costs a re-judgement on the next scan — correctness
+/// never depends on the cache.
+///
+/// Main-actor only (the scanner runs on the view model).
+@MainActor
+final class OffloadScanCache {
+    enum Verdict: UInt8 { case readback, alreadyOffloaded, tooSmall, candidate }
+
+    struct Entry {
+        var fingerprint: Int
+        var verdict: Verdict
+        /// Candidates only (0 otherwise).
+        var bytes: Int
+        /// ContextSizeMeter estimate, uncalibrated. Candidates only.
+        var tokens: Int
+        /// Scan generation of the last use, for LRU eviction.
+        var lastUsed: UInt32
+    }
+
+    static let capacity = 4096
+
+    private var entries: [String: Entry] = [:]
+    private var generation: UInt32 = 0
+    private(set) var hits = 0
+    private(set) var misses = 0
+
+    var count: Int { entries.count }
+
+    func beginScan() {
+        generation &+= 1
+        hits = 0
+        misses = 0
+    }
+
+    func lookup(_ key: String, fingerprint: Int) -> Entry? {
+        guard var entry = entries[key], entry.fingerprint == fingerprint else {
+            misses += 1
+            return nil
+        }
+        hits += 1
+        entry.lastUsed = generation
+        entries[key] = entry
+        return entry
+    }
+
+    func store(_ key: String, fingerprint: Int, verdict: Verdict, bytes: Int = 0, tokens: Int = 0) {
+        entries[key] = Entry(fingerprint: fingerprint, verdict: verdict, bytes: bytes,
+                             tokens: tokens, lastUsed: generation)
+    }
+
+    /// Evicts least-recently-used entries once over capacity.
+    func endScan() {
+        guard entries.count > Self.capacity else { return }
+        let keep = Self.capacity * 3 / 4
+        let victims = entries.sorted { $0.value.lastUsed < $1.value.lastUsed }
+            .prefix(entries.count - keep)
+        for (key, _) in victims { entries.removeValue(forKey: key) }
+    }
+
+    func removeAll() { entries.removeAll() }
+
+    /// Cheap: UTF-8 length (O(1) for native strings) plus the first and last
+    /// 32 bytes — an offload rewrite changes all of them.
+    nonisolated static func fingerprint(content: String, extraBytes: Int, flag: Bool) -> Int {
+        var h = Hasher()
+        let utf8 = content.utf8
+        h.combine(utf8.count)
+        h.combine(extraBytes)
+        h.combine(flag)
+        h.combine(utf8.prefix(32).reduce(0) { $0 &* 31 &+ Int($1) })
+        h.combine(utf8.suffix(32).reduce(0) { $0 &* 31 &+ Int($1) })
+        return h.finalize()
+    }
+
+    /// Size plus both ends: image headers (e.g. JPEG/JFIF) are often identical
+    /// across files, so the tail carries most of the distinction.
+    nonisolated static func fingerprint(data: Data) -> Int {
+        var h = Hasher()
+        h.combine(data.count)
+        h.combine(data.prefix(32))
+        h.combine(data.suffix(32))
+        return h.finalize()
+    }
 }

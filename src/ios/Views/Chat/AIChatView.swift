@@ -1110,7 +1110,6 @@ struct AIChatView: View {
         DeepModeWorkflowBanner(
             deepModeEnabled: vm.deepModeEnabled,
             clarifyState: vm.clarifyState,
-            activeSubagents: vm.activeSubagents,
             onCancelClarification: { vm.cancelClarification() },
             onSkipClarification: { vm.skipClarification() }
         )

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Security
 import UIKit
@@ -16,12 +17,46 @@ struct ProviderConfigTombstone: Codable, Hashable {
     let deletedAt: Date
 }
 
+// [T-backup-restore-tombstone] BEGIN restore-tombstone-rule
+extension ProviderConfigTombstone {
+    /// The local tombstones that survive a backup RESTORE carrying `restoring`.
+    ///
+    /// Sync and restore disagree on what a tombstone means. For sync it is a
+    /// peer's delete intent that must beat a stale snapshot. For a restore the
+    /// package IS the user's intent: they deleted a group, then explicitly asked
+    /// for their backup back. Keeping the tombstone made the merger drop the
+    /// very group the user was restoring, silently, while reporting success.
+    ///
+    /// So on restore an id the package carries clears its local tombstone, and
+    /// the package's OWN tombstones are not applied at all: the restore
+    /// confirmation promises "Nothing is deleted". Ids the package does not
+    /// carry keep their tombstones untouched.
+    static func survivingRestore(_ local: [ProviderConfigTombstone],
+                                 restoring: Set<String>) -> [ProviderConfigTombstone] {
+        local.filter { !restoring.contains($0.id) }
+    }
+}
+// [T-backup-restore-tombstone] END restore-tombstone-rule
+
 /// Top-level JSON structure for provider-config.json.
 struct ProviderConfig: Codable, Equatable {
     var instances: [ProviderInstance]
     var modelEntries: [ModelEntry]
     var modelGroups: [ModelGroup]
     var defaultPrimaryGroupId: String?
+    /// [T-sub-agents-v1] Read by delegation ONLY through the Auto path: a sub
+    /// agent whose definition pins no group runs on whichever of these the
+    /// delegating model asks for (`model_choice: sub_model` -> this group,
+    /// `default_model` -> `defaultPrimaryGroupId`, `same_as_me` -> the parent's
+    /// own binding). A definition that pins a group ignores all of it.
+    ///
+    /// There is no automatic downgrade: nothing routes work here just because
+    /// the group exists. The delegating model picks it deliberately for work it
+    /// judges simple and self-verifiable, and an unconfigured or unroutable
+    /// group falls back to the parent's model rather than to the other group.
+    ///
+    /// Also read by voice correction, title generation and the Model Groups
+    /// picker.
     var defaultSubGroupId: String?
     /// Stores per-session model bindings keyed by sessionId.
     var sessionBindings: [String: SessionModelBinding]
@@ -52,6 +87,11 @@ struct ProviderConfig: Codable, Equatable {
     var deletedInstances: [ProviderConfigTombstone]
     var deletedModelEntries: [ProviderConfigTombstone]
     var deletedModelGroups: [ProviderConfigTombstone]
+    // [T-subagent-own-store] `subAgents` used to live here. It moved to
+    // SubAgentStore: it is not provider configuration, and riding in this
+    // struct meant the v3 SQLite mirror (which has no sub-agent table)
+    // silently emptied the roster on every launch. See SubAgentStore's
+    // header for the full account.
 
     init(instances: [ProviderInstance], modelEntries: [ModelEntry], modelGroups: [ModelGroup],
          defaultPrimaryGroupId: String?, defaultSubGroupId: String?,
@@ -62,7 +102,8 @@ struct ProviderConfig: Codable, Equatable {
          sessionInferenceConfigs: [String: SessionInferenceConfig] = [:],
          deletedInstances: [ProviderConfigTombstone] = [],
          deletedModelEntries: [ProviderConfigTombstone] = [],
-         deletedModelGroups: [ProviderConfigTombstone] = []) {
+         deletedModelGroups: [ProviderConfigTombstone] = [],
+        ) {
         self.instances = instances
         self.modelEntries = modelEntries
         self.modelGroups = modelGroups
@@ -146,7 +187,39 @@ struct ProviderConfig: Codable, Equatable {
 final class ProviderConfigStore: ObservableObject {
     static let shared = ProviderConfigStore()
 
-    @Published private(set) var config: ProviderConfig
+    @Published private(set) var config: ProviderConfig {
+        // [T-composer-typing-lag] Any change to the config drops the entry index.
+        didSet { entryIndex = nil }
+    }
+
+    /// [T-composer-typing-lag] Positions in `config.modelEntries` by each
+    /// reference form `entry(for:)` accepts. A chat's body resolves the bound
+    /// entry ~6 times per evaluation (title, toolbar, thinking levels, fast
+    /// mode, cache toggle), and during streaming the body re-runs per token;
+    /// each lookup was up to four linear scans copying ModelEntry structs —
+    /// ~15% of the main thread in an iOS 16 Time Profiler trace, enough to make
+    /// typing in the composer lag while a reply streamed. Built lazily, dropped
+    /// whenever `config` changes.
+    private struct EntryIndex {
+        var byId: [String: Int] = [:]
+        var byUuid: [String: Int] = [:]
+        var byColonKey: [String: Int] = [:]
+    }
+    private var entryIndex: EntryIndex?
+
+    private func currentEntryIndex() -> EntryIndex {
+        if let entryIndex { return entryIndex }
+        var index = EntryIndex()
+        // First occurrence wins, matching the `first(where:)` scans it replaces.
+        for (i, e) in config.modelEntries.enumerated() {
+            if index.byId[e.id] == nil { index.byId[e.id] = i }
+            if index.byUuid[e.uuid] == nil { index.byUuid[e.uuid] = i }
+            let colon = e.legacyColonCompositeKey
+            if index.byColonKey[colon] == nil { index.byColonKey[colon] = i }
+        }
+        entryIndex = index
+        return index
+    }
 
     /// Bumped whenever an OAuth token or string is saved/deleted in the Keychain,
     /// so views observing the store re-evaluate auth state. Also an L1 cache key
@@ -159,6 +232,8 @@ final class ProviderConfigStore: ObservableObject {
     /// resolveCurrentEntry results. [T-new-session-hang-credential-cache]
     private(set) var configRevision: UInt = 0
 
+    private let fileURL: URL
+
     /// [review B3] The on-disk config path, exposed so the backup importer can
     /// snapshot it before a restore. Read-only accessor — the file itself is
     /// still written exclusively through `save()`.
@@ -166,8 +241,6 @@ final class ProviderConfigStore: ObservableObject {
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         return library.appendingPathComponent("MinisChat/provider-config.json")
     }
-
-    private let fileURL: URL
 
     /// v3 SQLite store. Populated on first launch from `provider-config.json`
     /// (migration); then becomes the source of truth for sync record
@@ -294,6 +367,10 @@ final class ProviderConfigStore: ObservableObject {
                 // is deterministic so it converges with peers; pruned rows are
                 // deleted + tombstoned so they don't resurrect.
                 let (deduped, prunedAtLoad) = Self.dedupeEntriesByModel(fresh)
+                // [T-group-order-log] The JSON mirror and the V3 database can
+                // disagree; from here on the database's order is the one used.
+                GroupOrderLog.noteAll(reason: "reload-db", before: self.config.modelGroups,
+                                      after: deduped.modelGroups, detail: "stage=init json-vs-db")
                 self.config = deduped
                 self.lastSavedSnapshot = deduped
                 // [T-provider-entry-composite-key] Build the legacyUuid map from
@@ -378,7 +455,7 @@ final class ProviderConfigStore: ObservableObject {
     /// from "file present but unreadable/undecodable" (must NOT clobber disk).
     private static func loadGuarded(from url: URL) -> (config: ProviderConfig, degradation: ConfigLoadDegradation) {
         guard FileManager.default.fileExists(atPath: url.path) else { return (.empty, .none) }
-        guard let data = try? Data(contentsOf: url) else {
+        guard let data = readConfigData(from: url) else {
             logger.error("[RebootGuard] provider-config.json exists but is UNREADABLE (protected data locked before first unlock, or I/O error) — degraded mode, save() suppressed")
             return (.empty, .unreadable)
         }
@@ -484,10 +561,100 @@ final class ProviderConfigStore: ObservableObject {
 
     // MARK: - Persistence
 
+    /// [T-model-entry-voice-seed-doubling] A healthy provider-config.json is
+    /// well under 1 MB (1,160 entries over 22 instances: 455 KB); past this
+    /// size it is almost certainly full of repeated model entries, and
+    /// decoding them all into `ModelEntry` on the main thread is slow - a
+    /// 303 MB file outlasted the launch watchdog on every launch. A large
+    /// file with nothing repeated only costs one extra JSONSerialization pass.
+    static let bloatedConfigThreshold = 4 * 1024 * 1024
+
+    /// One entry per (instance, uuid), in first-seen order. The copies the old
+    /// refresh produced are the same entry and differ only in `absentSince`:
+    /// every refresh stamped the still-unstamped copies with its own time, so
+    /// they drifted apart. Keep the EARLIEST stamp - when the provider first
+    /// stopped listing the model, which is what the grace window counts from.
+    static func collapsingRepeatedEntries(_ entries: [ModelEntry]) -> [ModelEntry] {
+        var indexByKey: [String: Int] = [:]
+        var unique: [ModelEntry] = []
+        unique.reserveCapacity(entries.count)
+        for entry in entries {
+            let key = "\(entry.providerInstanceId)/\(entry.uuid)"
+            guard let i = indexByKey[key] else {
+                indexByKey[key] = unique.count
+                unique.append(entry)
+                continue
+            }
+            if let since = entry.absentSince, unique[i].absentSince.map({ since < $0 }) ?? true {
+                unique[i].absentSince = since
+            }
+        }
+        return unique
+    }
+
+    /// `collapsingRepeatedEntries` on the raw JSON, which is several times
+    /// cheaper than decoding the entries. Entries without a uuid are kept
+    /// as they are. Returns nil when the data is not a config object or
+    /// nothing was repeated.
+    static func collapsingDuplicateModelEntries(in data: Data) -> Data? {
+        guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let entries = root["modelEntries"] as? [[String: Any]] else { return nil }
+        var indexByKey: [String: Int] = [:]
+        var unique: [[String: Any]] = []
+        unique.reserveCapacity(entries.count)
+        for entry in entries {
+            guard let uuid = entry["uuid"] as? String else { unique.append(entry); continue }
+            let key = "\(entry["providerInstanceId"] as? String ?? "")/\(uuid)"
+            guard let i = indexByKey[key] else {
+                indexByKey[key] = unique.count
+                unique.append(entry)
+                continue
+            }
+            if let since = entry["absentSince"] as? Double,
+               (unique[i]["absentSince"] as? Double).map({ since < $0 }) ?? true {
+                unique[i]["absentSince"] = since
+            }
+        }
+        guard unique.count != entries.count else { return nil }
+        root["modelEntries"] = unique
+        return try? JSONSerialization.data(withJSONObject: root)
+    }
+
+    /// Read provider-config.json, first collapsing a bloated file (see
+    /// `bloatedConfigThreshold`) and writing the collapsed bytes back so the
+    /// next launch reads the small file directly.
+    private static func readConfigData(from url: URL) -> Data? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard data.count > bloatedConfigThreshold,
+              let healed = collapsingDuplicateModelEntries(in: data) else { return data }
+        // Never replace a readable file with one the app cannot read: a
+        // collapsed copy that fails to decode is dropped, and the original
+        // bytes go down the normal (degraded-mode) path untouched.
+        guard (try? JSONDecoder().decode(ProviderConfig.self, from: healed)) != nil else {
+            logger.error("[ModelList] collapsed provider-config.json (\(healed.count) bytes) does not decode; keeping the original \(data.count) bytes")
+            return data
+        }
+        logger.warning("[ModelList] provider-config.json was \(data.count) bytes of repeated model entries; collapsed to \(healed.count) bytes before decoding")
+        do {
+            try healed.write(to: url, options: .atomic)
+        } catch {
+            logger.error("[ModelList] could not write the collapsed provider-config.json back: \(error)")
+        }
+        return healed
+    }
+
     private static func load(from url: URL) -> ProviderConfig {
-        guard let data = try? Data(contentsOf: url),
+        guard let data = readConfigData(from: url),
               var config = try? JSONDecoder().decode(ProviderConfig.self, from: data) else {
             return .empty
+        }
+        // [T-model-entry-voice-seed-doubling] Merge the repeated copies of one
+        // entry that replaceEntries used to append on every refresh. Distinct
+        // entries never share a uuid within an instance, so nothing real goes.
+        let entryCountBefore = config.modelEntries.count
+        config.modelEntries = collapsingRepeatedEntries(config.modelEntries)
+        if config.modelEntries.count != entryCountBefore {
+            logger.warning("[ModelList] load dropped \(entryCountBefore - config.modelEntries.count) duplicate model entr(ies) (same uuid); \(config.modelEntries.count) remain")
         }
         // Migrate group memberEntryIds from legacy composite keys to stable UUIDs.
         //
@@ -538,6 +705,13 @@ final class ProviderConfigStore: ObservableObject {
                 logger.warning("[GroupLoad] group \(config.modelGroups[i].id.prefix(8)) dropping unrecognisable member token '\(entryId.prefix(12))' (not a UUID, not a known composite key)")
                 return nil
             }
+            // [T-group-order-log] Legacy composite keys are mapped to ids and
+            // unrecognisable tokens dropped just above.
+            GroupOrderLog.note(reason: "normalize", groupId: config.modelGroups[i].id,
+                               name: config.modelGroups[i].name,
+                               before: before.map { compositeToUUID[$0] ?? $0 },
+                               after: config.modelGroups[i].memberEntryIds, warnOnReorder: true,
+                               detail: "stage=load-json")
             if unresolvedPreserved > 0 {
                 logger.info("[GroupLoad] group \(config.modelGroups[i].id.prefix(8)) (\(config.modelGroups[i].name)) preserved \(unresolvedPreserved) unresolved UUID member(s) across load — entries may still be syncing; members=\(before.count)→\(config.modelGroups[i].memberEntryIds.count)")
             }
@@ -556,6 +730,13 @@ final class ProviderConfigStore: ObservableObject {
             }
             if let def = config.defaultSubGroupId, emptyGroupIds.contains(def) {
                 config.defaultSubGroupId = nil
+            }
+            // [T-sub-agents-v1] Same reference cleanup as the pointers above: a
+            // sub agent pinned to a group that just went away must fall back to
+            // "chosen per task", not keep a dangling id the resolver would have
+            // to re-check on every delegation.
+            for gid in emptyGroupIds {
+                SubAgentStore.shared.clearModelGroup(gid)
             }
         }
         // Restore default group pointer if lost (e.g. missing key in JSON) but groups exist.
@@ -623,12 +804,27 @@ final class ProviderConfigStore: ObservableObject {
             }
         }
 
-        // 3. v2 compatibility: keep marking the legacy whole-file dirty
-        //    so old peer devices that haven't upgraded to v3 still
-        //    receive a current snapshot via the legacy
-        //    ProviderConfigV2 record. New peer devices ignore inbound
-        //    V2 records once their v3 flag is on (S7).
-        Task { await ChatStore.shared.markDirty(recordType: "ProviderConfig", recordId: "provider-config") }
+        // [T-icloud-drop-wholefile-producers] The legacy whole-file
+        // ProviderConfigV2 record is no longer emitted here. Every v3 device
+        // drops it on receipt (S7 short-circuit), so on a v3 fleet it was an
+        // 882 KB record in EVERY outbound batch that nobody read — and it is
+        // the record behind "You can't save the same record twice" (CKError
+        // 12) whenever two saves raced. The inbound merger stays so a
+        // not-yet-upgraded peer's snapshot can still be read.
+    }
+
+    /// [T-backup-restore-tombstone] Queue v3 upserts for everything a backup
+    /// restore changed, relative to the config before the restore.
+    ///
+    /// The restore merge commits through `applyMergedConfigFromSync`, which is
+    /// shaped for INBOUND data and so suppresses v3 emission; its only upload
+    /// signal was the whole-file record v3 peers drop. A restore is local
+    /// authorship, so it uses the same per-record diff as `save()`. The
+    /// re-inserted rows carry `updated_at = now` (bulkReplace), which is what
+    /// lets a peer's recently-deleted guard accept them as a genuine re-create.
+    func markRestoredRecordsDirty(prior: ProviderConfig) async {
+        let current = config
+        await Self.emitV3MarkDirty(prior: prior, current: current)
     }
 
     /// Diff `prior` vs `current` and emit per-record V3 markDirty calls
@@ -673,8 +869,13 @@ final class ProviderConfigStore: ObservableObject {
         // order. Detect an order change explicitly and mark every instance
         // dirty so records carry the fresh sortOrder (+ updated_at bumped by
         // bulkReplace, so LWW protects the new order against stale echoes).
-        if prior.instances.map(\.id) != current.instances.map(\.id) {
-            for inst in current.instances {
+        // [T-icloud-sync-tier3-row-level] Re-mark only the instances whose
+        // POSITION changed, not the whole list. Adding one provider used to
+        // re-queue all 24 (sortOrder is part of the record), which the server
+        // then reported as `conflict=8` against the peer's untouched copies.
+        let priorPos = Dictionary(uniqueKeysWithValues: prior.instances.enumerated().map { ($1.id, $0) })
+        for (idx, inst) in current.instances.enumerated() where priorPos[inst.id] != idx {
+            if priorInst[inst.id] == inst {   // content-equal but moved: the loop above skipped it
                 await ChatStore.shared.markDirty(recordType: "ProviderInstanceV3", recordId: inst.id, operation: "upsert")
             }
         }
@@ -766,6 +967,8 @@ final class ProviderConfigStore: ObservableObject {
             let priorMembers = config.modelGroups.reduce(0) { $0 + $1.memberEntryIds.count }
             let fresh = await db.dumpProviderConfig()
             let freshMembers = fresh.modelGroups.reduce(0) { $0 + $1.memberEntryIds.count }
+            GroupOrderLog.noteAll(reason: "reload-db", before: config.modelGroups,
+                                  after: fresh.modelGroups, detail: "stage=reloadFromDisk")   // [T-group-order-log]
             config = fresh
             lastSavedSnapshot = fresh
             logger.info("[GroupLoad] reloadFromDisk: V3 DB dump — groups=\(fresh.modelGroups.count) groupMembers(\(priorMembers)→\(freshMembers))")
@@ -773,7 +976,10 @@ final class ProviderConfigStore: ObservableObject {
             return
         }
         logger.info("[GroupLoad] reloadFromDisk: V2 JSON path (no DB / v3 disabled / not migrated)")
-        config = Self.load(from: fileURL)
+        let reloadedFromJSON = Self.load(from: fileURL)
+        GroupOrderLog.noteAll(reason: "reload-json", before: config.modelGroups,
+                              after: reloadedFromJSON.modelGroups, detail: "stage=reloadFromDisk")   // [T-group-order-log]
+        config = reloadedFromJSON
         objectWillChange.send()
     }
 
@@ -814,8 +1020,36 @@ final class ProviderConfigStore: ObservableObject {
             }
             config.modelEntries.append(contentsOf: entries)
             logger.info("[ModelList] addInstance (OAuth): instance=\(instance.label) seeded \(entries.count) built-in entries: [\(entries.map { $0.baseModel.id }.prefix(10).joined(separator: ","))]")
-            // Manual OAuth tokens and OpenRouter OAuth can fetch models from the API
-            if hasManualToken || instance.providerType == .openRouter {
+            // [T-provider-oauth-model-discovery] Reconcile the seed against the
+            // vendor's live catalog (GH#265).
+            //
+            // The seed above is this BUILD's idea of the provider's models, so
+            // it goes stale the moment the vendor ships anything new — a user
+            // who authenticated xAI saw a list with no grok-4.6 and had to find
+            // Settings → provider → Models → Refresh to fix it. Nothing was
+            // broken; the refresh simply was never triggered at the one moment
+            // it obviously should be.
+            //
+            // This used to fire only for a manual OAuth token or OpenRouter.
+            // The condition is now "can this provider discover models at all",
+            // which is the question actually being asked — so xAI, Kimi Code,
+            // Antigravity, Anthropic and Gemini OAuth are covered too, and a
+            // provider added later inherits the behaviour by answering
+            // `oauthSupportsModelDiscovery` rather than by someone remembering
+            // to edit this line.
+            //
+            // Safe by construction, and deliberately fire-and-forget:
+            //   * the credential already exists — OAuth completes and writes
+            //     its token BEFORE the instance is saved (AddProviderView's
+            //     startOAuth → saveOAuthInstance share `pendingInstanceId`), and
+            //     a manual token is written just above its `addInstance` call;
+            //   * it cannot leave the provider unusable — the seed is already
+            //     committed, and `fetchModelsWithFallback` degrades
+            //     API → models.dev → built-in, so a failure lands back on what
+            //     is on screen;
+            //   * it does not block the UI — the sheet dismisses immediately and
+            //     the list updates when the fetch lands.
+            if hasManualToken || instance.providerType.oauthSupportsModelDiscovery {
                 Task { await refreshModels(for: instance) }
             }
         } else if !VoiceProviderTemplate.mockEntries(for: instance).isEmpty {
@@ -982,6 +1216,7 @@ final class ProviderConfigStore: ObservableObject {
         // Remove from groups — stamp member-removal tombstones so the removal
         // survives the inbound union-merge on peers.
         let nowTs = Date()
+        let groupsBeforePrune = config.modelGroups   // [T-group-order-log]
         for i in config.modelGroups.indices {
             let hit = config.modelGroups[i].memberEntryIds.filter { removedEntryIds.contains($0) }
             guard !hit.isEmpty else { continue }
@@ -991,6 +1226,8 @@ final class ProviderConfigStore: ObservableObject {
                 config.modelGroups[i].addedMembers[e] = nil
             }
         }
+        GroupOrderLog.noteAll(reason: "entry-prune", before: groupsBeforePrune, after: config.modelGroups,
+                              detail: "cause=remove-instance instance=\(instanceId.prefix(8))")
         // [T-icloud-provider-sync-consistency] Remove ONLY the groups that
         // became empty as a direct result of THIS instance removal (computed
         // above as removedGroupIds). The old code removed EVERY empty group —
@@ -1095,6 +1332,30 @@ final class ProviderConfigStore: ObservableObject {
                     if let mod = entry.overrides.modalityOverride { o["modalityOverride"] = mod.rawValue }
                     if let ctx = entry.overrides.contextWindow { o["contextWindow"] = ctx }
                     if let sr = entry.overrides.supportsReasoning { o["supportsReasoning"] = sr }
+                    // [T-provider-export-thinking-ceiling] The user's per-model
+                    // thinking CEILING. It rides Codable (so backup and iCloud
+                    // sync always carried it) but was missing from this
+                    // hand-written list, so sharing a provider silently reset
+                    // the recipient's ceiling to the catalog default — the same
+                    // shape of bug as modalityOverride/contextWindow above.
+                    //
+                    // Encoded as the lowercase level id (`ThinkingLevel.rawValue`,
+                    // e.g. "xhigh"), which is also what the Codable/backup
+                    // payload writes, so the two agree. Android's importer reads
+                    // this id case-insensitively (its own enum names are
+                    // upper-case) — see ProviderRepository.thinkingLevelFromWire.
+                    if let mtl = entry.overrides.maxThinkingLevel { o["maxThinkingLevel"] = mtl.rawValue }
+                    // [T-model-custom-params] The four phase-one fields. This
+                    // serializer enumerates keys BY HAND, so a new field is
+                    // dropped on export unless it is added here — which is the
+                    // exact bug the note above records for modalityOverride /
+                    // contextWindow / supportsReasoning. Same additive contract:
+                    // older builds ignore unknown keys, and the importer reads
+                    // each independently.
+                    if let temp = entry.overrides.temperature { o["temperature"] = temp }
+                    if let tp = entry.overrides.topP { o["topP"] = tp }
+                    if let ch = entry.overrides.customHeaders, !ch.isEmpty { o["customHeaders"] = ch }
+                    if let eb = entry.overrides.extraBodyParams, !eb.isEmpty { o["extraBodyParams"] = eb }
                     m["overrides"] = o
                 }
                 return m
@@ -1332,6 +1593,22 @@ final class ProviderConfigStore: ObservableObject {
                     overrides.modalityOverride = (o["modalityOverride"] as? Int).map { ModelModality(rawValue: $0) }
                     overrides.contextWindow = o["contextWindow"] as? Int
                     overrides.supportsReasoning = o["supportsReasoning"] as? Bool
+                    // [T-provider-export-thinking-ceiling] Mirror of the export
+                    // above. `ThinkingLevel(rawValue:)` rather than
+                    // `ThinkingLevel.decoded`, because `decoded` clamps an
+                    // unrecognized token to `.xhigh` — correct when reading this
+                    // build's own persisted data, wrong here: a level a newer
+                    // build invented must stay nil ("inherit the catalog rule")
+                    // instead of silently pinning the ceiling to XHigh.
+                    // Lower-cased first so an Android export (its enum names are
+                    // upper-case, e.g. "XHIGH") is read rather than dropped.
+                    overrides.maxThinkingLevel = (o["maxThinkingLevel"] as? String)
+                        .flatMap { ThinkingLevel(rawValue: $0.lowercased()) }
+                    // [T-model-custom-params] Mirror of the export above.
+                    overrides.temperature = o["temperature"] as? Double
+                    overrides.topP = o["topP"] as? Double
+                    overrides.customHeaders = o["customHeaders"] as? [String: String]
+                    overrides.extraBodyParams = o["extraBodyParams"] as? [String: String]
                 }
                 let entry = ModelEntry(
                     providerInstanceId: instance.id,
@@ -1381,9 +1658,8 @@ final class ProviderConfigStore: ObservableObject {
     /// provider-detail list and the pickers can't disagree about which model is
     /// "first" — see that method for why alphabetical was actively harmful.
     func entries(for instanceId: String) -> [ModelEntry] {
-        config.modelEntries
-            .filter { $0.providerInstanceId == instanceId }
-            .sorted(by: Self.releaseRankOrder)
+        Self.sortedByReleaseRank(
+            config.modelEntries.filter { $0.providerInstanceId == instanceId })
     }
 
     /// Entries a picker should show for one instance, newest/most capable first.
@@ -1398,15 +1674,52 @@ final class ProviderConfigStore: ObservableObject {
     /// Undated models keep their alphabetical order and sit at the end — they
     /// are custom/local/relay entries, so they must stay visible.
     func visibleEntries(for instanceId: String) -> [ModelEntry] {
-        config.modelEntries
-            .filter { $0.providerInstanceId == instanceId && !$0.isHidden }
-            .sorted(by: Self.releaseRankOrder)
+        Self.sortedByReleaseRank(
+            config.modelEntries.filter { $0.providerInstanceId == instanceId && !$0.isHidden })
+    }
+
+    /// [T-model-release-ranking] Release-rank sort that ranks each entry ONCE
+    /// (decorate-sort-undecorate), which is what every list-shaped caller should
+    /// use instead of `sorted(by: releaseRankOrder)`.
+    ///
+    /// `releaseRankOrder` resolves BOTH sides on every comparison, so an n-entry
+    /// sort performs O(n log n) `ModelReleaseIndex.rank` calls instead of n — and
+    /// the first of those also pays for the lazy catalog build. Android hit
+    /// exactly this and ANR'd (710b43a64): a Pixel 4a with 939 visible entries
+    /// spent ~18,600 rank calls on the main thread while opening a chat, the
+    /// first one parsing a 4.5 MB models.dev catalog under memory pressure. iOS
+    /// has the same shape with a cheaper index; this removes the complexity
+    /// cliff before it is reported.
+    ///
+    /// The ordering is bit-for-bit identical to `sorted(by: releaseRankOrder)` —
+    /// same keys, same `baseModel.id` tiebreak, so the order stays total and the
+    /// list cannot jitter. Fewer than two elements return as-is so a device with
+    /// no models never triggers a catalog parse just to sort nothing.
+    static func sortedByReleaseRank(_ entries: [ModelEntry]) -> [ModelEntry] {
+        guard entries.count > 1 else { return entries }
+        return entries
+            .map { entry in
+                (entry: entry, rank: ModelReleaseIndex.rank(
+                    modelId: entry.baseModel.id,
+                    displayName: entry.baseModel.displayName,
+                    contextWindow: entry.baseModel.contextWindow))
+            }
+            .sorted { a, b in
+                if a.rank < b.rank { return true }
+                if b.rank < a.rank { return false }
+                return a.entry.baseModel.id < b.entry.baseModel.id
+            }
+            .map(\.entry)
     }
 
     /// [T-model-release-ranking] The shared comparator. Falls back to the model
     /// id so the order is total and stable when two entries rank identically
     /// (both undated, same price, same context) — otherwise `sorted` could
     /// reshuffle equal elements between reads and the list would visibly jitter.
+    ///
+    /// Prefer `sortedByReleaseRank` for sorting a whole list — this pairwise form
+    /// is for tiebreaking inside another comparator (e.g. the picker's
+    /// search-relevance sort), where each side is ranked at most a few times.
     static func releaseRankOrder(_ a: ModelEntry, _ b: ModelEntry) -> Bool {
         let ra = ModelReleaseIndex.rank(modelId: a.baseModel.id,
                                         displayName: a.baseModel.displayName,
@@ -1455,11 +1768,13 @@ final class ProviderConfigStore: ObservableObject {
         // to composite keys over time, but this lookup keeps them working in the
         // meantime — never returns nil just because a reference is still in an
         // old form.
-        if let hit = config.modelEntries.first(where: { $0.id == entryId }) { return hit }
-        if let hit = config.modelEntries.first(where: { $0.uuid == entryId }) { return hit }
-        if let mapped = legacyUuidToCompositeKey[entryId],
-           let hit = config.modelEntries.first(where: { $0.id == mapped }) { return hit }
-        if let hit = config.modelEntries.first(where: { $0.legacyColonCompositeKey == entryId }) { return hit }
+        // [T-composer-typing-lag] Same precedence as before, via the index.
+        let index = currentEntryIndex()
+        let entries = config.modelEntries
+        if let i = index.byId[entryId] { return entries[i] }
+        if let i = index.byUuid[entryId] { return entries[i] }
+        if let mapped = legacyUuidToCompositeKey[entryId], let i = index.byId[mapped] { return entries[i] }
+        if let i = index.byColonKey[entryId] { return entries[i] }
         return nil
     }
 
@@ -1509,11 +1824,14 @@ final class ProviderConfigStore: ObservableObject {
         // Also remove from groups — stamp a member-removal tombstone on each
         // group so the removal survives the inbound union-merge on peers.
         let now = Date()
+        let groupsBeforePrune = config.modelGroups   // [T-group-order-log]
         for i in config.modelGroups.indices where config.modelGroups[i].memberEntryIds.contains(entryId) {
             config.modelGroups[i].memberEntryIds.removeAll { $0 == entryId }
             config.modelGroups[i].removedMembers[entryId] = now
             config.modelGroups[i].addedMembers[entryId] = nil
         }
+        GroupOrderLog.noteAll(reason: "entry-prune", before: groupsBeforePrune, after: config.modelGroups,
+                              detail: "cause=remove-entry entry=\(GroupOrderDiff.shortId(entryId))")
         // Remove from agent loop list
         config.agentLoopModelEntryIds.removeAll { $0 == entryId }
         Self.recordTombstone(in: &config.deletedModelEntries, ids: [entryId])
@@ -1532,7 +1850,10 @@ final class ProviderConfigStore: ObservableObject {
     /// When a built-in model matches a previously custom entry, the custom entry's UUID and
     /// overrides are preserved and the entry is converted to non-custom (so the user's
     /// selected model keeps working after refresh).
-    func replaceEntries(for instanceId: String, models rawModels: [LLMModel], caller: String = #function) {
+    /// - Returns: [T-ios-model-refresh-visible] what this call did to the
+    ///   instance's list, for the Refresh row and the outcome log line.
+    @discardableResult
+    func replaceEntries(for instanceId: String, models rawModels: [LLMModel], caller: String = #function) -> ModelListDiff {
         // [T-icloud-provider-sync-consistency] Deduplicate the incoming model
         // list by id BEFORE building entries. Some provider /v1/models
         // endpoints (notably the OpenAI-compatible OAuth path) can return the
@@ -1544,7 +1865,12 @@ final class ProviderConfigStore: ObservableObject {
         if models.count != rawModels.count {
             logger.warning("[ModelList] replaceEntries caller=\(caller) instance=\(instanceId.prefix(8)) — provider returned \(rawModels.count - models.count) duplicate model id(s); deduped to \(models.count)")
         }
-        let existing = config.modelEntries.filter { $0.providerInstanceId == instanceId }
+        // [T-model-entry-voice-seed-doubling] One entry per uuid. Builds since
+        // 974c19cbf appended an absent voice-template seed twice per refresh
+        // (see `preservedVoice` below), so a store can hold the same entry
+        // 2^n times; collapsing the copies here heals it on the next refresh.
+        let existing = Self.collapsingRepeatedEntries(
+            config.modelEntries.filter { $0.providerInstanceId == instanceId })
         // Capture UUIDs that existed before the refresh. Any that are absent afterward
         // must be pruned from groups / agent-loop list so stale references don't linger.
         let existingEntryIds = Set(existing.map(\.id))
@@ -1598,10 +1924,60 @@ final class ProviderConfigStore: ObservableObject {
                 overrides: prior?.overrides ?? ModelOverrides(),
                 isCustom: false,
                 isHidden: prior?.isHidden ?? false,
-                userModifiedAt: prior?.userModifiedAt
+                userModifiedAt: prior?.userModifiedAt,
+                // [T-model-absence-grace] Listed again ⇒ clear any absence
+                // mark. A model that comes back is indistinguishable from one
+                // that never left, overrides included.
+                absentSince: nil
             )
         }
         config.modelEntries.append(contentsOf: newEntries)
+
+        // [T-model-absence-grace] Catalog entries the provider did NOT list this
+        // time are KEPT, marked unavailable, and only deleted once the absence
+        // has outlived `modelAbsenceGracePeriod`.
+        //
+        // Previously they were deleted on the spot, which conflated two
+        // different facts: "this response did not mention the model" and "this
+        // model is gone". Relay/aggregator endpoints drop a model from
+        // /v1/models transiently (upstream quota, backend rotation, a partial
+        // outage) and list it again minutes later — and the deletion took the
+        // user's `overrides` with it, permanently. That is the reported case:
+        // `gemini-3.8-flash-high` vanished from CPA-Mini2, and a context-window
+        // override "reverted" on a later refresh, which was the same deletion
+        // seen from the other side.
+        //
+        // `isCustom` entries already had this protection (they are kept
+        // unconditionally below); this extends the same courtesy to entries the
+        // provider itself gave us, which is where user overrides actually live.
+        //
+        // The two existing guards do not cover this: `fetchModelsWithFallback`
+        // only rescues an EMPTY list or an unreachable endpoint, and
+        // `suspiciousShrink` needs the list to roughly halve — losing one model
+        // out of twelve trips neither, and `suspiciousShrink` protects only
+        // group references, never the entry.
+        let now = Date()
+        let absentCatalog = existing.filter { !$0.isCustom && !refreshedModelIds.contains($0.baseModel.id) }
+        var keptAbsent: [ModelEntry] = []
+        var expiredAbsent: [ModelEntry] = []
+        for entry in absentCatalog {
+            let since = entry.absentSince ?? now
+            if now.timeIntervalSince(since) > Self.modelAbsenceGracePeriod {
+                expiredAbsent.append(entry)
+            } else {
+                var kept = entry
+                kept.absentSince = since   // first miss stamps the clock; later misses keep it
+                keptAbsent.append(kept)
+            }
+        }
+        config.modelEntries.append(contentsOf: keptAbsent)
+        if !keptAbsent.isEmpty {
+            let newlyAbsent = keptAbsent.filter { $0.absentSince == now }.count
+            logger.info("[ModelList] replaceEntries caller=\(caller) instance=\(instanceLabel)(\(instanceId.prefix(8))) kept \(keptAbsent.count) unlisted catalog entr(ies) within the \(Int(Self.modelAbsenceGracePeriod / 3600))h grace window (\(newlyAbsent) newly absent): [\(keptAbsent.map { $0.baseModel.id }.prefix(10).joined(separator: ","))]")
+        }
+        if !expiredAbsent.isEmpty {
+            logger.info("[ModelList] replaceEntries caller=\(caller) instance=\(instanceLabel)(\(instanceId.prefix(8))) dropped \(expiredAbsent.count) catalog entr(ies) absent for more than the grace window: [\(expiredAbsent.map { $0.baseModel.id }.prefix(10).joined(separator: ","))]")
+        }
 
         // Keep custom entries whose model ID was NOT covered by the refreshed list — enrich them too
         let remainingCustom = existing.filter { $0.isCustom && !refreshedModelIds.contains($0.baseModel.id) }
@@ -1613,7 +1989,11 @@ final class ProviderConfigStore: ObservableObject {
                 overrides: entry.overrides,
                 isCustom: true,
                 isHidden: entry.isHidden,
-                userModifiedAt: entry.userModifiedAt
+                userModifiedAt: entry.userModifiedAt,
+                // Custom entries were never deleted for being unlisted, so they
+                // carry no absence state; preserve whatever they had rather than
+                // silently resetting it.
+                absentSince: entry.absentSince
             )
         }
         config.modelEntries.append(contentsOf: enrichedCustom)
@@ -1635,10 +2015,19 @@ final class ProviderConfigStore: ObservableObject {
             let templateVoiceIds = Set(tpl.mockModels
                 .filter { ($0.modalityOverride ?? []).contains(.audioInput) || ($0.modalityOverride ?? []).contains(.audioOutput) }
                 .map { $0.id })
+            // [T-model-entry-voice-seed-doubling] Skip seeds the absence-grace
+            // pass above already re-added: a non-custom entry missing from the
+            // list is in `keptAbsent` too, and appending it here as well put
+            // two copies back on every refresh - each copy was then preserved
+            // twice on the next one (2^n; 1,048,574 copies of two MiniMax
+            // speech seeds and a 303 MB provider-config.json after ~20
+            // refreshes, so launch blew the 19 s scene-create watchdog).
+            let keptAbsentUUIDs = Set(keptAbsent.map(\.uuid))
             let preservedVoice = existing.filter { e in
                 !e.isCustom
                 && !refreshedModelIds.contains(e.baseModel.id)
                 && templateVoiceIds.contains(e.baseModel.id)
+                && !keptAbsentUUIDs.contains(e.uuid)
             }
             if !preservedVoice.isEmpty {
                 config.modelEntries.append(contentsOf: preservedVoice)
@@ -1682,6 +2071,7 @@ final class ProviderConfigStore: ObservableObject {
                 logger.warning("[ModelList] replaceEntries caller=\(caller) instance=\(instanceLabel)(\(instanceId.prefix(8))) SUSPICIOUS SHRINK before=\(existing.count) after=\(models.count) — stale entries removed from modelEntries but group/agent-loop references PRESERVED as stale (user will see them as unavailable)")
             } else {
                 var affectedGroups: [String] = []
+                let groupsBeforePrune = config.modelGroups   // [T-group-order-log]
                 for i in config.modelGroups.indices {
                     let before = config.modelGroups[i].memberEntryIds.count
                     config.modelGroups[i].memberEntryIds.removeAll { prunedEntryIds.contains($0) }
@@ -1689,12 +2079,18 @@ final class ProviderConfigStore: ObservableObject {
                         affectedGroups.append(config.modelGroups[i].name)
                     }
                 }
+                GroupOrderLog.noteAll(reason: "entry-prune", before: groupsBeforePrune, after: config.modelGroups,
+                                      detail: "cause=replace-entries instance=\(instanceId.prefix(8)) caller=\(caller)")
                 config.agentLoopModelEntryIds.removeAll { prunedEntryIds.contains($0) }
                 logger.info("[ModelList] replaceEntries caller=\(caller) instance=\(instanceLabel)(\(instanceId.prefix(8))) pruned \(prunedEntryIds.count) stale entries from groups=[\(affectedGroups.joined(separator: ","))]")
             }
         }
 
         save()
+        // `removed` is what really left the list now; a model the provider
+        // merely stopped listing stays for the grace window and is `unlisted`.
+        return ModelListDiff(total: models.count, added: added.count,
+                             removed: expiredAbsent.count, unlisted: keptAbsent.count)
     }
 
     // MARK: - Model Groups
@@ -1706,8 +2102,19 @@ final class ProviderConfigStore: ObservableObject {
         save()
     }
 
-    func updateGroup(_ group: ModelGroup) {
+    /// - Parameter orderReason: [T-group-order-log] why the caller is writing
+    ///   the group, used ONLY for the `[GroupOrder]` log line when the member
+    ///   order or membership differs from what is stored (`user-drag`,
+    ///   `user-add`, `user-delete`, `config-tool`, `debug-rpc`; `group-update`
+    ///   for a caller that only meant to change a setting - a reorder logged
+    ///   under that reason means it wrote back a stale copy of the members).
+    func updateGroup(_ group: ModelGroup, orderReason: String = "group-update",
+                     file: String = #fileID, line: Int = #line) {
         guard let idx = config.modelGroups.firstIndex(where: { $0.id == group.id }) else { return }
+        GroupOrderLog.note(reason: orderReason, groupId: group.id, name: group.name,
+                           before: config.modelGroups[idx].memberEntryIds, after: group.memberEntryIds,
+                           warnOnReorder: orderReason == "group-update",
+                           detail: "via=\(file):\(line)")
         // [T-icloud-provider-sync-consistency] Stamp per-member add/remove
         // timestamps by diffing the prior member list against the new one, so
         // the inbound union-merge on other devices can arbitrate concurrent
@@ -1770,6 +2177,8 @@ final class ProviderConfigStore: ObservableObject {
         // describer behind it. (The resolver also guards, but the tool-exposure
         // gate reads the pointer directly.)
         if config.visionGroupId == groupId { config.visionGroupId = nil }
+        // [T-sub-agents-v1] Mirrors the pointer cleanups above.
+        SubAgentStore.shared.clearModelGroup(groupId)
         config.agentLoopGroupIds.removeAll { $0 == groupId }
         Self.recordTombstone(in: &config.deletedModelGroups, ids: [groupId])
         save()
@@ -1927,6 +2336,13 @@ final class ProviderConfigStore: ObservableObject {
         }
     }
 
+    // MARK: - Sub Agents  [T-sub-agents-v1]
+
+    // [T-subagent-own-store] The sub agent roster API moved to
+    // `SubAgentStore.shared` — see that type's header. Call sites use the
+    // store directly; nothing proxies through here, so the lossy v3 mirror
+    // can never touch the roster again.
+
     // MARK: - Session Bindings
 
     func binding(for sessionId: String) -> SessionModelBinding? {
@@ -1961,7 +2377,10 @@ final class ProviderConfigStore: ObservableObject {
 
     // MARK: - Bulk Update (for migration)
 
-    func applyConfig(_ newConfig: ProviderConfig) {
+    /// - Parameter orderReason: [T-group-order-log] for the `[GroupOrder]`
+    ///   log only (`restore-merge` from a backup restore).
+    func applyConfig(_ newConfig: ProviderConfig, orderReason: String = "apply-config") {
+        GroupOrderLog.noteAll(reason: orderReason, before: config.modelGroups, after: newConfig.modelGroups)
         config = newConfig
         save()
     }
@@ -2007,14 +2426,19 @@ final class ProviderConfigStore: ObservableObject {
                 self.syncApplyRetryTimer = nil
                 guard let pending = self.pendingSyncApply else { return }
                 self.pendingSyncApply = nil
-                self.applyMergedConfigFromSync(pending)
+                self.applyMergedConfigFromSync(pending, source: "deferred")
             }
         }
         syncApplyRetryTimer = timer
         RunLoop.main.add(timer, forMode: .default)
     }
 
-    func applyMergedConfigFromSync(_ newConfig: ProviderConfig) {
+    /// - Parameter source: [T-group-order-log] who produced `newConfig`, for
+    ///   the `[GroupOrder] reason=sync-apply` line only: `v3-db-refresh` (the
+    ///   row-level inbound merges, read back from the database),
+    ///   `legacy-merge`, `restore`, or `deferred` for an apply that was held
+    ///   back and is replayed.
+    func applyMergedConfigFromSync(_ newConfig: ProviderConfig, source: String = "v3-db-refresh") {
         // Compute the set of instances that ended up with zero model
         // entries after the merge. The remote ProviderConfig snapshot
         // can be missing model rows when the peer hadn't refreshed yet
@@ -2087,6 +2511,11 @@ final class ProviderConfigStore: ObservableObject {
             return
         }
 
+        // [T-group-order-log] The moment an inbound result replaces what the
+        // app is using. The sync paths log their own decision in detail; this
+        // line also catches anything they did not (and the dedupe above).
+        GroupOrderLog.noteAll(reason: "sync-apply", before: config.modelGroups,
+                              after: deduped.modelGroups, detail: "source=\(source)")
         config = deduped
         // [T-icloud-fresh-restore-provider-groups] Summary of what this device
         // holds after an inbound merge — the single most useful triage line for
@@ -2212,6 +2641,11 @@ final class ProviderConfigStore: ObservableObject {
         }
         config.modelEntries = survivors
         if !uuidRewrite.isEmpty {
+            let groupsBeforeRewrite = config.modelGroups   // [T-group-order-log]
+            defer {
+                GroupOrderLog.noteAll(reason: "dedupe", before: groupsBeforeRewrite, after: config.modelGroups,
+                                      detail: "rewrittenEntries=\(uuidRewrite.count)")
+            }
             // Rewrite group member references from pruned uuids → representative.
             for i in config.modelGroups.indices {
                 var seen = Set<String>()
@@ -2263,7 +2697,16 @@ final class ProviderConfigStore: ObservableObject {
                 let m = remap(mid)
                 return seen.insert(m).inserted ? m : nil
             }
-            if after != before { config.modelGroups[i].memberEntryIds = after; changed = true }
+            if after != before {
+                // [T-group-order-log] Ids are remapped here, so compare the
+                // remapped "before" with the result: what is left is a member
+                // dropped as a duplicate or one that changed places.
+                GroupOrderLog.note(reason: "normalize", groupId: config.modelGroups[i].id,
+                                   name: config.modelGroups[i].name,
+                                   before: before.map(remap), after: after, warnOnReorder: true,
+                                   detail: "stage=legacy-uuid-remap")
+                config.modelGroups[i].memberEntryIds = after; changed = true
+            }
 
             for (oldKey, t) in config.modelGroups[i].addedMembers where map[oldKey] != nil {
                 let nk = map[oldKey]!
@@ -2373,10 +2816,10 @@ final class ProviderConfigStore: ObservableObject {
     /// ability is a per-MODEL concern, computed dynamically from the instance's
     /// entries rather than hardcoded per vendor host.
     func hasVoiceModels(for instanceId: String) -> Bool {
+        // [T-openrouter-voice-catalog] Voice candidates, not raw audio bits:
+        // an OpenRouter chat model that merely hears audio is no voice model.
         config.modelEntries.contains { e in
-            guard e.providerInstanceId == instanceId else { return false }
-            let m = e.baseModel.capabilities.supportedModalities
-            return m.contains(.audioInput) || m.contains(.audioOutput)
+            e.providerInstanceId == instanceId && e.baseModel.isVoiceCandidate
         }
     }
 
@@ -2428,7 +2871,15 @@ final class ProviderConfigStore: ObservableObject {
             inst.isEnabled
             && hasVoiceModels(for: inst.id)
             && !isVoiceShadowDisabled(inst.id)
-            && VoiceProviderFactory.make(for: inst) != nil
+            // [T-voice-capability-probe] Was `make(for: inst) != nil`, which
+            // built a whole provider — and read the Keychain — just to answer a
+            // yes/no. This function is called from a SwiftUI view body
+            // (ProviderInstancesView), so every re-render of the provider list
+            // re-read every instance's credential: bursts of up to 40 Keychain
+            // reads in a single second on device. `supportsVoice` answers from
+            // providerType + base URL and touches the Keychain only for Xunfei,
+            // whose viability genuinely depends on the key's contents.
+            && VoiceProviderFactory.supportsVoice(for: inst)
         }
         // Fold by normalized base URL (empty key = no custom base → keep separate by id).
         var byKey: [String: [ProviderInstance]] = [:]
@@ -2454,8 +2905,8 @@ final class ProviderConfigStore: ObservableObject {
                 return a.id < b.id
             }.first!
             let entries = config.modelEntries.filter { $0.providerInstanceId == rep.id }
-            let inputs = entries.filter { $0.baseModel.capabilities.supportedModalities.contains(.audioInput) }
-            let outputs = entries.filter { $0.baseModel.capabilities.supportedModalities.contains(.audioOutput) }
+            let inputs = entries.filter { $0.baseModel.isVoiceInputCandidate }
+            let outputs = entries.filter { $0.baseModel.isVoiceOutputCandidate }
             result.append(ShadowVoiceProvider(
                 instanceId: rep.id,
                 displayName: rep.label,
@@ -2468,7 +2919,7 @@ final class ProviderConfigStore: ObservableObject {
     }
 
     /// True when ≥2 enabled instances share a normalized base URL AND have voice
-    /// models — the migration/dup case (场景 B). UI shows a non-destructive hint.
+    /// models — the migration/dup case (scenario B). UI shows a non-destructive hint.
     func hasFoldedShadowDuplicates() -> Bool {
         var seen = Set<String>()
         for inst in config.instances where inst.isEnabled && hasVoiceModels(for: inst.id) {
@@ -2484,21 +2935,54 @@ final class ProviderConfigStore: ObservableObject {
     /// Manual refresh: fetch models from the API (with models.dev fallback) and merge into entries.
     /// Appends new models without removing user-added custom entries.
     /// Errors are logged but not thrown (fire-and-forget friendly).
-    func refreshModels(for instance: ProviderInstance) async {
+    ///
+    /// - Returns: [T-ios-model-refresh-visible] what the refresh did - where the
+    ///   list came from, how it changed, and the provider's error if it had
+    ///   one. A failed refresh returns `.kept`; it never throws and never
+    ///   touches the stored list.
+    @discardableResult
+    func refreshModels(for instance: ProviderInstance, caller: String = "refreshModels(manual)") async -> ModelRefreshOutcome {
         // [T-mimo-shadow-voice] No longer skipped for "voice-only" providers.
         // Refresh ALWAYS runs the real /models fetch so a mixed vendor (e.g.
         // MiMo: text chat + voice on one host) gets its text models; audio-modality
         // template seed entries are preserved by replaceEntries (see below), so
         // the voice models are never wiped by the text list.
+        logger.info("[ModelList] \(caller): instance=\(instance.label) starting fetch")
+        let outcome: ModelRefreshOutcome
         do {
-            logger.info("[ModelList] refreshModels (MANUAL): instance=\(instance.label) starting fetch")
             let result = try await Self.fetchModelsWithFallback(instance, forceRefresh: true)
-            replaceEntries(for: instance.id, models: result.models, caller: "refreshModels(manual)")
-            logger.info("[ModelList] refreshModels (MANUAL): instance=\(instance.label) source=\(result.source) count=\(result.models.count)")
+            let diff = replaceEntries(for: instance.id, models: result.models, caller: caller)
             for w in result.warnings { logger.warning("⚠️ \(w)") }
+            outcome = ModelRefreshOutcome(source: ModelRefreshSource(fetchSource: result.source),
+                                          diff: diff, vendorError: result.vendorError)
         } catch {
-            logger.error("[ModelList] refreshModels (MANUAL): instance=\(instance.label) FAILED — \(error)")
+            // Nothing was replaced: the list on screen is the list from before.
+            let kept = config.modelEntries.filter { $0.providerInstanceId == instance.id }.count
+            outcome = ModelRefreshOutcome(source: .kept, diff: ModelListDiff(total: kept),
+                                          vendorError: Self.keptReason(error))
         }
+        // One line per refresh, whatever happened.
+        logger.info("[ModelList] refresh outcome caller=\(caller) instance=\(instance.label)(\(instance.id.prefix(8))) \(outcome.logLine)")
+        return outcome
+    }
+
+    /// Why a refresh kept the old list, as shown under the Refresh row.
+    static func keptReason(_ error: Error) -> String {
+        switch error {
+        case ModelRefreshError.noCredential:
+            return "no API key is set for this provider"
+        case ModelRefreshError.modelsDevNoMatch(_, let vendorError):
+            return vendorError ?? "no model list is available"
+        default:
+            return vendorErrorReason(error)
+        }
+    }
+
+    /// The provider-side reason of a failed /models call.
+    static func vendorErrorReason(_ error: Error) -> String {
+        if let listError = error as? ModelListFetchError { return listError.reason }
+        if case LLMError.invalidAPIKey(let detail) = error, !detail.isEmpty { return detail }
+        return "could not read the model list: \(error.localizedDescription)"
     }
 
     /// Auto-refresh: fetch models for a single instance, skipping if user has custom models.
@@ -2510,14 +2994,7 @@ final class ProviderConfigStore: ObservableObject {
             logger.info("[ModelList] autoRefreshModels (DAILY): instance=\(instance.label) SKIP — user has custom models")
             return
         }
-        do {
-            logger.info("[ModelList] autoRefreshModels (DAILY): instance=\(instance.label) starting fetch")
-            let result = try await Self.fetchModelsWithFallback(instance, forceRefresh: true)
-            replaceEntries(for: instance.id, models: result.models, caller: "autoRefreshModels(daily)")
-            logger.info("[ModelList] autoRefreshModels (DAILY): instance=\(instance.label) source=\(result.source) count=\(result.models.count)")
-        } catch {
-            logger.error("[ModelList] autoRefreshModels (DAILY): instance=\(instance.label) FAILED — \(error)")
-        }
+        await refreshModels(for: instance, caller: "autoRefreshModels(daily)")
     }
 
     /// [T-mimo-shadow-voice] One-time upgrade migration: existing users whose
@@ -2564,14 +3041,52 @@ final class ProviderConfigStore: ObservableObject {
     /// Refresh models for all enabled provider instances.
     /// Called on first daily launch to keep model lists up-to-date.
     /// Skips instances where the user has manually added custom models.
+    /// [T-copilot-models-refresh-window] Minimum interval between automatic
+    /// all-provider model-list refreshes.
+    static let modelsRefreshWindow: TimeInterval = 6 * 60 * 60
+
+    /// [T-model-absence-grace] How long a catalog model may stay unlisted by its
+    /// provider before the entry (and its overrides) is really deleted.
+    ///
+    /// 7 days, chosen against `modelsRefreshWindow` above: automatic refreshes
+    /// are at most every 6h, so this spans roughly 28 of them. A model has to be
+    /// missing from many consecutive responses — not one unlucky one — before
+    /// anything is lost, which is the whole point. Deliberately generous: the
+    /// cost of keeping a dead entry a few days too long is one greyed-out row,
+    /// while the cost of deleting a live one is the user's overrides, silently
+    /// and permanently.
+    static let modelAbsenceGracePeriod: TimeInterval = 7 * 24 * 60 * 60
+
     func refreshAllModelsIfNeeded() {
         let key = "lastModelsRefreshDate"
         let lastRefresh = UserDefaults.standard.object(forKey: key) as? Date
         let calendar = Calendar.current
         let lastStr = lastRefresh.map { ISO8601DateFormatter().string(from: $0) } ?? "nil"
 
-        if let lastRefresh, calendar.isDateInToday(lastRefresh) {
-            logger.info("[ModelList] refreshAllModelsIfNeeded: SKIP — already refreshed today (lastRefresh=\(lastStr))")
+        // [T-copilot-models-refresh-window] Was "once per calendar day"
+        // (`isDateInToday`). Field case 2026-09-19: GitHub enabled gpt-6-astra
+        // and claude-opus-5 for the account mid-day; the Mac had refreshed at
+        // 09:55 and held a 7-model Copilot list until a manual refresh at
+        // 22:20 returned 26 — the user's "the official CLI has it, Minis
+        // can't see it" report exactly. Providers add models whenever they
+        // like; a day-boundary gate turns that into a same-day outage. Now a
+        // rolling window (6 h) checked at launch AND on every foreground
+        // resume, so a model granted while the app was open shows up on the
+        // next return to the app. Cost: at most four /models calls per
+        // provider per day of continuous use.
+        _ = calendar
+        // [T-codex-client-0159] A new Codex client version can change what the
+        // Codex catalogue offers (the 0.159.0 bump is for gpt-6.1-sol), so the
+        // first launch after an update refreshes once without waiting out the
+        // window — no manual "Refresh" needed. The discovery cache is keyed on
+        // the version too, so this refresh really re-fetches.
+        let versionKey = "lastModelsRefreshCodexClientVersion"
+        let versionChanged = UserDefaults.standard.string(forKey: versionKey) != OpenAIProvider.codexClientVersion
+        if versionChanged {
+            logger.info("[ModelList] refreshAllModelsIfNeeded: Codex client version changed → \(OpenAIProvider.codexClientVersion), refreshing now")
+        }
+        if !versionChanged, let lastRefresh, Date().timeIntervalSince(lastRefresh) < Self.modelsRefreshWindow {
+            logger.info("[ModelList] refreshAllModelsIfNeeded: SKIP — refreshed \(Int(Date().timeIntervalSince(lastRefresh)))s ago (window \(Int(Self.modelsRefreshWindow))s, lastRefresh=\(lastStr))")
             return
         }
 
@@ -2583,6 +3098,7 @@ final class ProviderConfigStore: ObservableObject {
 
         logger.info("[ModelList] refreshAllModelsIfNeeded: FIRE — lastRefresh=\(lastStr) instanceCount=\(enabledInstances.count) instances=[\(enabledInstances.map { $0.label }.joined(separator: ","))]")
         UserDefaults.standard.set(Date(), forKey: key)
+        UserDefaults.standard.set(OpenAIProvider.codexClientVersion, forKey: versionKey)
 
         for instance in enabledInstances {
             Task {
@@ -2619,6 +3135,38 @@ final class ProviderConfigStore: ObservableObject {
         logger.info("Created default model group with \(entry.model.displayName)")
     }
 
+    /// [T-ios-refresh-models-empty-key] The API key to fetch `/models` with, or
+    /// `nil` when the instance genuinely has no usable credential.
+    ///
+    /// A keyless self-hosted endpoint (ollama, LM Studio, LiteLLM, an internal
+    /// gateway) stores NO Keychain entry at all — the key field writes on edit
+    /// and DELETES when emptied, and `AddProviderView` deliberately skips the
+    /// write for a keyless endpoint. So `loadAPIKey` returns nil, and every
+    /// `guard let key … else { throw .noCredential }` below used to abort the
+    /// refresh before a request was ever made. The user saw "No API key
+    /// configured for this provider instance." from a server that wanted no key.
+    ///
+    /// `allowsEmptyAPIKey` is the predicate that already models this — it is
+    /// what makes such an instance read as configured in `hasAnyCredential`,
+    /// and the chat path has always sent these requests (`loadAPIKey(…) ?? ""`
+    /// in LLMProviderFactory). Refresh was simply the one path that never
+    /// consulted it, so a provider you could chat with could not list models.
+    ///
+    /// Its scope is deliberately narrow and inherited as-is: API-key mode AND a
+    /// custom base URL AND an OpenAI/Anthropic-compatible type. Official
+    /// endpoints keep throwing `.noCredential`, because an empty key against
+    /// api.openai.com is a misconfiguration and reporting it locally beats a
+    /// confusing 401.
+    private static func modelFetchAPIKey(for instance: ProviderInstance) -> String? {
+        if let key = ProviderKeychainHelper.loadAPIKey(instanceId: instance.id), !key.isEmpty {
+            return key
+        }
+        // Keyless-by-design endpoint: fetch with an empty credential and let the
+        // server decide. A real auth failure now surfaces as its own HTTP error
+        // instead of being masked by a local "no API key" message.
+        return instance.allowsEmptyAPIKey ? "" : nil
+    }
+
     /// Fetch the model list from a provider's API for the given instance.
     static func fetchModelsForInstance(_ instance: ProviderInstance, forceRefresh: Bool = false) async throws -> [LLMModel] {
         let customBase = instance.effectiveCustomBaseURL
@@ -2628,7 +3176,7 @@ final class ProviderConfigStore: ObservableObject {
         let ua = instance.supportsCustomUserAgent ? instance.effectiveCustomUserAgent : nil
         switch (instance.providerType, instance.credentialType) {
         case (.anthropic, .apiKey):
-            guard let key = ProviderKeychainHelper.loadAPIKey(instanceId: instance.id) else {
+            guard let key = modelFetchAPIKey(for: instance) else {
                 throw ModelRefreshError.noCredential
             }
             return try await AnthropicModelsAPI.fetchModels(apiKey: key, baseURL: customBase, appendV1Suffix: appendV1, forceRefresh: forceRefresh, userAgent: ua)
@@ -2652,7 +3200,7 @@ final class ProviderConfigStore: ObservableObject {
             let projectID = GeminiOAuthManager.shared.gcpProjectID(instanceId: instance.id)
             return try await GeminiModelsAPI.fetchModels(oauthToken: token, gcpProjectID: projectID ?? "", customBaseURL: customBase)
         case (.openAI, .apiKey):
-            guard let key = ProviderKeychainHelper.loadAPIKey(instanceId: instance.id) else {
+            guard let key = modelFetchAPIKey(for: instance) else {
                 throw ModelRefreshError.noCredential
             }
             return try await OpenAIModelsAPI.fetchModels(apiKey: key, baseURL: customBase, appendV1Suffix: appendV1, forceRefresh: forceRefresh, userAgent: ua)
@@ -2660,7 +3208,13 @@ final class ProviderConfigStore: ObservableObject {
             if let manualToken = ProviderKeychainHelper.loadOAuthString(instanceId: instance.id, account: "manual-oauth-token") {
                 return try await OpenAIModelsAPI.fetchModels(apiKey: manualToken, baseURL: customBase, appendV1Suffix: appendV1, forceRefresh: forceRefresh, userAgent: ua)
             }
-            return OpenAIModelsAPI.fetchModelsOAuth()
+            // [T-codex-model-discovery] Codex OAuth now discovers models from
+            // the backend, so the token/account/forceRefresh the caller already
+            // has must actually reach it (issue #319). The manual-token branch
+            // directly above is untouched — that is a user-supplied bearer for
+            // an OpenAI-compatible endpoint, not a Codex session.
+            return try await OpenAIModelsAPI.fetchModelsOAuth(
+                instanceId: instance.id, forceRefresh: forceRefresh)
         case (.antigravity, .apiKey):
             // Antigravity only supports OAuth
             return ModelsDevAPI.enrichModels(AntigravityModelsAPI.fetchModelsBuiltIn())
@@ -2683,7 +3237,7 @@ final class ProviderConfigStore: ObservableObject {
             }
             return try await OpenRouterModelsAPI.fetchModels(apiKey: key, forceRefresh: forceRefresh)
         case (.openAIResponses, .apiKey):
-            guard let key = ProviderKeychainHelper.loadAPIKey(instanceId: instance.id) else {
+            guard let key = modelFetchAPIKey(for: instance) else {
                 throw ModelRefreshError.noCredential
             }
             return try await OpenAIModelsAPI.fetchModels(apiKey: key, baseURL: customBase, appendV1Suffix: appendV1, forceRefresh: forceRefresh, userAgent: ua)
@@ -2719,10 +3273,28 @@ final class ProviderConfigStore: ObservableObject {
             let kimiAppendV1 = customBase == nil ? true : appendV1  // default base …/coding needs /v1 appended
             return try await OpenAIModelsAPI.fetchModels(apiKey: key, baseURL: kimiBase, appendV1Suffix: kimiAppendV1, forceRefresh: forceRefresh, userAgent: ua)
         case (.kimiCode, .oauth):
+            // [T-kimi-manual-token-ignored] Mirror of the factory branch: a
+            // manually-pasted bearer token wins over the device-flow manager,
+            // the same way the anthropic / gemini / openAI oauth cases above do.
+            // Without it a manual Kimi instance could not even list its models.
+            if let manualToken = ProviderKeychainHelper.loadOAuthString(
+                instanceId: instance.id, account: "manual-oauth-token") {
+                let kimiBase = customBase ?? "https://api.kimi.com/coding"
+                let kimiAppendV1 = customBase == nil ? true : appendV1
+                return try await OpenAIModelsAPI.fetchModels(
+                    apiKey: manualToken, baseURL: kimiBase, appendV1Suffix: kimiAppendV1,
+                    forceRefresh: forceRefresh, userAgent: ua)
+            }
             let token = try await KimiOAuthManager.shared.validAccessToken(instanceId: instance.id)
             let kimiBase = customBase ?? "https://api.kimi.com/coding"
             let kimiAppendV1 = customBase == nil ? true : appendV1  // default base …/coding needs /v1 appended
             return try await OpenAIModelsAPI.fetchModels(apiKey: token, baseURL: kimiBase, appendV1Suffix: kimiAppendV1, forceRefresh: forceRefresh, userAgent: nil)
+        case (.githubCopilot, _):
+            // [T-copilot-provider] Always the OAuth path — there is no API-key
+            // form of Copilot. The session token is minted on demand, so a
+            // refresh right after sign-in works without any extra priming.
+            let token = try await CopilotOAuthManager.shared.validSessionToken(instanceId: instance.id)
+            return try await CopilotModelsAPI.fetchModels(sessionToken: token)
         case (.unsupported, _):
             // Synced from a newer build — can't fetch; keep whatever's stored.
             return []
@@ -2732,8 +3304,11 @@ final class ProviderConfigStore: ObservableObject {
     /// Result of a model fetch with fallback — includes diagnostic warnings for each step.
     struct ModelFetchResult {
         let models: [LLMModel]
-        let source: String            // "api", "models.dev", or "none"
+        let source: String            // "api", "models.dev", or "built-in"
         let warnings: [String]        // Diagnostic messages from each failed step
+        /// [T-ios-model-refresh-visible] Why the provider's own list was not
+        /// used, when `source` is a fallback; nil for a list from the provider.
+        var vendorError: String? = nil
     }
 
     /// Whether the instance uses a third-party (non-official) OpenAI-compatible base URL
@@ -2825,6 +3400,10 @@ final class ProviderConfigStore: ObservableObject {
     static func fetchModelsWithFallback(_ instance: ProviderInstance, forceRefresh: Bool = false) async throws -> ModelFetchResult {
         var warnings: [String] = []
         let isThirdParty = isThirdPartyOpenAICompat(instance)
+        // [T-ios-model-refresh-visible] Why the provider's own list is not
+        // being used, in words the Refresh row can show.
+        var vendorError: String?
+        var vendorThrew = false
 
         // Step 1: Try /v1/models API
         do {
@@ -2832,63 +3411,58 @@ final class ProviderConfigStore: ObservableObject {
             if !models.isEmpty {
                 return ModelFetchResult(models: models, source: "api", warnings: [])
             }
+            vendorError = "the provider listed no models"
             let msg = "API returned empty model list"
             warnings.append(msg)
             logger.info("\(msg) for \(instance.label)")
         } catch let error as ModelRefreshError {
             throw error  // No credential — don't attempt fallback
         } catch {
+            vendorThrew = true
+            vendorError = vendorErrorReason(error)
             let msg = "API fetch failed: \(error.localizedDescription)"
             warnings.append(msg)
             logger.info("\(msg) for \(instance.label)")
-            // Third-party endpoints (vLLM, Ollama, etc.): do not fall back to
-            // built-in GPT models — keep the previously fetched list intact.
-            if isThirdParty {
-                logger.info("Third-party endpoint unreachable, preserving existing models for \(instance.label)")
-                throw ModelRefreshError.modelsDevNoMatch(warnings: warnings)
-            }
         }
 
-        // Step 2: Try models.dev fallback (skip for third-party endpoints)
+        // Step 2: models.dev, matched by base URL. Step 3: the provider's
+        // built-in list. Which one applies is `ModelRefreshFallback.decide`:
+        // a third-party endpoint (vLLM, Ollama, a relay) that FAILED keeps its
+        // previously fetched list, and never gets the built-in GPT models.
         let baseURL = modelsDevBaseURL(for: instance)
-        guard let baseURL else {
+        var catalog: [LLMModel] = []
+        if vendorThrew && isThirdParty {
+            logger.info("Third-party endpoint unreachable, preserving existing models for \(instance.label)")
+        } else if let baseURL {
+            logger.info("models.dev fallback: matching baseURL=\(baseURL) for \(instance.label)")
+            catalog = ModelsDevAPI.fetchModels(forBaseURL: baseURL)
+            if catalog.isEmpty {
+                let msg = "models.dev: no match for baseURL \(baseURL)"
+                warnings.append(msg)
+                logger.info("\(msg)")
+            }
+        } else {
             let msg = "No base URL resolved, cannot try models.dev"
             warnings.append(msg)
             logger.info("\(msg) for \(instance.label)")
-            if isThirdParty {
-                throw ModelRefreshError.modelsDevNoMatch(warnings: warnings)
-            }
-            // Fall back to built-in models
-            let builtIn = ModelsDevAPI.enrichModels(instance.providerType.builtInModels)
-            if !builtIn.isEmpty {
-                logger.info("Using \(builtIn.count) built-in models for \(instance.label)")
-                return ModelFetchResult(models: builtIn, source: "built-in", warnings: warnings)
-            }
-            throw ModelRefreshError.modelsDevNoMatch(warnings: warnings)
         }
+        let builtIn = (catalog.isEmpty && !isThirdParty)
+            ? ModelsDevAPI.enrichModels(instance.providerType.builtInModels) : []
 
-        logger.info("models.dev fallback: matching baseURL=\(baseURL) for \(instance.label)")
-        let fallbackModels = ModelsDevAPI.fetchModels(forBaseURL: baseURL)
-        if !fallbackModels.isEmpty {
-            logger.info("models.dev fallback returned \(fallbackModels.count) models for \(instance.label)")
-            return ModelFetchResult(models: fallbackModels, source: "models.dev", warnings: warnings)
-        }
-        let msg = "models.dev: no match for baseURL \(baseURL)"
-        warnings.append(msg)
-        logger.info("\(msg)")
-
-        // Step 3: Fall back to provider's built-in models (skip for third-party endpoints)
-        if isThirdParty {
-            logger.info("Third-party endpoint, skipping built-in fallback for \(instance.label)")
-            throw ModelRefreshError.modelsDevNoMatch(warnings: warnings)
-        }
-        let builtIn = ModelsDevAPI.enrichModels(instance.providerType.builtInModels)
-        if !builtIn.isEmpty {
+        switch ModelRefreshFallback.decide(vendorThrew: vendorThrew, isThirdParty: isThirdParty,
+                                           catalogCount: catalog.count, builtInCount: builtIn.count) {
+        case .modelsDev:
+            logger.info("models.dev fallback returned \(catalog.count) models for \(instance.label)")
+            return ModelFetchResult(models: catalog, source: "models.dev", warnings: warnings, vendorError: vendorError)
+        case .builtIn:
             logger.info("Using \(builtIn.count) built-in models for \(instance.label)")
-            return ModelFetchResult(models: builtIn, source: "built-in", warnings: warnings)
+            return ModelFetchResult(models: builtIn, source: "built-in", warnings: warnings, vendorError: vendorError)
+        case .kept, .vendor:
+            if isThirdParty {
+                logger.info("Third-party endpoint, skipping built-in fallback for \(instance.label)")
+            }
+            throw ModelRefreshError.modelsDevNoMatch(warnings: warnings, vendorError: vendorError)
         }
-
-        throw ModelRefreshError.modelsDevNoMatch(warnings: warnings)
     }
 
     /// Resolve the effective API base URL for an instance (for models.dev matching).
@@ -2902,6 +3476,7 @@ final class ProviderConfigStore: ObservableObject {
         case .openAI, .openAIResponses: return "https://api.openai.com"
         case .xAI: return "https://api.x.ai"
         case .kimiCode: return "https://api.kimi.com/coding"
+        case .githubCopilot: return CopilotConstants.apiBaseURL
         case .gemini: return "https://generativelanguage.googleapis.com"
         case .openRouter: return "https://openrouter.ai/api"
         case .antigravity: return nil // No public base URL
@@ -2992,13 +3567,15 @@ final class ProviderConfigStore: ObservableObject {
 
 enum ModelRefreshError: LocalizedError {
     case noCredential
-    case modelsDevNoMatch(warnings: [String])
+    /// `vendorError`: [T-ios-model-refresh-visible] why the provider's own
+    /// list could not be used, for the Refresh row.
+    case modelsDevNoMatch(warnings: [String], vendorError: String? = nil)
 
     var errorDescription: String? {
         switch self {
         case .noCredential:
             return "No API key configured for this provider instance."
-        case .modelsDevNoMatch(let warnings):
+        case .modelsDevNoMatch(let warnings, _):
             let detail = warnings.isEmpty ? "" : "\n" + warnings.joined(separator: "\n")
             return "Could not fetch models from API or models.dev fallback.\(detail)"
         }
@@ -3075,7 +3652,27 @@ enum ProviderKeychainHelper {
         let syncStatus = SecItemCopyMatching(syncQuery as CFDictionary, &result)
         if syncStatus == errSecSuccess, let data = result as? Data {
             let s = String(data: data, encoding: .utf8)
-            AppLogger(category: "Keychain").info("read apiKey instanceId=\(instanceId.prefix(8)) src=sync hit=\(s != nil) keyLen=\(s?.count ?? 0) caller=\(caller)")
+            // [T-keychain-log-volume] The successful fast path is deliberately
+            // SILENT. It reports that nothing happened — the key was found where
+            // it was expected — and it is by far the most frequent Keychain
+            // operation in the app: 206 of 260 sampled apiKey reads were this
+            // line, including bursts of 40 in a single second from one caller
+            // re-reading the same ten instances four times over.
+            //
+            // Everything with diagnostic value is still logged: writes, deletes,
+            // misses (with both OSStatus values) and — importantly — a hit on
+            // the LEGACY path, which is the one that says an entry has not yet
+            // migrated to the synchronizable form. These were added as temporary
+            // scaffolding for T-apikey (3ca9b95ec, 2026-05-08), the bug they
+            // were tracking was fixed in 6e7665512, and the scaffolding then
+            // stayed for four months.
+            //
+            // A decode failure is NOT silent: `hit=false` on a successful
+            // SecItemCopyMatching means the bytes were not valid UTF-8, which is
+            // corruption rather than absence.
+            if s == nil {
+                AppLogger(category: "Keychain").error("read apiKey instanceId=\(instanceId.prefix(8)) src=sync FOUND BUT NOT UTF-8 bytes=\(data.count) caller=\(caller)")
+            }
             return s
         }
         // Fallback to legacy non-sync entry
@@ -3154,6 +3751,7 @@ enum ProviderKeychainHelper {
         if status != errSecSuccess {
             AppLogger(category: "Keychain").warning("write rawOAuthToken instanceId=\(instanceId.prefix(8)) status=\(status)")
         }
+        clearOAuthNeedsReauth(instanceId: instanceId)
     }
 
     static func loadRawOAuthToken(instanceId: String) -> Data? {
@@ -3193,6 +3791,7 @@ enum ProviderKeychainHelper {
         addQuery[kSecAttrSynchronizable as String] = true
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         AppLogger(category: "Keychain").info("write oauthToken instanceId=\(instanceId.prefix(8)) blobLen=\(data.count) addStatus=\(addStatus) caller=\(caller)")
+        clearOAuthNeedsReauth(instanceId: instanceId)
         notifyAuthChanged(instanceId: instanceId)
     }
 
@@ -3212,7 +3811,14 @@ enum ProviderKeychainHelper {
         let syncStatus = SecItemCopyMatching(syncQuery as CFDictionary, &result)
         if syncStatus == errSecSuccess, let data = result as? Data {
             let decoded = try? JSONDecoder().decode(type, from: data)
-            AppLogger(category: "Keychain").info("read oauthToken instanceId=\(instanceId.prefix(8)) src=sync hit=true decoded=\(decoded != nil) caller=\(caller)")
+            // [T-keychain-log-volume] Silent on the successful fast path, as for
+            // apiKey above. A DECODE failure is kept and raised to error: the
+            // blob was found but does not fit the expected Codable, which is the
+            // shape of a schema change or a corrupted entry — and it presents to
+            // the caller as "not signed in", so it needs to be greppable.
+            if decoded == nil {
+                AppLogger(category: "Keychain").error("read oauthToken instanceId=\(instanceId.prefix(8)) src=sync FOUND BUT UNDECODABLE as \(type) blobLen=\(data.count) caller=\(caller)")
+            }
             return decoded
         }
         // Fallback to legacy
@@ -3223,6 +3829,11 @@ enum ProviderKeychainHelper {
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+        // [T-envvar-redactor-crash] Clear before reusing: SecItemCopyMatching
+        // writes a +1 reference straight through the pointer without releasing
+        // what was there, so reusing a non-nil `result` corrupts ARC's
+        // ownership bookkeeping (loadAPIKey above already does this).
+        result = nil
         let legacyStatus = SecItemCopyMatching(query as CFDictionary, &result)
         guard legacyStatus == errSecSuccess, let data = result as? Data else {
             AppLogger(category: "Keychain").info("read oauthToken instanceId=\(instanceId.prefix(8)) hit=false syncStatus=\(syncStatus) legacyStatus=\(legacyStatus) caller=\(caller)")
@@ -3246,7 +3857,65 @@ enum ProviderKeychainHelper {
         syncQuery[kSecAttrSynchronizable as String] = true
         let s2 = SecItemDelete(syncQuery as CFDictionary)
         AppLogger(category: "Keychain").info("delete oauthToken instanceId=\(instanceId.prefix(8)) legacyStatus=\(s1) syncStatus=\(s2) caller=\(caller)")
+        clearOAuthNeedsReauth(instanceId: instanceId)
         notifyAuthChanged(instanceId: instanceId)
+    }
+
+    // MARK: - OAuth "needs re-login" mark
+
+    /// [T-oauth-keep-credentials] Set when the token endpoint rejects a refresh.
+    /// Automatic paths never delete an OAuth credential any more (a misread
+    /// transient reply used to log users out for good); they call
+    /// `markOAuthNeedsReauth` instead, and only an explicit Sign Out or instance
+    /// removal deletes the blob.
+    ///
+    /// The mark is device-local and holds a SHA-256 fingerprint of the rejected
+    /// blob, never the credential. It applies only while that exact blob is
+    /// still stored, so any new credential lapses it automatically, including
+    /// one that arrives through iCloud Keychain from a peer that re-logged in,
+    /// where no local save runs to clear it.
+    private static func oauthNeedsReauthUDKey(instanceId: String) -> String {
+        "oauthNeedsReauthFingerprint.\(instanceId)"
+    }
+
+    private static func oauthFingerprint(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func markOAuthNeedsReauth(instanceId: String, caller: String = #function) {
+        guard let data = loadRawOAuthToken(instanceId: instanceId) else { return }
+        let fingerprint = oauthFingerprint(data)
+        let key = oauthNeedsReauthUDKey(instanceId: instanceId)
+        // [T-oauth-reauth-mark-loop] Marking the credential that is already
+        // marked changes nothing, so it must not announce a change. It used
+        // to notify every time, and a notification is itself a trigger:
+        // authRevision → QuotaStore.credentialsChanged → quota re-check of
+        // recently viewed instances → on-demand refresh with the rejected
+        // token → rejected again → mark → notify … every ~0.45 s (device log
+        // 2026-10-07 19:29:48-19:31:24, instance 37D5CC24: 153 marks). Each
+        // round re-rendered every provider row and dropped the row credential
+        // cache, so Settings › AI Providers re-read the Keychain on the main
+        // thread twice a second while scrolling - the reported stutter - and
+        // the app posted the dead refresh token to claude.ai at the same rate.
+        if UserDefaults.standard.string(forKey: key) == fingerprint { return }
+        UserDefaults.standard.set(fingerprint, forKey: key)
+        AppLogger(category: "Keychain").warning("mark oauthNeedsReauth instanceId=\(instanceId.prefix(8)) credentials kept caller=\(caller)")
+        notifyAuthChanged(instanceId: instanceId)
+    }
+
+    /// True when the stored OAuth credential is the one a refresh rejected
+    /// and no manual token (which never refreshes) stands in for it.
+    /// Cheap when unmarked (one UserDefaults read, no Keychain access).
+    static func oauthNeedsReauth(instanceId: String) -> Bool {
+        guard let mark = UserDefaults.standard.string(forKey: oauthNeedsReauthUDKey(instanceId: instanceId)),
+              let data = loadRawOAuthToken(instanceId: instanceId),
+              oauthFingerprint(data) == mark
+        else { return false }
+        return loadOAuthString(instanceId: instanceId, account: "manual-oauth-token")?.isEmpty != false
+    }
+
+    private static func clearOAuthNeedsReauth(instanceId: String) {
+        UserDefaults.standard.removeObject(forKey: oauthNeedsReauthUDKey(instanceId: instanceId))
     }
 
     // MARK: - OAuth Strings (per-instance, e.g. email, project ID)
@@ -3286,7 +3955,11 @@ enum ProviderKeychainHelper {
         let syncStatus = SecItemCopyMatching(syncQuery as CFDictionary, &result)
         if syncStatus == errSecSuccess, let data = result as? Data {
             let s = String(data: data, encoding: .utf8)
-            AppLogger(category: "Keychain").info("read oauthString instanceId=\(instanceId.prefix(8)) acct=\(account) src=sync hit=\(s != nil) valLen=\(s?.count ?? 0) caller=\(caller)")
+            // [T-keychain-log-volume] Silent on the successful fast path; a
+            // non-UTF-8 payload is still reported.
+            if s == nil {
+                AppLogger(category: "Keychain").error("read oauthString instanceId=\(instanceId.prefix(8)) acct=\(account) src=sync FOUND BUT NOT UTF-8 bytes=\(data.count) caller=\(caller)")
+            }
             return s
         }
         // Fallback to legacy
@@ -3297,6 +3970,8 @@ enum ProviderKeychainHelper {
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+        // [T-envvar-redactor-crash] Clear before reusing — see loadOAuthToken.
+        result = nil
         let legacyStatus = SecItemCopyMatching(query as CFDictionary, &result)
         guard legacyStatus == errSecSuccess, let data = result as? Data else {
             AppLogger(category: "Keychain").info("read oauthString instanceId=\(instanceId.prefix(8)) acct=\(account) hit=false syncStatus=\(syncStatus) legacyStatus=\(legacyStatus) caller=\(caller)")
@@ -3322,3 +3997,72 @@ enum ProviderKeychainHelper {
         notifyAuthChanged(instanceId: instanceId)
     }
 }
+
+// BEGIN ModelRefreshOutcome
+/// [T-ios-model-refresh-visible] Where a refreshed model list came from.
+/// Mirrors Android `ModelRefreshOutcome.Source`.
+enum ModelRefreshSource: String {
+    /// The provider's own /models answer.
+    case vendor
+    /// The provider type's compiled-in list.
+    case builtIn = "built-in"
+    /// The public models.dev catalog, matched by base URL.
+    case modelsDev = "models.dev"
+    /// Nothing usable came back: the list from before was left as it was.
+    case kept
+
+    /// From `ModelFetchResult.source` ("api" / "models.dev" / "built-in").
+    init(fetchSource: String) {
+        switch fetchSource {
+        case "api": self = .vendor
+        case "models.dev": self = .modelsDev
+        default: self = .builtIn
+        }
+    }
+}
+
+/// What one `replaceEntries` did to an instance's list.
+struct ModelListDiff: Equatable {
+    /// Models in the list that was applied (for `.kept`: entries left in place).
+    var total = 0
+    /// Ids that were not in the list before.
+    var added = 0
+    /// Entries deleted now: unlisted for longer than the grace window.
+    var removed = 0
+    /// Entries the provider no longer lists, kept (marked "Not listed by
+    /// provider") until the grace window runs out.
+    var unlisted = 0
+}
+
+/// The result of one model-list refresh, for the Refresh row, the log and
+/// the `provider.models.refresh` debug RPC.
+struct ModelRefreshOutcome: Equatable {
+    let source: ModelRefreshSource
+    let diff: ModelListDiff
+    /// "HTTP <code>: <provider message>", "the response is not a model list:
+    /// …", "the provider listed no models", "could not read the model list:
+    /// …", "no API key is set for this provider"; nil when the provider's own
+    /// list was used.
+    let vendorError: String?
+
+    var logLine: String {
+        "source=\(source.rawValue) total=\(diff.total) added=\(diff.added) removed=\(diff.removed) unlisted=\(diff.unlisted)"
+            + (vendorError.map { " vendorError=\($0)" } ?? "")
+    }
+}
+
+/// Which list replaces the provider's own when that one failed or was empty.
+enum ModelRefreshFallback {
+    /// - vendorThrew: the /models call failed (as opposed to answering with
+    ///   an empty list).
+    /// - isThirdParty: a custom base URL that is not an official host.
+    static func decide(vendorThrew: Bool, isThirdParty: Bool, catalogCount: Int, builtInCount: Int) -> ModelRefreshSource {
+        // An unreachable relay keeps what it had: its models are its own, and
+        // neither the catalog nor the built-in GPT list describes them.
+        if vendorThrew && isThirdParty { return .kept }
+        if catalogCount > 0 { return .modelsDev }
+        if !isThirdParty && builtInCount > 0 { return .builtIn }
+        return .kept
+    }
+}
+// END ModelRefreshOutcome

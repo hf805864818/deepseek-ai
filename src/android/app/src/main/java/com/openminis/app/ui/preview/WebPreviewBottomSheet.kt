@@ -131,10 +131,26 @@ fun WebPreviewBottomSheet(
             onDispose { }
         } else {
             val controller = WindowCompat.getInsetsController(window, view)
-            val previous = controller.isAppearanceLightStatusBars
             controller.isAppearanceLightStatusBars = !darkTheme
             onDispose {
-                controller.isAppearanceLightStatusBars = previous
+                // [T-android-preview-statusbar-leak] Restore to the value the
+                // THEME implies, not to a value captured on entry.
+                //
+                // isAppearanceLightStatusBars is a single mutable flag on the
+                // ACTIVITY window, and this sheet is not its only writer — the
+                // fullscreen preview writes it too, and the two overlap when
+                // the user swaps between them (ChatScreen swaps the sheet for
+                // the fullscreen dialog in one recomposition, so there is no
+                // guaranteed dispose-then-enter ordering across the siblings).
+                // A captured "previous" therefore restores whatever the OTHER
+                // screen happened to have set mid-swap, and the pair can settle
+                // on `true` — dark icons — while the app is on a dark
+                // background, leaving the status bar unreadable.
+                //
+                // Deriving the restore from `darkTheme` makes it idempotent and
+                // order-independent: whichever writer disposes last, the flag
+                // lands on the value the theme actually wants.
+                controller.isAppearanceLightStatusBars = !darkTheme
             }
         }
     }

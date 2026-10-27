@@ -52,8 +52,7 @@ struct WorkflowStep: Identifiable, Equatable {
     let title: String
     var status: WorkflowStepStatus
     /// [T-deep-mode-parallel-plan] True when the plan step carried a
-    /// [PARALLEL] tag, marking it as independent and dispatchable via
-    /// task_dispatch. Purely informational for the step tracker UI.
+    /// [PARALLEL] tag. Purely informational for the step tracker UI.
     let isParallel: Bool
 
     init(id: Int, title: String, status: WorkflowStepStatus = .pending, isParallel: Bool = false) {

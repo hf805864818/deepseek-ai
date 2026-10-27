@@ -1763,14 +1763,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // in the cross-session store. Historical summaries are preserved
         // (passive data, no behavioral impact when deep mode is off).
         try? CrossSessionContextStore.clearActiveProject()
-        // [T-phase5] Cancel and clear all active subagent sessions.
-        // Ensures no subagent processes are left running when the master
-        // switch is turned off. Total-switch safe: all UI is guarded by
-        // deepModeEnabled, so the cleared array won't render.
-        for subagent in activeSubagents {
-            subagent.cancel()
-        }
-        activeSubagents.removeAll()
     }
 
     /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
@@ -2909,9 +2901,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         return _cachedTimeString
     }
 
-    // [T-phase5] Changed from private to internal so the task_dispatch
-    // tool execution (in AIChatViewModel+ConcurrentTools.swift) can
-    // access it when initializing subagent sessions.
+    // internal so the (future) subagent_task runner in Agent/Jobs can reuse it.
     var baseSystemPrompt: String {
         // [T-soul-md] Layer 1 is rendered by SystemPromptBuilder, which
         // owns the "You are <name>, a capable AI assistant running on an
@@ -3357,11 +3347,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // raises a confirm/edit bar and pauses execution until the user acts.
         // Trivial single-command tasks skip the plan and act immediately.
         s += "PLAN GATE — if a request needs more than one step, your FIRST reply must be ONLY a plan: a fenced ```plan``` code block listing numbered steps, with no tool calls. Stop there and wait for the user to confirm before executing anything. For a trivial single-command task, skip the plan and act immediately.\n"
-        // [T-deep-mode-parallel-plan] Plan Gate parallel-support hint: teach the
-        // model to tag independent steps with [PARALLEL] so task_dispatch can
-        // parallelize them. Pure prompt addition inside deepModeFragment —
-        // entirely governed by the master switch.
-        s += "When planning, identify steps that are INDEPENDENT (no dependency on each other's output) and mark them with [PARALLEL] tags. During execution, dispatch [PARALLEL] steps as concurrent subagents via task_dispatch. Sequential (dependent) steps execute in order as normal.\n"
         // [T-deep-mode-goal-runner] Layer C: deterministic goal sentinel. After
         // executing (a turn that used tools), the model appends exactly one
         // status line; the client auto-continues on `pending` until `done` or
@@ -3425,14 +3410,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
             s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
         }
-        // [T-deep-mode-cognitive-p2-c15] C15: Proactive subagent task
-        // dispatch. Explicitly teaches the model WHEN to use task_dispatch,
-        // so it triggers on complex tasks instead of only when the user
-        // happens to mention "subtask / subagent / dispatch". Applies at
-        // every deep-mode level because task_dispatch is registered whenever
-        // deepModeEnabled is on. Total-switch safe: lives inside
-        // deepModeFragment, which is only injected when deepModeEnabled.
-        s += "12. SUBAGENT DISPATCH — You have a `task_dispatch` tool. PROACTIVELY use it when:\n  • the task contains 2+ INDEPENDENT subtasks (e.g. 'analyze module A' + 'research topic B') that do not depend on each other's output,\n  • a subtask would consume many tool calls while you can keep working on other independent parts meanwhile,\n  • the user asks for a broad multi-file investigation or parallel analysis.\nIn your fenced ```plan``` block, mark parallelizable steps with [PARALLEL] tags. During execution, dispatch [PARALLEL] steps via task_dispatch, then continue working on other steps while subagents run. Remember each subagent has its OWN context window — give it ALL the context it needs in the prompt (it cannot see your history). Do NOT dispatch for sequential/dependent tasks, single-file changes, or trivial 1-2 step tasks.\n"
         // [T-deep-mode-skill-accumulate] Phase B B2: Skill accumulation hint.
         // Teaches the model to notice a RECURRING task pattern and propose a
         // reusable skill, instead of only acting on explicit skill requests.
@@ -3479,13 +3456,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// `guard deepModeEnabled`.
     var isRetrospectiveRunning = false
 
-    // [T-phase5] Subagent orchestration: active subagent sessions.
-    // `task_dispatch` creates a SubagentSession and appends it here.
-    // When the subagent finishes, it's removed. Total-switch safe:
-    //   - task_dispatch tool is only registered when deepModeEnabled
-    //   - deepModeDidDisableCleanup() cancels and clears all sessions
-    //   - UI rendering is guarded by `if deepModeEnabled`
-    @Published var activeSubagents: [SubagentSession] = []
+    // [T-phase5] Subagent orchestration was removed — activeSubagents is gone.
 
     /// [T-deep-mode-cognitive-p1] C8: Detect uncertainty markers in the model's
     /// output text. Returns true if any uncertainty marker is found. Pure

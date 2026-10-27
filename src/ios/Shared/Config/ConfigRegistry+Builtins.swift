@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// Built-in field registrations. This file is the single place to add
@@ -21,9 +22,42 @@ extension ConfigRegistry {
         registerDefaults(into: r)
         registerSync(into: r)
         registerRootfsMirror(into: r)
+        registerNetwork(into: r)
         registerSession(into: r)
         registerSoul(into: r)
         registerMemory(into: r)
+        registerAgentTools(into: r)
+    }
+
+    /// [T-user-ask] `agentTools.userAsk.*` — the user_ask tool and its
+    /// timeout / notification settings (Settings › Agent Tools).
+    /// [T-user-ask-no-policy] There is no auto-default mode and no "Always
+    /// allow" rule list any more: the app never answers or approves for the
+    /// user, so nothing here can grant the agent unattended approval.
+    static func registerAgentTools(into r: ConfigRegistry) {
+        r.register(AppStorageBoolField(
+            path: UserAskSettings.enabledPath,
+            displayName: "User interaction tool (user_ask)",
+            description: "Whether the assistant may ask you structured questions (choices, or a confirmation before a risky action) on an in-chat card and wait for the answer. Only offered in interactive chats — never to sub agents, Shortcuts, scheduled jobs or runs that start in the background. When off the tool is removed and the assistant is told not to perform risky actions without an explicit go-ahead in your next message.",
+            userDefaultsKey: UserAskSettings.enabledKey,
+            defaultValue: UserAskSettings.defaultEnabled
+        ))
+        r.register(AppStorageIntField(
+            path: UserAskSettings.timeoutMinutesPath,
+            displayName: "Question timeout (minutes)",
+            description: "Minutes the assistant waits for an answer. After that the question is returned to the assistant as timed out - nothing is applied, approved or cancelled on your behalf. 0 = wait indefinitely. Default 5.",
+            userDefaultsKey: UserAskSettings.timeoutMinutesKey,
+            defaultValue: UserAskSettings.defaultTimeoutMinutes,
+            min: 0, max: UserAskSettings.maxTimeoutMinutes,
+            unit: .plain, zeroLabel: "Wait indefinitely"
+        ))
+        r.register(AppStorageBoolField(
+            path: UserAskSettings.notifyInBackgroundPath,
+            displayName: "Notify about questions in the background",
+            description: "Post a notification when the assistant asks while Minis is in the background.",
+            userDefaultsKey: UserAskSettings.notifyInBackgroundKey,
+            defaultValue: UserAskSettings.defaultNotifyInBackground
+        ))
     }
 
     // MARK: Memory — global default toggle for the persistent memory feature
@@ -95,6 +129,7 @@ extension ConfigRegistry {
             description: "Assistant display name. Shown in the sidebar title, chat bubble header, and substituted into the identity line of the system prompt (`You are <name>, a capable AI assistant ...`).",
             valueSchema: .string(maxLength: 64),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.text()),
             reader: { .string(currentFile().metadata.name) },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
@@ -112,10 +147,138 @@ extension ConfigRegistry {
             description: "Short voice / style tag shown in the SOUL.md frontmatter (e.g. \"Warm, direct, opinionated\"). Stored verbatim; not directly injected into the prompt.",
             valueSchema: .string(maxLength: 200),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.text(preview: 60)),
             reader: { .string(currentFile().metadata.style) },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
                 try updateMetadata { $0.style = s }
+            }
+        ))
+
+        // [T-soul-custom-icon] [T-soul-icon-config-images] Emoji OR an image.
+        //
+        // An image may be given as a data URI, bare base64, a `minis://`
+        // resource, a path inside the minis directories, or an http(s) URL.
+        // Whatever the source, it is decoded and pushed through the SAME
+        // `SoulIconImage.encode` the Settings picker uses — alpha check,
+        // square crop, 96px cap, PNG — and the RESULT is stored inline.
+        //
+        // An address is an import source only, never the stored value: keeping
+        // a path would leave the icon dangling the moment the attachment is
+        // cleaned up, the session is deleted, or the value syncs to a device
+        // where that path means nothing.
+        //
+        // The resolution (including the download) happens in
+        // `ConfigOffloadBridge.performWriteBatch`, which is `async`, so by the
+        // time this synchronous writer runs the value is already a finished
+        // data URI. See `SoulIconSource` for why.
+        //
+        // Reading stays summarized: a data URI is reported as `<image>` so
+        // `minis-config get` never floods the context with base64, and the
+        // same substitution keeps the confirmation sheet and the audit log
+        // clean. Clearing (empty string) restores the default sparkle.
+        r.register(ClosureField(
+            path: "soul.icon",
+            displayName: "Soul icon",
+            // [T-soul-icon-config-images] The description IS the API doc —
+            // `minis-config topic-help soul` renders it verbatim, so every
+            // accepted form is spelled out with a runnable example. Claims
+            // here are limited to what is actually implemented: the decodable
+            // formats were checked against ImageIO on-device rather than
+            // assumed, and SVG is absent because it genuinely does not decode.
+            description: "The Soul's identity icon — also called its avatar, its persona image, or its "
+                + "character image (中文：角色形象 / 图标 / 头像). All of those refer to THIS one setting; "
+                + "there is no separate avatar field. Shown beside the assistant name in the chat header "
+                + "and on the Soul settings card. Accepts an emoji or an image.\n"
+                + "\n"
+                + "EMOJI\n"
+                + "  A single emoji, e.g. \"⚡\". An empty string \"\" restores the default sparkle.\n"
+                + "\n"
+                + "IMAGE — any of these forms:\n"
+                + "  • data URI (preferred for inline bytes):\n"
+                + "      data:image/png;base64,iVBORw0KGgo...\n"
+                + "      MIME may be image/png, image/jpeg, image/webp, image/gif, image/heic or image/tiff.\n"
+                + "  • bare base64 (no data: prefix) — auto-detected, e.g. iVBORw0KGgo...\n"
+                + "  • minis:// resource, e.g. minis://attachments/icon.png or minis://workspace/icon.png\n"
+                + "  • local path inside the minis directories, e.g. /var/minis/attachments/icon.png\n"
+                + "  • https:// URL, e.g. https://example.com/icon.png (http:// also works; "
+                + "private/loopback/link-local hosts are refused)\n"
+                + "\n"
+                + "TRANSPARENCY — not required. Both transparent and opaque images are accepted "
+                + "(a JPEG or a flattened PNG is fine); the icon is displayed with rounded corners, "
+                + "so an opaque image still reads as a normal small avatar. Transparency is preserved "
+                + "when the source has it.\n"
+                + "\n"
+                + "PROCESSING — identical to picking an image in Settings → Soul: "
+                + "the image is centre-cropped to a square, downscaled to 96×96 and re-encoded as PNG, "
+                + "then stored inline. An address is only an import source — "
+                + "it is never persisted, so the file can be deleted afterwards and the icon survives "
+                + "attachment cleanup and syncing to other devices.\n"
+                + "\n"
+                + "READING — `get soul.icon` returns \"<image>\" for an image, never the base64.\n"
+                + "\n"
+                + "EXAMPLES (note the value is JSON, so the string needs its own quotes)\n"
+                + "  minis-config set soul.icon '\"⚡\"'\n"
+                + "  minis-config set soul.icon '\"minis://attachments/icon.png\"'\n"
+                + "  minis-config set soul.icon '\"https://example.com/icon.png\"'\n"
+                + "  minis-config set soul.icon '\"data:image/png;base64,iVBORw0KGgo...\"'\n"
+                + "  minis-config set soul.icon '\"\"'    # back to the default sparkle\n"
+                + "A long data URI is easier to pass via a file. --file reads the JSON VALUE "
+                + "(a quoted string), not the raw image — write the quoted data URI to the file first:\n"
+                + "  printf '\"%s\"' \"data:image/png;base64,$(base64 -w0 icon.png)\" > /tmp/icon-value.json\n"
+                + "  minis-config set soul.icon --file /tmp/icon-value.json\n"
+                + "Simpler still: point at the file directly with minis:// or a path and skip base64 entirely.",
+            // Wide enough for an inline base64 argument; `SoulIconSource`
+            // applies the real byte/pixel limits once it knows the source
+            // kind. Emoji validation below is unchanged.
+            valueSchema: .string(maxLength: SoulIconSource.maxInlineBase64Chars),
+            // .sensitive: this is the assistant's visible identity, and an
+            // image write cannot be rolled back from the audit log (see
+            // `revertable` below), so it deserves an explicit confirmation.
+            risk: .sensitive,
+            // An emoji write is trivially revertable, but an image write is
+            // not: the audit log stores `<image>` rather than the base64, so
+            // there is nothing to restore from. Claiming otherwise would give
+            // `audit revert` a button that silently does the wrong thing.
+            revertable: false,
+            readable: ConfigReadable(.image),
+            reader: {
+                let raw = currentFile().metadata.icon
+                // Never surface the base64 payload.
+                return .string(SoulIconImage.isDataURI(raw) ? "<image>" : raw)
+            },
+            writer: { v in
+                guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
+                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Empty clears back to the default sparkle.
+                guard !trimmed.isEmpty else {
+                    try updateMetadata { $0.icon = "" }
+                    return
+                }
+                // Already a stored icon: either the bridge resolved an image
+                // source into one, or a caller handed us the final form.
+                if SoulIconImage.isDataURI(trimmed) {
+                    guard trimmed.count <= SoulIconSource.maxStoredChars else {
+                        throw ConfigError.invalidValue(
+                            "encoded icon is \(trimmed.count) chars, over the \(SoulIconSource.maxStoredChars) limit")
+                    }
+                    try updateMetadata { $0.icon = trimmed }
+                    return
+                }
+                // An image source that reached the writer unresolved means the
+                // async resolve step was skipped. Fail loudly rather than
+                // storing a path that would dangle.
+                if SoulIconSource.looksLikeImageSource(trimmed) {
+                    throw ConfigError.invalidValue(
+                        "image source was not resolved before the write — this is a bug; "
+                        + "please report it")
+                }
+                // One grapheme cluster, so a flag or skin-toned/ZWJ emoji
+                // (several scalars, one glyph) counts as one.
+                guard trimmed.count == 1 else {
+                    throw ConfigError.invalidValue("icon must be a single emoji")
+                }
+                try updateMetadata { $0.icon = trimmed }
             }
         ))
 
@@ -125,6 +288,7 @@ extension ConfigRegistry {
             description: "Preferred reply language hint: auto / zh / en. Stored in SOUL.md frontmatter for forward use; the agent should respect it when set non-auto.",
             valueSchema: .stringEnum(["auto", "zh", "en"]),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.enumLabels(["auto": "Automatic", "zh": "Chinese", "en": "English"])),
             reader: {
                 // Older SOUL.md files may have no `lang` field — surface
                 // "auto" rather than whatever happens to be in the
@@ -141,30 +305,30 @@ extension ConfigRegistry {
         ))
 
         // Personality body. The Settings UI calls this the "Personality
-        // Prompt" — same field, different surface. Length is a unified
-        // 2000-token recommendation (CJK glyphs + CJK punctuation count one
-        // each; Latin words count one each) surfaced via SoulStore.isOverLimit
-        // as an advisory hint rather than a hard gate; the schema does not
-        // carry a byte-level maxLength because a fixed char count would be
-        // wrong for non-ASCII text. SoulMDParser injection scrubbing also
-        // runs at prompt-build time (SystemPromptBuilder.identitySection), so
-        // a stored body with an "ignore previous instructions" line still
-        // won't reach the model — but we leave it on disk verbatim so the
-        // user can see and fix it.
+        // Prompt" — same field, different surface. Length cap is a unified
+        // 2000-token budget (CJK glyphs + CJK punctuation count one each;
+        // Latin words count one each) enforced via SoulStore.isOverLimit;
+        // the schema does not carry a byte-level maxLength because a fixed
+        // char count would be wrong for non-ASCII text. SoulMDParser
+        // injection scrubbing also runs at prompt-build time
+        // (SystemPromptBuilder.identitySection), so a stored body with an
+        // "ignore previous instructions" line still won't reach the model
+        // — but we leave it on disk verbatim so the user can see and fix it.
         r.register(ClosureField(
             path: "soul.body",
             displayName: "Soul personality body",
-            description: "Markdown body of SOUL.md — your character and voice. NOT the place for the \"You are X\" identity line (the app owns that template); write only personality / stance / tone guidance. Recommended length: 2000 tokens total (advisory, not enforced). CJK glyphs and CJK punctuation count one each; non-CJK text counts whitespace-delimited words. Mixed-language bodies add both kinds together.",
+            description: "Markdown body of SOUL.md — your character and voice. NOT the place for the \"You are X\" identity line (the app owns that template); write only personality / stance / tone guidance. Length cap: 2000 tokens total. CJK glyphs and CJK punctuation count one each; non-CJK text counts whitespace-delimited words. Mixed-language bodies add both kinds together.",
             valueSchema: .string(maxLength: nil),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.longText),
             reader: { .string(currentFile().body) },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
-                // The token length is a soft hint, not a hard gate: over-limit
-                // bodies are saved and injected, with a warning logged for
-                // diagnostics (mirrors the Settings UI's advisory-only footer).
-                if case .overLimit(let count, let cap) = SoulStore.isOverLimit(s) {
-                    AppLogger(category: "MinisConfig").warning("[MinisConfig] soul.body is over the recommended length (\(count)/\(cap)); saving anyway.")
+                switch SoulStore.isOverLimit(s) {
+                case .ok:
+                    break
+                case .overLimit(let count, let cap):
+                    throw ConfigError.invalidValue("Over limit: \(count) tokens exceeds cap of \(cap). Trim the body — each CJK character and each Latin word counts as one token.")
                 }
                 var file = currentFile()
                 file.body = s
@@ -196,6 +360,7 @@ extension ConfigRegistry {
             description: "off / low / medium / high / xhigh / max / ultra. Applied to the active chat.",
             valueSchema: .stringEnum(["off", "low", "medium", "high", "xhigh", "max", "ultra"]),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.enumLabels(ThinkingLevel.readableLabels)),
             reader: {
                 guard let sid = AIChatViewModel.activeSessionId else { return .null }
                 let level = ProviderConfigStore.shared.inferenceConfig(for: sid)?.thinkingLevel ?? .off
@@ -203,7 +368,7 @@ extension ConfigRegistry {
             },
             writer: { v in
                 guard case .string(let s) = v,
-                      let level = ThinkingLevel(rawValue: s) else {
+                      let level = ThinkingLevel.parse(s) else {
                     throw ConfigError.invalidValue("Unknown thinking level. Valid: \(ThinkingLevel.allCases.map(\.rawValue).joined(separator: ", "))")
                 }
                 guard let sid = AIChatViewModel.activeSessionId else {
@@ -225,6 +390,7 @@ extension ConfigRegistry {
             description: "Set as `entry:<uuid>` or `group:<id>` (use `models` / `groups` topics to discover ids). Empty clears the binding.",
             valueSchema: .string(maxLength: 200),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.ref(.modelSource)),
             reader: {
                 guard let sid = AIChatViewModel.activeSessionId,
                       let binding = ProviderConfigStore.shared.binding(for: sid) else {
@@ -264,6 +430,7 @@ extension ConfigRegistry {
             description: "Optional fallback. Format same as primaryModel. Empty clears.",
             valueSchema: .string(maxLength: 200),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.ref(.modelSource)),
             reader: {
                 guard let sid = AIChatViewModel.activeSessionId,
                       let binding = ProviderConfigStore.shared.binding(for: sid),
@@ -371,6 +538,11 @@ extension ConfigRegistry {
         r.register(GroupsCollection())
         r.register(EnvVarsCollection())
         r.register(ThinkingRulesCollection())
+        // [T-sub-agents-cli] Sub agents are global (not per-provider), so the
+        // collection uses a plain id as its child key and needs only one
+        // `order` field rather than one per instance.
+        r.register(SubAgentsCollection())
+        r.register(SubAgentsCollection.orderField())
 
         // [T-thinking-rules-minis-config] One `order` field per provider instance.
         // These are flat fields rather than collection children because the collection
@@ -386,6 +558,49 @@ extension ConfigRegistry {
         // Aggregate read-only summary. This is the ONLY place built-in rules are
         // exposed: they are computed per request from code, never persisted and never
         // synced, so they are shown for reference but have no writable path anywhere.
+        // [T-sub-agents-cli] Aggregate view so `get subagents` alone answers
+        // "what exists, which is writable, and what is each one's model" —
+        // without it a caller has to walk every child path to find out.
+        r.register(ReadOnlyField(
+            path: "subagents",
+            displayName: "Sub agents (summary)",
+            description: "Read-only roster view. Each entry's writable paths are subagents.<id>.{name,description,instructions,model_group}; the built-in one refuses name/description and cannot be removed. Reorder with subagents.order.",
+            valueSchema: .json,
+            reader: {
+                let store = ProviderConfigStore.shared
+                let items: [ConfigValue] = SubAgentStore.shared.subAgents.map { def in
+                    var obj: [String: ConfigValue] = [
+                        "id": .string(def.id),
+                        "name": .string(def.name),
+                        "description": .string(def.description),
+                        "built_in": .bool(def.isBuiltIn),
+                        "path": .string("subagents.\(def.id)"),
+                    ]
+                    if !def.instructions.isEmpty {
+                        obj["instructions"] = .string(def.instructions)
+                    }
+                    if let gid = def.modelGroupId {
+                        obj["model_group"] = .string(store.group(for: gid)?.name ?? gid)
+                    } else {
+                        // Spelled out rather than omitted: "Auto" is a real
+                        // setting, not an absence, and the reader should not
+                        // have to infer it from a missing key.
+                        obj["model_group"] = .string("")
+                        obj["model"] = .string("auto — chosen per task")
+                    }
+                    if def.isBuiltIn {
+                        obj["note"] = .string("Built-in: name and description are fixed and it cannot be deleted; model and instructions are writable.")
+                    }
+                    return .object(obj)
+                }
+                return .object([
+                    "count": .int(items.count),
+                    "max": .int(SubAgentLimits.maxCount),
+                    "agents": .array(items),
+                ])
+            }
+        ))
+
         r.register(ReadOnlyField(
             path: "thinkingrules",
             displayName: "Thinking rules (summary)",
@@ -478,7 +693,7 @@ extension ConfigRegistry {
         r.register(ReadOnlyField(
             path: "envvars",
             displayName: "Environment variables (summary)",
-            description: "Read-only list of env var keys with note and createdAt. Values are never exposed.",
+            description: "Read-only list of env var keys with note, createdAt and enabled. Values are never exposed.",
             valueSchema: .json,
             reader: {
                 let iso = ISO8601DateFormatter()
@@ -487,6 +702,8 @@ extension ConfigRegistry {
                         "key": .string(e.key),
                         "note": .string(e.note),
                         "created_at": .string(iso.string(from: e.createdAt)),
+                        // [T-envvar-disable]
+                        "enabled": .bool(EnvVarStore.shared.isEnabled(id: e.id)),
                     ])
                 }
                 return .array(summaries)
@@ -507,6 +724,7 @@ extension ConfigRegistry {
             valueSchema: .bool,
             risk: .sensitive,
             revertable: true,
+            readable: ConfigReadable(.bool()),
             reader: { .bool(EnvVarPrivacyStore.shared.enabled) },
             writer: { v in
                 guard case .bool(let b) = v else { throw ConfigError.typeMismatch(expected: "bool") }
@@ -581,6 +799,7 @@ extension ConfigRegistry {
             description: "Group used by new sessions. Empty string clears the default.",
             valueSchema: .string(maxLength: 200),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.ref(.group)),
             reader: { .string(ProviderConfigStore.shared.defaultPrimaryGroupId ?? "") },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
@@ -601,6 +820,7 @@ extension ConfigRegistry {
             description: "Secondary group for fallback. Empty string clears the default.",
             valueSchema: .string(maxLength: 200),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.ref(.group)),
             reader: { .string(ProviderConfigStore.shared.defaultSubGroupId ?? "") },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
@@ -630,6 +850,7 @@ extension ConfigRegistry {
             // [T-ios-agentloop-dirty-data-skip] Normalize, then drop any id that
             // still doesn't match a known entry (stale legacy uuid) so the agent
             // never sees an unresolvable ref it can't act on.
+            readable: ConfigReadable(.refList(.modelEntry, ordered: false)),
             reader: {
                 let store = ProviderConfigStore.shared
                 let validIds = Set(store.config.modelEntries.map(\.id))
@@ -672,6 +893,7 @@ extension ConfigRegistry {
             valueSchema: .array(.string()),
             risk: .sensitive, revertable: true,
             // [T-ios-agentloop-dirty-data-skip] Filter unknown group ids on read.
+            readable: ConfigReadable(.refList(.group, ordered: false)),
             reader: {
                 let store = ProviderConfigStore.shared
                 let validIds = Set(store.config.modelGroups.map(\.id))
@@ -758,6 +980,7 @@ extension ConfigRegistry {
             description: "Master switch for iCloud sync. Reflects the engine that is actually running (v2 when active, otherwise the legacy v1 engine).",
             valueSchema: .bool,
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.bool()),
             reader: {
                 if syncV2Live() {
                     if #available(iOS 17.0, *) { return .bool(SyncV2Bootstrap.isEnabled) }
@@ -797,6 +1020,7 @@ extension ConfigRegistry {
                 description: "Include \(category.displayName) in iCloud sync uploads. Turning this off stops NEW uploads; records already in iCloud are not pulled back.",
                 valueSchema: .bool,
                 risk: .normal, revertable: true,
+                readable: ConfigReadable(.bool(), label: syncLabels[syncFieldSuffix(for: category)]),
                 reader: { .bool(UploadPolicy.isEnabled(category)) },
                 writer: { v in
                     guard case .bool(let on) = v else { throw ConfigError.typeMismatch(expected: "bool") }
@@ -811,6 +1035,7 @@ extension ConfigRegistry {
             description: "Files larger than this are skipped during iCloud sync.",
             valueSchema: .int(min: 0, max: 100_000_000),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.number(.bytes)),
             reader: { .int(UploadPolicy.maxFileSizeBytes) },
             writer: { v in
                 guard case .int(let n) = v else { throw ConfigError.typeMismatch(expected: "int") }
@@ -866,10 +1091,82 @@ extension ConfigRegistry {
                 description: "Selected mirror for \(category). Empty = default.",
                 userDefaultsKey: "mirror.selected.\(category)",
                 defaultValue: "",
-                maxLength: 256
+                maxLength: 256,
+                readable: ConfigReadable(.custom(mirrorPhrase))
             ))
         }
     }
+
+    // MARK: Network — Shell Container DNS [T-container-network-dns GH#396]
+    //
+    // Mirrors Settings › Rootfs › Container Network. Both writes take effect
+    // at once: they rewrite the container's /etc/resolv.conf through the same
+    // ISHKernel.refreshDns the network monitor uses.
+
+    // BEGIN registerNetwork
+    @MainActor
+    private static func registerNetwork(into r: ConfigRegistry) {
+        r.register(ClosureField(
+            path: ContainerDnsSettings.modeKey,
+            displayName: "Container DNS mode",
+            description: "Where the Shell Container's /etc/resolv.conf comes from. auto (default): the system's DNS, re-read on every network change — required for proxy apps in Fake-IP / TUN mode and for VPN DNS. custom: exactly the servers in network.dnsCustomServers, kept across network changes. custom with no valid server falls back to auto.",
+            valueSchema: .stringEnum(ContainerDnsSettings.Mode.allCases.map(\.rawValue)),
+            risk: .normal, revertable: true,
+            readable: ConfigReadable(.enumLabels(["auto": "Automatic (system)", "custom": "Custom"])),
+            reader: { .string(ContainerDnsSettings.mode().rawValue) },
+            writer: { v in
+                guard case .string(let s) = v, let mode = ContainerDnsSettings.Mode(rawValue: s) else {
+                    throw ConfigError.invalidValue("expected one of: auto, custom")
+                }
+                UserDefaults.standard.set(mode.rawValue, forKey: ContainerDnsSettings.modeKey)
+                ISHKernel.shared.refreshDns()
+            }
+        ))
+        r.register(ClosureField(
+            path: ContainerDnsSettings.serversKey,
+            displayName: "Container custom DNS servers",
+            description: "DNS servers for the Shell Container when network.dnsMode is custom: IPv4 and/or IPv6 addresses. Accepts a JSON array ('[\"1.1.1.1\",\"2606:4700:4700::1111\"]') or one comma/newline-separated list (1.1.1.1,8.8.8.8); .append/.remove take one address. Every entry must be a literal address (no hostnames, ports or %zone); addresses are stored in canonical form, duplicates dropped. Linux resolvers use the first 3. An empty list makes custom mode fall back to auto.",
+            valueSchema: .array(.string(maxLength: 64)),
+            risk: .normal, revertable: true,
+            readable: ConfigReadable(.stringList(ordered: true)),
+            reader: { .array(ContainerDnsSettings.storedServers().map { .string($0) }) },
+            writer: { v in
+                guard case .array(let items) = v else { throw ConfigError.typeMismatch(expected: "array of strings") }
+                let servers = items.compactMap { item -> String? in
+                    if case .string(let s) = item { return s } else { return nil }
+                }
+                UserDefaults.standard.set(servers.joined(separator: "\n"), forKey: ContainerDnsSettings.serversKey)
+                ISHKernel.shared.refreshDns()
+            },
+            normalizer: { v in
+                let text: String
+                switch v {
+                case .string(let s): text = s
+                case .array(let items):
+                    text = try items.map { item -> String in
+                        guard case .string(let s) = item else { throw ConfigError.typeMismatch(expected: "string") }
+                        return s
+                    }.joined(separator: "\n")
+                default: throw ConfigError.typeMismatch(expected: "array of strings, or a comma/newline-separated string")
+                }
+                // Canonical, de-duplicated addresses; anything invalid is kept
+                // verbatim so the validator can name it.
+                let parsed = ContainerDnsSettings.parse(text)
+                return .array((parsed.servers + parsed.invalid).map { .string($0) })
+            },
+            validator: { v in
+                guard case .array(let items) = v else { throw ConfigError.typeMismatch(expected: "array of strings") }
+                let invalid = items.compactMap { item -> String? in
+                    guard case .string(let s) = item else { return item.displayString }
+                    return ContainerDnsSettings.canonicalAddress(s) == nil ? s : nil
+                }
+                guard invalid.isEmpty else {
+                    throw ConfigError.invalidValue("not a valid IPv4 or IPv6 address: \(invalid.joined(separator: ", "))")
+                }
+            }
+        ))
+    }
+    // END registerNetwork
 
     // MARK: Self-meta — read-only status queries
 
@@ -922,6 +1219,7 @@ extension ConfigRegistry {
             access: .readonly,
             risk: .destructive,
             revertable: false,
+            readable: .notWritable,
             reader: { .bool(MinisConfigPermissionStore.shared.enabled) },
             writer: { _ in
                 throw ConfigError.permissionDenied(
@@ -940,6 +1238,7 @@ extension ConfigRegistry {
             description: "Light / Dark / System color scheme.",
             userDefaultsKey: "appearanceMode",
             cases: ["system", "light", "dark"],
+            valueLabels: ["system": "System", "light": "Light", "dark": "Dark"],
             defaultIndex: 0
         ))
         r.register(AppStorageIntCodedEnumField(
@@ -948,6 +1247,8 @@ extension ConfigRegistry {
             description: "Home screen icon variant.",
             userDefaultsKey: "appIconMode",
             cases: ["auto", "light", "dark", "legacy_light", "legacy_dark"],
+            valueLabels: ["auto": "Automatic", "light": "Light", "dark": "Dark",
+                          "legacy_light": "Classic light", "legacy_dark": "Classic dark"],
             defaultIndex: 0
         ))
         r.register(AppStorageStringField(
@@ -956,7 +1257,8 @@ extension ConfigRegistry {
             description: "BCP-47 code (zh-Hans, en, ja, …) or empty for system.",
             userDefaultsKey: "appLanguage",
             defaultValue: "",
-            maxLength: 16
+            maxLength: 16,
+            readable: ConfigReadable(.custom(languagePhrase))
         ))
         r.register(AppStorageIntCodedEnumField(
             path: "appearance.launchScreen",
@@ -964,6 +1266,7 @@ extension ConfigRegistry {
             description: "Which screen the app opens to.",
             userDefaultsKey: "launchScreen",
             cases: ["auto", "last", "new", "home"],
+            valueLabels: ["auto": "Automatic", "last": "Last chat", "new": "New chat", "home": "Home"],
             defaultIndex: 0
         ))
         // Global UI font scale (settings labels, list rows, etc.).
@@ -990,14 +1293,49 @@ extension ConfigRegistry {
             description: "What the on-screen Return key does in the chat box.",
             userDefaultsKey: "returnKeyBehavior",
             cases: ["newline", "send"],
+            valueLabels: ["newline": "New line", "send": "Send"],
             defaultIndex: 0
         ))
         r.register(AppStorageBoolField(
             path: "chat.keepScreenAwake",
             displayName: "Keep screen awake during tasks",
-            description: "Prevents auto-lock while the agent is busy.",
+            // [T-always-on] Always On mode is part of this switch, not a key of its own.
+            description: "Prevents auto-lock while the agent is busy. Also Always On mode: with the Screen Saver on (`chat.alwaysOnIdleSeconds`), the chat on screen turns black after that long without a touch and shows only the current step (tap to return), which keeps the app in the foreground so tasks run faster, at some battery cost. A chat's … menu can turn it on or off for that chat only (not persisted).",
             userDefaultsKey: "keepScreenAwakeDuringTasks",
             defaultValue: false
+        ))
+        // [T-always-on-idle-setting] Screen Saver sub-setting of Keep Screen Awake.
+        r.register(AppStorageIntField(
+            path: "chat.alwaysOnIdleSeconds",
+            displayName: "Screen Saver (Always On black screen)",
+            description: "Seconds without a touch before the chat on screen turns black while a task runs; only applies when Keep Screen Awake is on (globally or for that chat). 0 = off (default): the screen stays awake but never goes black. Settings offers 30, 60, 120 and 300.",
+            userDefaultsKey: AlwaysOnController.idleSecondsKey,
+            defaultValue: 0,
+            min: 0, max: 3600,
+            unit: .seconds, zeroLabel: "Off"
+        ))
+        // [T-tools-switches-cli] The two optional-tool switches, same keys the
+        // Settings toggles write (AgentToolSwitch.browser / .agents). Exposed so
+        // they can be scripted and so their cost can be measured — each one adds
+        // its tool schema AND its system-prompt section to every request, which
+        // is invisible until you diff the token usage with them on and off.
+        //
+        // Registered as plain AppStorage fields rather than through
+        // AgentToolSwitch so the CLI reads and writes exactly the stored value;
+        // `isEnabled` applies the same `?? defaultValue` fallback on read.
+        r.register(AppStorageBoolField(
+            path: "chat.tools.browserUse",
+            displayName: "Browser Use tool",
+            description: "Whether the assistant is offered browser_use. When off the tool is removed from the schema entirely and the system prompt drops the sentences advertising it — the model never learns it exists.",
+            userDefaultsKey: AgentToolSwitch.browser.key,
+            defaultValue: AgentToolSwitch.browser.defaultValue
+        ))
+        r.register(AppStorageBoolField(
+            path: "chat.tools.subAgents",
+            displayName: "Sub Agents tool",
+            description: "Whether the assistant is offered subagent_task. When off that tool and the sub agent roster both leave the request. Configure the agents themselves under `subagents`.",
+            userDefaultsKey: AgentToolSwitch.agents.key,
+            defaultValue: AgentToolSwitch.agents.defaultValue
         ))
         r.register(AppStorageBoolField(
             path: "chat.toolPreview",
@@ -1005,6 +1343,23 @@ extension ConfigRegistry {
             description: "Show live preview during agent tool execution.",
             userDefaultsKey: "toolPreviewEnabled",
             defaultValue: true
+        ))
+        // [T-fold-consecutive-tools] Settings → Appearance → Tool Calls.
+        r.register(AppStorageBoolField(
+            path: "chat.foldTools",
+            displayName: "Fold Consecutive Tool Calls",
+            description: "Show consecutive tool calls as one tappable line.",
+            userDefaultsKey: "chat.foldConsecutiveTools",
+            defaultValue: false
+        ))
+        // [T-stop-mode-longpress] Settings → Appearance → Confirm Before
+        // Stopping; same key the stop button's long-press menu writes.
+        r.register(AppStorageBoolField(
+            path: "chat.confirmBeforeStopping",
+            displayName: "Confirm before stopping",
+            description: "What tapping the composer's stop button does while a task runs. false (default) = stop immediately; true = ask \"Stop this task?\" first. Long-pressing the stop button switches it too. Stopping a conversation with scheduled tasks always asks, either way.",
+            userDefaultsKey: StopConfirmPolicy.settingsKey,
+            defaultValue: StopConfirmPolicy.defaultValue
         ))
         r.register(AppStorageBoolField(
             path: "chat.fabOnLeft",
@@ -1066,6 +1421,7 @@ extension ConfigRegistry {
             valueSchema: .stringEnum(cases),
             risk: risk,
             revertable: true,
+            readable: ConfigReadable(.enumLabels(fontScaleLabels)),
             reader: {
                 .string(fontScaleToken(FontSettings.shared[keyPath: keyPath]))
             },
@@ -1084,6 +1440,40 @@ extension ConfigRegistry {
     /// Stable string token for a FontScaleLevel — must match exactly
     /// across read/write so audit revert works without translation.
     /// Decoupled from `label` (which is user-visible and may localise).
+    /// [T-config-readable] Token → label key.
+    private static let fontScaleLabels: [String: String] = [
+        "xSmall": "Extra small", "small": "Small", "default": "Default",
+        "medium": "Medium", "large": "Large", "extraLarge": "Extra large",
+    ]
+
+    /// [T-config-readable] `sync.<suffix>` → label key.
+    private static let syncLabels: [String: String] = [
+        "sessions": "Sync chats", "files": "Sync session files", "skills": "Sync skills",
+        "providers": "Sync providers", "environments": "Sync environment variables",
+        "memory": "Sync memory",
+    ]
+
+    /// [T-config-readable] BCP-47 code → the language's name; "" = system.
+    @MainActor private static func languagePhrase(_ v: ConfigValue) -> ReadableArg {
+        guard case .string(let code) = v else { return ConfigReadableRenderer.genericPhrase(v) }
+        if code.isEmpty { return .key("System") }
+        return .text(Locale.current.localizedString(forIdentifier: code) ?? code)
+    }
+
+    /// [T-config-readable] A TTS voice identifier → the voice's name.
+    @MainActor private static func voicePhrase(_ v: ConfigValue) -> ReadableArg {
+        guard case .string(let id) = v else { return ConfigReadableRenderer.genericPhrase(v) }
+        if id.isEmpty { return .key("System default") }
+        return .text(AVSpeechSynthesisVoice(identifier: id)?.name ?? id)
+    }
+
+    /// [T-config-readable] A mirror base URL → the mirror's name.
+    @MainActor private static func mirrorPhrase(_ v: ConfigValue) -> ReadableArg {
+        guard case .string(let url) = v else { return ConfigReadableRenderer.genericPhrase(v) }
+        if url.isEmpty { return .key("Default") }
+        return .text(MirrorEntry.find(baseURL: url)?.name ?? ReadableCore.safeURL(url))
+    }
+
     private static func fontScaleToken(_ level: FontScaleLevel) -> String {
         switch level {
         case .xSmall:     return "xSmall"
@@ -1116,7 +1506,9 @@ extension ConfigRegistry {
             displayName: "Sort key",
             description: "Sort field in the in-app file browser.",
             userDefaultsKey: "fileBrowser.sortKey",
-            defaultValue: "name"
+            defaultValue: "name",
+            readable: ConfigReadable(.enumLabels(["name": "Name", "modified": "Date Modified",
+                                                  "size": "Size", "kind": "Kind"]))
         ))
         r.register(AppStorageBoolField(
             path: "files.sortAscending",
@@ -1136,11 +1528,12 @@ extension ConfigRegistry {
 
     // MARK: Browser (browser_use tool's WebKit pool)
     //
-    // Storage backs UserDefaults directly. The live BrowserTabPool
-    // instance is owned by ContentView, so we don't reach into it from
-    // here — instead we write the same UserDefaults keys it reads on
-    // launch. The pool re-applies viewport/UA on next tab open; for an
-    // immediate refresh users can dismiss/reopen the browser tab.
+    // Storage backs UserDefaults directly. There is one BrowserTabPool per
+    // chat plus the home screen's own, so we don't reach into any of them
+    // from here - we write the UserDefaults keys every pool re-reads each
+    // time it creates a tab (BrowserTabPool.syncGlobalDefaultsFromStore).
+    // These are defaults for tabs opened from now on, in any chat; a tab
+    // that is already open keeps its UA and viewport until it is closed.
 
     @MainActor
     private static func registerBrowser(into r: ConfigRegistry) {
@@ -1150,6 +1543,7 @@ extension ConfigRegistry {
             description: "mobile_safari / desktop_safari / custom.",
             userDefaultsKey: "BrowserUserAgentProfile",
             cases: ["mobile_safari", "desktop_safari", "custom"],
+            valueLabels: ["mobile_safari": "Mobile Safari", "desktop_safari": "Desktop Safari", "custom": "Custom"],
             defaultValue: "mobile_safari"
         ))
         r.register(AppStorageStringField(
@@ -1158,7 +1552,8 @@ extension ConfigRegistry {
             description: "Used when uaProfile = custom. UTF-8 string up to 1 KB.",
             userDefaultsKey: "BrowserCustomUserAgentString",
             defaultValue: "",
-            maxLength: 1024
+            maxLength: 1024,
+            readable: ConfigReadable(.text(preview: 60, empty: "Default"))
         ))
         r.register(AppStorageIntField(
             path: "browser.viewportWidth",
@@ -1166,7 +1561,8 @@ extension ConfigRegistry {
             description: "0 disables the override.",
             userDefaultsKey: "BrowserCustomViewportWidth",
             defaultValue: 0,
-            min: 0, max: 4096
+            min: 0, max: 4096,
+            unit: .points, zeroLabel: "Default"
         ))
         r.register(AppStorageIntField(
             path: "browser.viewportHeight",
@@ -1174,7 +1570,8 @@ extension ConfigRegistry {
             description: "0 disables the override.",
             userDefaultsKey: "BrowserCustomViewportHeight",
             defaultValue: 0,
-            min: 0, max: 4096
+            min: 0, max: 4096,
+            unit: .points, zeroLabel: "Default"
         ))
     }
 
@@ -1219,7 +1616,8 @@ extension ConfigRegistry {
             description: "AVSpeechSynthesisVoice identifier; empty = system default.",
             userDefaultsKey: "speechVoiceEn",
             defaultValue: "",
-            maxLength: 256
+            maxLength: 256,
+            readable: ConfigReadable(.custom(voicePhrase))
         ))
         r.register(AppStorageStringField(
             path: "speech.voiceZh",
@@ -1227,7 +1625,8 @@ extension ConfigRegistry {
             description: "AVSpeechSynthesisVoice identifier; empty = system default.",
             userDefaultsKey: "speechVoiceZh",
             defaultValue: "",
-            maxLength: 256
+            maxLength: 256,
+            readable: ConfigReadable(.custom(voicePhrase))
         ))
         r.register(AppStorageStringField(
             path: "speech.recognitionLocale",
@@ -1235,7 +1634,8 @@ extension ConfigRegistry {
             description: "BCP-47 locale used by speech-to-text.",
             userDefaultsKey: "savedLocaleKey",
             defaultValue: "",
-            maxLength: 32
+            maxLength: 32,
+            readable: ConfigReadable(.custom(languagePhrase))
         ))
     }
 
@@ -1250,6 +1650,14 @@ extension ConfigRegistry {
             userDefaultsKey: "enhancedBackgroundExecution",
             defaultValue: false,
             risk: .sensitive
+        ))
+        // [T-bka-continued-setting] Settings › Background, iOS 26+.
+        r.register(AppStorageBoolField(
+            path: "background.continuedProcessing",
+            displayName: "Prefer continued background processing (iOS 26+)",
+            description: "Use iOS 26's continued-processing task instead of the location keep-alive to keep the Live Activity refreshing, for runs started in the foreground. Shows a Minis task status on screen while the task runs. Off by default.",
+            userDefaultsKey: "continuedProcessingPreferred",
+            defaultValue: false
         ))
         r.register(AppStorageBoolField(
             path: "background.notifications",
@@ -1282,6 +1690,7 @@ extension ConfigRegistry {
             description: "Show agent task progress on the Lock Screen and in the Dynamic Island. Turning this off also removes the currently displayed Live Activity.",
             valueSchema: .bool,
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.bool()),
             reader: { .bool(BackgroundKeepAliveManager.shared.liveActivityEnabled) },
             writer: { v in
                 guard case .bool(let b) = v else {
@@ -1310,6 +1719,7 @@ extension ConfigRegistry {
             description: "Capture stdout/stderr to daily log files for diagnostics.",
             valueSchema: .bool,
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.bool()),
             reader: { .bool(LoggingManager.shared.isEnabled) },
             writer: { v in
                 guard case .bool(let b) = v else {

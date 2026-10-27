@@ -1,5 +1,9 @@
 package com.openminis.app.ui.settings.backup
 
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -38,16 +42,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.openminis.app.R
 import com.openminis.app.ui.components.MinisButton
 import com.openminis.app.ui.components.MinisOutlinedButton
 import com.openminis.app.ui.components.MinisTextButton
+import com.openminis.app.ui.components.safeLaunchPicker
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.openminis.app.backup.remote.RcloneBackendCatalog
+import com.openminis.app.backup.remote.RcloneRemoteStore
+import com.openminis.app.data.SafMountHelper
 import com.openminis.app.ui.settings.SettingsScaffold
 import com.openminis.app.ui.settings.SettingsSection
+import com.openminis.app.ui.settings.SettingsRow
+import com.openminis.app.ui.settings.SettingsSwitch
 import com.openminis.app.ui.settings.SettingsSwitchRow
 
 /**
@@ -66,11 +76,48 @@ fun RcloneDestinationsScreen(onBack: () -> Unit) {
     val browse by vm.browse.collectAsState()
 
     var adding by remember { mutableStateOf(false) }
+    // [T-android-backup-dest-edit] The destination whose detail page is open.
+    val detail = remember { DestinationDetailNav() }
+    BackHandler(enabled = detail.isOpen) { detail.back(vm) }
     // Name of the destination saved by the last completed save, so the list
     // can confirm it. Cleared once acknowledged.
     var justSaved by remember { mutableStateOf<String?>(null) }
 
-    SettingsScaffold(title = stringResource(R.string.backup_dest_title), onBack = onBack) {
+    val context = LocalContext.current
+    // [T-android-backup-local-folder] Pick a folder on this device as a
+    // destination. Unlike the mount picker in MountedFoldersScreen, ANY
+    // document provider is accepted here — a backup is written with
+    // ContentResolver, so it never needs a POSIX path, and rejecting
+    // Drive/Dropbox would remove the case where a local destination is most
+    // useful (an off-device copy with no server to configure).
+    val folderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        // Without a PERSISTED grant the URI dies with this process, and the
+        // next backup would fail on a destination the user believes is saved.
+        // Refuse to save one we cannot hold on to.
+        if (!SafMountHelper.handlePickerResult(context, uri)) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.backup_dest_local_folder_no_permission),
+                Toast.LENGTH_LONG,
+            ).show()
+            return@rememberLauncherForActivityResult
+        }
+        val display = runCatching { SafMountHelper.treeDisplayPath(uri) }.getOrNull().orEmpty()
+        justSaved = vm.addLocalFolder(uri.toString(), display)
+    }
+
+    SettingsScaffold(
+        title = detail.title() ?: stringResource(R.string.backup_dest_title),
+        onBack = { if (detail.isOpen) detail.back(vm) else onBack() },
+    ) {
+        if (detail.isOpen) {
+            DestinationDetailContent(vm, detail)
+            return@SettingsScaffold
+        }
+
         if (browse != null) {
             // Returning to the list on success is the whole point: the form
             // used to stay put, so a successful save looked identical to one
@@ -111,14 +158,33 @@ fun RcloneDestinationsScreen(onBack: () -> Unit) {
                 )
             } else {
                 remotes.forEachIndexed { i, r ->
-                    SettingsSwitchRow(
+                    // [T-android-backup-dest-edit] Tapping the row opens the
+                    // destination's detail page (rename, folder, connection,
+                    // remove); the switch keeps its own on/off job.
+                    SettingsRow(
                         title = r.name,
                         subtitle = stringResource(
                             R.string.backup_dest_row_subtitle,
-                            r.backend.uppercase(), r.path.trimStart('/'),
+                            // A local folder has no protocol to name, and
+                            // "LOCAL-FOLDER" as a pseudo-protocol reads like a
+                            // bug. Use the localized label instead.
+                            if (RcloneRemoteStore.isLocalFolder(r.backend)) {
+                                stringResource(R.string.backup_dest_kind_local_folder)
+                            } else {
+                                r.backend.uppercase()
+                            },
+                            r.path.trimStart('/'),
                         ),
-                        checked = r.enabled,
-                        onCheckedChange = { vm.setEnabled(r.name, it) },
+                        onClick = {
+                            vm.clearError()
+                            detail.open(r.name)
+                        },
+                        trailing = {
+                            SettingsSwitch(
+                                checked = r.enabled,
+                                onCheckedChange = { vm.setEnabled(r.name, it) },
+                            )
+                        },
                         showDivider = i < remotes.lastIndex,
                     )
                 }
@@ -131,15 +197,20 @@ fun RcloneDestinationsScreen(onBack: () -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
             ) { Text(stringResource(R.string.backup_dest_add_server)) }
 
-            if (remotes.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                remotes.forEach { r ->
-                    MinisOutlinedButton(
-                        onClick = { vm.remove(r.name) },
-                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    ) { Text(stringResource(R.string.backup_dest_remove, r.name)) }
-                }
-            }
+            // [T-android-backup-local-folder] Second, equal-weight entry point:
+            // a destination can be a folder on this device, not only a server.
+            // Outlined rather than filled so "Add Server…" stays the primary
+            // action for the remote-backup case the screen was built for.
+            Spacer(Modifier.height(8.dp))
+            MinisOutlinedButton(
+                onClick = { folderPicker.safeLaunchPicker(null, context, "RcloneDestinations") },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(stringResource(R.string.backup_dest_add_local_folder)) }
+
+            // [T-android-backup-dest-edit] No per-destination "Remove X"
+            // buttons here any more: removing lives on the detail page, behind
+            // a confirmation, as on iOS. One button per destination under the
+            // list also read as removing them in bulk.
 
             error?.let {
                 Text(
@@ -240,21 +311,11 @@ internal fun AddServerForm(
 
         backend.fields.forEach { f ->
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
+            ServerFieldInput(
+                field = f,
                 value = fieldValues[f.key] ?: "",
                 onValueChange = { fieldValues[f.key] = it },
-                label = {
-                    Text(
-                        if (f.isOptional) stringResource(R.string.backup_dest_field_optional, f.label)
-                        else f.label,
-                    )
-                },
-                placeholder = { Text(f.placeholder) },
-                singleLine = true,
                 enabled = !busy,
-                visualTransformation = if (f.isSecret) PasswordVisualTransformation()
-                else androidx.compose.ui.text.input.VisualTransformation.None,
-                modifier = Modifier.fillMaxWidth(),
             )
         }
 
@@ -276,13 +337,10 @@ internal fun AddServerForm(
         // it would actually help keeps the choice informed.
         if (certificateRejected) {
             Spacer(Modifier.height(16.dp))
-            SettingsSwitchRow(
-                title = stringResource(R.string.backup_dest_trust_certificate),
-                subtitle = stringResource(R.string.backup_dest_trust_certificate_warning),
+            TrustCertificateRow(
                 checked = allowInsecureTLS,
                 onCheckedChange = { allowInsecureTLS = it },
                 enabled = !busy,
-                showDivider = false,
             )
         }
 
@@ -351,6 +409,51 @@ internal fun AddServerForm(
             )
         }
     }
+}
+
+/**
+ * One connection field of a server form. Shared by [AddServerForm] and the
+ * connection editor so the two cannot drift apart: same labels, same
+ * "(optional)" marking, same masking of the secret.
+ */
+@Composable
+internal fun ServerFieldInput(
+    field: RcloneBackendCatalog.Field,
+    value: String,
+    onValueChange: (String) -> Unit,
+    enabled: Boolean,
+    label: String = if (field.isOptional) {
+        stringResource(R.string.backup_dest_field_optional, field.label)
+    } else {
+        field.label
+    },
+    supportingText: String? = null,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        placeholder = { Text(field.placeholder) },
+        supportingText = supportingText?.let { { Text(it) } },
+        singleLine = true,
+        enabled = enabled,
+        visualTransformation = if (field.isSecret) PasswordVisualTransformation()
+        else androidx.compose.ui.text.input.VisualTransformation.None,
+        modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+/** The self-signed certificate opt-in, offered only after a TLS refusal. */
+@Composable
+internal fun TrustCertificateRow(checked: Boolean, onCheckedChange: (Boolean) -> Unit, enabled: Boolean) {
+    SettingsSwitchRow(
+        title = stringResource(R.string.backup_dest_trust_certificate),
+        subtitle = stringResource(R.string.backup_dest_trust_certificate_warning),
+        checked = checked,
+        onCheckedChange = onCheckedChange,
+        enabled = enabled,
+        showDivider = false,
+    )
 }
 
 // [T-android-restore-server-list] internal for the same reason as
@@ -511,7 +614,12 @@ internal fun FolderBrowser(vm: RcloneDestinationsViewModel, onSaved: (String) ->
             // savePending only invokes this on success (the catch sets _error
             // instead), so leaving the form here cannot strand a failed save
             // on a screen the user has already been navigated away from.
-            onClick = { vm.savePending(b.path) { onSaved(b.remote.name) } },
+            onClick = {
+                // [T-android-backup-dest-edit] A saved destination being
+                // re-pointed updates its path; a new one is added.
+                if (b.existing) vm.applyFolder(b.path) { onSaved(it.name) }
+                else vm.savePending(b.path) { onSaved(b.remote.name) }
+            },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) { Text(stringResource(R.string.backup_dest_use_folder)) }

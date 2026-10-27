@@ -71,7 +71,8 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
+import com.openminis.app.ui.components.FitOrWrapLine
+import com.openminis.app.ui.components.ModelActiveBadge
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -135,6 +136,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import com.openminis.app.BuildConfig
@@ -147,6 +149,9 @@ import com.openminis.app.ui.components.MinisMenuDivider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import com.openminis.app.ui.components.rememberSheetScrollGuard
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
@@ -178,12 +183,14 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.positionInWindow
@@ -275,24 +282,6 @@ import com.openminis.app.ui.browser.BrowserSheet
 import com.openminis.app.ui.theme.ChatColors
 import com.openminis.app.ui.components.MinisTextButton
 
-/**
- * Fuzzy match: substring first, then all query chars appear in order.
- * Matches iOS SessionModelPicker.fuzzyMatch.
- */
-private fun fuzzyMatch(text: String, query: String): Boolean {
-    if (query.isEmpty()) return true
-    val q = query.lowercase()
-    val t = text.lowercase()
-    if (t.contains(q)) return true
-    var idx = 0
-    for (ch in q) {
-        val found = t.indexOf(ch, idx)
-        if (found < 0) return false
-        idx = found + 1
-    }
-    return true
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun ModelPickerSheet(
@@ -310,6 +299,9 @@ internal fun ModelPickerSheet(
      *  section header — dismisses the sheet and navigates to the Model Groups
      *  management screen. Null hides the button (callers without a route). */
     onEditGroups: (() -> Unit)? = null,
+    /** [T-android-picker-provider-edit] Edit button on each provider section
+     *  header — opens that provider instance's settings. Null hides it. */
+    onEditProvider: ((instanceId: String) -> Unit)? = null,
 ) {
     val openTime = remember { System.nanoTime() }
 
@@ -342,46 +334,64 @@ internal fun ModelPickerSheet(
      * and another from the picker would be worse than no button at all.
      */
     var quickTestEntry by remember { mutableStateOf<ModelEntry?>(null) }
+    // [T-quota-badge-ui] Provider whose quota sheet is open (header pill or a
+    // Model Group member pill).
+    var quotaSheetInstanceId by remember { mutableStateOf<String?>(null) }
 
-    // Filtered groups
-    val filteredGroups = remember(groups, searchText) {
-        if (searchText.isEmpty()) groups
-        else {
-            val t0 = System.nanoTime()
-            val result = groups.filter { fuzzyMatch(it.name, searchText) }
-            val ms = (System.nanoTime() - t0) / 1_000_000.0
-            AppLogger.info("ModelPicker", "[ModelPicker] filter groups: ${result.size}/${groups.size}, ${"%.1f".format(ms)}ms")
-            result
-        }
+    // [T-picker-search-debounce] Filter on the DEBOUNCED, normalized query,
+    // not on every keystroke (iOS GH#271). `searchText` still drives the field
+    // and the empty-state icon; only the search itself trails it.
+    val query = com.openminis.app.ui.components.rememberDebouncedQuery(searchText)
+
+    // Filtered groups — cheap (a handful of groups), stays in composition.
+    val filteredGroups = remember(groups, query) {
+        if (query.isEmpty()) groups
+        else groups.filter { com.openminis.app.ui.components.ModelSearch.score(it.name, query) > 0 }
     }
 
-    // Filtered entries by instance
-    val allInstancesWithEntries = remember(config, searchText) {
-        val t0 = System.nanoTime()
-        var totalCount = 0
-        val result = config.instances
+    // [T-picker-search-cap] Provider sections built ONCE per config: one pass
+    // grouping entries by instance. This used to re-filter the whole entry
+    // list once per provider on every keystroke, in composition, and log a
+    // line per provider each time.
+    val baseSections = remember(config) {
+        val byInstance = config.modelEntries.asSequence()
+            .filter { !it.isHidden }
+            .groupBy { it.providerInstanceId }
+        config.instances
             .filter { it.isEnabled }
-            .map { instance ->
-                val pt = System.nanoTime()
-                val entries = config.modelEntries.filter {
-                    it.providerInstanceId == instance.id && !it.isHidden
-                }
-                val filtered = if (searchText.isEmpty()) entries
-                else entries.filter {
-                    fuzzyMatch(it.model.displayName, searchText) || fuzzyMatch(it.model.id, searchText)
-                }
-                val pms = (System.nanoTime() - pt) / 1_000_000.0
-                if (filtered.isNotEmpty()) {
-                    totalCount += filtered.size
-                    AppLogger.info("ModelPicker", "[ModelPicker] provider \"${instance.label.ifEmpty { instance.providerType.displayName }}\" models loaded: ${filtered.size} items, ${"%.1f".format(pms)}ms")
-                }
-                instance to filtered
-            }
+            .map { it to (byInstance[it.id] ?: emptyList()) }
             .filter { it.second.isNotEmpty() }
-        val ms = (System.nanoTime() - t0) / 1_000_000.0
-        AppLogger.info("ModelPicker", "[ModelPicker] all providers loaded: total $totalCount items, ${"%.1f".format(ms)}ms")
-        result
     }
+    fun sectionLabel(instance: com.openminis.app.data.model.ProviderInstance) =
+        instance.label.ifEmpty { instance.providerType.displayName }
+
+    // [T-picker-search-relevance] Rank + cap off the main thread: with 7,000+
+    // models a search is thousands of string scans. The last result stays on
+    // screen until the new one lands, so a keystroke never flashes the
+    // unfiltered list.
+    var searchResult by remember {
+        mutableStateOf<com.openminis.app.ui.components.ModelSearch.Result<com.openminis.app.data.model.ProviderInstance>?>(null)
+    }
+    LaunchedEffect(baseSections, query) {
+        if (query.isEmpty()) {
+            searchResult = null
+            return@LaunchedEffect
+        }
+        val t0 = System.nanoTime()
+        val r = withContext(Dispatchers.Default) {
+            com.openminis.app.ui.components.ModelSearch.search(baseSections, ::sectionLabel, query)
+        }
+        searchResult = r
+        AppLogger.info(
+            "ModelPicker",
+            "[ModelPicker] search len=${query.length} matches=${r.totalMatches} shown=${r.shown} " +
+                "${"%.1f".format((System.nanoTime() - t0) / 1_000_000.0)}ms",
+        )
+    }
+    val allInstancesWithEntries: List<Pair<com.openminis.app.data.model.ProviderInstance, List<ModelEntry>>> =
+        if (query.isEmpty()) baseSections
+        else searchResult?.sections?.map { it.key to it.entries } ?: baseSections
+    val truncatedSearch = searchResult?.takeIf { query.isNotEmpty() && it.truncated }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -516,10 +526,57 @@ internal fun ModelPickerSheet(
                 },
             )
 
+            // [T-android-picker-scroll-guard] Swallow fling momentum at the top
+            // of the list so it cannot dismiss the sheet, while leaving a
+            // deliberate finger drag free to close it.
+            val pickerScrollGuard = rememberSheetScrollGuard()
+
+            // [FEAT-261025-02] Where the current selection sits in the list, as
+            // (item index, offset in the item): the selected group's row inside
+            // the one Model Groups card item, else the active model's row - or
+            // its provider's card while that is collapsed. Mirrors the item
+            // order emitted below. Null when the selection is not listed (a
+            // search that filters it out).
+            val pickerListState = rememberLazyListState()
+            val pickerScope = rememberCoroutineScope()
+            var selectedGroupRowTop by remember { mutableStateOf(0) }
+            var selectedGroupRowOnScreen by remember { mutableStateOf(false) }
+            val pickerJumpTarget: Pair<Int, Int>? = run {
+                var index = 0
+                if (filteredGroups.isNotEmpty()) {
+                    if (selectedGroupId != null) {
+                        return@run if (filteredGroups.any { it.id == selectedGroupId }) 0 to selectedGroupRowTop else null
+                    }
+                    index += if (searchText.isEmpty()) 2 else 1
+                }
+                if (selectedGroupId != null) return@run null
+                for ((instance, entries) in allInstancesWithEntries) {
+                    val collapsed = collapsedInstanceIds.contains(instance.id)
+                    val at = entries.indexOfFirst { it.id == activeEntryId }
+                    if (at >= 0) return@run (if (collapsed) index else index + 1 + at) to 0
+                    index += 1 + if (collapsed) 0 else entries.size
+                }
+                null
+            }
+            val showJumpButton by remember(pickerJumpTarget, selectedGroupRowOnScreen) {
+                derivedStateOf {
+                    val target = pickerJumpTarget ?: return@derivedStateOf false
+                    if (!pickerListState.canScrollForward && !pickerListState.canScrollBackward) return@derivedStateOf false
+                    val info = pickerListState.layoutInfo
+                    val item = info.visibleItemsInfo.firstOrNull { it.index == target.first } ?: return@derivedStateOf true
+                    if (selectedGroupId != null) return@derivedStateOf !selectedGroupRowOnScreen
+                    item.offset < info.viewportStartOffset || item.offset + item.size > info.viewportEndOffset
+                }
+            }
+
+            // The list keeps its indentation inside this Box, which only
+            // overlays the jump button on it.
+            Box(modifier = Modifier.fillMaxWidth().weight(1f, fill = false)) {
             LazyColumn(
+                state = pickerListState,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f, fill = false),
+                    .nestedScroll(pickerScrollGuard),
             ) {
                 // ── Model Groups (grouped section card with embedded header) ──
                 if (filteredGroups.isNotEmpty()) {
@@ -608,6 +665,15 @@ internal fun ModelPickerSheet(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
+                                        .then(
+                                            // [FEAT-261025-02] Where the jump button
+                                            // scrolls to: this row's top in the
+                                            // card, and whether it is in view.
+                                            if (isSelected) Modifier.onGloballyPositioned { c ->
+                                                selectedGroupRowTop = c.positionInParent().y.toInt()
+                                                selectedGroupRowOnScreen = c.boundsInWindow().height >= c.size.height * 0.9f
+                                            } else Modifier
+                                        )
                                         .clip(groupShape)
                                         .clickable { onSelectGroup(group.id) }
                                         .padding(horizontal = 16.dp, vertical = 12.dp),
@@ -835,7 +901,23 @@ internal fun ModelPickerSheet(
                                                 )
                                                 Spacer(Modifier.width(8.dp))
                                                 Column(modifier = Modifier.weight(1f)) {
-                                                    Text(entry.model.displayName, style = MaterialTheme.typography.bodyMedium)
+                                                    ModelNameWithActiveBadge(
+                                                        entry.model.displayName,
+                                                        showActiveBadge = isActive,
+                                                        quotaPill = if (instance != null) {
+                                                            {
+                                                                // [T-quota-group-member-pill] Group rows have no
+                                                                // provider header: the model's (or its account's)
+                                                                // quota sits after the name, before Active.
+                                                                com.openminis.app.ui.quota.ModelQuotaMemberPill(
+                                                                    instanceId = entry.providerInstanceId,
+                                                                    modelId = entry.model.id,
+                                                                ) { quotaSheetInstanceId = entry.providerInstanceId }
+                                                            }
+                                                        } else {
+                                                            null
+                                                        },
+                                                    )
                                                     Row {
                                                         if (instance != null) {
                                                             Text(
@@ -856,21 +938,6 @@ internal fun ModelPickerSheet(
                                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
                                                         )
                                                     }
-                                                }
-                                                if (isActive) {
-                                                    Text(
-                                                        stringResource(R.string.model_picker_active_badge),
-                                                        fontSize = 9.sp,
-                                                        lineHeight = 11.sp,
-                                                        fontWeight = FontWeight.Medium,
-                                                        color = Color(0xFF34C759),
-                                                        modifier = Modifier
-                                                            .background(
-                                                                Color(0xFF34C759).copy(alpha = 0.1f),
-                                                                RoundedCornerShape(50),
-                                                            )
-                                                            .padding(horizontal = 5.dp, vertical = 1.dp),
-                                                    )
                                                 }
                                                 QuickTestButton(onClick = { quickTestEntry = entry })
                                             }
@@ -914,13 +981,19 @@ internal fun ModelPickerSheet(
                 if (allInstancesWithEntries.isNotEmpty()) {
                     allInstancesWithEntries.forEach { (instance, entries) ->
                         val isCollapsed = collapsedInstanceIds.contains(instance.id)
+                        // [T-picker-search-cap] An EXPANDED provider's rows are
+                        // their own lazy items (below), so a 7,000-model
+                        // aggregator composes only what is on screen. This
+                        // item is the card's top: header, hairline and — when
+                        // collapsed — the summary rows, closing the card.
                         item(key = "section_${instance.id}") {
                             Column(
                                 modifier = Modifier
-                                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                                    .padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = if (isCollapsed) 6.dp else 0.dp)
                                     .background(
                                         MaterialTheme.colorScheme.surfaceContainerHigh,
-                                        RoundedCornerShape(14.dp),
+                                        if (isCollapsed) RoundedCornerShape(14.dp)
+                                        else RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
                                     ),
                             ) {
                                 // Header row, embedded in the card.
@@ -934,15 +1007,61 @@ internal fun ModelPickerSheet(
                                         .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Text(
-                                        instance.label.ifEmpty { instance.providerType.displayName },
-                                        // Same rank as the "Model Groups"
-                                        // header above — see that comment.
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    val providerName = instance.label.ifEmpty { instance.providerType.displayName }
+                                    Row(
                                         modifier = Modifier.weight(1f),
-                                    )
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Text(
+                                            providerName,
+                                            // Same rank as the "Model Groups"
+                                            // header above — see that comment.
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            // [T-android-picker-provider-edit] One
+                                            // line, so a long name cannot push the
+                                            // two buttons off the row.
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false),
+                                        )
+                                        // [T-provider-quota P2] The account's balance /
+                                        // quota right after the name - the only place
+                                        // a shared pool shows in the picker. Empty
+                                        // without data; a tap opens the quota sheet.
+                                        com.openminis.app.ui.quota.QuotaSectionHeaderBadge(instance.id) {
+                                            quotaSheetInstanceId = instance.id
+                                        }
+                                    }
+                                    // [T-android-picker-provider-edit] Edit
+                                    // button left of the chevron, as on iOS
+                                    // (698cc65c6): its own tap target, so it
+                                    // never folds the section, same 24dp
+                                    // circle as the chevron but tinted so it
+                                    // reads as an action.
+                                    if (onEditProvider != null) {
+                                        // [T-android-picker-provider-edit-text] A text "Edit" link,
+                                        // styled like the Model Groups "Edit" (iOS a0acb1c0f replaced its
+                                        // icon button with this). Compact rather than a MinisTextButton so
+                                        // the header row keeps its height; still its own tap target, so it
+                                        // never folds the section.
+                                        val editLabel = stringResource(R.string.model_picker_edit_provider, providerName)
+                                        Text(
+                                            stringResource(R.string.model_picker_groups_edit),
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            modifier = Modifier
+                                                .padding(end = 4.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { onEditProvider(instance.id) }
+                                                .semantics { contentDescription = editLabel }
+                                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                                        )
+                                    }
                                     // [T-android-model-picker-polish] Same
                                     // neutral treatment as the group chevron
                                     // above — see that comment for why the
@@ -1017,25 +1136,17 @@ internal fun ModelPickerSheet(
                                                     .background(dotColor, CircleShape),
                                             )
                                             Spacer(Modifier.width(10.dp))
-                                            // [T-android-provider-voice] Modality chips
-                                            // (iOS entryRow badges) — without them a
-                                            // voice seed serving as the collapsed
-                                            // representative is indistinguishable from
-                                            // a chat model. FlowRow so overflow wraps
-                                            // whole chips instead of shattering them.
-                                            FlowRow(
+                                            // [T-model-row-premature-wrap] The collapsed
+                                            // representative is the same row as an
+                                            // expanded one (iOS renders it with entryRow
+                                            // too): name line, then quota hint + id with
+                                            // the modality chips. It used to be one
+                                            // FlowRow of name + chips with no id line.
+                                            ProviderEntryRowText(
+                                                entry = displayEntry,
+                                                showActiveBadge = selectedGroupId != null && activeEntryId == displayEntry.id,
                                                 modifier = Modifier.weight(1f),
-                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                itemVerticalAlignment = Alignment.CenterVertically,
-                                            ) {
-                                                Text(
-                                                    displayEntry.model.displayName,
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                )
-                                                com.openminis.app.ui.components.modalityBadges(displayEntry.model).forEach { badge ->
-                                                    com.openminis.app.ui.components.ModalityBadge(badge)
-                                                }
-                                            }
+                                            )
                                             // [T-android-model-picker-polish]
                                             // Quick Test, not a model count. The
                                             // count is already stated by the
@@ -1107,8 +1218,21 @@ internal fun ModelPickerSheet(
                                         }
                                         }
                                     }
-                                } else {
-                                    entries.forEachIndexed { index, entry ->
+                                }
+                            }
+                        }
+                        if (!isCollapsed) {
+                            itemsIndexed(entries, key = { _, e -> "entry_${instance.id}_${e.id}" }) { index, entry ->
+                                val isLastRow = index == entries.size - 1
+                                Column(
+                                    modifier = Modifier
+                                        .padding(start = 16.dp, end = 16.dp, bottom = if (isLastRow) 6.dp else 0.dp)
+                                        .background(
+                                            MaterialTheme.colorScheme.surfaceContainerHigh,
+                                            if (isLastRow) RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)
+                                            else androidx.compose.ui.graphics.RectangleShape,
+                                        ),
+                                ) {
                                         val isSelected = activeEntryId == entry.id && selectedGroupId == null
                                         val dotColor = providerDotColor(instance.providerType)
                                         // Last row clips its own bottom so the
@@ -1144,45 +1268,11 @@ internal fun ModelPickerSheet(
                                                     .background(dotColor, CircleShape),
                                             )
                                             Spacer(Modifier.width(10.dp))
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    entry.model.displayName,
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                )
-                                                // [T-android-provider-voice] Modality
-                                                // chips (iOS entryRow badges). FlowRow so
-                                                // an overflow wraps whole chips to the
-                                                // next line instead of squeezing each
-                                                // Text into a vertical letter column.
-                                                FlowRow(
-                                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                    itemVerticalAlignment = Alignment.CenterVertically,
-                                                ) {
-                                                    Text(
-                                                        entry.model.id,
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                                                    )
-                                                    com.openminis.app.ui.components.modalityBadges(entry.model).forEach { badge ->
-                                                        com.openminis.app.ui.components.ModalityBadge(badge)
-                                                    }
-                                                }
-                                            }
-                                            if (selectedGroupId != null && activeEntryId == entry.id) {
-                                                Text(
-                                                    stringResource(R.string.model_picker_active_badge),
-                                                    fontSize = 9.sp,
-                                                    lineHeight = 11.sp,
-                                                    fontWeight = FontWeight.Medium,
-                                                    color = Color(0xFF34C759),
-                                                    modifier = Modifier
-                                                        .background(
-                                                            Color(0xFF34C759).copy(alpha = 0.1f),
-                                                            RoundedCornerShape(50),
-                                                        )
-                                                        .padding(horizontal = 5.dp, vertical = 1.dp),
-                                                )
-                                            }
+                                            ProviderEntryRowText(
+                                                entry = entry,
+                                                showActiveBadge = selectedGroupId != null && activeEntryId == entry.id,
+                                                modifier = Modifier.weight(1f),
+                                            )
                                             QuickTestButton(onClick = { quickTestEntry = entry })
                                         }
                                         // Inset hairline between entries.
@@ -1193,10 +1283,25 @@ internal fun ModelPickerSheet(
                                                 color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
                                             )
                                         }
-                                    }
                                 }
                             }
                         }
+                    }
+                }
+
+                // [T-picker-search-cap] Say when a search was truncated, so the
+                // capped list never silently reads as "that's all".
+                truncatedSearch?.let { r ->
+                    item(key = "__search_cap_footer__") {
+                        Text(
+                            stringResource(R.string.model_picker_search_capped, r.shown, r.totalMatches),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 8.dp),
+                        )
                     }
                 }
 
@@ -1241,6 +1346,35 @@ internal fun ModelPickerSheet(
                     }
                 }
             }
+                // [FEAT-261025-02] Jump to what this chat uses, for a list too
+                // long to find it by eye (field request: many Model Groups).
+                // Shown only while the list can scroll and the target is off
+                // screen.
+                val jumpTarget = pickerJumpTarget
+                if (jumpTarget != null && showJumpButton) {
+                    androidx.compose.material3.SmallFloatingActionButton(
+                        onClick = { pickerScope.launch { pickerListState.animateScrollToItem(jumpTarget.first, jumpTarget.second) } },
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = 20.dp, bottom = 12.dp),
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        contentColor = MaterialTheme.colorScheme.primary,
+                    ) {
+                        Icon(
+                            Icons.Default.MyLocation,
+                            contentDescription = stringResource(R.string.model_picker_jump_current),
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // [T-quota-badge-ui] Read-only quota details, on top of the picker.
+    quotaSheetInstanceId?.let { id ->
+        key(id) {
+            com.openminis.app.ui.quota.QuotaDetailSheet(instanceId = id, onDismiss = { quotaSheetInstanceId = null })
         }
     }
 
@@ -1256,6 +1390,80 @@ internal fun ModelPickerSheet(
                 onDismiss = { quickTestEntry = null },
             )
         }
+    }
+}
+
+/**
+ * A picker row's model name, then its tags: the group member's quota pill and
+ * the green "Active" badge.
+ *
+ * The badge used to sit at the row's trailing edge, beside the quick-test
+ * button. There it took width from the whole text column, so the second line
+ * (provider label + model id) wrapped early: long ids such as
+ * `claude-opus-4-6-thinking` broke onto a third line. Inline after the name,
+ * it only competes with the name.
+ *
+ * [T-model-row-premature-wrap] Name and tags share one line when they fit;
+ * otherwise the name keeps the full width and the tags drop to their own line
+ * (iOS memberRowName / memberRowTags in a ViewThatFits). The earlier Row with
+ * `weight(1f, fill = false)` on the name wrapped the NAME early instead.
+ */
+@Composable
+private fun ModelNameWithActiveBadge(
+    name: String,
+    showActiveBadge: Boolean,
+    quotaPill: (@Composable () -> Unit)? = null,
+) {
+    FitOrWrapLine(
+        lead = {
+            Text(name, style = MaterialTheme.typography.bodyMedium)
+        },
+        tags = {
+            quotaPill?.invoke()
+            if (showActiveBadge) ModelActiveBadge()
+        },
+    )
+}
+
+/**
+ * [T-model-row-premature-wrap] Text column of a provider-section model row
+ * (iOS entryRow), shared by the expanded rows and the collapsed section's
+ * representative row: the name (+ Active badge), then the quota hint + model
+ * id, "·" and the modality chips on one line when they fit, else the id keeps
+ * the full width and the chips drop below it without the "·".
+ */
+@Composable
+private fun ProviderEntryRowText(
+    entry: ModelEntry,
+    showActiveBadge: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val badges = com.openminis.app.ui.components.modalityBadges(entry.model)
+    Column(modifier = modifier) {
+        ModelNameWithActiveBadge(entry.model.displayName, showActiveBadge = showActiveBadge)
+        FitOrWrapLine(
+            separator = if (badges.isNotEmpty()) {
+                { com.openminis.app.ui.components.ModelRowSeparatorDot() }
+            } else {
+                null
+            },
+            lead = {
+                // [T-provider-quota P2] Only a warning on a pool bound to
+                // THIS model; the account is on the section header.
+                com.openminis.app.ui.quota.ModelQuotaHintView(
+                    instanceId = entry.providerInstanceId,
+                    modelId = entry.model.id,
+                )
+                Text(
+                    entry.model.id,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                )
+            },
+            tags = {
+                badges.forEach { badge -> com.openminis.app.ui.components.ModalityBadge(badge) }
+            },
+        )
     }
 }
 
@@ -1293,6 +1501,7 @@ private fun providerDotColor(providerType: ProviderType?): Color = when (provide
     ProviderType.openRouter -> Color(0xFF00BCD4) // cyan
     ProviderType.xAI -> Color(0xFFFF7043)        // orange — Grok brand
     ProviderType.kimiCode -> Color(0xFF5C6BC0)   // indigo — Kimi accent
+    ProviderType.githubCopilot -> Color(0xFF6E5494) // purple — GitHub accent
     // [T-android-provider-type-parity] Responses API instances are
     // OpenAI under the hood — same green dot. Undrivable types share
     // the neutral gray used for "no provider".

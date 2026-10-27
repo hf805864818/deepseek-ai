@@ -215,10 +215,53 @@ let minisDocumentExtensions: Set<String> = [
     "rtf", "rtfd",
 ]
 
+/// [T-minis-folder-link] Where the in-app file browser should be rooted for a
+/// resolved minis:// folder, and how to label that root: the namespace
+/// directory (`/var/minis/<host>`, or `/var/minis/mounts/<name>` for a user
+/// mount), so the breadcrumb reads like the path the agent wrote and the user
+/// can walk up to the namespace but not out of it. Mirrors the bases
+/// `resolveMinisFileURL` resolves against; when the folder is somehow not
+/// under the expected base, the browser is rooted at the folder itself.
+@MainActor
+func minisFolderBrowseRoot(url: URL, resolved: URL, sessionId: String?) -> (root: URL, label: String) {
+    let host = url.host ?? ""
+    let components = url.path.split(separator: "/").map(String.init)
+    var label = "/var/minis/\(host)"
+    let base: URL?
+    switch host {
+    case "skills": base = AIChatViewModel.minisSkillsPersistentDir
+    case "memory": base = AIChatViewModel.minisMemoryPersistentDir
+    case "shared": base = AIChatViewModel.minisSharedPersistentDir
+    case "mounts":
+        if let name = components.first {
+            label += "/\(name)"
+            base = MountedFoldersManager.shared.resolvedURL(forName: name)
+        } else {
+            base = nil
+        }
+    default:
+        base = (sessionId ?? AIChatViewModel.activeSessionId).map {
+            AIChatViewModel.minisPersistentBase
+                .appendingPathComponent($0, isDirectory: true)
+                .appendingPathComponent(host, isDirectory: true)
+        }
+    }
+    let folderPath = resolved.standardized.path
+    if let base, folderPath == base.standardized.path || folderPath.hasPrefix(base.standardized.path + "/") {
+        return (base, label)
+    }
+    return (resolved, resolved.lastPathComponent)
+}
+
 /// Resolve a minis:// URL to a host filesystem URL.
 /// Maps directly to persistent storage: Library/MinisChat/minis/<sessionId>/<subdir>/<path>
 /// No dependency on iSH boot or bind mounts.
-func resolveMinisFileURL(url: URL) -> URL? {
+///
+/// [T-minisurl-wrong-active-session] Pass `sessionId` when the caller knows
+/// which session owns the reference (e.g. a link tapped inside a specific
+/// chat) — the `activeSessionId` fallback is the frontmost-UI session and can
+/// briefly diverge during session switches or concurrent background runs.
+func resolveMinisFileURL(url: URL, sessionId: String? = nil) -> URL? {
     guard let host = url.host else {
         minisLogger.warning("[ResolveMinisURL] no host in URL: \(url.absoluteString)")
         return nil
@@ -229,8 +272,8 @@ func resolveMinisFileURL(url: URL) -> URL? {
 
     let fm = FileManager.default
 
-    // Primary: resolve via active session → persistent directory
-    if let sid = AIChatViewModel.activeSessionId {
+    // Primary: resolve via the owning session → persistent directory
+    if let sid = sessionId ?? AIChatViewModel.activeSessionId {
         for subPath in subPaths {
             let persistURL = AIChatViewModel.minisPersistentBase
                 .appendingPathComponent(sid, isDirectory: true)
@@ -684,7 +727,8 @@ private struct MinisImageView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .onTapGesture { showFullscreen = true }
                 .fullScreenCover(isPresented: $showFullscreen) {
-                    ImagePreviewView(image: image)
+                    // [T-image-save-original] Export the file, not this 2048-px bitmap.
+                    ImagePreviewView(image: image, source: .markdown(url.absoluteString))
                 }
         } else {
             // Fixed-height placeholder prevents layout jumps when LazyVStack recycles
@@ -782,7 +826,7 @@ struct MinisImageFilePreviewView: View {
 
     var body: some View {
         if let image = loadedImage {
-            ImagePreviewView(image: image)
+            ImagePreviewView(image: image, source: .file(fileURL))
         } else {
             ZStack {
                 Color.black.ignoresSafeArea()
@@ -1137,62 +1181,13 @@ struct MinisHTMLPreviewView: View {
 
 
 // MARK: - minis:// Document Preview
-
-import QuickLook
-
-struct MinisDocumentPreviewView: UIViewControllerRepresentable {
-    let fileURL: URL
-
-    func makeUIViewController(context: Context) -> UINavigationController {
-        let controller = QLPreviewController()
-        controller.dataSource = context.coordinator
-        context.coordinator.controller = controller
-        return UINavigationController(rootViewController: controller)
-    }
-
-    func updateUIViewController(_ uiViewController: UINavigationController, context: Context) {
-        // [T-ios-file-preview-stale-cache] QLPreviewController caches a
-        // rendered representation keyed by URL. When the agent rewrites the
-        // file in place (same path, new bytes) the controller can keep showing
-        // the earlier render. If the on-disk fingerprint (mtime/size) has
-        // changed since we last rendered, force a reloadData() so QuickLook
-        // re-reads the file. Cheap stat; only reloads on an actual change.
-        let fp = context.coordinator.currentFingerprint()
-        if fp != context.coordinator.lastFingerprint {
-            context.coordinator.lastFingerprint = fp
-            context.coordinator.controller?.reloadData()
-        }
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(fileURL: fileURL)
-    }
-
-    class Coordinator: NSObject, QLPreviewControllerDataSource {
-        let fileURL: URL
-        weak var controller: QLPreviewController?
-        var lastFingerprint: String
-
-        init(fileURL: URL) {
-            self.fileURL = fileURL
-            self.lastFingerprint = ""
-            super.init()
-            self.lastFingerprint = currentFingerprint()
-        }
-
-        /// mtime+size fingerprint of the file on disk, aligned with
-        /// minisMediaCacheKey's stat-based approach.
-        func currentFingerprint() -> String {
-            var st = stat()
-            guard stat(fileURL.path, &st) == 0 else { return "" }
-            return "\(st.st_size)|\(st.st_mtimespec.tv_sec).\(st.st_mtimespec.tv_nsec)"
-        }
-
-        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
-
-        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
-            fileURL as QLPreviewItem
-        }
-    }
-}
+//
+// Documents (pdf / Office / iWork / rtf) are presented from AIChatView via
+// SwiftUI's `.quickLookPreview($previewDocumentFile)` — see
+// [T-ios-office-preview-toolbar] there. The previous
+// UIViewControllerRepresentable wrapper (a bare QLPreviewController inside a
+// .sheet) never got QuickLook's system chrome: inside a sheet QL is a child
+// of the hosting controller, so no Done and no Share were installed. Its
+// [T-ios-file-preview-stale-cache] reloadData() workaround is obsolete with
+// the native presentation, which builds a fresh preview per open.
 

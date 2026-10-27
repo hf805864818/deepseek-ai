@@ -34,6 +34,7 @@ import com.openminis.app.R
 import com.openminis.app.data.repository.MemoryRepository
 import com.openminis.app.ui.theme.ChatColors
 import com.openminis.app.ui.components.MinisTextButton
+import com.openminis.app.i18n.uppercaseForDisplay
 
 /**
  * Stateless detail body composables used by [SessionMemorySheet] when a row
@@ -63,18 +64,17 @@ fun MemoryFileViewerBody(
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         if (isEditing) {
-            BasicTextField(
+            // [T-android-editor-keyboard-overlap] The caret stays above the
+            // keyboard; see DocumentEditorField.
+            com.openminis.app.ui.components.DocumentEditorField(
                 value = editedContent,
                 onValueChange = onEditedContentChange,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxSize(),
                 textStyle = LocalTextStyle.current.copy(
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,
                     color = ChatColors.primaryText,
                 ),
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
             )
         } else {
             SelectionContainer(
@@ -136,18 +136,17 @@ fun MemoryWriteDetailBody(
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (isEditing) {
-            BasicTextField(
+            // [T-android-editor-keyboard-overlap] The caret stays above the
+            // keyboard; see DocumentEditorField.
+            com.openminis.app.ui.components.DocumentEditorField(
                 value = editedContent,
                 onValueChange = onEditedContentChange,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxSize(),
                 textStyle = LocalTextStyle.current.copy(
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,
                     color = ChatColors.primaryText,
                 ),
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
             )
         } else {
             Column(
@@ -234,7 +233,7 @@ fun MemoryGetDetailBody(record: MemoryToolRecord) {
 @Composable
 private fun SectionHeader(text: String) {
     Text(
-        text = text.uppercase(),
+        text = text.uppercaseForDisplay(),
         fontSize = 11.sp,
         fontWeight = FontWeight.Medium,
         letterSpacing = 0.5.sp,

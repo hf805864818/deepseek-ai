@@ -45,6 +45,9 @@ data class VoiceOutputRequest(
     /** 0.25 ~ 4.0, null = 1.0 (provider default). */
     val speed: Float? = null,
     val responseFormat: VoiceOutputFormat = VoiceOutputFormat.MP3,
+    /** The resolved model — lets the provider route by catalog voice role
+     *  ([LLMModel.voiceRole]). null = the provider only knows [model]. */
+    val resolvedModel: LLMModel? = null,
 )
 
 enum class VoiceOutputFormat(val wireValue: String) {
@@ -57,6 +60,8 @@ sealed class VoiceProviderException(message: String) : Exception(message) {
     class Http(val code: Int, val body: ByteArray?) :
         VoiceProviderException(httpMessage(code, body))
     class Parse(detail: String) : VoiceProviderException("Parse failed: $detail")
+    /** The vendor answered with its own error code (not an HTTP status), as reported. */
+    class Service(detail: String) : VoiceProviderException(detail)
     class Auth : VoiceProviderException("Authentication failed, please check the API key")
     class NoAudioData : VoiceProviderException("No audio data")
 

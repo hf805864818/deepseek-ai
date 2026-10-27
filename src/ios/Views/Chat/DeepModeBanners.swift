@@ -141,7 +141,6 @@ struct PlanGateBanner: View {
 struct DeepModeWorkflowBanner: View {
     let deepModeEnabled: Bool
     let clarifyState: ClarifyGate.State
-    let activeSubagents: [SubagentSession]
 
     // Actions — only used when the corresponding state is active.
     let onCancelClarification: () -> Void
@@ -157,12 +156,6 @@ struct DeepModeWorkflowBanner: View {
                         onSkip: onSkipClarification
                     )
                 }
-            }
-            if deepModeEnabled && !activeSubagents.isEmpty {
-                SubagentCardStack(subagents: activeSubagents)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 4)
-                    .transition(.opacity)
             }
         }
     }

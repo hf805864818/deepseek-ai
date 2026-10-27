@@ -16,13 +16,69 @@ import UIKit
 
 private let ctLogger = AppLogger(category: "AIChatVM")
 
+// MARK: - [T-tool-title-reminder] Gentle one-time nudge for a missing tool_title
+
+/// Some models skip the `tool_title` argument even though the schema marks it
+/// required. The tool still runs, but its card can only show the raw command
+/// (e.g. a long `ssh user@… 'cd ~/src/…'` line), which reads poorly.
+///
+/// The model gets a short, soft `<system-reminder>` appended to the result of
+/// a titled tool that came back without a title — not every time: on the 1st,
+/// 11th, 21st… such call. The counting and throttling live in
+/// `ToolLoopDetector.recordToolTitle` (the loop detector's lock, warning
+/// buckets and reset lifecycle); this type only holds the text and the
+/// display-side helpers.
+///
+/// Only the model-facing copy carries it. The live tool card shows the tool's
+/// own output, and the reload paths strip it with `stripForDisplay`, so the
+/// user never sees the note.
+enum ToolTitleReminder {
+    /// Unique tag inside the reminder, so detection and stripping never touch
+    /// any other `<system-reminder>` (cancel notices, offload stubs, …).
+    static let marker = "[minis:tool-title-reminder]"
+
+    static let text = "<system-reminder>\(marker) This is a soft reminder. This tool call has no `tool_title`; please include a short one next time.</system-reminder>"
+
+    /// True when the call has no usable title: absent, not a string, or blank.
+    static func isMissingTitle(_ args: [String: Any]) -> Bool {
+        guard let title = args["tool_title"] as? String else { return true }
+        return title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Only tools whose schema asks for a title (built-in tools); MCP and other
+    /// tools without the parameter are never "missing" one.
+    static func declaresTitle(_ parameterNames: some Sequence<String>) -> Bool {
+        parameterNames.contains("tool_title")
+    }
+
+    /// Append the note to a tool result's content, after the real output.
+    static func appending(to content: String) -> String {
+        content.isEmpty ? text : content + "\n\n" + text
+    }
+
+    private static let displayRe = try! NSRegularExpression(
+        pattern: "\\n*<system-reminder>\\[minis:tool-title-reminder\\][\\s\\S]*?</system-reminder>"
+    )
+
+    /// The tool output as the user should see it: this note removed, nothing
+    /// else touched (other reminders, e.g. a cancel notice, stay).
+    static func stripForDisplay(_ text: String) -> String {
+        guard text.contains(marker) else { return text }
+        let ns = text as NSString
+        return displayRe.stringByReplacingMatches(
+            in: text, range: NSRange(location: 0, length: ns.length), withTemplate: "")
+    }
+}
+// END ToolTitleReminder
+
 extension AIChatViewModel {
 
     /// Hard cap on simultaneous in-flight tool executions per agent turn.
     /// 10 is the requested ceiling; iSH itself can fan out further but
     /// concurrent shell forks on the emulator past this start to compete
-    /// for emulator scheduling.
-    static let maxConcurrentTools = 10
+    /// for emulator scheduling. Defined with the other caps in
+    /// `ConcurrencyLimits` ([T-limits-per-parent]).
+    static var maxConcurrentTools: Int { ConcurrencyLimits.toolsPerTurn }
 
     /// Set-typed view of currently-running shell PIDs.
     ///
@@ -88,6 +144,34 @@ extension AIChatViewModel {
         batchBudget: BatchImageBudget
     ) async -> ToolExecOutcome {
         let blockIdx = tu.blockIdx
+
+        // [T-perf-cpu-probe] Every tool call in the app funnels through this
+        // function, so one pair of samples here covers them all — no per-tool
+        // instrumentation to keep in sync as tools are added.
+        //
+        // `defer` rather than a call before each `return`: this function exits
+        // from many places (early cancel checks, per-tool error paths, two
+        // catch blocks), and a missed exit would silently drop the "after"
+        // sample for exactly the failure cases most worth measuring.
+        // [T-perf-cpu-probe] Identify WHICH conversation issued the call, not
+        // just which tool ran. A sub agent reports its job id (and its agent
+        // name, since several agents can share a tool and the name is what a
+        // reader recognises); the main conversation reports its session id.
+        // Without this, a `browser_use` line under concurrent sub agents says
+        // the tool is expensive but not which agent is spending it.
+        let perfJobId: String = {
+            if let cfg = helperConfig {
+                let name = cfg.subAgentName.isEmpty ? "builtin" : cfg.subAgentName
+                return "\(name)#\(cfg.jobId.prefix(8))"
+            }
+            return "main:\(sessionId?.prefix(8) ?? "none")"
+        }()
+        let perfStarted = PerfProbe.toolBefore(tool: tu.name, job: perfJobId)
+        defer { PerfProbe.toolAfter(tool: tu.name, job: perfJobId, started: perfStarted) }
+        // [T-crash-breadcrumbs] Tool name only - never its arguments.
+        let crumbTool = String(tu.name.prefix(40))
+        CrashBreadcrumbs.record("tool.start", detail: crumbTool)
+        defer { CrashBreadcrumbs.record("tool.end", detail: crumbTool) }
 
         // Graceful cancel pre-check: any task that begins after the user
         // tapped Stop short-circuits with a synthetic cancellation result
@@ -239,6 +323,73 @@ extension AIChatViewModel {
             )
         }
 
+        // [T-offload-placeholder-write-guard issue #374] Refuse to execute a
+        // WRITE whose payload IS an offload placeholder.
+        //
+        // offloadContextIfNeeded rewrites a historical file_write's `content`
+        // argument in `agentHistory` to the "[CONTEXT OFFLOADED] … saved to: …"
+        // stub, to reclaim the tokens. That rewritten tool_use is what the model
+        // sees from then on — so a call re-issued from it (a retry, a resumed
+        // pending call, the model copying its own earlier call) carries the
+        // ~130-char stub where the real file body used to be. Nothing in the
+        // write path could tell the difference: the args are complete and
+        // well-formed, so the stub landed on disk over the user's real file and
+        // was reported as a plain success with a byte count matching the stub.
+        //
+        // Same reasoning as the truncated-write refusal above: for a write, a
+        // wrong artifact is strictly worse than none, and it silently destroys
+        // data. Refuse, and tell the model what actually happened so it re-reads
+        // the offloaded file instead of repeating the call verbatim. Reads and
+        // shell calls are untouched — a stub as a *path* is just a miss.
+        if tu.name == "file_write" || tu.name == "file_edit" {
+            // Only the fields whose value BECOMES file bytes: file_write's
+            // `content` and file_edit's replacement text. A stub in
+            // file_edit's `old_string` is merely a search that will not match,
+            // which the edit tool already reports clearly.
+            let payloadKeys = tu.name == "file_write" ? ["content"] : ["new_string"]
+            // Both stub formats, current and legacy — see isOffloadedStub.
+            if let offendingKey = payloadKeys.first(where: {
+                guard let v = toolArgs[$0] as? String else { return false }
+                return Self.isOffloadedStub(v)
+            }) {
+                let path = (toolArgs["path"] as? String) ?? (toolArgs["file_path"] as? String) ?? ""
+                AppLogger(category: "ToolPreflight").warning(
+                    "[ToolRepair] REFUSED offload-placeholder write tool=\(tu.name) id=\(tu.id) field=\(offendingKey) path=\(path)"
+                )
+                let uiMessage = AppLocalized("Blocked: content was offloaded from context")
+                let modelMessage = """
+                Error: This call was NOT executed. Its `\(offendingKey)` is an offload \
+                placeholder, not real content — the original text was moved out of context \
+                to free tokens, and only a reference notice survived in the conversation. \
+                Writing it would have replaced the file\(path.isEmpty ? "" : " at \(path)") \
+                with that notice. Nothing was written to disk — the target file is unchanged.
+
+                Use file_read on the path named inside the placeholder to recover the real \
+                content, then re-issue this write with it. Do not resend the placeholder.
+                """
+                if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
+                    messages[msgIdx].blocks[blockIdx].content = uiMessage
+                    messages[msgIdx].blocks[blockIdx].toolStatus = .failed(message: uiMessage)
+                }
+                toolLoopDetector.record(
+                    toolName: tu.name, params: tu.args,
+                    result: nil, errorMessage: modelMessage, toolCallId: tu.id
+                )
+                let refusedSnap = ToolSnapshot(type: .text, text: modelMessage, mediaRef: nil, duration: nil)
+                let item = ToolSnapshotItem(
+                    id: tu.id, toolName: tu.name, snapshot: refusedSnap,
+                    mediaResolver: await ChatStore.shared.mediaFileURLResolver()
+                )
+                return ToolExecOutcome(
+                    toolId: tu.id, toolName: tu.name,
+                    resultPart: .toolResult(id: tu.id, name: tu.name, content: modelMessage, isError: true),
+                    snapshotEntry: (toolName: tu.name, snapshot: refusedSnap),
+                    snapshotItem: item,
+                    cancelled: false
+                )
+            }
+        }
+
         // Preflight: reject empty / missing-required-field tool calls.
         if let preflightError = Self.preflightValidateToolCall(name: tu.name, args: toolArgs, tools: tools) {
             let chunkRing = tu.inputChunkRing
@@ -251,6 +402,8 @@ extension AIChatViewModel {
                 messages[msgIdx].blocks[blockIdx].content = uiMessage
                 messages[msgIdx].blocks[blockIdx].toolStatus = .failed(message: uiMessage)
             }
+            // [T-user-ask-notsent-merge] Fold it into a run of not-sent asks.
+            if tu.name == UserAskTool.name { regroupUserAskNotSent(msgIdx: msgIdx) }
             toolLoopDetector.record(
                 toolName: tu.name, params: tu.args,
                 result: nil, errorMessage: modelMessage, toolCallId: tu.id
@@ -354,18 +507,44 @@ extension AIChatViewModel {
                 }
             }
 
+            // [T-aojit-shell-stats] Counters before the command; the [AOJIT]
+            // log line after it reports what this command compiled and how
+            // much of it came from AOT images.
+            let aojitToken = await AOJITShellStats.begin()
             let preSnapshot = snapshotMinisFiles()
             let result: CommandResult
             do {
                 var lineBuffer: [String] = []
                 var lastFlush = Date.distantPast
                 let kMaxStreamingDisplayChars = 30_000
+                // [T-ios-flushlines-mainactor] Hop to the main actor before
+                // touching `messages`.
+                //
+                // This closure runs on ISHShellExecutor's reader queue (it is
+                // `executeCommand`'s per-line callback), but `messages` is
+                // @Published on a @MainActor view model and
+                // `scrollToBottomSignal` drives UI. Writing both from a
+                // background queue is a data race on SwiftUI state — the kind
+                // that corrupts the view graph rather than failing cleanly.
+                //
+                // The buffer drain stays OUTSIDE the hop and remains
+                // synchronous: `lineBuffer` and `lastFlush` belong to the
+                // reader queue, and deferring their reset would let the next
+                // callback re-read lines this flush already claimed. So the
+                // lines are taken here, and only the UI write is hopped.
+                //
+                // The bounds check moves inside the hop with the access it
+                // guards — checking on the reader queue and using the value on
+                // the main actor would be checking a snapshot that could have
+                // changed by the time it is used.
                 let flushLines: () -> Void = { [weak self] in
                     guard let self, !lineBuffer.isEmpty else { return }
                     let joined = lineBuffer.joined(separator: "\n")
                     lineBuffer.removeAll()
                     lastFlush = Date()
-                    if msgIdx < self.messages.count && blockIdx < self.messages[msgIdx].blocks.count {
+                    Task { @MainActor in
+                        guard msgIdx < self.messages.count,
+                              blockIdx < self.messages[msgIdx].blocks.count else { return }
                         let current = self.messages[msgIdx].blocks[blockIdx].content
                         var newContent: String
                         if current.hasSuffix("Executing...") {
@@ -416,6 +595,7 @@ extension AIChatViewModel {
             } catch {
                 result = CommandResult(output: "Error: \(error.localizedDescription)", exitCode: -1)
             }
+            await AOJITShellStats.end(aojitToken, command: command, exitCode: result.exitCode)
             // [T-tool-exec-breadcrumb] Pair for the STARTING line above. The
             // existing `[ToolLifecycle] COMPLETED` covers every tool, but it
             // travels the droppable NSLog pipe; this one shares the STARTING
@@ -545,10 +725,17 @@ extension AIChatViewModel {
             }
 
         case "browser_use":
+            // [T-tools-master-switch] Not in the schema when off; a request
+            // built before the switch flipped can still name it.
+            guard AgentToolSwitch.isToolEnabled(tu.name) else {
+                toolOutput = Self.toolsDisabledMessage
+                toolSuccess = false
+                break
+            }
             var browserResult: BrowserActionResult
             if let input = BrowserActionInput.parse(from: argsJson) {
                 do {
-                    browserResult = try await browserTabPool.execute(action: input)
+                    browserResult = try await browserTabPool.execute(action: input, owner: sessionId)
                 } catch {
                     browserResult = .error(error.localizedDescription)
                 }
@@ -580,19 +767,11 @@ extension AIChatViewModel {
             toolSuccess = browserResult.success
             toolPageURL = browserResult.pageURL
             if let b64 = browserResult.base64Image, let data = Data(base64Encoded: b64) {
-                toolImageData = Self.resizedImageData(data, maxLongEdge: 2000) ?? data
-                toolImageMimeType = "image/jpeg"
+                let inference = Self.browserUseInferenceImage(data)
+                toolImageData = inference.data
+                toolImageMimeType = inference.mimeType
 
-                let timestamp = Int(Date().timeIntervalSince1970)
-                let screenshotFilename = "screenshot_\(timestamp).jpg"
-                let sid = sessionId ?? "unknown"
-                let persistDir = Self.minisBrowserPersistentDir(for: sid)
-                let fm = FileManager.default
-                try? fm.createDirectory(at: persistDir, withIntermediateDirectories: true)
-                let persistPath = persistDir.appendingPathComponent(screenshotFilename)
-                try? data.write(to: persistPath)
-
-                let linuxPath = "\(Self.minisBrowserLinuxDir)/\(screenshotFilename)"
+                let linuxPath = Self.writeBrowserScreenshotCopy(data, sessionId: sessionId)
                 toolImageLinuxPath = linuxPath
 
                 if let minisURL = linuxPathToMinisURL(linuxPath) {
@@ -651,22 +830,12 @@ extension AIChatViewModel {
                let fileData = try? Data(contentsOf: fileURL),
                let uiImage = UIImage(data: fileData) {
                 let originalSize = fileData.count
-                let originalW = uiImage.cgImage.map { $0.width } ?? Int(uiImage.size.width)
-                let originalH = uiImage.cgImage.map { $0.height } ?? Int(uiImage.size.height)
-
-                let inferenceData: Data
-                let resizedW: Int
-                let resizedH: Int
-                if let resized = Self.resizedImageData(fileData, maxLongEdge: 2000),
-                   let resizedImage = UIImage(data: resized) {
-                    inferenceData = resized
-                    resizedW = resizedImage.cgImage.map { $0.width } ?? Int(resizedImage.size.width)
-                    resizedH = resizedImage.cgImage.map { $0.height } ?? Int(resizedImage.size.height)
-                } else {
-                    inferenceData = uiImage.jpegData(compressionQuality: 0.85) ?? fileData
-                    resizedW = originalW
-                    resizedH = originalH
-                }
+                let inference = Self.readImageInference(fileData: fileData, image: uiImage)
+                let originalW = inference.originalW
+                let originalH = inference.originalH
+                let inferenceData = inference.data
+                let resizedW = inference.resizedW
+                let resizedH = inference.resizedH
 
                 if pathArg.hasPrefix("/var/minis/") {
                     toolImageLinuxPath = pathArg
@@ -683,7 +852,7 @@ extension AIChatViewModel {
                 if resizedW != originalW || resizedH != originalH {
                     meta += "\nResized for analysis: \(resizedW)x\(resizedH)"
                 }
-                meta += "\nMIME: image/jpeg"
+                meta += "\nMIME: \(inference.mimeType)"
 
                 // [T-ios-vision-group #182] Two ways to answer this call.
                 //
@@ -713,7 +882,7 @@ extension AIChatViewModel {
                 let nativeVision = self.activeModelHasNativeVision
                 if nativeVision {
                     toolImageData = inferenceData
-                    toolImageMimeType = "image/jpeg"
+                    toolImageMimeType = inference.mimeType
                     // Native models see the pixels, so the prompt isn't needed to
                     // direct anything — but echo it so the transcript shows what
                     // the model was looking for. Image data is untouched.
@@ -779,8 +948,23 @@ extension AIChatViewModel {
                 }
             } else {
                 ctLogger.error("[read_image] FAILED pathArg=\(pathArg) resolvedURL=\(resolvedURL?.path ?? "nil")")
-                toolOutput = "Error: Could not read image at '\(pathArg)'. Verify the path exists and is a valid image file."
+                // [T-readimage-fail-visible] Say WHICH failure it was. The
+                // single "Could not read image … Verify the path exists"
+                // text sent models off guessing (caches, delays) when the
+                // file simply did not exist yet.
+                let fileSize: Int? = resolvedURL.flatMap {
+                    (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size]) as? Int
+                }
+                toolOutput = Self.readImageFailureText(pathArg: pathArg,
+                                                      resolved: resolvedURL != nil,
+                                                      fileSize: fileSize)
                 toolSuccess = false
+                // The live card and the detail sheet render the block's
+                // `content`, which still held the "Reading image <path>…"
+                // progress line - so a failure showed no reason at all.
+                if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
+                    messages[msgIdx].blocks[blockIdx].content = toolOutput
+                }
             }
 
         case "memory_write":
@@ -799,416 +983,75 @@ extension AIChatViewModel {
             toolOutput = memResult.output
             toolSuccess = memResult.success
 
-        default:
-            // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
-            // The model calls this tool when it needs to structure its reasoning.
-            // Only registered when deepModeEnabled is on; the guard below is
-            // defensive — if the toggle was turned off between registration and
-            // execution, return a safe error instead of running the tool.
-            switch tu.name {
-            case "sequential_thinking":
-                guard deepModeEnabled else {
-                    toolOutput = "Error: Deep mode was disabled after sequential_thinking was registered. Cannot execute structured reasoning."
-                    toolSuccess = false
-                    break
-                }
-                let problem = (tu.args["problem"] as? String) ?? ""
-                // [T-phase4-fix] Use NSNumber cast — JSONSerialization may
-                // return NSNumber (Double-backed) for integer fields, and
-                // `as? Int` silently fails → always default. Matches the
-                // pattern used for timeout/delay in SSEStream.swift.
-                let maxSteps = (tu.args["max_steps"] as? NSNumber)?.intValue ?? SequentialThinkingTool.defaultSteps
-
-                // Validate input
-                if let error = SequentialThinkingTool.validateInput(problem: problem, maxSteps: maxSteps) {
-                    toolOutput = error
-                    toolSuccess = false
-                    break
-                }
-
-                // [T-deep-mode-cognitive-p2-c11] C11 enhancement: inject
-                // current context (workflow phase, step number, cognitive
-                // load level, multi-path status) so the reasoning framework
-                // is context-aware. This connects C11 to C9 (cognitive load)
-                // and C12 (multi-path).
-                let phaseStr: String
-                switch workflowPhase {
-                case .idle: phaseStr = "idle"
-                case .planning: phaseStr = "planning"
-                case .executing: phaseStr = "executing"
-                case .verifying: phaseStr = "verifying"
-                case .specWriting: phaseStr = "spec_writing"
-                case .specReviewing: phaseStr = "spec_reviewing"
-                case .specApproved: phaseStr = "spec_approved"
-                }
-                let currentStep = workflowSteps.first(where: { $0.status == .active })?.id ?? 0
-                let isMultiPath = pendingGoalSentinel != nil
-
-                let result = SequentialThinkingTool.generateFramework(
-                    problem: problem,
-                    maxSteps: maxSteps,
-                    workflowPhase: phaseStr,
-                    workflowStep: currentStep,
-                    cognitiveLoadLevel: cognitiveLoadState.level,
-                    isMultiPath: isMultiPath
-                )
-                toolOutput = result.framework
-                toolSuccess = true
-                ctLogger.info("[SequentialThinking] C11: framework generated — problem=\"\(problem.prefix(60))\" steps=\(result.steps.count) phase=\(phaseStr) load=\(cognitiveLoadState.level.displayName)")
-
-            // [T-phase4] S3: Diff Apply — apply unified diff patch to a file.
-            case "diff_apply":
-                let filePath = (tu.args["file_path"] as? String) ?? ""
-                let patchContent = (tu.args["patch"] as? String) ?? ""
-
-                if filePath.isEmpty {
-                    toolOutput = "Error: 'file_path' parameter is required."
-                    toolSuccess = false
-                    break
-                }
-                if patchContent.isEmpty {
-                    toolOutput = "Error: 'patch' parameter is required."
-                    toolSuccess = false
-                    break
-                }
-
-                // Write the patch to a temp file, then apply with `patch`.
-                // [T-phase4-fix] Use a UUID-based heredoc delimiter to prevent
-                // injection — if the patch content contains "PATCH_EOF" on its
-                // own line, a static delimiter would terminate the heredoc
-                // early and execute the rest as shell commands.
-                let tempPatchPath = "/tmp/minis_patch_\(UUID().uuidString.prefix(8)).diff"
-                let heredocTag = "MINIS_PATCH_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))_EOF"
-                let writeCmd = "cat > '\(tempPatchPath)' << '\(heredocTag)'\n\(patchContent)\n\(heredocTag)"
-                let writeResult: CommandResult
-                do {
-                    writeResult = try await executeCommand(writeCmd, timeout: 10) { _ in }
-                } catch {
-                    toolOutput = "Error: Failed to write patch to temp file: \(error.localizedDescription)"
-                    toolSuccess = false
-                    break
-                }
-                if writeResult.exitCode != 0 {
-                    toolOutput = "Error: Failed to write patch to temp file: \(writeResult.output)"
-                    toolSuccess = false
-                    break
-                }
-
-                // Apply the patch. Use --no-backup to avoid .orig files.
-                // [T-phase4-fix] Use --dry-run to test before applying, so
-                // we don't partially apply a patch with -p0 and then try -p1
-                // on the already-modified file. Try -p0 dry-run, then -p1
-                // dry-run, then apply with whichever path level works.
-                let applyCmd = "cd / && if patch -p0 --dry-run < '\(tempPatchPath)' >/dev/null 2>&1; then patch -p0 < '\(tempPatchPath)' 2>&1; elif patch -p1 --dry-run < '\(tempPatchPath)' >/dev/null 2>&1; then patch -p1 < '\(tempPatchPath)' 2>&1; else patch -p0 < '\(tempPatchPath)' 2>&1; fi"
-                let applyResult: CommandResult
-                do {
-                    applyResult = try await executeCommand(applyCmd, timeout: 30) { _ in }
-                } catch {
-                    toolOutput = "Patch application failed: \(error.localizedDescription)"
-                    toolSuccess = false
-                    // Clean up temp file even on error
-                    _ = try? await executeCommand("rm -f '\(tempPatchPath)'", timeout: 5) { _ in }
-                    break
-                }
-                // Clean up temp file
-                _ = try? await executeCommand("rm -f '\(tempPatchPath)'", timeout: 5) { _ in }
-
-                if applyResult.exitCode == 0 {
-                    toolOutput = "Patch applied successfully to \(filePath).\n\n\(applyResult.output)"
-                    toolSuccess = true
-                } else {
-                    toolOutput = "Patch application failed:\n\(applyResult.output)\n\nEnsure the patch is in unified diff format with correct file paths and line numbers. Read the file first with file_read to verify current contents."
-                    toolSuccess = false
-                }
-
-            // [T-phase4] S4: Code Search — regex search across project files.
-            case "code_search":
-                let pattern = (tu.args["pattern"] as? String) ?? ""
-                let directory = (tu.args["directory"] as? String) ?? "/root"
-                let filePattern = (tu.args["file_pattern"] as? String)
-                let maxResults = (tu.args["max_results"] as? NSNumber)?.intValue ?? 50
-
-                if pattern.isEmpty {
-                    toolOutput = "Error: 'pattern' parameter is required."
-                    toolSuccess = false
-                    break
-                }
-
-                // Build grep command. Use grep -rnE for extended regex.
-                // [T-phase4-fix] Escape single quotes in directory and
-                // file_pattern — without this, paths containing ' would
-                // break the command or allow injection.
-                let escapedDir = directory.replacingOccurrences(of: "'", with: "'\\''")
-                var cmd = "grep -rnE --include='*'"
-                if let fp = filePattern, !fp.isEmpty {
-                    let escapedFp = fp.replacingOccurrences(of: "'", with: "'\\''")
-                    cmd = "grep -rnE --include='\(escapedFp)'"
-                }
-                cmd += " '\(pattern.replacingOccurrences(of: "'", with: "'\\''"))' '\(escapedDir)' 2>/dev/null | head -\(maxResults)"
-
-                let searchResult: CommandResult
-                do {
-                    searchResult = try await executeCommand(cmd, timeout: 30) { _ in }
-                } catch {
-                    toolOutput = "Search failed: \(error.localizedDescription)"
-                    toolSuccess = false
-                    break
-                }
-
-                let lines = searchResult.output.components(separatedBy: "\n").filter { !$0.isEmpty }
-                if lines.isEmpty {
-                    toolOutput = "No matches found for pattern '\(pattern)' in \(directory)."
-                    toolSuccess = true
-                } else {
-                    toolOutput = "Found \(lines.count) match(es):\n\n\(searchResult.output)"
-                    toolSuccess = true
-                }
-
-            // [T-phase5] S5: Task Dispatch — subagent task delegation.
-            // Creates a SubagentSession with its own context window and
-            // bounded tool calls, runs it, and returns the result.
-            // Total-switch safe: the tool is only registered when
-            // deepModeEnabled is on. If it was turned off between
-            // registration and execution, return a safe error.
-            case "task_dispatch":
-                guard deepModeEnabled else {
-                    toolOutput = "Error: Deep mode was disabled after task_dispatch was registered. Cannot dispatch subagent."
-                    toolSuccess = false
-                    break
-                }
-
-                let taskDesc = (tu.args["task_description"] as? String) ?? "Subtask"
-                let subPrompt = (tu.args["prompt"] as? String) ?? ""
-                let maxCalls = (tu.args["max_tool_calls"] as? NSNumber)?.intValue ?? 10
-                let allowedToolsStr = (tu.args["allowed_tools"] as? String)
-                let allowedTools = allowedToolsStr?
-                    .components(separatedBy: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-
-                // [T-subagent-type] Phase C C3: optional typed role for the
-                // subagent. Unknown/missing values fall back to .general.
-                let typeRaw = (tu.args["subagent_type"] as? String)?.lowercased()
-                let subagentType = SubagentType(rawValue: typeRaw ?? "") ?? .general
-
-                if subPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    toolOutput = "Error: 'prompt' parameter is required. Provide full instructions for the subagent."
-                    toolSuccess = false
-                    break
-                }
-
-                // Resolve the current provider entry for the subagent.
-                guard let entry = resolveCurrentEntry() else {
-                    toolOutput = "Error: No model configured for subagent dispatch."
-                    toolSuccess = false
-                    break
-                }
-
-                let subProvider = await makeAgentProvider(for: entry)
-                let subSystemPrompt = baseSystemPrompt
-
-                // Create the subagent session.
-                let subagent = SubagentSession(
-                    taskDescription: taskDesc,
-                    prompt: subPrompt,
-                    maxToolCalls: maxCalls,
-                    allowedTools: allowedTools,
-                    subagentType: subagentType
-                )
-                activeSubagents.append(subagent)
-
-                // Execute the subagent. Tool execution is delegated back
-                // to the parent's executeSingleToolUse, which contains all
-                // the tool switch logic. We create a temporary message +
-                // block at the END of the messages array (not messages[0]),
-                // execute, extract output, then remove the temp message.
-                // Total-switch safe: only reachable when deepModeEnabled.
-                let result = await subagent.run(
-                    provider: subProvider,
-                    systemPrompt: subSystemPrompt,
-                    makeTools: { [weak self] in
-                        guard let self else { return [] }
-                        return self.makeAgentTools()
-                    },
-                    executeTool: { [weak self] toolUse, loopNum, callNum in
-                        guard let self else {
-                            return ("Error: Parent view model deallocated.", false)
-                        }
-                        // Determine the block kind from the tool name —
-                        // same mapping as the SSE stream handler.
-                        let blockKind: AssistantBlockKind = switch toolUse.name {
-                        case "shell_execute": .shellTool(command: "")
-                        case "file_read": .fileReadTool(path: "")
-                        case "file_write": .fileWriteTool(path: "")
-                        case "file_edit": .fileEditTool(path: "")
-                        case "browser_use": .browserTool(action: "")
-                        case "read_image": .readImageTool(path: "")
-                        case "memory_write", "memory_get": .memoryTool(action: toolUse.name)
-                        case "render_widget": .visualization
-                        default: .shellTool(command: toolUse.name)
-                        }
-
-                        // Create a temporary assistant message with the
-                        // tool block at the end of the messages array.
-                        // [T-phase5-fix] Use defer to guarantee cleanup —
-                        // even if executeSingleToolUse's internal await
-                        // points are cancelled, the temp message must be
-                        // removed from the chat list to avoid a leak.
-                        let tempMsg = ChatMessage(role: .assistant, content: "", blocks: [])
-                        let block = AssistantBlock(
-                            kind: blockKind,
-                            content: "",
-                            toolStatus: .running,
-                            toolUseId: toolUse.id
-                        )
-                        block.toolStartTime = Date()
-                        tempMsg.blocks.append(block)
-                        self.messages.append(tempMsg)
-                        let tempIdx = self.messages.count - 1
-                        let tempBlockIdx = 0
-
-                        // [T-phase5-fix] Guarantee temp message removal
-                        // even on cancellation/error paths.
-                        defer {
-                            if tempIdx < self.messages.count {
-                                self.messages.remove(at: tempIdx)
-                            }
-                        }
-
-                        // Build a complete ToolEntry with all required fields.
-                        let streamResult = StreamResult.ToolEntry(
-                            id: toolUse.id,
-                            name: toolUse.name,
-                            args: toolUse.args,
-                            blockIdx: tempBlockIdx,
-                            metadata: nil,
-                            inputChunkRing: []
-                        )
-
-                        // Per-call image budget for the subagent.
-                        let imageBudget = BatchImageBudget(initial: Self.kImageContextKeepCount)
-
-                        let outcome = await self.executeSingleToolUse(
-                            tu: streamResult,
-                            msgIdx: tempIdx,
-                            tools: self.makeAgentTools(),
-                            batchBudget: imageBudget
-                        )
-
-                        // Extract (output, success) from the ToolExecOutcome.
-                        if case .toolResult(_, _, let content, let isError, _, _, _, _) = outcome.resultPart {
-                            let success = !isError && !outcome.cancelled
-                            return (content, success)
-                        }
-                        return ("Error: Unexpected tool result format.", false)
-                    }
-                )
-
-                // Remove the subagent from active list.
-                activeSubagents.removeAll { $0.id == subagent.id }
-
-                toolOutput = "Subagent result for '\(taskDesc)':\n\n\(result)"
-                toolSuccess = subagent.status == .completed
-
-            // [T-deep-mode-phase-d] D2: Inline visualization execution.
-            // Registered only in deep mode; if the switch was turned off
-            // between registration and execution, reject safely. Produces an
-            // inline visual in the message stream as its tool output.
-            case "render_widget":
-                guard deepModeEnabled else {
-                    toolOutput = "Error: Deep mode was disabled after render_widget was registered. Cannot render widget."
-                    toolSuccess = false
-                    break
-                }
-
-                let content = (tu.args["content"] as? String) ?? ""
-
-                if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    toolOutput = "Error: 'content' parameter is required. Provide SVG (diagram/chart/comparison) or HTML (interactive) markup."
-                    toolSuccess = false
-                    break
-                }
-
-                // The widget renders inline in the message stream. The markup
-                // (SVG or HTML) is carried as the tool result content; the UI
-                // renderer keys off the tool name `render_widget` and renders
-                // it via an inline WebView instead of treating it as text.
-                toolOutput = content
-                toolSuccess = true
-
-            // [T-deep-mode-phase-e] E2: Scheduled automation execution.
-            // Registered only in deep mode; if the switch was turned off
-            // between registration and execution, reject safely. Creates a
-            // persisted scheduled task via ScheduledTaskStore + a local
-            // notification at the next trigger (fire-and-forget deliverable;
-            // iOS cannot run a live agent loop at a wall-clock time in the
-            // background, so the notification points the user to the task).
-            case "schedule_task":
-                guard deepModeEnabled else {
-                    toolOutput = "Error: Deep mode was disabled after schedule_task was registered. Cannot create scheduled task."
-                    toolSuccess = false
-                    break
-                }
-
-                let label = (tu.args["label"] as? String) ?? ""
-                let prompt = (tu.args["prompt"] as? String) ?? ""
-                let time = (tu.args["time"] as? String) ?? ""
-
-                if label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || time.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    toolOutput = "Error: 'label', 'prompt', and 'time' (HH:MM) are all required."
-                    toolSuccess = false
-                    break
-                }
-
-                let parts = time.split(separator: ":").map { String($0).trimmingCharacters(in: .whitespaces)}
-                guard parts.count == 2, let hour = Int(parts[0]), let minute = Int(parts[1]),
-                      (0...23).contains(hour), (0...59).contains(minute) else {
-                    toolOutput = "Error: 'time' must be 24-hour HH:MM (e.g. '09:00', '14:30')."
-                    toolSuccess = false
-                    break
-                }
-
-                let repeatVal = (tu.args["repeat"] as? String) ?? "once"
-                let repeatMode: String
-                switch repeatVal.lowercased() {
-                case "daily": repeatMode = "daily"
-                case "weekdays": repeatMode = "weekdays"
-                case "custom": repeatMode = "custom"
-                default: repeatMode = "once"
-                }
-
-                var customDays: [Int] = []
-                if repeatMode == "custom" {
-                    customDays = Self.parseScheduleDays((tu.args["days"] as? String) ?? "")
-                    if customDays.isEmpty {
-                        toolOutput = "Error: repeat='custom' requires 'days' (e.g. 'Mon,Wed,Fri')."
-                        toolSuccess = false
-                        break
-                    }
-                }
-
-                let task = ScheduledTaskItem(
-                    label: label,
-                    prompt: prompt,
-                    hour: hour,
-                    minute: minute,
-                    repeatMode: repeatMode,
-                    customDays: customDays,
-                    enabled: true
-                )
-                await ScheduledTaskScheduler.shared.upsert(task)
-
-                let next = ScheduledTaskItem.nextTriggerDate(task, from: Date())
-                    .flatMap { Self.fmtScheduledDate($0) } ?? "n/a"
-                toolOutput = "Scheduled task created: id=\(task.id) label='\(label)' time=\(String(format: "%02d:%02d", hour, minute)) repeat=\(repeatMode) next=\(next). Manage it anytime at [Settings → Agent Runtime → Scheduled Tasks](minis://settings/scheduled-tasks)."
-                toolSuccess = true
-
-            default:
-                toolOutput = "Error: Unknown tool '\(tu.name)'"
+        case UserAskTool.name:
+            // [T-user-ask] Waits for the user: card in the chat, a notification
+            // with answer actions when backgrounded, wall-clock timeout. A run
+            // that does not expose the tool (sub agent, Shortcut, job) gets a
+            // plain refusal if the model names it anyway.
+            guard userAskExposed else {
+                toolOutput = "Error: user_ask is not available in this run."
                 toolSuccess = false
+                if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
+                    messages[msgIdx].blocks[blockIdx].content = toolOutput
+                }
+                break
             }
+            userAskAskedThisRun = true  // [T-user-ask-fallback]
+            let askResult = await executeUserAsk(args: toolArgs, toolUseId: tu.id, msgIdx: msgIdx, blockIdx: blockIdx)
+            toolOutput = askResult.output
+            toolSuccess = askResult.success
+
+        case SubAgentDefinition.toolName:
+            // [T-agents-debug-only] A refusal in the sub-agent result dialect,
+            // so HelperBlockInfo renders the block as "Rejected" (a plain
+            // string parsed as the `.starting` phase and left a spinner on a
+            // call that never ran — Release device run).
+            guard AgentToolSwitch.isToolEnabled(tu.name) else {
+                toolOutput = Self.jsonString(["ok": false, "status": "rejected", "reason": "tools_disabled",
+                                              "detail": Self.toolsDisabledMessage])
+                toolSuccess = false
+                // The live block reads `content`, not `toolOutput` — the latter
+                // only reaches the block via applyToolResults on a session
+                // reload. Without this write the row stayed on the "starting"
+                // spinner for the rest of the turn and only read "Rejected"
+                // after reopening the session. Same as HelperRunner.reject.
+                if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
+                    messages[msgIdx].blocks[blockIdx].content = toolOutput
+                }
+                break
+            }
+            // [T-sub-agents-v1] One tool, three actions:
+            // delegating and inspecting/stopping what was delegated are the
+            // same capability, so they share a declaration. `delegate` is the
+            // default because it is what the model calls almost every time.
+            switch (toolArgs["action"] as? String)?.lowercased() ?? "delegate" {
+            case "resume":
+                let r = await executeResumeAgents(args: toolArgs)
+                if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
+                    messages[msgIdx].blocks[blockIdx].content = r.output
+                }
+                toolOutput = r.output
+                toolSuccess = r.success
+            case "status", "steer", "cancel":
+                let statusResult = executeAgentStatus(args: toolArgs)
+                if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
+                    messages[msgIdx].blocks[blockIdx].content = statusResult.output
+                }
+                toolOutput = statusResult.output
+                toolSuccess = statusResult.success
+            default:
+                // [T-p1-delegate-task] Runs a sub agent in a hidden child
+                // session; wait mode blocks this tool call on it. See
+                // HelperRunner.swift.
+                let helperResult = await executeDelegateTask(args: toolArgs, toolUseId: tu.id,
+                                                             msgIdx: msgIdx, blockIdx: blockIdx)
+                toolOutput = helperResult.output
+                toolSuccess = helperResult.success
+            }
+
+        default:
+            toolOutput = "Error: Unknown tool '\(tu.name)'"
+            toolSuccess = false
         }
         } catch is CancellationError {
             let cancelContent = "<system-reminder>The user cancelled this operation. The returned result may be incomplete.</system-reminder>"
@@ -1248,14 +1091,17 @@ extension AIChatViewModel {
         let snapshot: ToolSnapshot
         switch tu.name {
         case "browser_use":
+            // [T-image-gate #412] When the result carried an image to the model,
+            // the snapshot stores THAT image (the gate's output): a restart
+            // resends the snapshot, and it must be the bytes the live turn sent.
+            // The original screenshot stays in browser/ (minis_url) for viewing.
             if let imagePath = (msgIdx < messages.count && blockIdx < messages[msgIdx].blocks.count)
                 ? messages[msgIdx].blocks[blockIdx].imageFilePath : nil,
-               let imageData = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
+               let imageData = toolImageData ?? (try? Data(contentsOf: URL(fileURLWithPath: imagePath))),
                let sid = sessionId {
-                let ref = await ChatStore.shared.saveMedia(
-                    data: imageData, mimeType: "image/jpeg", sessionId: sid,
-                    originalFileName: "browser_snapshot.jpg", subdir: "browser",
-                    linuxPath: toolImageLinuxPath
+                let ref = await Self.saveBrowserSnapshotMedia(
+                    imageData: imageData, sessionId: sid, linuxPath: toolImageLinuxPath,
+                    mimeType: toolImageData != nil ? (toolImageMimeType ?? "image/jpeg") : "image/jpeg"
                 )
                 snapshot = ToolSnapshot(type: .image, text: nil, mediaRef: ref, duration: toolDuration)
             } else {
@@ -1264,15 +1110,15 @@ extension AIChatViewModel {
                 snapshot = ToolSnapshot(type: .text, text: lastLines, mediaRef: nil, duration: toolDuration)
             }
         case "read_image":
+            // [T-image-gate #412] Same as browser_use: the model image when one
+            // was sent (a text-only model's vision-group path sends none, and
+            // then the snapshot keeps the file read, for display only).
             if let imagePath = (msgIdx < messages.count && blockIdx < messages[msgIdx].blocks.count)
                 ? messages[msgIdx].blocks[blockIdx].imageFilePath : nil,
-               let imageData = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
+               let imageData = toolImageData ?? (try? Data(contentsOf: URL(fileURLWithPath: imagePath))),
                let sid = sessionId {
-                let fileURL = URL(fileURLWithPath: imagePath)
-                let mime = Self.detectImageMime(imageData)
-                let ref = await ChatStore.shared.saveMedia(
-                    data: imageData, mimeType: mime, sessionId: sid,
-                    originalFileName: fileURL.lastPathComponent, subdir: "images",
+                let ref = await Self.saveReadImageSnapshotMedia(
+                    imagePath: imagePath, imageData: imageData, sessionId: sid,
                     linuxPath: toolImageLinuxPath
                 )
                 snapshot = ToolSnapshot(type: .image, text: nil, mediaRef: ref, duration: toolDuration)
@@ -1318,15 +1164,57 @@ extension AIChatViewModel {
                     ? .success
                     : .failed(message: toolOutput.components(separatedBy: "\n").first ?? "Failed")
             }
+            // [T-p2-agent-in-toolbar] A delegate_task that returned
+            // `status: running` (background mode) is NOT finished from the
+            // user's point of view: keep the block `.running` so the floating
+            // tool bar / Live Activity treat it as active until the job's
+            // completion hook writes the final state.
+            if tu.name == SubAgentDefinition.toolName,
+               let obj = AIChatViewModel.parseDelegateResult(toolOutput),
+               (obj["status"] as? String) == "running" {
+                blk.toolStatus = .running
+            }
             ctLogger.info("[ToolLifecycle] COMPLETED toolId=\(tu.id.prefix(20)) tool=\(tu.name) sid=\(sessionId?.prefix(8) ?? "nil") appState=\(UIApplication.shared.applicationState == .active ? "fg" : "bg") suspended=\(streamingUIUpdatesSuspended) isProcessing=\(isProcessing) success=\(toolSuccess) duration=\(String(format: "%.1f", toolDuration ?? 0))s")
             scrollToBottomSignal.send()
         }
+
+        // [T-offload-readback-loop] GH#343. Is this result merely the content of
+        // a file the offloader itself wrote, fetched back by `file_read`?
+        //
+        // Decided from the ARGUMENT the call was made with, before the content
+        // is looked at — by the time it is content, it is byte-for-byte the
+        // original payload and indistinguishable from new material, which is
+        // precisely the bug. Only `file_read` performs such a fetch; every
+        // other tool reaching the offload store produces genuinely new output.
+        let isOffloadReadback: Bool = {
+            guard tu.name == "file_read",
+                  let path = toolArgs["path"] as? String else { return false }
+            return AIChatViewModel.isOffloadStorePath(path)
+        }()
 
         // Compose finalOutput with truncation/offload.
         let maxToolResultLength = Self.kMaxToolResultChars
         var finalOutput: String
         if toolOutput.isEmpty {
             finalOutput = "(no output)"
+        } else if toolOutput.count > maxToolResultLength && isOffloadReadback {
+            // [T-offload-readback-loop] PATH B of the loop. This branch used to
+            // write a SECOND copy of content that is already on disk — the
+            // `file_read_<ts>_c-read-*.txt` files observed piling up on device —
+            // and hand the model a stub pointing at the new copy, which it read,
+            // which produced another copy.
+            //
+            // Truncate (the 15K cap still protects the context) but do NOT
+            // write, and point the model back at the file it already has. Note
+            // the tail differs from the normal branch on purpose: telling it to
+            // "use file_read to read the complete output" is exactly the advice
+            // that starts the cycle over.
+            finalOutput = String(toolOutput.prefix(maxToolResultLength))
+                + "\n\n[OUTPUT TRUNCATED] Showing the first \(maxToolResultLength) of \(toolOutput.count) chars. "
+                + "This content is already stored at the path you just read — it has not been copied "
+                + "anywhere new. To see more, call file_read on that same path again with the "
+                + "`offset` from the `next_offset=` value in the header above."
+            ctLogger.info("♻️[OffloadReadback] file_read id:\(tu.id.prefix(8)) returned offload-store content — truncated WITHOUT writing a second copy")
         } else if toolOutput.count > maxToolResultLength {
             let offloadResult = offloadToolOutput(toolOutput, toolName: tu.name, toolId: tu.id)
             let offloadMinisURL = linuxPathToMinisURL(offloadResult.linuxPath)
@@ -1378,6 +1266,15 @@ extension AIChatViewModel {
                 finalOutput += "\n\n" + warningMsg
             }
         }
+        // [T-tool-title-reminder] Same channel as the loop warning above: the
+        // detector counts titled calls with no tool_title and hands back the
+        // soft reminder on the 1st, 11th, 21st… of them.
+        let titleDeclared = tools.first(where: { $0.name == tu.name })
+            .map { ToolTitleReminder.declaresTitle($0.parameters.keys) } ?? false
+        if toolLoopDetector.recordToolTitle(params: toolArgs, titleDeclared: titleDeclared) != nil {
+            finalOutput = ToolTitleReminder.appending(to: finalOutput)
+            ctLogger.info("[ToolTitleReminder] \(tu.name) came back without tool_title — soft reminder appended")
+        }
 
         // [T-truncated-args-visibility #119] Tell the MODEL when the call it
         // just got a success for was built from truncated arguments.
@@ -1398,7 +1295,8 @@ extension AIChatViewModel {
         let resultPart = AgentContentPart.toolResult(
             id: tu.id, name: tu.name, content: finalOutput, isError: !toolSuccess,
             imageData: toolImageData, imageMimeType: toolImageMimeType,
-            pageURL: toolPageURL, imageLinuxPath: toolImageLinuxPath
+            pageURL: toolPageURL, imageLinuxPath: toolImageLinuxPath,
+            isOffloadReadback: isOffloadReadback
         )
 
         #if DEBUG
@@ -1415,40 +1313,131 @@ extension AIChatViewModel {
             cancelled: cancelledHere
         )
     }
+}
 
-    // MARK: - Scheduled Task Helpers
+// MARK: - [T-image-seams] Tool-image steps, callable on their own
 
-    /// [T-deep-mode-phase-e] Maps weekday names (Sun..Sat, any case) to
-    /// Calendar.dayOfWeek values (Sun=1 ... Sat=7). Unknown names are ignored.
-    static func parseScheduleDays(_ raw: String) -> [Int] {
-        let map: [String: Int] = [
-            "sun": 1, "sunday": 1,
-            "mon": 2, "monday": 2,
-            "tue": 3, "tues": 3, "tuesday": 3,
-            "wed": 4, "wednesday": 4,
-            "thu": 5, "thur": 5, "thurs": 5, "thursday": 5,
-            "fri": 6, "friday": 6,
-            "sat": 7, "saturday": 7,
-        ]
-        var seen = Set<Int>()
-        var result: [Int] = []
-        for token in raw.split(whereSeparator: { $0 == "," || $0.isWhitespace }) {
-            let key = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if let day = map[key], !seen.contains(day) {
-                seen.insert(day)
-                result.append(day)
-            }
-        }
-        return result.sorted()
+/// Moved verbatim out of `executeSingleToolUse` so tests can run the exact code
+/// the tool path runs. No behaviour change: same resize, quality, MIME, file
+/// names, directories and saveMedia arguments as the inline code they replace.
+extension AIChatViewModel {
+
+    /// browser_use: the screenshot bytes the live turn hands the model -
+    /// [T-image-gate] ModelImageGate's output, which the tool snapshot also
+    /// stores, so a restart resends these same bytes (#412). A screenshot the
+    /// gate cannot read goes out as captured; the request gate then replaces
+    /// it with a placeholder.
+    static func browserUseInferenceImage(_ data: Data) -> (data: Data, mimeType: String) {
+        let gated = ModelImageGate.prepare(data, maxBytes: Self.rawBytesForBase64Budget(Self.kPerImageMaxBytes))
+        return (gated.data ?? data, gated.mimeType ?? "image/jpeg")
     }
 
-    /// Formats a next-trigger date for the tool result string.
-    static func fmtScheduledDate(_ date: Date) -> String? {
-        let f = DateFormatter()
-        f.locale = Locale.current
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        // Include weekday so day-based schedules are readable.
-        f.dateFormat = "EEE yyyy-MM-dd HH:mm"
-        return f.string(from: date)
+    /// browser_use: writes the ORIGINAL screenshot to the session's browser dir
+    /// (the file `minis_url` points at) and returns its Linux path.
+    static func writeBrowserScreenshotCopy(_ data: Data, sessionId: String?) -> String {
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let screenshotFilename = "screenshot_\(timestamp).jpg"
+        let sid = sessionId ?? "unknown"
+        let persistDir = Self.minisBrowserPersistentDir(for: sid)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: persistDir, withIntermediateDirectories: true)
+        let persistPath = persistDir.appendingPathComponent(screenshotFilename)
+        try? data.write(to: persistPath)
+        return "\(Self.minisBrowserLinuxDir)/\(screenshotFilename)"
+    }
+
+    struct ReadImageInference {
+        let data: Data
+        let mimeType: String
+        let originalW: Int
+        let originalH: Int
+        let resizedW: Int
+        let resizedH: Int
+    }
+
+    /// read_image: the bytes the live turn hands the model, plus the sizes the
+    /// tool output reports. [T-image-gate] ModelImageGate's output: a file that
+    /// already follows the rule goes out as its own bytes (it used to be
+    /// re-encoded even when small), anything else converted; the snapshot
+    /// stores the same bytes (#412).
+    static func readImageInference(fileData: Data, image uiImage: UIImage) -> ReadImageInference {
+        let originalW = uiImage.cgImage.map { $0.width } ?? Int(uiImage.size.width)
+        let originalH = uiImage.cgImage.map { $0.height } ?? Int(uiImage.size.height)
+
+        let gated = ModelImageGate.prepare(fileData, maxBytes: Self.rawBytesForBase64Budget(Self.kPerImageMaxBytes))
+        guard let data = gated.data, let mime = gated.mimeType else {
+            // Not usable as an image for the model; the request gate turns it
+            // into a visible placeholder.
+            return ReadImageInference(data: fileData, mimeType: "image/jpeg",
+                                      originalW: originalW, originalH: originalH,
+                                      resizedW: originalW, resizedH: originalH)
+        }
+        return ReadImageInference(data: data, mimeType: mime,
+                                  originalW: originalW, originalH: originalH,
+                                  resizedW: gated.width, resizedH: gated.height)
+    }
+
+    /// browser_use: the tool snapshot's media file (its mediaRef is what a
+    /// reload resends when the result carried an image) - the model image.
+    static func saveBrowserSnapshotMedia(imageData: Data, sessionId sid: String, linuxPath: String?,
+                                         mimeType: String = "image/jpeg") async -> MediaRef {
+        await ChatStore.shared.saveMedia(
+            data: imageData, mimeType: mimeType, sessionId: sid,
+            originalFileName: "browser_snapshot.jpg", subdir: "browser",
+            linuxPath: linuxPath
+        )
+    }
+
+    /// read_image: the tool snapshot's media file - the model image when one
+    /// was sent, else a copy of the file that was read.
+    static func saveReadImageSnapshotMedia(imagePath: String, imageData: Data, sessionId sid: String, linuxPath: String?) async -> MediaRef {
+        let fileURL = URL(fileURLWithPath: imagePath)
+        let mime = Self.detectImageMime(imageData)
+        return await ChatStore.shared.saveMedia(
+            data: imageData, mimeType: mime, sessionId: sid,
+            originalFileName: fileURL.lastPathComponent, subdir: "images",
+            linuxPath: linuxPath
+        )
     }
 }
+
+// BEGIN ReadImageFailureText
+extension AIChatViewModel {
+    /// [T-readimage-fail-visible] The tool result (and card text) for a
+    /// read_image that could not load its file. `resolved` is false when the
+    /// path does not map into the sandbox at all; `fileSize` is nil when
+    /// nothing exists there.
+    nonisolated static func readImageFailureText(pathArg: String, resolved: Bool, fileSize: Int?) -> String {
+        guard resolved else {
+            return "Error: '\(pathArg)' is not a readable Minis path. Use a path under /var/minis/ (e.g. /var/minis/workspace/chart.png) or a minis:// URL."
+        }
+        guard let size = fileSize else {
+            return "Error: No file at '\(pathArg)'. If a command in this same turn creates it, read it in the next turn after that command has finished."
+        }
+        if size == 0 {
+            return "Error: '\(pathArg)' exists but is empty (0 bytes) - it may still be being written."
+        }
+        return "Error: '\(pathArg)' exists (\(size) bytes) but is not a decodable image. Supported: PNG, JPEG, HEIC, GIF, WebP, BMP, TIFF."
+    }
+}
+// END ReadImageFailureText
+
+// BEGIN BatchToolOrder
+/// [T-batch-read-after-write] Which calls of one tool batch must wait for
+/// which. A reader (`read_image`, `file_read`) waits for every writer
+/// (`shell_execute`, `file_write`, `file_edit`) that precedes it in the
+/// batch, because the model routinely writes a file and reads it in the same
+/// turn. Nothing else is ordered: writers, browser calls, sub agents and
+/// readers with no writer before them still start together.
+enum BatchToolOrder {
+    static let writers: Set<String> = ["shell_execute", "file_write", "file_edit"]
+    static let readers: Set<String> = ["read_image", "file_read"]
+
+    /// Indices of the writers a call at `index` must wait for (empty when it
+    /// is not a reader, or no writer precedes it).
+    static func writersBefore(index: Int, in names: [String]) -> [Int] {
+        guard names.indices.contains(index), readers.contains(names[index]) else { return [] }
+        return names[..<index].indices.filter { writers.contains(names[$0]) }
+    }
+}
+// END BatchToolOrder

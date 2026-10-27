@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -55,6 +56,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.graphics.Color
 import com.openminis.app.data.model.FallbackStrategy
@@ -121,6 +123,8 @@ fun ModelGroupDetailScreen(
     // Local copy of member IDs for live reorder
     var memberIds by remember(group.memberEntryIds) { mutableStateOf(group.memberEntryIds.toList()) }
     var entryToRemove by remember { mutableStateOf<String?>(null) }
+    // [T-quota-group-member-pill] Provider whose quota sheet is open.
+    var quotaSheetInstanceId by remember { mutableStateOf<String?>(null) }
 
     val lazyListState = rememberLazyListState()
     val reorderState = rememberReorderableLazyListState(lazyListState) { from, to ->
@@ -288,7 +292,7 @@ fun ModelGroupDetailScreen(
                             ListItem(
                                 headlineContent = {
                                     Text(
-                                        "Model no longer available",
+                                        stringResource(R.string.model_group_detail_stale_member),
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 },
@@ -328,18 +332,43 @@ fun ModelGroupDetailScreen(
                         val instance = config.instances.find { it.id == entry.providerInstanceId }
                         val instanceLabel = instance?.label
                         val providerDisabled = instance?.isEnabled == false
+                        // [T-android-model-absence-grace] The provider stopped
+                        // listing this model. The entry (and its overrides) is
+                        // retained through the grace window, so say why the row
+                        // is dimmed instead of letting it look normal — or, as
+                        // before, letting it silently vanish from the group.
+                        val notListed = entry.isUnavailableFromProvider
                         var showMenu by remember { mutableStateOf(false) }
 
                         ReorderableItem(reorderState, key = entryId) { _ ->
                             ListItem(
-                                modifier = Modifier.alpha(if (providerDisabled) 0.4f else 1f),
-                                headlineContent = { Text(entry.model.displayName) },
+                                modifier = Modifier.alpha(if (providerDisabled || notListed) 0.4f else 1f),
+                                headlineContent = {
+                                    // [T-model-row-premature-wrap] Name and quota pill on
+                                    // one line when they fit, else the name keeps the width
+                                    // and the pill drops below, as in the model picker.
+                                    com.openminis.app.ui.components.FitOrWrapLine(
+                                        lead = { Text(entry.model.displayName) },
+                                        tags = {
+                                            // [T-quota-group-member-pill] The model's (or its
+                                            // account's) quota; this page has no other way to
+                                            // the provider's quota. Tap opens the quota sheet.
+                                            if (instance != null && !providerDisabled) {
+                                                com.openminis.app.ui.quota.ModelQuotaMemberPill(
+                                                    instanceId = entry.providerInstanceId,
+                                                    modelId = entry.model.id,
+                                                ) { quotaSheetInstanceId = entry.providerInstanceId }
+                                            }
+                                        },
+                                    )
+                                },
                                 supportingContent = {
-                                    if (providerDisabled) {
+                                    if (providerDisabled || notListed) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             Text(instanceLabel ?: "")
                                             Text(
-                                                " · Provider disabled",
+                                                if (providerDisabled) " · Provider disabled"
+                                                else " · " + stringResource(R.string.model_not_listed_by_provider),
                                                 color = MaterialTheme.colorScheme.error,
                                                 style = MaterialTheme.typography.bodySmall,
                                             )
@@ -488,7 +517,27 @@ fun ModelGroupDetailScreen(
                                             index = idx,
                                             count = cases.size,
                                         ),
-                                    ) { Text(label) }
+                                        // [T-android-thinking-segment-overflow]
+                                        // Same six-segment overflow as the sub
+                                        // agent editor, which was ported from
+                                        // here: without this the labels break
+                                        // mid-word ("Medi/um", "XHig/h"). The
+                                        // check icon is redundant next to the
+                                        // selected segment's fill and was
+                                        // costing ~24dp of label width.
+                                        icon = {},
+                                    ) {
+                                        Text(
+                                            label,
+                                            // One size below labelSmall: six segments on a phone leave
+                                    // ~55dp each, and labelSmall's 11sp still made
+                                    // "Medium" the widest thing in the row.
+                                    fontSize = 10.sp,
+                                    lineHeight = 12.sp,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -510,7 +559,7 @@ fun ModelGroupDetailScreen(
                             if (on) {
                                 // Restore last user-selected value verbatim,
                                 // defaulting to 128K for first-time activation.
-                                val restored = group.lastContextLimitTokens ?: 128_000
+                                val restored = group.lastContextLimitTokens ?: 100_000
                                 contextLimitTokens = restored
                                 providerRepository.updateGroup(
                                     group.copy(
@@ -578,6 +627,10 @@ fun ModelGroupDetailScreen(
         }
     }
 
+    quotaSheetInstanceId?.let { id ->
+        com.openminis.app.ui.quota.QuotaDetailSheet(instanceId = id, onDismiss = { quotaSheetInstanceId = null }, halfHeight = false)
+    }
+
     // Confirm remove model from group
     if (entryToRemove != null) {
         val removingId = entryToRemove!!
@@ -634,10 +687,10 @@ fun ModelGroupDetailScreen(
 
 /**
  * Discrete-step max-context slider that mirrors iOS `ContextLimitSlider`
- * (ModelGroupDetailView.swift, fa77f493). Step labels:
- * 32K / 64K / 128K / 200K / 400K / 1M / Unlimited.
+ * (ModelGroupDetailView.swift). Step labels: every 100K from 100K to 1M,
+ * then Unlimited.
  *
- * Fixed 7-stop ladder, always shown verbatim regardless of which models (if
+ * Fixed ladder, always shown verbatim regardless of which models (if
  * any) are in the group. The previous behaviour clipped the ladder to the
  * largest member-declared context window, but model metadata is unreliable
  * (e.g. image-output / router models report no window and fall through to
@@ -653,14 +706,7 @@ fun ModelGroupDetailScreen(
  */
 private const val CONTEXT_LIMIT_UNLIMITED_SENTINEL: Int = Int.MAX_VALUE
 
-private val CONTEXT_LIMIT_PRESETS = listOf(
-    32_000,
-    64_000,
-    128_000,
-    200_000,
-    400_000,
-    1_000_000,
-)
+private val CONTEXT_LIMIT_PRESETS = (100_000..1_000_000 step 100_000).toList()
 
 private fun formatPresetLabel(tokens: Int): String =
     if (tokens >= 1_000_000) "${tokens / 1_000_000}M" else "${tokens / 1_000}K"
@@ -678,7 +724,7 @@ private fun ContextLimitSlider(
             Step(unlimitedLabel, CONTEXT_LIMIT_UNLIMITED_SENTINEL)
     }
     // Track the selected stop by index. Snap to nearest stop <= value
-    // so legacy saved values (e.g. 350K) land on the next stop down (200K).
+    // so legacy saved values (e.g. 128K) land on the next stop down (100K).
     var selectedIndex by remember(steps, value) {
         mutableStateOf(
             when {

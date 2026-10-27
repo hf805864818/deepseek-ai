@@ -1,6 +1,7 @@
 import Foundation
 
-/// Exposes ModelEntry overrides under `models.<entryUUID>.…`.
+/// Exposes ModelEntry overrides under `models.<entry_id>.…`, where entry_id is
+/// the raw "<instanceUUID>/<modelId>" `get models` prints (dots allowed).
 ///
 /// `add` creates a custom entry (isCustom=true). `remove` is allowed
 /// only for those custom entries — API-reported models can be hidden
@@ -26,12 +27,61 @@ struct ModelsCollection: ConfigCollection {
     /// }
     let addPayloadSchema: ConfigValueSchema = .json
 
+    // MARK: - Entry ids in paths
+    //
+    // [T-config-path-dotted-id] OpenMinis#390. A model's real id is its
+    // compositeKey, "<instanceUUID>/<modelId>", and model ids usually contain
+    // DOTS (glm-5.1, gpt-4.1, mimo-v2.6-pro). Paths now carry that id VERBATIM
+    // — exactly as `get models` prints it as `entry_id` — because
+    // `ConfigRegistry.splitCollectionPath` takes everything between the first
+    // and last dot as the id.
+    //
+    // Before, the resolver cut the id at its first dot, so this collection
+    // escaped dots on the way into a path ("." → "~d", "~" → "~~",
+    // [T-config-model-id-dot]). That worked, but nothing told a caller: `get`
+    // printed the raw id, the help never mentioned `~d`, and the reporter of
+    // #390 tried four escaping schemes without guessing it. The escaped form is
+    // still ACCEPTED (`lookup` below), so audit-log keys and scripts written
+    // against builds 09-18 … #390 keep resolving and reverting.
+
+    /// Decode the legacy `~d` / `~~` escape. A single left-to-right scan, not two
+    /// `replacingOccurrences` passes: sequential replaces break on ids that
+    /// contain the escape text itself (a literal "~d~" once round-tripped to
+    /// "~t.t~"). One pass consuming the escape and its argument together has no
+    /// such ambiguity.
+    private static func decodeLegacySegment(_ segment: String) -> String {
+        var out = ""
+        out.reserveCapacity(segment.count)
+        var it = segment.makeIterator()
+        while let ch = it.next() {
+            guard ch == "~" else { out.append(ch); continue }
+            switch it.next() {
+            case "~": out.append("~")
+            case "d": out.append(".")
+            case let other?: out.append(other)   // stray escape: pass through
+            case nil: out.append("~")            // trailing "~": keep it
+            }
+        }
+        return out
+    }
+
+    /// The entry a path id names: the raw id first, then the legacy escaped
+    /// form. Raw wins, so an id that literally contains "~d" is never decoded
+    /// into a different id.
+    private func lookup(_ idOrSegment: String) -> ModelEntry? {
+        if let e = entry(idOrSegment) { return e }
+        let decoded = Self.decodeLegacySegment(idOrSegment)
+        guard decoded != idOrSegment else { return nil }
+        return entry(decoded)
+    }
+
     func childIds() -> [String] {
         ProviderConfigStore.shared.config.modelEntries.map(\.id)
     }
 
-    func fields(for id: String) -> [ConfigField] {
-        guard let entry = entry(id) else { return [] }
+    func fields(for idOrSegment: String) -> [ConfigField] {
+        guard let entry = lookup(idOrSegment) else { return [] }
+        let id = entry.id
         return [
             providerInstanceId(for: id),
             modelId(for: id),
@@ -104,19 +154,60 @@ struct ModelsCollection: ConfigCollection {
         guard added else {
             throw ConfigError.invalidValue("Entry already exists for this model")
         }
+        // Used verbatim as a path id ([T-config-path-dotted-id]).
         return entry.id
     }
 
-    func remove(id: String) throws {
-        guard let entry = entry(id) else {
-            throw ConfigError.unknownPath("models.\(id)")
+    func remove(id idOrSegment: String) throws {
+        // Raw id, or the legacy escaped form ([T-config-path-dotted-id]).
+        guard let entry = lookup(idOrSegment) else {
+            throw ConfigError.unknownPath("models.\(idOrSegment)")
         }
         guard entry.isCustom else {
             throw ConfigError.permissionDenied(
-                reason: "Only custom-added models can be removed; use `set models.\(id).isHidden true` for API-reported models"
+                reason: "Only custom-added models can be removed; use `set models.\(entry.id).isHidden true` for API-reported models"
             )
         }
-        ProviderConfigStore.shared.removeEntry(id)
+        ProviderConfigStore.shared.removeEntry(entry.id)
+    }
+
+    // MARK: [T-config-readable] Readable descriptions
+
+    let readableSubjectFormat = "Model %1$@ – %2$@"
+
+    func entityLabel(id: String) -> String? {
+        lookup(id).map(ConfigRefResolver.modelLabel)
+    }
+
+    /// Modality names → label keys, for the override list.
+    static let modalityLabels: [String: String] = [
+        "text_input": "Text input", "text_output": "Text output",
+        "image_input": "Image input", "pdf_input": "PDF input",
+        "audio_input": "Audio input", "video_input": "Video input",
+        "image_output": "Image output", "audio_output": "Audio output",
+        "video_output": "Video output",
+    ]
+
+    func readableForAdd(_ payload: RedactedConfigValue) -> [ReadableLine] {
+        guard case .object(let d) = payload.value else { return [] }
+        let modelId: String = { if case .string(let s)? = d["model_id"] { return s }; return "?" }()
+        var name = modelId
+        if case .string(let s)? = d["display_name"], !s.isEmpty { name = s }
+        let provider: ReadableArg = {
+            if case .string(let i)? = d["instance_id"] { return ConfigRefResolver.name(.providerInstance, i) }
+            return .text("?")
+        }()
+        return [ReadableLine("Add custom model %1$@ to “%2$@”", [.text(name), provider])]
+    }
+
+    func readableForRemove(id: String) -> [ReadableLine] {
+        guard let e = lookup(id) else { return [] }
+        var lines = [ReadableLine("Delete custom model %@", [.text(ConfigRefResolver.modelLabel(e))])]
+        let groups = ProviderConfigStore.shared.config.modelGroups.filter { $0.memberEntryIds.contains(e.id) }
+        if !groups.isEmpty {
+            lines.append(ReadableLine("It is also in: %@", [.list(groups.map { .text($0.name) })]))
+        }
+        return lines
     }
 
     // MARK: Field factories
@@ -126,7 +217,9 @@ struct ModelsCollection: ConfigCollection {
     }
 
     private func mutate(_ id: String, _ apply: (inout ModelEntry) -> Void) throws {
-        guard var e = entry(id) else { throw ConfigError.unknownPath("models.\(id)") }
+        guard var e = entry(id) else {
+            throw ConfigError.unknownPath("models.\(id)")
+        }
         apply(&e)
         ProviderConfigStore.shared.updateEntry(e)
     }
@@ -177,6 +270,7 @@ struct ModelsCollection: ConfigCollection {
             description: "User-visible label override. Empty restores the API default.",
             valueSchema: .string(maxLength: 200),
             risk: .normal, revertable: true,
+            readable: ConfigReadable(.text(empty: "Default")),
             reader: { [self] in
                 guard let e = entry(id) else { return .null }
                 return .string(e.overrides.displayName ?? e.baseModel.displayName)
@@ -201,6 +295,7 @@ struct ModelsCollection: ConfigCollection {
             description: "Override the API-reported max. 0 restores the default.",
             valueSchema: .int(min: 0, max: 1_000_000),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.number(.tokens, zero: "Default")),
             reader: { [self] in
                 guard let e = entry(id) else { return .null }
                 return .int(e.overrides.maxOutputTokens ?? e.baseModel.maxOutputTokens ?? 0)
@@ -223,6 +318,7 @@ struct ModelsCollection: ConfigCollection {
             description: "When true, the model is excluded from pickers and agent loop.",
             valueSchema: .bool,
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.bool(on: "Hidden", off: "Shown"), label: "Visibility"),
             reader: { [self] in
                 guard let e = entry(id) else { return .null }
                 return .bool(e.isHidden)
@@ -289,6 +385,7 @@ struct ModelsCollection: ConfigCollection {
             description: "User override list. Pass [] or null to clear and fall back to inferred. Allowed: text_input, text_output, image_input, pdf_input, audio_input, video_input, image_output, audio_output, video_output.",
             valueSchema: .array(.string()),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.stringList(ordered: false, labels: Self.modalityLabels)),
             reader: { [self] in
                 guard let e = entry(id) else { return .null }
                 if let override = e.overrides.modalityOverride {
@@ -331,6 +428,7 @@ struct ModelsCollection: ConfigCollection {
             description: "User override in tokens. 0 clears the override and restores the API/heuristic value.",
             valueSchema: .int(min: 0, max: 10_000_000),
             risk: .sensitive, revertable: true,
+            readable: ConfigReadable(.number(.tokens, zero: "Default")),
             reader: { [self] in
                 guard let e = entry(id) else { return .null }
                 return .int(e.overrides.contextWindow ?? 0)

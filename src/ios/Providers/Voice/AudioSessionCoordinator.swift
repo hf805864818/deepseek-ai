@@ -124,6 +124,28 @@ final class AudioSessionCoordinator {
 
     private var sessionActive = false
 
+    /// [T-voice-mic-preempted] Error from the most recent `apply()`, or nil if it
+    /// succeeded. Lets a caller that just ran `beginAndWait` tell "the session
+    /// never activated" (another app owns the mic — FaceTime, a phone call, a
+    /// Bluetooth device) apart from "activated fine but the input node still
+    /// reported 0 channels", which have completely different user-facing causes.
+    ///
+    /// Written on `sessionQueue` inside apply()'s catch and read from the main
+    /// actor after `beginAndWait`'s barrier, so it needs the same lock as
+    /// `pendingApplies` rather than actor isolation. Cleared at the START of
+    /// every apply so a stale failure can never be attributed to a later attempt.
+    /// Annotated exactly like `pendingApplies`/`pendingLock` below: the lock,
+    /// not actor isolation, is what makes these safe across the main actor and
+    /// `sessionQueue`.
+    nonisolated private static let lastApplyLock = NSLock()
+    nonisolated(unsafe) private static var _lastApplyError: Error?
+
+    /// The most recent activation failure, or nil if the last apply succeeded.
+    /// Only meaningful immediately after `beginAndWait` returns.
+    nonisolated static var lastApplyError: Error? {
+        lastApplyLock.withLock { _lastApplyError }
+    }
+
     private var highest: Intent? { active.max(by: { $0.rawValue < $1.rawValue }) }
 
     private func profile(for intent: Intent) -> (AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions) {
@@ -200,6 +222,9 @@ final class AudioSessionCoordinator {
         Self.pendingLock.withLock { Self.pendingApplies += 1 }
         let t0 = CFAbsoluteTimeGetCurrent()
         Self.sessionQueue.async {
+            // [T-voice-mic-preempted] Clear before attempting, so a success
+            // wipes any earlier failure and a reader can never see a stale one.
+            Self.lastApplyLock.withLock { Self._lastApplyError = nil }
             do {
                 if needsReconfig {
                     try session.setCategory(cat, mode: mode, options: opts)
@@ -212,6 +237,9 @@ final class AudioSessionCoordinator {
             } catch {
                 let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
                 log.error("[VoiceInputDebug][AudioSession] \(reason) apply FAILED after \(String(format: "%.0f", ms))ms: \(error.localizedDescription)")
+                // [T-voice-mic-preempted] Publish the reason so the capture path
+                // can report "mic busy" instead of a generic parse failure.
+                Self.lastApplyLock.withLock { Self._lastApplyError = error }
                 // Roll back the optimistic flag so the next begin() retries the
                 // activation instead of assuming the session is already live.
                 Task { @MainActor in self.sessionActive = false }
@@ -287,6 +315,9 @@ final class AudioSessionCoordinator {
         guard !pausedByExternalAudio else { return }
         pausedByExternalAudio = true
         VoiceOutputPlayer.shared.pause()
+        // [T-tts-external-pause-stuck] Show the pause in the UI. Without this the
+        // capsule kept spinning as "reading" while nothing could play.
+        VoiceOutputState.shared.reflectExternalPause(true)
         logger.info("[AudioSession] \(reason) → TTS paused (external audio)")
     }
 
@@ -295,7 +326,24 @@ final class AudioSessionCoordinator {
         guard pausedByExternalAudio else { return }
         pausedByExternalAudio = false
         VoiceOutputPlayer.shared.resume()
+        VoiceOutputState.shared.reflectExternalPause(false)
         logger.info("[AudioSession] \(reason) → TTS resumed")
+    }
+
+    /// [T-tts-external-pause-stuck] Forget an external-audio pause because the
+    /// user has explicitly asked for playback (read-aloud menu, resume button).
+    /// The matching `.end` / hint-clear signal is not guaranteed: the hint can
+    /// stay true for as long as another app keeps playing, which left the pause
+    /// latched for hours and silently swallowed every later read-aloud request.
+    /// Reply TTS runs under `.playback` + duckOthers, so playing over the other
+    /// app is the expected result of an explicit tap. Returns whether a latch
+    /// was cleared.
+    @discardableResult
+    func clearExternalPauseLatch(reason: String) -> Bool {
+        guard pausedByExternalAudio else { return false }
+        pausedByExternalAudio = false
+        logger.info("[AudioSession] \(reason) → external-audio pause overridden by user")
+        return true
     }
 
     @objc private func handleInterruption(_ note: Notification) {

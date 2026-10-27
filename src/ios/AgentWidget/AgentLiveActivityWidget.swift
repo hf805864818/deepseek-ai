@@ -16,7 +16,7 @@ struct AgentLiveActivityWidget: Widget {
                     HStack(spacing: 3) {
                         Image(systemName: "sparkles")
                             .font(.caption2)
-                        Text(context.state.soulName.isEmpty ? "龙虾Ai" : context.state.soulName)
+                        Text(context.state.soulName.isEmpty ? "Minis" : context.state.soulName)
                             .font(.caption.bold())
                     }
                     .padding(.horizontal, 6)
@@ -75,17 +75,14 @@ struct AgentLiveActivityWidget: Widget {
                                 // .timer must stop ticking (it kept counting up
                                 // even after "Completed" showed). Matches the Lock
                                 // Screen view's guard.
-                                if !session.isCompleted {
+                                if !session.isCompleted, session.showsRunClock {
                                     Text("00:00")
                                         .font(.caption2.monospacedDigit())
                                         .hidden()
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 2)
                                         .overlay {
-                                            Text(context.attributes.startDate, style: .timer)
-                                                .font(.caption2.monospacedDigit())
-                                                .multilineTextAlignment(.center)
-                                                .foregroundStyle(.secondary)
+                                            RunClock(session: session, startDate: context.attributes.startDate)
                                         }
                                         .background(.white.opacity(0.12), in: Capsule())
                                 } else if let finishedAt = context.state.finishedAt {
@@ -124,7 +121,7 @@ struct AgentLiveActivityWidget: Widget {
                                 HStack(spacing: 5) {
                                     Image(systemName: session.toolIcon)
                                         .font(.caption)
-                                        .foregroundStyle(.blue)
+                                        .foregroundStyle(session.isScheduledWait ? .orange : .blue)
                                         .id(session.toolIcon)
                                         .transition(.opacity.animation(.easeInOut(duration: 0.35)))
                                     Text(session.toolStatus)
@@ -133,7 +130,7 @@ struct AgentLiveActivityWidget: Widget {
                                         .lineLimit(1)
                                         .contentTransition(.interpolate)
                                     Spacer()
-                                    if !context.state.privacyMode {
+                                    if !context.state.privacyMode, !session.isScheduledWait {
                                         Text("Loop \(session.loopIteration)")
                                             .font(.caption2.monospacedDigit())
                                             .foregroundStyle(.tertiary)
@@ -220,7 +217,7 @@ struct AgentLockScreenView: View {
                 HStack(spacing: 3) {
                     Image(systemName: "sparkles")
                         .font(.caption2)
-                    Text(state.soulName.isEmpty ? "龙虾Ai" : state.soulName)
+                    Text(state.soulName.isEmpty ? "Minis" : state.soulName)
                         .font(.caption.bold())
                 }
                 .padding(.horizontal, 6)
@@ -232,28 +229,31 @@ struct AgentLockScreenView: View {
                     AudioTogglePill(isPlaying: state.isAudioPlaying)
                 }
                 Spacer()
+                // [T-ios-live-activity-status-summary] Text-only progress.
+                //
+                // The green checkmark that used to sit here duplicated the one
+                // already drawn on each completed task row below (see
+                // `session.isCompleted` further down) — same glyph, same
+                // colour, ~40pt apart. The row icon is the one that carries
+                // per-task meaning, so this badge drops the icon and keeps only
+                // the count, which is the thing the row cannot show.
+                //
+                // The capsule tint still distinguishes the two states, so
+                // removing the glyph costs no information.
                 if state.allCompleted {
-                    HStack(spacing: 3) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.green)
-                        Text("\(state.sessions.count) completed")
-                            .font(.caption.bold())
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.green.opacity(0.18), in: Capsule())
+                    Text(doneSummary(state.sessions.count))
+                        .font(.caption.bold())
+                        .contentTransition(.numericText())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.green.opacity(0.18), in: Capsule())
                 } else {
-                    HStack(spacing: 3) {
-                        Text("\(state.activeSessionCount)")
-                            .font(.caption.bold())
-                            .contentTransition(.numericText())
-                        Text(state.activeSessionCount == 1 ? "session" : "sessions")
-                            .font(.caption.bold())
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.white.opacity(0.15), in: Capsule())
+                    Text(doingSummary(state.activeSessionCount))
+                        .font(.caption.bold())
+                        .contentTransition(.numericText())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.white.opacity(0.15), in: Capsule())
                 }
             }
 
@@ -272,17 +272,14 @@ struct AgentLockScreenView: View {
                                 .foregroundStyle(.tertiary)
                         }
                         Spacer(minLength: 6)
-                        if !session.isCompleted {
+                        if !session.isCompleted, session.showsRunClock {
                             Text("00:00")
                                 .font(.caption2.monospacedDigit())
                                 .hidden()
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
                                 .overlay {
-                                    Text(attributes.startDate, style: .timer)
-                                        .font(.caption2.monospacedDigit())
-                                        .multilineTextAlignment(.center)
-                                        .foregroundStyle(.secondary)
+                                    RunClock(session: session, startDate: attributes.startDate)
                                 }
                                 .background(.white.opacity(0.12), in: Capsule())
                         } else if let finishedAt = state.finishedAt {
@@ -312,7 +309,7 @@ struct AgentLockScreenView: View {
                         HStack(spacing: 5) {
                             Image(systemName: session.toolIcon)
                                 .font(.caption)
-                                .foregroundStyle(.blue)
+                                .foregroundStyle(session.isScheduledWait ? .orange : .blue)
                                 .id(session.toolIcon)
                                 .transition(.opacity.animation(.easeInOut(duration: 0.35)))
                             Text(session.toolStatus)
@@ -322,7 +319,8 @@ struct AgentLockScreenView: View {
                                 .contentTransition(.interpolate)
                             Spacer()
                             // [T-ios-live-activity-privacy-mode] Hide loop count.
-                            if !state.privacyMode {
+                            // [T-live-activity-scheduled] A waiting card has no loop.
+                            if !state.privacyMode, !session.isScheduledWait {
                                 Text("Loop \(session.loopIteration)")
                                     .font(.caption2.monospacedDigit())
                                     .foregroundStyle(.tertiary)
@@ -386,6 +384,35 @@ struct CompactTrailingView: View {
 /// [T-ios-live-activity-privacy-duration] Static "total run time" string for
 /// the completed resting state (e.g. "3m 12s", "1h 5m"). System formatter →
 /// localized unit abbreviations without any catalog dependency.
+/// [T-live-activity-scheduled] The time capsule on a card: how long the task
+/// has run, or, on a card waiting for its next scheduled run, the countdown to
+/// it. Both are system-rendered timers, so the activity needs no per-second
+/// update.
+@available(iOSApplicationExtension 16.2, *)
+struct RunClock: View {
+    let session: LiveSessionSnapshot
+    let startDate: Date
+
+    var body: some View {
+        if session.isScheduledWait, let next = session.nextRunAt {
+            Text(timerInterval: Date()...max(next, Date()), countsDown: true)
+                .font(.caption2.monospacedDigit())
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.orange)
+        } else {
+            Text(startDate, style: .timer)
+                .font(.caption2.monospacedDigit())
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+extension LiveSessionSnapshot {
+    /// A card waiting on another task's completion has no time to show.
+    var showsRunClock: Bool { !(isScheduledWait && nextRunAt == nil) }
+}
+
 @available(iOSApplicationExtension 16.2, *)
 func totalRunTime(from start: Date, to end: Date) -> String {
     let formatter = DateComponentsFormatter()
@@ -415,4 +442,37 @@ extension AgentActivityAttributes.ContentState {
         }
         return result
     }
+}
+
+// MARK: - Status summary text
+
+// [T-ios-live-activity-status-summary] The Lock Screen badge's progress text.
+//
+// Whole-phrase keys, not "\(n) " + a separate word. English puts the count
+// first ("2 doing") and Chinese puts it last ("进行中 2"), so a
+// number-plus-noun concatenation cannot express both — the count has to be an
+// argument inside the localized string, letting each locale place it.
+//
+// `String.LocalizedStringResource` (not `String(localized:)`) because this runs
+// in the widget extension: it resolves against the extension's own bundle at
+// render time, which is what lets a Live Activity follow the device language.
+//
+// Plurals are handled by the catalog's plural rules rather than a Swift
+// ternary, so a locale with more than two forms (ru has three) is expressible
+// without touching this code.
+
+/// "1 done" / "3 done" — English; "已完成 1" — Chinese.
+@available(iOS 16.2, *)
+private func doneSummary(_ count: Int) -> String {
+    String(localized: "live_activity.status.done",
+           defaultValue: "\(count) done",
+           comment: "Lock Screen Live Activity badge: how many agent tasks finished. The number may be placed wherever the language needs it.")
+}
+
+/// "1 doing" / "2 doing" — English; "进行中 2" — Chinese.
+@available(iOS 16.2, *)
+private func doingSummary(_ count: Int) -> String {
+    String(localized: "live_activity.status.doing",
+           defaultValue: "\(count) doing",
+           comment: "Lock Screen Live Activity badge: how many agent tasks are still running. The number may be placed wherever the language needs it.")
 }

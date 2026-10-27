@@ -12,14 +12,14 @@ private let logger = AppLogger(category: "AskMinisIntent")
 /// existing `.openSessionFromIntent` navigation path — no separate agent logic.
 /// New session when `session` is nil; follow-up when a `SessionEntity` is given.
 struct AskMinisIntent: AppIntent {
-    static var title: LocalizedStringResource = "问问龙虾Ai"
-    static var description = IntentDescription("打开龙虾Ai，发送提示并显示对话。可开启新会话，或选择已有会话继续。")
+    static var title: LocalizedStringResource = "Ask Minis"
+    static var description = IntentDescription("Opens Minis, sends your prompt, and shows the conversation. Starts a new session, or continues an existing one when you pick a session.")
 
     // Open the app and land in the conversation (the Siri experience). The send
     // itself still goes through the normal in-app pipeline.
     static var openAppWhenRun = true
 
-    @Parameter(title: "Prompt", requestValueDialog: "你想问龙虾Ai什么？")
+    @Parameter(title: "Prompt", requestValueDialog: "What would you like to ask Minis?")
     var prompt: String
 
     @Parameter(title: "Session", description: "Existing session to continue. Leave empty to start a new session.")
@@ -70,8 +70,9 @@ struct AskMinisIntent: AppIntent {
             for await processing in vm.$isProcessing.values where !processing { break }
         }
 
-        vm.inputText = prompt
-        vm.send()
+        // [T-programmatic-prompt-no-composer] Existing sessions reuse the
+        // user's cached vm — never route the prompt through their composer.
+        vm.send(overrideText: prompt)
 
         let sid = vm.sessionId ?? session?.id ?? ""
         logger.info("AskMinis send sid=\(sid.prefix(8)) new=\(session == nil)")

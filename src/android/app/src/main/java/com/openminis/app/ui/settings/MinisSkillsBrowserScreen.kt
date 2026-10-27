@@ -58,8 +58,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
 
 private enum class HudState {
     HIDDEN, IMPORTING, SUCCESS, ERROR, HINT
@@ -73,7 +71,7 @@ fun MinisSkillsBrowserScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    var currentUrl by remember { mutableStateOf("https://github.com/vbox-Ai/Lobsterskills") }
+    var currentUrl by remember { mutableStateOf("https://github.com/OpenMinis/MinisSkills") }
     var hudState by remember { mutableStateOf(HudState.HIDDEN) }
     var hudMessage by remember { mutableStateOf("") }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
@@ -147,6 +145,21 @@ fun MinisSkillsBrowserScreen(
                         settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
 
                         webViewClient = object : WebViewClient() {
+                            // [T-net-android-phase3] Settings > Network: answer the local entry's
+                            // proxy challenge (WebViewNetworkProxy); any other auth request as before.
+                            override fun onReceivedHttpAuthRequest(view: android.webkit.WebView?, handler: android.webkit.HttpAuthHandler?, host: String?, realm: String?) {
+                                if (handler != null && com.openminis.app.network.WebViewNetworkProxy.answerAuth(handler, host, realm, view?.url)) return
+                                super.onReceivedHttpAuthRequest(view, handler, host, realm)
+                            }
+
+                            // [T-android-webview-render-process-gone] (GH#341)
+                            // AndroidView factory rebuilds on recomposition.
+                            override fun onRenderProcessGone(
+                                view: WebView?,
+                                detail: android.webkit.RenderProcessGoneDetail?,
+                            ): Boolean = com.openminis.app.ui.webview.WebViewRenderProcess
+                                .handle("MinisSkillsBrowserScreen", detail)
+
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 url?.let { currentUrl = it }
                             }
@@ -171,15 +184,23 @@ fun MinisSkillsBrowserScreen(
                                 // T134: hand off intent:// / market:// /
                                 // tel: / mailto: links to the system so the
                                 // user doesn't see ERR_UNKNOWN_URL_SCHEME.
+                                // [T-android-user-initiated-scheme-dispatch]
+                                // Visible skills browser; user-tapped link.
                                 return com.openminis.app.ui.browser
                                     .BrowserExternalSchemeHandler
-                                    .handle(ctx, request?.url)
+                                    .handle(
+                                        ctx,
+                                        request?.url,
+                                        com.openminis.app.ui.browser
+                                            .BrowserExternalSchemeHandler
+                                            .Origin.USER_INITIATED,
+                                    )
                             }
                         }
 
                         webChromeClient = WebChromeClient()
 
-                        loadUrl("https://github.com/vbox-Ai/Lobsterskills")
+                        loadUrl("https://github.com/OpenMinis/MinisSkills")
                     }.also { webViewRef = it }
                 },
                 modifier = Modifier.fillMaxSize(),
@@ -273,17 +294,9 @@ private suspend fun importSkillFromCurrentUrl(
         // updating existing" path so users can refresh in place.
         val rawUrl = toRawGitHubUrl(url)
         val content = withContext(Dispatchers.IO) {
-            val conn = URL(rawUrl).openConnection() as HttpURLConnection
-            conn.connectTimeout = 15_000
-            conn.readTimeout = 15_000
-            try {
-                if (conn.responseCode == 200) {
-                    conn.inputStream.bufferedReader().readText()
-                } else {
-                    null
-                }
-            } finally {
-                conn.disconnect()
+            // [FEAT-261021-16] Follows the default route in Settings > Network.
+            com.openminis.app.network.NetworkUrlRequest.open(com.openminis.app.network.NetworkHttp.DEFAULT_TAG, rawUrl, connectTimeoutMs = 15_000, readTimeoutMs = 15_000).use { r ->
+                if (r.code == 200) r.text() else null
             }
         }
 
@@ -323,9 +336,9 @@ private suspend fun importSkillFromCurrentUrl(
 
 /**
  * Check if the URL points to a specific skill directory (not repo root or non-skill pages).
- * e.g. github.com/vbox-Ai/Lobsterskills/tree/main/exa-search → true
- *      github.com/vbox-Ai/Lobsterskills → false
- *      github.com/vbox-Ai/Lobsterskills/issues → false
+ * e.g. github.com/OpenMinis/MinisSkills/tree/main/exa-search → true
+ *      github.com/OpenMinis/MinisSkills → false
+ *      github.com/OpenMinis/MinisSkills/issues → false
  */
 private fun isSkillDirectoryUrl(url: String): Boolean {
     if (!url.contains("github.com")) return true // Non-GitHub URL, let it try

@@ -2,11 +2,17 @@ import Foundation
 
 /// Single source of truth for every configurable setting in the app.
 ///
-/// Add a new setting in three steps:
+/// Add a new setting in four steps:
 ///   1. Pick a dot-path id (`appearance.theme`, `browser.uaProfile`, …).
 ///   2. Construct a `ConfigField` (or `ConfigCollection` for dynamic
 ///      children) and register it in `ConfigRegistry+Builtins.swift`.
-///   3. Done — the offload bridge, confirmation sheet, audit log,
+///   3. Say how it reads to a person: pass `readable:` (a `ConfigReadable`
+///      — bool / enum labels / number unit / id → name …) and add its label
+///      keys to Localizable.xcstrings. [T-config-readable] This is required:
+///      the field does not compile without it, `.generic(reason:)` is the
+///      only (logged) opt-out, and ConfigReadableKeysTests fails on a label
+///      key with no zh-Hans / zh-Hant translation.
+///   4. Done — the offload bridge, confirmation sheet, audit log,
 ///      revert flow, and `--help` output all derive from this registry.
 ///
 /// Threading: the registry is `@MainActor` because every reader/writer
@@ -29,6 +35,7 @@ final class ConfigRegistry {
         guard !didRegisterBuiltins else { return }
         didRegisterBuiltins = true
         Self.registerBuiltins(into: self)
+        ConfigReadableRenderer.validateRegistry(self)
     }
 
     func register(_ field: ConfigField) {
@@ -40,25 +47,108 @@ final class ConfigRegistry {
     }
 
     /// Look up a field by path. Handles both flat fields and collection
-    /// children (`<base>.<id>.<sub>`). Returns nil for unknown paths.
+    /// children (`<base>.<id>.<leaf>`). Returns nil for unknown paths.
     func resolveField(path: String) -> ConfigField? {
         if let f = fields[path] { return f }
-        // Collection child lookup: split into [base, id, leaf] (leaf
-        // may itself contain dots, e.g. `models.<uuid>.modality.video`).
-        let segments = path.split(separator: ".", maxSplits: 2,
-                                  omittingEmptySubsequences: true).map(String.init)
-        guard segments.count == 3 else { return nil }
-        let base = segments[0]
-        let id = segments[1]
-        guard let coll = collections[base] else { return nil }
-        // The leaf path the collection produces matches its full child
-        // path; we filter by suffix so callers don't need to know the
-        // collection's leaf naming scheme.
-        return coll.fields(for: id).first { $0.path == path }
+        guard let (base, id, leaf) = Self.splitCollectionPath(path),
+              let coll = collections[base] else { return nil }
+        // [T-config-path-dotted-id] OpenMinis#390. Match by LEAF, not by the
+        // whole path. The collection builds its canonical path from its own
+        // spelling of the id (an alias such as subagents' `general`, or the
+        // pre-#390 `~d`-escaped model id), which the caller's spelling need not
+        // equal — whole-path comparison would turn a correctly split path back
+        // into `unknown_path`. Leaves are unique within one child.
+        return coll.fields(for: id).first { Self.leaf(of: $0.path) == leaf }
+    }
+
+    /// [T-config-path-dotted-id] OpenMinis#390. Split a collection child path
+    /// into (base, id, leaf): the topic runs to the FIRST dot, the field starts
+    /// after the LAST dot, and everything in between is the entry id — dots and
+    /// slashes included.
+    ///
+    /// Before this, the path was split with `maxSplits: 2` into exactly three
+    /// parts, so an id was cut at its first dot: `models.<uuid>/mimo-v2.6-pro
+    /// .contextWindow` became id `<uuid>/mimo-v2`, leaf `6-pro.contextWindow`,
+    /// and every model id with a dot (most of them: glm-5.1, gpt-4.1, …)
+    /// answered `unknown_path`. The earlier workaround escaped dots as `~d`,
+    /// which no caller could guess; `get models` prints the raw id.
+    ///
+    /// Relies on leaves being a single segment, which every collection honours
+    /// (guarded by ConfigPathSplitTests). nil when any part would be empty or
+    /// there are fewer than two dots (`topic.entry` names an entry, not a
+    /// field). Empty segments are NOT collapsed, so `models..x` stays invalid.
+    nonisolated static func splitCollectionPath(_ path: String) -> (base: String, id: String, leaf: String)? {
+        guard let first = path.firstIndex(of: "."),
+              let last = path.lastIndex(of: "."),
+              first < last else { return nil }
+        let base = String(path[..<first])
+        let id = String(path[path.index(after: first)..<last])
+        let leaf = String(path[path.index(after: last)...])
+        guard !base.isEmpty, !id.isEmpty, !leaf.isEmpty else { return nil }
+        return (base, id, leaf)
+    }
+
+    /// The part of a field path after its last dot.
+    nonisolated static func leaf(of path: String) -> String {
+        guard let last = path.lastIndex(of: ".") else { return path }
+        return String(path[path.index(after: last)...])
+    }
+
+    /// [T-config-path-dotted-id] OpenMinis#390. The `reason` for an
+    /// `unknown_path` answer, saying which part was wrong and how to find the
+    /// right one. The error code stays `unknown_path`; only the text changes.
+    /// Keep the wording in step with Android `ConfigRegistry.explainUnknownPath`.
+    func explainUnknownPath(_ path: String) -> String {
+        let base = path.firstIndex(of: ".").map { String(path[..<$0]) } ?? path
+        let topicKnown = collections[base] != nil
+            || fields.values.contains { $0.access != .hidden && ($0.path == base || $0.path.hasPrefix(base + ".")) }
+        guard !base.isEmpty, topicKnown else {
+            return "No topic '\(base)'. Run `minis-config list-topics`."
+        }
+        guard let coll = collections[base],
+              let dot = path.firstIndex(of: ".") else {
+            return "No registered field at '\(path)'."
+        }
+        let rest = String(path[path.index(after: dot)...])
+        func leaves(_ id: String) -> [String] {
+            coll.fields(for: id).filter { $0.access != .hidden }.map { Self.leaf(of: $0.path) }
+        }
+        // The whole remainder is an entry id (dots allowed): no field given.
+        let entryLeaves = leaves(rest)
+        if !entryLeaves.isEmpty {
+            return "'\(path)' names an entry, not a field. Append a field, e.g. \(base).\(rest).\(entryLeaves[0]). Fields: \(entryLeaves.joined(separator: ", "))."
+        }
+        if let (_, id, leaf) = Self.splitCollectionPath(path) {
+            let idLeaves = leaves(id)
+            if !idLeaves.isEmpty {
+                return "Unknown field '\(leaf)' for \(base) entry '\(id)'. Fields: \(idLeaves.joined(separator: ", "))."
+            }
+            return Self.noEntryReason(base: base, id: id)
+        }
+        return Self.noEntryReason(base: base, id: rest)
+    }
+
+    nonisolated private static func noEntryReason(base: String, id: String) -> String {
+        "No entry '\(id)' under '\(base)'. Run `minis-config get \(base)` and use an entry_id verbatim — ids may contain dots and slashes, no escaping needed: \(base).<entry_id>.<field>."
     }
 
     func collection(basePath: String) -> ConfigCollection? {
         collections[basePath]
+    }
+
+    /// [T-config-readable] Every registered field, hidden ones included, plus
+    /// one representative child's fields per collection. Used by the launch-
+    /// time readable-template validation only.
+    func allFieldsForValidation() -> [ConfigField] {
+        var out = Array(fields.values)
+        for c in collections.values {
+            if let first = c.childIds().first { out.append(contentsOf: c.fields(for: first)) }
+        }
+        return out.sorted { $0.path < $1.path }
+    }
+
+    func allCollections() -> [ConfigCollection] {
+        collections.values.sorted { $0.basePath < $1.basePath }
     }
 
     /// All registered top-level field paths (excluding hidden), used by

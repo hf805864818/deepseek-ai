@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -40,10 +41,12 @@ import androidx.compose.material.icons.outlined.FormatSize
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Keyboard
+import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material.icons.outlined.Launch
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.ScreenLockPortrait
+import androidx.compose.material.icons.outlined.UnfoldLess
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Icon
@@ -83,6 +86,12 @@ const val KEY_LAUNCH_SESSION = "launch_session"    // 0=Auto, 1=LastSession, 2=N
 const val KEY_RETURN_KEY_BEHAVIOR = "returnKeyBehavior"  // Int 0=Newline (default), 1=Send
 const val KEY_KEEP_SCREEN_AWAKE = "keepScreenAwakeDuringTasks"  // Boolean, default false
 const val KEY_TOOL_PREVIEW = "tool_preview"        // Boolean, default true
+/**
+ * [T-port-fold-tools] Fold consecutive tool calls into one row.
+ * [PAR-261022-05] Default ON on every platform; a stored choice is kept.
+ */
+const val KEY_FOLD_TOOLS = "fold_consecutive_tools" // Boolean, default true
+const val FOLD_TOOLS_DEFAULT = true
 // [T-keyboard-auto-pop default flip] Default ON — most users want the
 // composer ready for a follow-up immediately after the model finishes.
 // Key name mirrors iOS `@AppStorage("chat.autoFocusAfterReply")` so a
@@ -113,7 +122,12 @@ const val KEY_AUTO_GROUPING = "autoGroupingEnabled"  // Boolean, default true
 const val KEY_FONT_CHAT_INPUT = "font_chat_input"  // Int scale level -2..3
 const val KEY_FONT_MESSAGE = "font_message"        // Int scale level -2..3
 const val KEY_FONT_APP_BASE = "font_app_base"      // Int scale level -2..3
-const val KEY_LANGUAGE = "app_language"             // "" = system, "en", "zh", "ja", "ko", "fr", "de", "ru"
+// "" = system, else a BCP-47 tag: "en", "zh", "zh-Hant", "ja", "ko", "fr",
+// "de", "ru", "es". Region-qualified tags are stored in BCP-47 form so both
+// LocaleList.forLanguageTags (API 33+) and LocaleWrap.parseLocale (pre-33)
+// resolve them; every value here must also appear in res/xml/locales_config.xml
+// or Android will not offer the language in system per-app settings.
+const val KEY_LANGUAGE = "app_language"
 
 /** True when Enter (without Shift) should send the message. iOS calls this
  *  `returnKeyBehavior == 1`. Default 0 = Enter inserts a newline (matches
@@ -139,7 +153,23 @@ fun autoExpandThinkingEnabled(context: Context): Boolean =
     getAppearancePrefs(context).getBoolean(KEY_AUTO_EXPAND_THINKING, true)
 
 /** Font scale levels matching iOS: XS(-2) Small(-1) Default(0) Medium(1) Large(2) XL(3) */
-private val fontScaleLabels = listOf("XS", "Small", "Default", "Medium", "Large", "XL")
+/**
+ * [T-android-app-icon-tile-max-width] Upper bound for one app-icon preview tile.
+ *
+ * Matches the 192px the preview bitmap is rasterized at — a launcher icon's
+ * native size, and there is no higher-resolution source to draw from — so the
+ * artwork is never asked to scale far past its own resolution. Without a cap the
+ * weight(1f) tiles reached ~380dp on a tablet and the icons visibly blurred.
+ */
+private val APP_ICON_TILE_MAX_WIDTH = 192.dp
+
+// [T-eu-locales] Slider labels are resources (they read "Default" in every
+// language before); XS and XL are size codes, the same everywhere.
+private val fontScaleLabelRes: List<Int?> = listOf(
+    null, R.string.appearance_font_scale_small, R.string.common_default,
+    R.string.appearance_font_scale_medium, R.string.appearance_font_scale_large, null,
+)
+private val fontScaleCodes = listOf("XS", "", "", "", "", "XL")
 private val fontScaleValues = listOf(-2, -1, 0, 1, 2, 3)
 private val fontScaleMultipliers = listOf(0.88f, 0.94f, 1.0f, 1.06f, 1.12f, 1.21f)
 
@@ -151,12 +181,85 @@ private val languageOptions = listOf(
     LanguageOption("", "\uD83C\uDF10", ""),
     LanguageOption("en", "\uD83C\uDDFA\uD83C\uDDF8", "English"),
     LanguageOption("zh", "\uD83C\uDDE8\uD83C\uDDF3", "简体中文"),
+    // zh-Hant: values-zh-rTW has carried a Traditional Chinese translation
+    // all along, but the picker never listed it and locales_config.xml never
+    // declared it, so those users could not select it at all. The tag is
+    // BCP-47 on purpose \u2014 LocaleList.forLanguageTags and
+    // LocaleWrap.parseLocale both resolve it to the zh-rTW resources,
+    // whereas a bare "zh" would land on Simplified.
+    // [T-android-zh-hant-flag] Flag is HK (\uD83C\uDDED\uD83C\uDDF0), matching
+    // iOS ContentView's own zh-Hant entry.
+    //
+    // It was TW (\uD83C\uDDF9\uD83C\uDDFC), which rendered as an EMPTY BOX on a
+    // Huawei MatePad \u2014 Chinese-market ROMs generally ship fonts with that
+    // flag glyph withheld, so the row had no icon at all.
+    //
+    // HK is the same glyph iOS already uses for this row, so it is the smallest
+    // change that also keeps the platforms aligned. If it turns out to be
+    // withheld on the same devices, the answer is to drop the flag for this row
+    // rather than hunt for a third region \u2014 a script is not a country.
+    //
+    // A region flag is a poor label for a script in any case (zh-Hant is used
+    // in TW, HK and MO alike), but keeping the two platforms on the same glyph
+    // beats inventing a third answer here.
+    LanguageOption("zh-Hant", "\uD83C\uDDED\uD83C\uDDF0", "\u7E41\u9AD4\u4E2D\u6587"),
     LanguageOption("ja", "\uD83C\uDDEF\uD83C\uDDF5", "日本語"),
     LanguageOption("ko", "\uD83C\uDDF0\uD83C\uDDF7", "한국어"),
     LanguageOption("fr", "\uD83C\uDDEB\uD83C\uDDF7", "Français"),
     LanguageOption("de", "\uD83C\uDDE9\uD83C\uDDEA", "Deutsch"),
     // ru: flag \uD83C\uDDF7\uD83C\uDDFA (RU), self-name \u0420\u0443\u0441\u0441\u043A\u0438\u0439 (Russkiy)
     LanguageOption("ru", "\uD83C\uDDF7\uD83C\uDDFA", "\u0420\u0443\u0441\u0441\u043A\u0438\u0439"),
+    // es: flag \uD83C\uDDEA\uD83C\uDDF8 (ES), self-name Espanol
+    LanguageOption("es", "\uD83C\uDDEA\uD83C\uDDF8", "Espa\u00F1ol"),
+    // id: flag \uD83C\uDDEE\uD83C\uDDE9 (ID), self-name Bahasa Indonesia.
+    //
+    // The tag is "id", but the resources live in res/values-in. Android's
+    // resource resolver normalises Indonesian to the legacy code "in" at every
+    // API level \u2014 a values-id directory is never consulted and the app would
+    // silently fall back to English. Verified on Android 13 and 17 that "id"
+    // resolves to values-in through both code paths this picker feeds:
+    // LocaleList.forLanguageTags (API 33+, MainActivity) and new Locale(code)
+    // (LocaleWrap, pre-33). Keep the tag modern here and the directory legacy.
+    LanguageOption("id", "\uD83C\uDDEE\uD83C\uDDE9", "Bahasa Indonesia"),
+    // ms: flag \uD83C\uDDF2\uD83C\uDDFE (MY), self-name Bahasa Melayu. No legacy-code caveat \u2014 the
+    // tag and the directory (values-ms) agree, and Indonesian does not resolve
+    // to it, so the two stay separate despite the shared vocabulary.
+    LanguageOption("ms", "\uD83C\uDDF2\uD83C\uDDFE", "Bahasa Melayu"),
+    // fil: flag \uD83C\uDDF5\uD83C\uDDED (PH), self-name Filipino. The tag is "fil", not "tl" \u2014 both
+    // resolve to values-fil at runtime, but fil is the standardised national
+    // language and the code CLDR and the Play Store use.
+    LanguageOption("fil", "\uD83C\uDDF5\uD83C\uDDED", "Filipino"),
+    // th: flag \uD83C\uDDF9\uD83C\uDDED (TH), self-name \u0E44\u0E17\u0E22. No naming caveat \u2014 values-th serves
+    // both "th" and "th-TH".
+    LanguageOption("th", "\uD83C\uDDF9\uD83C\uDDED", "\u0E44\u0E17\u0E22"),
+    // tr: flag \uD83C\uDDF9\uD83C\uDDF7 (TR), self-name T\u00FCrk\u00E7e. Note the
+    // dotted/dotless i \u2014 see LocaleAwareCase.uppercaseForDisplay for why the
+    // section headers must not use a bare .uppercase() in this language.
+    LanguageOption("tr", "\uD83C\uDDF9\uD83C\uDDF7", "T\u00FCrk\u00E7e"),
+    // pl: flag \uD83C\uDDF5\uD83C\uDDF1 (PL), self-name Polski.
+    LanguageOption("pl", "\uD83C\uDDF5\uD83C\uDDF1", "Polski"),
+    // ro: flag \uD83C\uDDF7\uD83C\uDDF4 (RO), self-name Rom\u00E2n\u0103.
+    LanguageOption("ro", "\uD83C\uDDF7\uD83C\uDDF4", "Rom\u00E2n\u0103"),
+    // pt-BR: flag \uD83C\uDDE7\uD83C\uDDF7 (BR), self-name Portugu\u00EAs (Brasil). Region-qualified on
+    // purpose \u2014 the resources live in values-pt-rBR and the wording is
+    // Brazilian, so the tag should say so rather than claim generic "pt".
+    LanguageOption("pt-BR", "\uD83C\uDDE7\uD83C\uDDF7", "Portugu\u00EAs (Brasil)"),
+    // hr: flag \uD83C\uDDED\uD83C\uDDF7 (HR), self-name Hrvatski. Three CLDR plural
+    // categories (one/few/other) and NO "many" \u2014 unlike Polish, so the
+    // counts pl sends to `many` land on `other` here.
+    LanguageOption("hr", "\uD83C\uDDED\uD83C\uDDF7", "Hrvatski"),
+    // it: flag \uD83C\uDDEE\uD83C\uDDF9 (IT), self-name Italiano.
+    LanguageOption("it", "\uD83C\uDDEE\uD83C\uDDF9", "Italiano"),
+    // nl: flag \uD83C\uDDF3\uD83C\uDDF1 (NL), self-name Nederlands.
+    LanguageOption("nl", "\uD83C\uDDF3\uD83C\uDDF1", "Nederlands"),
+    // hu: flag \uD83C\uDDED\uD83C\uDDFA (HU), self-name Magyar.
+    LanguageOption("hu", "\uD83C\uDDED\uD83C\uDDFA", "Magyar"),
+    // cs: flag \uD83C\uDDE8\uD83C\uDDFF (CZ), self-name \u010Ce\u0161tina.
+    LanguageOption("cs", "\uD83C\uDDE8\uD83C\uDDFF", "\u010Ce\u0161tina"),
+    // fa: flag \uD83C\uDDEE\uD83C\uDDF7 (IR), self-name \u0641\u0627\u0631\u0633\u06CC (Farsi).
+    // The app's only right-to-left language; its text is Persian but the
+    // layout stays left-to-right - see LocaleWrap.forceLtr.
+    LanguageOption("fa", "\uD83C\uDDEE\uD83C\uDDF7", "\u0641\u0627\u0631\u0633\u06CC"),
 )
 
 fun getAppearancePrefs(context: Context): SharedPreferences =
@@ -186,7 +289,11 @@ fun AppearanceScreen(
     var returnKeyBehavior by remember { mutableIntStateOf(prefs.getInt(KEY_RETURN_KEY_BEHAVIOR, 0)) }
     var keepScreenAwake by remember { mutableStateOf(prefs.getBoolean(KEY_KEEP_SCREEN_AWAKE, false)) }
     var toolPreview by remember { mutableStateOf(prefs.getBoolean(KEY_TOOL_PREVIEW, true)) }
+    var foldTools by remember { mutableStateOf(prefs.getBoolean(KEY_FOLD_TOOLS, FOLD_TOOLS_DEFAULT)) }
     var autoFocusAfterReply by remember { mutableStateOf(prefs.getBoolean(KEY_AUTO_FOCUS_AFTER_REPLY, true)) }
+    var confirmBeforeStopping by remember {
+        mutableStateOf(prefs.getBoolean(com.openminis.app.ui.chat.StopConfirmPolicy.SETTINGS_KEY, com.openminis.app.ui.chat.StopConfirmPolicy.DEFAULT_ENABLED))
+    }
     var autoExpandThinking by remember { mutableStateOf(prefs.getBoolean(KEY_AUTO_EXPAND_THINKING, true)) }
     var showChatTitle by remember { mutableStateOf(prefs.getBoolean(KEY_SHOW_CHAT_TITLE, true)) }
     var autoGrouping by remember { mutableStateOf(prefs.getBoolean(KEY_AUTO_GROUPING, true)) }
@@ -358,6 +465,26 @@ fun AppearanceScreen(
             )
         }
 
+        // [T-port-fold-tools] -- Tool Calls --
+        // Fold a run of consecutive tool calls into one "Ran N tools" line.
+        // An open chat re-folds at once through its prefs listener.
+        SettingsSection(
+            header = stringResource(R.string.tool_fold_section),
+            footer = stringResource(R.string.tool_fold_setting_footer),
+        ) {
+            SettingsSwitchRow(
+                icon = Icons.Outlined.UnfoldLess,
+                iconColor = tileTeal,
+                title = stringResource(R.string.tool_fold_setting_title),
+                checked = foldTools,
+                onCheckedChange = {
+                    foldTools = it
+                    prefs.edit().putBoolean(KEY_FOLD_TOOLS, it).apply()
+                },
+                showDivider = false,
+            )
+        }
+
         // [T-thinking-auto-expand-toggle] -- Deep Thinking --
         // Whether a NEW streaming thinking block opens expanded (historical
         // behavior, default ON) or stays collapsed. Only affects the streaming
@@ -395,6 +522,26 @@ fun AppearanceScreen(
                 onCheckedChange = {
                     autoFocusAfterReply = it
                     prefs.edit().putBoolean(KEY_AUTO_FOCUS_AFTER_REPLY, it).apply()
+                },
+                showDivider = false,
+            )
+        }
+
+        // -- Confirm Before Stopping (T-stop-confirm) --
+        // The composer's stop button asks "Stop this task?" first. Default OFF
+        // since [T-stop-mode-longpress]; same key and default as iOS Settings >
+        // Appearance, also switched from the stop button's long-press.
+        SettingsSection(
+            footer = stringResource(R.string.appearance_confirm_before_stopping_footer),
+        ) {
+            SettingsSwitchRow(
+                icon = Icons.Outlined.StopCircle,
+                iconColor = Color(0xFFFF3B30),
+                title = stringResource(R.string.appearance_confirm_before_stopping_title),
+                checked = confirmBeforeStopping,
+                onCheckedChange = {
+                    confirmBeforeStopping = it
+                    prefs.edit().putBoolean(com.openminis.app.ui.chat.StopConfirmPolicy.SETTINGS_KEY, it).apply()
                 },
                 showDivider = false,
             )
@@ -539,22 +686,29 @@ fun AppearanceScreen(
                     R.string.appearance_app_icon_dark,
                     R.mipmap.ic_launcher_classic_dark,
                 ),
-                IconOption(
-                    AppIconRepository.Variant.LegacyLight,
-                    R.string.appearance_app_icon_legacy_light,
-                    R.mipmap.ic_launcher_legacy_light,
-                ),
-                IconOption(
-                    AppIconRepository.Variant.LegacyDark,
-                    R.string.appearance_app_icon_legacy_dark,
-                    R.mipmap.ic_launcher_legacy_dark,
-                ),
             )
+            // [T-android-app-icon-tile-max-width] Cap each tile and centre the
+            // row.
+            //
+            // The tiles are weight(1f) + aspectRatio(1f), so on a tablet they
+            // grew to ~380dp each. The preview bitmap is rasterized at 192px
+            // (a launcher icon's native size — there is no larger source), so
+            // at that size it is being upscaled roughly 4.6x on this display
+            // and visibly blurs. The cap keeps the artwork at or under its own
+            // resolution; the row centres so the three stay together as a group
+            // instead of drifting apart across a wide settings pane.
+            //
+            // Phones are unaffected: a third of a phone-width row is already
+            // well under the cap, so widthIn is inert there and the layout is
+            // byte-identical.
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(
+                    12.dp,
+                    Alignment.CenterHorizontally,
+                ),
             ) {
                 for (option in iconOptions) {
                     val isSelected = selectedAppIcon == option.variant
@@ -581,7 +735,13 @@ fun AppearanceScreen(
                     }
                     Column(
                         modifier = Modifier
-                            .weight(1f)
+                            .weight(1f, fill = false)
+                            // 192dp = the preview bitmap's own 192px, so the
+                            // artwork is never scaled past 1:1 at mdpi and only
+                            // mildly at higher densities. `fill = false` on the
+                            // weight is what lets the tile stop growing at the
+                            // cap instead of being forced to its full share.
+                            .widthIn(max = APP_ICON_TILE_MAX_WIDTH)
                             .clickable {
                                 if (selectedAppIcon != option.variant) {
                                     selectedAppIcon = option.variant
@@ -700,7 +860,8 @@ private fun FontScaleSliderRow(
 ) {
     val idx = fontScaleValues.indexOf(level).coerceIn(0, fontScaleValues.lastIndex)
     var sliderPos by remember(level) { mutableFloatStateOf(idx.toFloat()) }
-    val currentLabel = fontScaleLabels.getOrElse(sliderPos.roundToInt()) { "Default" }
+    val labelIdx = sliderPos.roundToInt().coerceIn(0, fontScaleCodes.lastIndex)
+    val currentLabel = fontScaleLabelRes[labelIdx]?.let { stringResource(it) } ?: fontScaleCodes[labelIdx]
 
     Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
         Row(

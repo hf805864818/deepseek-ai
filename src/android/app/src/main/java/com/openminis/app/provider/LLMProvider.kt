@@ -7,8 +7,12 @@ import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.LLMResponse
 import com.openminis.app.data.model.LLMStreamChunk
 import com.openminis.app.data.model.ThinkingLevel
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.produceIn
+import kotlinx.coroutines.withTimeoutOrNull
 
 interface LLMProvider {
     val name: String
@@ -22,7 +26,12 @@ interface LLMProvider {
     fun effectiveMaxOutputTokens(model: LLMModel): Int =
         model.maxOutputTokens ?: defaultMaxOutputTokens
 
-    /** Provider-level fallback when model.maxOutputTokens is unknown. */
+    /**
+     * Provider-level fallback when model.maxOutputTokens is unknown. 16K is the
+     * iOS default for Gemini and Antigravity; OpenAIProvider (16K Chat
+     * Completions / 32K Responses) and AnthropicProvider (64K) override it,
+     * as their iOS counterparts do. [T-android-max-tokens-default]
+     */
     val defaultMaxOutputTokens: Int get() = 16_384
 
     /**
@@ -111,6 +120,14 @@ interface LLMProvider {
      * default entries above; the catalog ceiling is resolved off the live
      * `model`.
      */
+    /**
+     * [T-ctx-count-reasoning] True when this provider's requests replay past
+     * assistant turns' `reasoningContent` (DeepSeek-style `reasoning_content`
+     * echo, unsigned interleaved thinking). The context meter counts it then,
+     * and the trim ladder may empty it on older turns. Default: not replayed.
+     */
+    fun echoesReasoningContent(thinkingLevel: ThinkingLevel): Boolean = false
+
     fun clampThinkingLevel(level: ThinkingLevel): ThinkingLevel {
         val ceiling = model.catalogMaxThinkingLevel
         return if (level.rank > ceiling.rank) ceiling else level
@@ -158,5 +175,57 @@ fun Flow<LLMStreamChunk>.failOnSilentEmptyCompletion(providerName: String): Flow
             "$providerName: stream completed with no content and no finish reason — treating as transient upstream failure",
         )
         throw LLMError.TransientError("Server returned an empty response (connection dropped or upstream error)")
+    }
+}
+
+/**
+ * [T-compact-idle-timeout] Fail a stream that stops producing, while letting a
+ * slow-but-alive one run as long as it needs.
+ *
+ * The distinction matters because the two are indistinguishable to a total
+ * elapsed-time budget: a long transcript and a dead socket both just "take too
+ * long". Measuring the GAP BETWEEN chunks separates them — a healthy stream
+ * resets the clock thousands of times, a stuck one never resets it once — so a
+ * limit can be strict about hangs without being a limit on length.
+ *
+ * [onTimeout] runs on the collecting coroutine and is expected to throw; it
+ * takes the elapsed idle milliseconds so the caller can word its own error.
+ *
+ * Implemented over a channel rather than by racing a `delay()` against the
+ * flow, so the timer is armed per element and the upstream is left running
+ * untouched between elements. `coroutineScope` bounds the producer: normal
+ * completion, a throw from [onTimeout], and cancellation all tear it down, so
+ * no collection outlives the caller.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+fun <T> Flow<T>.withIdleTimeout(
+    idleMs: Long,
+    onTimeout: (Long) -> Unit,
+): Flow<T> = flow {
+    coroutineScope {
+        val channel = produceIn(this)
+        while (true) {
+            // receiveCatching, not receive(): a normally-closed channel means
+            // the stream ended, which is success, while a close CAUSED by an
+            // upstream error carries that error and must be re-thrown so the
+            // caller sees the provider's failure rather than a silent stop.
+            val result = withTimeoutOrNull(idleMs) { channel.receiveCatching() }
+            if (result == null) {
+                onTimeout(idleMs)
+                // Defensive: a caller whose onTimeout returns instead of
+                // throwing would otherwise spin here forever.
+                throw LLMError.TransientError(
+                    "Stream idle for ${idleMs}ms with no new data"
+                )
+            }
+            if (result.isClosed) {
+                // A close with no cause is the stream ending normally; a close
+                // WITH one is the provider's error, which must reach the caller
+                // rather than looking like a clean finish.
+                result.exceptionOrNull()?.let { throw it }
+                return@coroutineScope
+            }
+            emit(result.getOrThrow())
+        }
     }
 }

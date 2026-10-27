@@ -23,6 +23,41 @@ extension AIChatViewModel {
         let success: Bool
     }
 
+    /// [T-offload-placeholder-write-guard issue #374] Refuse a write whose
+    /// payload is an offload placeholder rather than real content.
+    ///
+    /// `offloadContextIfNeeded` rewrites a historical `file_write`'s `content`
+    /// argument to the `[CONTEXT OFFLOADED] … saved to: <path>` stub to reclaim
+    /// the tokens. From then on that is what the model sees, so a re-issued call
+    /// carries a ~130-character reference where the file body used to be — and
+    /// nothing downstream could tell the difference, so the stub overwrote the
+    /// user's real file and was reported as a success whose byte count matched
+    /// the stub. Returns `nil` (write proceeds) for any genuine content.
+    ///
+    /// Leading whitespace is trimmed before the test so a payload the provider
+    /// prefixed with a newline is still caught.
+    static func offloadPlaceholderRefusal(
+        field: String, value: String, path: String
+    ) -> FileToolResult? {
+        // [T-offload-stub-system-reminder issue #374] Both stub formats are
+        // refused: the current <system-reminder> notice and the legacy
+        // "[CONTEXT OFFLOADED]" text still present in older persisted history
+        // and in sync payloads from a peer on an older build.
+        guard Self.isOffloadedStub(value) else { return nil }
+        let prefix = offloadedStubPrefix
+        logger.warning("[FileTools] REFUSED offload-placeholder write field=\(field) path=\(path)")
+        return FileToolResult(
+            output: """
+            Error: `\(field)` is an offload placeholder ("\(prefix) …"), not real content — \
+            the original text was moved out of context to free tokens and only this reference \
+            remains in the conversation. Nothing was written to \(path); the file is unchanged. \
+            Use file_read on the path named inside the placeholder to recover the real content, \
+            then re-issue this write with it.
+            """,
+            success: false
+        )
+    }
+
     /// Snapshot all files under /var/minis/ with their modification dates.
     func snapshotMinisFiles() -> [String: Date] {
         let fm = FileManager.default
@@ -80,7 +115,7 @@ extension AIChatViewModel {
         case "shared": base = Self.minisSharedPersistentDir
         case "mcp-servers": base = Self.minisMcpServersPersistentDir
         default:
-            guard let sid = sessionId else { return nil }
+            guard let sid = fsSessionId else { return nil }
             base = Self.minisPersistentBase
                 .appendingPathComponent(sid, isDirectory: true)
                 .appendingPathComponent(host, isDirectory: true)
@@ -117,6 +152,11 @@ extension AIChatViewModel {
                 logger.notice("📂[RESOLVE] stale mount entry, trying fallbacks…")
             }
             // Mount table has no entry — fall back to resolveMinisURL with self.sessionId
+            // [T-minisurl-wrong-active-session] This calls the INSTANCE
+            // overload above (String argument), which already scopes session
+            // hosts to self.sessionId — do not route it through the static
+            // resolver, whose activeSessionId fallback is the frontmost-UI
+            // session and wrong for background agent loops.
             if let minisURL = linuxPathToMinisURL(linuxPath),
                let resolved = resolveMinisURL(minisURL) {
                 let exists = FileManager.default.fileExists(atPath: resolved.path)
@@ -258,13 +298,21 @@ extension AIChatViewModel {
             return FileToolResult(output: "Error: No such file: \(path)", success: false)
         }
 
-        // Check for binary content (null bytes in first 512 bytes)
+        // [T-filetool-io-offmain] Read off the main thread with a timeout; an
+        // iCloud file is downloaded first and read under file coordination.
+        // A plain read() of a not-yet-downloaded iCloud file froze the main
+        // thread until the watchdog killed the app (see FileToolIO).
         let fileData: Data
         do {
-            fileData = try Data(contentsOf: hostURL)
+            fileData = try await FileToolIO.run("Reading \(path)", url: hostURL) { try FileToolIO.readData(hostURL, cancellation: $0) }
+        } catch let ioError as FileToolIO.IOError {
+            AppLogger(category: "FileTool").warning("[FileTool] read failed path=\(path): \(ioError)")
+            return FileToolResult(output: "Error reading \(path): \(ioError)", success: false)
         } catch {
             return FileToolResult(output: "Error reading \(path): \(error.localizedDescription)", success: false)
         }
+
+        // Check for binary content (null bytes in first 512 bytes)
 
         let sampleSize = min(fileData.count, 512)
         let sample = fileData.prefix(sampleSize)
@@ -306,14 +354,21 @@ extension AIChatViewModel {
 
         // Apply max_length truncation.
         //
-        // For `tail`, take from the END of the content (the whole point of
-        // tail is "show me the last N lines"). For head/offset, take from the
-        // start. Both back off to whole-line boundaries so a partial line
-        // never lands in the middle of the truncated output.
+        // [T-fileread-truncation-header] The header used to keep reporting the
+        // line range chosen BEFORE this truncation, so a 1324-line file cut at
+        // 80 000 chars still announced "showing lines 1-1324 of 1324" — the
+        // agent read that as "the whole file arrived" and never paged on. The
+        // `(truncated at N chars)` note contradicted the range right next to
+        // it, and offered nothing actionable.
+        //
+        // So the truncated branch now recomputes which lines actually survived
+        // and hands back the offset to resume from. Everything here is inside
+        // `content.count > maxLength`; the untruncated path is byte-identical
+        // to before.
         var wasTruncated = false
         var effectiveStart = displayStart
         var effectiveEnd = displayEnd
-        var nextOffset: Int? = nil
+        var nextOffset: Int?
         if content.count > maxLength {
             wasTruncated = true
             if direction == "tail" {
@@ -351,7 +406,7 @@ extension AIChatViewModel {
                 // Named to match the tool's own `offset` parameter so the model
                 // can copy it straight into the next call.
                 header += ", next_offset=\(nextOffset)"
-            } else if direction != "tail" {
+            } else {
                 header += ", retry with a smaller lines value"
             }
         }
@@ -376,6 +431,19 @@ extension AIChatViewModel {
         #if DEBUG
         print("[FileWrite] ▶ START path=\(path) sessionId=\(self.sessionId ?? "<nil>") contentBytes=\(content.utf8.count)")
         #endif
+
+        // [T-offload-placeholder-write-guard issue #374] Refuse to write an
+        // offload placeholder as file content. Offloading rewrites a historical
+        // file_write's `content` to the stub, so a re-issued call carries the
+        // reference instead of the body and would overwrite the real file with
+        // it. The main gate is in +ConcurrentTools.swift before dispatch; this
+        // is defense-in-depth for every other caller of this handler (debug
+        // RPCs, sub-agent tool paths) so the check cannot be routed around.
+        if let offloadRefusal = Self.offloadPlaceholderRefusal(
+            field: "content", value: content, path: path
+        ) {
+            return offloadRefusal
+        }
 
         // Pre-reject writes to read-only mounts using the Linux path directly.
         // This avoids the firmlink / symlink / case-sensitivity pitfalls of
@@ -477,18 +545,6 @@ extension AIChatViewModel {
         let appendMode = (dict["append"] as? Bool) ?? false
         let createDirs = (dict["create_dirs"] as? Bool) ?? false
 
-        let fm = FileManager.default
-        let parentDir = hostURL.deletingLastPathComponent()
-
-        // Create parent directories if needed
-        if createDirs || !fm.fileExists(atPath: parentDir.path) {
-            do {
-                try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
-            } catch {
-                return FileToolResult(output: "Error creating directories: \(error.localizedDescription)", success: false)
-            }
-        }
-
         guard let contentData = content.data(using: .utf8) else {
             return FileToolResult(output: "Error: Content is not valid UTF-8", success: false)
         }
@@ -524,22 +580,21 @@ extension AIChatViewModel {
             }
         }
 
+        // [T-filetool-io-offmain] Create the parent directory (if needed) and
+        // write off the main thread with a timeout; an iCloud target is
+        // written under file coordination. The directory is now created after
+        // the read-only and mount checks above, not before them.
         do {
-            if appendMode, fm.fileExists(atPath: hostURL.path) {
-                let handle = try FileHandle(forWritingTo: hostURL)
-                handle.seekToEndOfFile()
-                handle.write(contentData)
-                handle.closeFile()
-                #if DEBUG
-                print("[FileWrite] APPENDED \(contentData.count) bytes to \(hostURL.path)")
-                #endif
-            } else {
-                try contentData.write(to: hostURL)
-                #if DEBUG
-                let landedSize = (try? FileManager.default.attributesOfItem(atPath: hostURL.path)[.size] as? Int) ?? -1
-                print("[FileWrite] WROTE \(contentData.count) bytes to \(hostURL.path) (on-disk size now \(landedSize))")
-                #endif
+            try await FileToolIO.run("Writing \(path)", writes: true, url: hostURL) {
+                try FileToolIO.writeData(contentData, to: hostURL, append: appendMode,
+                                         createDirs: createDirs, cancellation: $0)
             }
+            #if DEBUG
+            print("[FileWrite] \(appendMode ? "APPENDED" : "WROTE") \(contentData.count) bytes to \(hostURL.path)")
+            #endif
+        } catch let ioError as FileToolIO.IOError {
+            AppLogger(category: "FileTool").warning("[FileTool] write failed path=\(path): \(ioError)")
+            return FileToolResult(output: "Error writing \(path): \(ioError)", success: false)
         } catch {
             #if DEBUG
             print("[FileWrite] ✗ WRITE ERROR path=\(path) url=\(hostURL.path) err=\(error.localizedDescription)")
@@ -572,6 +627,15 @@ extension AIChatViewModel {
             return FileToolResult(output: "Error: Missing required parameters (path, old_string, new_string)", success: false)
         }
 
+        // [T-offload-placeholder-write-guard issue #374] See executeFileWrite.
+        // Only the REPLACEMENT text is checked: a placeholder in `old_string` is
+        // just a search that will not match, which is reported normally below.
+        if let offloadRefusal = Self.offloadPlaceholderRefusal(
+            field: "new_string", value: newString, path: path
+        ) {
+            return offloadRefusal
+        }
+
         // Pre-reject edits to read-only mounts via Linux path first — immune
         // to firmlink / case-sensitivity issues that can hide mount membership.
         if MountedFolderCoordinator.isLinuxPathUnderReadOnlyMount(path) {
@@ -597,106 +661,42 @@ extension AIChatViewModel {
             return FileToolResult(output: "Error: File does not exist: \(path). Use file_write to create new files.", success: false)
         }
 
-        guard let fileContent = try? String(contentsOf: hostURL, encoding: .utf8) else {
-            return FileToolResult(output: "Error: Could not read \(path) as UTF-8 text", success: false)
-        }
-
         guard !oldString.isEmpty else {
             return FileToolResult(output: "Error: old_string must not be empty. Use file_write to create or overwrite files.", success: false)
         }
 
         let replaceAll = (dict["replace_all"] as? Bool) ?? false
-        let strictRanges = Self.findAllRanges(of: oldString, in: fileContent)
 
-        // Fuzzy fallback. AIs routinely emit smart quotes as ASCII quotes
-        // (Claude tokenizer especially) and drop trailing whitespace or
-        // collapse runs of inline spaces when re-emitting code/prose they
-        // just read. Strict byte-equality matching then rejects edits the
-        // user clearly intended. When strict fails, normalize BOTH sides
-        // (quotes, trailing whitespace, runs of inline spaces) and search
-        // the normalized text — but apply the replacement against the
-        // ORIGINAL byte range so the file's actual bytes are preserved
-        // around the swap. Surface "fuzzy" in the success message so the
-        // model learns its old_string didn't match verbatim.
-        let fuzzyNote: String?
-        let editRanges: [Range<String.Index>]
-        if !strictRanges.isEmpty {
-            editRanges = strictRanges
-            fuzzyNote = nil
-        } else {
-            let (normFile, fileMap) = Self.normalizeForFuzzyMatch(fileContent)
-            let (normOld, _) = Self.normalizeForFuzzyMatch(oldString)
-            let normRanges = Self.findAllRanges(of: normOld, in: normFile)
-            if normRanges.isEmpty {
-                let preview = Self.buildFileEditPreview(
-                    fileContent: fileContent,
-                    oldString: oldString,
-                    normFile: normFile,
-                    normOld: normOld
-                )
-                return FileToolResult(
-                    output: "Error: old_string not found in \(path). Use file_read to view current file contents before editing.\n\n\(preview)",
-                    success: false
-                )
-            }
-            // Map normalized character offsets back to original String.Index
-            // ranges. The map array stores the original index for each char
-            // in normFile; we look up the start char's mapping and walk to
-            // the end char's mapping (+1) to get the matching original
-            // range. This is robust across multi-byte UTF-8 because both
-            // sides are operated on as Character sequences.
-            var mapped: [Range<String.Index>] = []
-            mapped.reserveCapacity(normRanges.count)
-            for r in normRanges {
-                let startOffset = normFile.distance(from: normFile.startIndex, to: r.lowerBound)
-                let endOffset = normFile.distance(from: normFile.startIndex, to: r.upperBound)
-                guard startOffset < fileMap.count else { continue }
-                let originalStart = fileMap[startOffset]
-                let originalEnd: String.Index
-                if endOffset == 0 {
-                    originalEnd = fileContent.startIndex
-                } else if endOffset <= fileMap.count {
-                    // Use the next char's mapped start (or file end) as the
-                    // exclusive upper bound so we don't truncate.
-                    let lastIncluded = fileMap[endOffset - 1]
-                    originalEnd = fileContent.index(after: lastIncluded)
-                } else {
-                    originalEnd = fileContent.endIndex
-                }
-                mapped.append(originalStart..<originalEnd)
-            }
-            editRanges = mapped
-            fuzzyNote = "fuzzy-matched: quotes/whitespace normalized"
-        }
-
-        if editRanges.count > 1 && !replaceAll {
-            return FileToolResult(
-                output: "Error: old_string matches \(editRanges.count) locations in \(path). Provide more surrounding context to make the match unique, or set replace_all: true to replace all occurrences.",
-                success: false
-            )
-        }
-
-        // Apply replacements from the last range backwards so earlier
-        // indices stay valid as we mutate the string.
-        var updatedContent = fileContent
-        for range in editRanges.reversed() {
-            updatedContent.replaceSubrange(range, with: newString)
-        }
-
-        guard let writeData = updatedContent.data(using: .utf8) else {
-            return FileToolResult(output: "Error: Updated content is not valid UTF-8", success: false)
-        }
-
+        // [T-filetool-io-offmain] Read, match/replace and write back off the
+        // main thread, with a timeout. An iCloud file is downloaded first and
+        // edited under one coordinated read+write. This String(contentsOf:)
+        // used to run on the main actor: on 2026-10-02 an edit of a mounted
+        // Surge iCloud config blocked in read() for 75s and FrontBoard's
+        // watchdog killed the app, twice. The matching code itself moved
+        // unchanged into FileToolIO.applyEdit.
+        let outcome: FileToolIO.EditOutcome
         do {
-            try writeData.write(to: hostURL)
+            outcome = try await FileToolIO.run("Editing \(path)", writes: true, url: hostURL) {
+                try FileToolIO.editFile(hostURL, path: path, oldString: oldString, newString: newString,
+                                        replaceAll: replaceAll, cancellation: $0)
+            }
+        } catch let ioError as FileToolIO.IOError {
+            AppLogger(category: "FileTool").warning("[FileTool] edit failed path=\(path): \(ioError)")
+            return FileToolResult(output: "Error editing \(path): \(ioError)", success: false)
         } catch {
-            return FileToolResult(output: "Error writing \(path): \(error.localizedDescription)", success: false)
+            return FileToolResult(output: "Error editing \(path): \(error.localizedDescription)", success: false)
+        }
+        guard case let .edited(replacementCount, bytes, fuzzyNote) = outcome else {
+            if case let .failed(message) = outcome {
+                return FileToolResult(output: message, success: false)
+            }
+            return FileToolResult(output: "Error editing \(path)", success: false)
         }
 
         ensureFakefsMetadata(for: path, isDirectory: false)
 
-        let replacements = editRanges.count == 1 ? "1 replacement" : "\(editRanges.count) replacements"
-        var result = "Edited \(path) (\(replacements), \(updatedContent.utf8.count) bytes)"
+        let replacements = replacementCount == 1 ? "1 replacement" : "\(replacementCount) replacements"
+        var result = "Edited \(path) (\(replacements), \(bytes) bytes)"
         if let note = fuzzyNote {
             result += " — \(note)"
         }
@@ -704,148 +704,6 @@ extension AIChatViewModel {
             result += "\nminis_url: \(minisURL)"
         }
         return FileToolResult(output: result, success: true)
-    }
-
-    /// Find every (non-overlapping) range of `needle` in `haystack`,
-    /// returning ranges in ascending order. Empty needle returns [].
-    private static func findAllRanges(of needle: String, in haystack: String) -> [Range<String.Index>] {
-        guard !needle.isEmpty else { return [] }
-        var results: [Range<String.Index>] = []
-        var searchStart = haystack.startIndex
-        while searchStart < haystack.endIndex,
-              let r = haystack.range(of: needle, range: searchStart..<haystack.endIndex) {
-            results.append(r)
-            searchStart = r.upperBound
-        }
-        return results
-    }
-
-    /// Normalize text for fuzzy file_edit matching. Returns the normalized
-    /// string AND a parallel array mapping each normalized character's
-    /// position back to the corresponding original `String.Index`. The
-    /// caller uses this map to translate a match position in the
-    /// normalized string into the original file's byte range so the
-    /// replacement preserves the file's actual bytes outside the match.
-    ///
-    /// Rules:
-    ///   - Smart quotes → ASCII quotes
-    ///     U+201C/U+201D → `"`,  U+2018/U+2019 → `'`
-    ///   - Each line's trailing whitespace dropped
-    ///   - Runs of inline ASCII spaces collapsed to a single space
-    ///     (but only between non-whitespace — leading indent on a line
-    ///     is preserved verbatim so source code formatting isn't lost)
-    ///
-    /// Tabs and other whitespace are left intact so indentation-significant
-    /// files (Python, Makefile) are still matchable strictly when the
-    /// model emits tabs correctly.
-    private static func normalizeForFuzzyMatch(_ text: String) -> (String, [String.Index]) {
-        var out = String()
-        out.reserveCapacity(text.count)
-        var map: [String.Index] = []
-        map.reserveCapacity(text.count)
-
-        // First pass: substitute characters one-by-one, tracking trailing
-        // whitespace per line and inline-space collapsing.
-        // We process character-by-character, peeking at the next non-space
-        // to decide whether trailing spaces should be dropped.
-        let chars = Array(text)
-        let indices = Array(text.indices)
-        var i = 0
-        var atLineStart = true   // true until first non-whitespace on the line
-        while i < chars.count {
-            let ch = chars[i]
-            // Newline always emitted (with original mapping). Resets
-            // atLineStart for the next line.
-            if ch == "\n" {
-                out.append(ch); map.append(indices[i])
-                atLineStart = true
-                i += 1
-                continue
-            }
-            // Substitute smart quotes.
-            var emit: Character = ch
-            switch ch {
-            case "\u{201C}", "\u{201D}": emit = "\""
-            case "\u{2018}", "\u{2019}": emit = "'"
-            default: break
-            }
-            // Trailing whitespace drop: if this is an ASCII space and
-            // every remaining char before the next '\n' (or end) is also
-            // a space, drop the run.
-            if ch == " " {
-                // Look ahead to next non-space
-                var j = i
-                while j < chars.count, chars[j] == " " { j += 1 }
-                let isTrailing = (j == chars.count) || (chars[j] == "\n")
-                if isTrailing {
-                    // Skip this whole trailing whitespace run.
-                    i = j
-                    continue
-                }
-                // Inline space — collapse runs to a single space UNLESS
-                // we're at the start of a line (preserve indentation).
-                if atLineStart {
-                    // Leading indent: emit every space verbatim.
-                    for k in i..<j {
-                        out.append(" "); map.append(indices[k])
-                    }
-                    i = j
-                    atLineStart = false
-                    continue
-                }
-                // Inline collapse: emit one space mapped to the first
-                // space's index.
-                out.append(" "); map.append(indices[i])
-                i = j
-                continue
-            }
-            out.append(emit); map.append(indices[i])
-            atLineStart = false
-            i += 1
-        }
-        return (out, map)
-    }
-
-    /// Build a context-rich preview for file_edit miss. We try to locate
-    /// the most likely region using a heuristic: search the first 60 chars
-    /// of the (normalized) old_string against the (normalized) file. If
-    /// found, return ±10 lines of context around that hit. Otherwise fall
-    /// back to the original first-20-lines preview so the AI at least sees
-    /// the file head.
-    private static func buildFileEditPreview(
-        fileContent: String,
-        oldString: String,
-        normFile: String,
-        normOld: String
-    ) -> String {
-        // Use first ~60 chars of normalized old as anchor; many failed
-        // matches differ later in the string but the start lines up.
-        let probeLen = min(60, normOld.count)
-        let probeEnd = normOld.index(normOld.startIndex, offsetBy: probeLen)
-        let probe = String(normOld[..<probeEnd])
-        var anchorLine: Int? = nil
-        if !probe.isEmpty, let r = normFile.range(of: probe) {
-            // Convert match offset to line number in the ORIGINAL file.
-            let offset = normFile.distance(from: normFile.startIndex, to: r.lowerBound)
-            // Walk normFile up to offset, counting newlines; this is the
-            // same line index in the original file because normalization
-            // never adds or removes \n.
-            let prefix = normFile[normFile.startIndex..<r.lowerBound]
-            anchorLine = prefix.filter { $0 == "\n" }.count
-        }
-        let lines = fileContent.components(separatedBy: "\n")
-        if let a = anchorLine {
-            let start = max(0, a - 10)
-            let end = min(lines.count, a + 11)
-            var out = "Closest match in file (lines \(start + 1)–\(end), normalized old_string anchor at line \(a + 1)):\n"
-            out += lines[start..<end].enumerated()
-                .map { "\(start + $0.offset + 1): \($0.element)" }
-                .joined(separator: "\n")
-            out += "\n\nNote: file may use smart quotes (\u{201C}\u{201D}\u{2018}\u{2019}), tabs, or trailing whitespace your old_string omits. Re-read the file and copy the exact bytes."
-            return out
-        }
-        let preview = lines.prefix(20).enumerated().map { "\($0.offset + 1): \($0.element)" }.joined(separator: "\n")
-        return "First 20 lines:\n\(preview)"
     }
 
 }

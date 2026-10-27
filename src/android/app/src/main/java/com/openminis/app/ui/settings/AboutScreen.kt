@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material3.MaterialTheme
@@ -30,6 +31,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
+import com.openminis.app.AppBuildInfo
 import com.openminis.app.BuildConfig
 import com.openminis.app.R
 import com.openminis.app.ui.components.openExternalUrl
@@ -87,6 +89,16 @@ fun AboutScreen(onBack: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // [T-android-about-build-date] Selectable so it can be copied
+            // into a bug report.
+            val buildDate = remember(context) { AppBuildInfo.buildDate(context) }
+            SelectionContainer {
+                Text(
+                    stringResource(R.string.about_built_format, buildDate),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                )
+            }
             Text(
                 stringResource(R.string.about_minis_tagline),
                 style = MaterialTheme.typography.bodyMedium,
@@ -106,7 +118,7 @@ fun AboutScreen(onBack: () -> Unit) {
                 // LocalInAppBrowserLauncher ambient defaults to a no-op when
                 // no InAppBrowserHost is in the tree above this screen — and
                 // nothing wraps Settings, so the row used to be a dead tap.
-                onClick = { openExternalUrl(context, "https://github.com/vbox-Ai/Lobster-APP") },
+                onClick = { openExternalUrl(context, "https://github.com/OpenMinis/OpenMinis") },
                 trailing = { ExternalLinkIcon() },
                 showDivider = false,
             )

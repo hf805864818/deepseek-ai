@@ -718,12 +718,6 @@ extension AIChatViewModel {
         // Gemini provider restore if the count doesn't match the new history.
         pendingThoughtSignatures.removeAll()
 
-        // Subagent sessions belong to the old conversation
-        for subagent in activeSubagents {
-            subagent.cancel()
-        }
-        activeSubagents.removeAll()
-
         // Reset per-turn flags
         hasClearedTTSForCurrentTurn = false
         // Note: heartbeatToolCallCount is a local var in runAgentLoop,

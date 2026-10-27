@@ -3,7 +3,8 @@ package com.openminis.app.provider.anthropic
 import android.util.Base64
 import com.openminis.app.data.model.AgentContentPart
 import com.openminis.app.data.model.AgentToolDefinition
-import com.openminis.app.data.model.sanitizeToolId
+import com.openminis.app.data.model.WireToolIdMap
+import com.openminis.app.data.model.logWireToolIds
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.LLMModel
@@ -45,8 +46,15 @@ class AnthropicProvider(
      * request. Only set for custom-base Anthropic-compat instances.
      */
     private val customUserAgent: String? = null,
-) : LLMProvider {
+) : LLMProvider, com.openminis.app.network.NetworkTagged {
     override val name = "Anthropic"
+
+    /**
+     * [T-quota-claude-subscription] The instance this provider serves, set by
+     * ProviderFactory for OAuth (Claude subscription) instances only. Every
+     * reply's `anthropic-ratelimit-unified-*` headers feed its quota.
+     */
+    var quotaInstanceId: String? = null
     override val defaultMaxOutputTokens: Int get() = 64_000
 
     /**
@@ -73,7 +81,7 @@ class AnthropicProvider(
     /** Use Bearer auth for custom (non-Anthropic) base URLs or OAuth. */
     private val isCustomEndpoint: Boolean = basePath != "https://api.anthropic.com"
 
-    private val client = OkHttpClient.Builder()
+    private val baseClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.MINUTES)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -81,6 +89,17 @@ class AnthropicProvider(
         // Network-transition eviction must reach provider connections.
         .connectionPool(com.openminis.app.network.NetworkMonitor.sharedLLMConnectionPool)
         .build()
+
+    /** [T-net-android-phase3] Policy tag (prov:<instanceId>), set by ProviderFactory. */
+    override var netTag: String? = null
+
+    /**
+     * [T-net-android-phase3] The client for this request: [baseClient] itself
+     * unless Settings > Network routes this provider through the local entry
+     * (NetworkHttp). Read per request, so a route change applies to the next
+     * request without rebuilding the provider.
+     */
+    private val client: OkHttpClient get() = com.openminis.app.network.NetworkHttp.client(netTag, baseClient)
 
     override suspend fun sendMessageClamped(
         messages: List<LLMMessage>,
@@ -94,6 +113,7 @@ class AnthropicProvider(
         val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = false, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel)
         val request = buildRequest(body.toString(), body)
         val response = client.newCall(request).execute()
+        if (isOAuth) com.openminis.app.quota.QuotaObservationSink.recordAnthropicResponse(quotaInstanceId, response.headers)
         val responseBody = response.body?.string() ?: ""
 
         if (!response.isSuccessful) {
@@ -143,6 +163,8 @@ class AnthropicProvider(
 
         val response = client.newCall(request).execute()
         val durationMs = System.currentTimeMillis() - startTime
+        // [T-quota-claude-subscription] Errors included: a 429 still reports usage.
+        if (isOAuth) com.openminis.app.quota.QuotaObservationSink.recordAnthropicResponse(quotaInstanceId, response.headers)
 
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: ""
@@ -197,7 +219,23 @@ class AnthropicProvider(
                 if (payload == "[DONE]") break
 
                 val event = try { JSONObject(payload) } catch (_: Exception) { continue }
-                android.util.Log.d("ToolChain[Provider]", "RAW SSE: $payload")
+                // [T-android-vm-store-leak] Gated on DEBUG. This dumps the ENTIRE
+                // raw SSE payload for every event — ~8.5k lines and 1.4 MB in a
+                // 3-hour device log, 20% of the whole file. The `$payload`
+                // interpolation builds that string BEFORE logcat decides whether
+                // anything is listening, so a release build paid the allocation
+                // and the I/O in full. Note the T321 summary right below this
+                // deliberately logs only counts and lengths "never the actual
+                // delta text — keeps log volume bounded"; this line was quietly
+                // undoing that.
+                //
+                // NOT the cause of the stutter this was filed under (the log
+                // shows the heaviest SSE hour had ZERO of the blocking GCs), but
+                // it is real per-token overhead on the hot streaming path and
+                // does not belong in a shipped build.
+                if (com.openminis.app.BuildConfig.DEBUG) {
+                    android.util.Log.d("ToolChain[Provider]", "RAW SSE: $payload")
+                }
                 val eventType = event.safeOptString("type", "")
 
                 when (eventType) {
@@ -232,7 +270,10 @@ class AnthropicProvider(
                                 val partial = delta.safeOptString("partial_json", "")
                                 if (partial.isNotEmpty() && currentToolId != null) {
                                     toolInputBuffer.append(partial)
-                                    android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta id=$currentToolId accumulated=${toolInputBuffer.length}chars")
+                                    // [T-android-log-hotpath] Fires per tool-argument chunk.
+                                    if (com.openminis.app.logging.AppLogger.traceEnabled) {
+                                        android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta id=$currentToolId accumulated=${toolInputBuffer.length}chars")
+                                    }
                                     send(LLMStreamChunk.ToolInputDelta(currentToolId!!, toolInputBuffer.toString()))
                                 }
                             }
@@ -256,9 +297,50 @@ class AnthropicProvider(
                         event.optJSONObject("usage")?.let { usage ->
                             send(LLMStreamChunk.Usage(parseUsage(usage)))
                         }
-                        val stopReason = event.optJSONObject("delta")
-                            ?.safeOptString("stop_reason", "")?.ifEmpty { null }
-                        send(LLMStreamChunk.Finished(stopReason))
+                        val delta = event.optJSONObject("delta")
+                        val stopReason = delta?.safeOptString("stop_reason", "")?.ifEmpty { null }
+                        // [FIX-261018-12] A refusal's stop_details says why
+                        // (category "cyber", the policy explanation).
+                        val details = if (stopReason == "refusal") delta?.optJSONObject("stop_details") else null
+                        send(LLMStreamChunk.Finished(
+                            stopReason,
+                            refusalCategory = details?.safeOptString("category", "")?.ifEmpty { null },
+                            refusalExplanation = details?.safeOptString("explanation", "")?.ifEmpty { null },
+                        ))
+                    }
+                    // [T-android-fallback-providererror] Anthropic can emit an
+                    // `error` frame MID-STREAM (overloaded_error, rate-limit,
+                    // an invalidated key) after tokens have already flowed.
+                    // This `when` had no branch for it, so the frame was
+                    // ignored, the loop ran to EOF and the flow completed
+                    // NORMALLY — the turn looked successful, nothing threw, and
+                    // the group-fallback decision was never reached. Throwing
+                    // here routes it through the same `catch` below as any
+                    // other stream failure (`cancel("Stream error", mapError(e))`),
+                    // which is what carries the error to the fallback logic.
+                    "error" -> {
+                        val err = event.optJSONObject("error")
+                        val errType = err?.safeOptString("type", "") ?: "error"
+                        val errMessage = err?.safeOptString("message", "") ?: payload.take(500)
+                        android.util.Log.w(
+                            "AnthropicProvider",
+                            "SSE error frame mid-stream: type=$errType message=${errMessage.take(200)}",
+                        )
+                        // Map the documented error `type` onto the same LLMError
+                        // shapes mapHttpError produces for the equivalent HTTP
+                        // status, so downstream classification (isFallbackable /
+                        // isHttpServerError) behaves identically whether the
+                        // failure arrived as a status code or as a frame.
+                        throw when (errType) {
+                            "overloaded_error" ->
+                                LLMError.TransientError("[$errType] $errMessage", httpStatus = 529)
+                            "api_error" ->
+                                LLMError.TransientError("[$errType] $errMessage", httpStatus = 500)
+                            "rate_limit_error" -> LLMError.RateLimited()
+                            "authentication_error", "permission_error" ->
+                                LLMError.InvalidApiKey("[$errType] $errMessage")
+                            else -> LLMError.ProviderError("[$errType] $errMessage")
+                        }
                     }
                 }
             }
@@ -361,7 +443,8 @@ class AnthropicProvider(
         com.openminis.app.logging.AppLogger.info(
             "Thinking",
             "[resolve] provider=anthropic model=${model.id} level=${thinkingLevel.name} " +
-                "shape=[${thinkShape.keys.sorted().joinToString(",")}]",
+                "shape=[${thinkShape.keys.sorted().joinToString(",")}]" +
+                (if (thinkingLevel.isEnabled) "" else " off=${offThinking(model.id).name}"),
         )
         if (thinkingLevel.isEnabled) {
             if (modelUsesAdaptiveThinking(model.id)) {
@@ -394,15 +477,35 @@ class AnthropicProvider(
                     }
                 }
             }
-        } else if (modelUsesAdaptiveThinking(model.id)) {
-            // Adaptive-generation models (4.6+/5) think by DEFAULT when the
-            // request carries no thinking field at all — "off" must be sent
-            // explicitly, or small-maxTokens calls burn the whole budget on
-            // thinking_tokens and return zero text (iOS ea86dd8a observed:
-            // max_tokens=256 → stop_reason=max_tokens, thinking_tokens=256/256,
-            // empty body). Legacy (<=4.5) models default to no thinking, so
-            // absence is fine there.
-            body.put("thinking", JSONObject().put("type", "disabled"))
+        } else {
+            // Thinking OFF. [T-claude5-thinking-off] The literal is per model
+            // (offThinking): omitting the field is NOT off on Claude 5 — it is
+            // adaptive thinking at the model's default effort, so every OFF caller
+            // (title generation, voice correction, a chat set to Off) used to think
+            // at full effort. iOS ef86ed890 hit it as a voice-correction timeout on
+            // claude-sonnet-5-5.
+            //
+            // Claude 4.6-4.x (and Sonnet 5) take `disabled`: they think by default,
+            // and a small-maxTokens call otherwise burns its whole budget on
+            // thinking and returns zero text (iOS ea86dd8a: max_tokens=256 →
+            // stop_reason=max_tokens, thinking_tokens=256/256, empty body).
+            // Legacy (<=4.5) models are off by default, so absence is right there.
+            when (offThinking(model.id)) {
+                OffThinking.OMIT -> Unit
+                OffThinking.DISABLED ->
+                    body.put("thinking", JSONObject().put("type", "disabled"))
+                OffThinking.BETWEEN_TOOLS ->
+                    body.put("thinking", JSONObject().put("type", "between_tools"))
+                OffThinking.LOW_EFFORT -> {
+                    // Thinking cannot be switched off on this model: ask for as
+                    // little as it allows, in the same shape as the enabled path.
+                    body.put("thinking", JSONObject().apply {
+                        put("type", "adaptive")
+                        put("display", "summarized")
+                    })
+                    body.put("output_config", JSONObject().put("effort", "low"))
+                }
+            }
         }
 
         // System prompt blocks — mirrors iOS AnthropicProvider.resolveSystemPrompt.
@@ -524,6 +627,9 @@ class AnthropicProvider(
      * even when supportsReasoning=true. Independent of the user's thinking
      * toggle — DeepSeek V4 emits thinking even when we don't request it.
      */
+    /** [T-ctx-count-reasoning] Unsigned interleaved thinking is replayed only here. */
+    override fun echoesReasoningContent(thinkingLevel: ThinkingLevel): Boolean = shouldEchoInterleavedThinking()
+
     private fun shouldEchoInterleavedThinking(): Boolean {
         val modelMayReason = model.supportsReasoning != false
         val modelRequiresInterleave = model.interleavedReasoningField != null
@@ -541,6 +647,8 @@ class AnthropicProvider(
         // [T-android-anthropic-thinking-echo] (issue #70) Compute once — the
         // gate depends only on the model + endpoint, not the message.
         val echoThinking = shouldEchoInterleavedThinking()
+        // [B02] Wire tool ids of this request: raw ids stay in the history.
+        val wireIds = WireToolIdMap()
         val messagesArray = JSONArray()
         for ((index, msg) in messages.withIndex()) {
             val obj = JSONObject()
@@ -573,12 +681,13 @@ class AnthropicProvider(
                             })
                         }
                         is AgentContentPart.ToolUse -> {
-                            // Anthropic requires tool ids to match ^[a-zA-Z0-9_-]+$.
-                            // OpenAI Responses can emit ids like `call_abc|fc_def`
-                            // (pipe), so echo every id through sanitizeToolId.
+                            // Anthropic requires tool ids to match ^[a-zA-Z0-9_-]+$,
+                            // and Bedrock-class backends cap their length. OpenAI
+                            // Responses stores ids like `call_abc|fc_def`, so every
+                            // id goes out as its wire id (B02, wireToolId).
                             contentArray.put(JSONObject().apply {
                                 put("type", "tool_use")
-                                put("id", sanitizeToolId(part.id))
+                                put("id", wireIds.idFor(part.id))
                                 put("name", part.name)
                                 put("input", part.input)
                             })
@@ -595,20 +704,11 @@ class AnthropicProvider(
                                 // never went through the composer's budget pass.
                                 // Re-encode in-place if a single part already blows
                                 // the per-image cap so we don't 413 on replay.
-                                val safeBytes = ImageBudget.compressUnderBudget(part.imageData)
-                                val safeMime = if (safeBytes === part.imageData) part.imageMimeType else "image/jpeg"
-                                resultContent.put(JSONObject().apply {
-                                    put("type", "image")
-                                    put("source", JSONObject().apply {
-                                        put("type", "base64")
-                                        put("media_type", safeMime)
-                                        put("data", Base64.encodeToString(safeBytes, Base64.NO_WRAP))
-                                    })
-                                })
+                                resultContent.put(imageBlock(part.imageData, part.imageMimeType))
                             }
                             contentArray.put(JSONObject().apply {
                                 put("type", "tool_result")
-                                put("tool_use_id", sanitizeToolId(part.id))
+                                put("tool_use_id", wireIds.idFor(part.id))
                                 put("content", resultContent)
                                 if (part.isError) put("is_error", true)
                             })
@@ -618,16 +718,7 @@ class AnthropicProvider(
                             // image bytes that bypassed the composer budget
                             // (restored sessions, retry-after-edit, agent-emitted
                             // ImageData). Composer already capped fresh sends.
-                            val safeBytes = ImageBudget.compressUnderBudget(part.data)
-                            val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
-                            contentArray.put(JSONObject().apply {
-                                put("type", "image")
-                                put("source", JSONObject().apply {
-                                    put("type", "base64")
-                                    put("media_type", safeMime)
-                                    put("data", Base64.encodeToString(safeBytes, Base64.NO_WRAP))
-                                })
-                            })
+                            contentArray.put(imageBlock(part.data, part.mimeType))
                         }
                     }
                 }
@@ -643,16 +734,7 @@ class AnthropicProvider(
                         // pre-T132). Composer already runs ImageBudget but this
                         // arm is also reached on session restore where
                         // contentParts may not be populated.
-                        val safeBytes = ImageBudget.compressUnderBudget(part.data)
-                        val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
-                        contentArray.put(JSONObject().apply {
-                            put("type", "image")
-                            put("source", JSONObject().apply {
-                                put("type", "base64")
-                                put("media_type", safeMime)
-                                put("data", Base64.encodeToString(safeBytes, Base64.NO_WRAP))
-                            })
-                        })
+                        contentArray.put(imageBlock(part.data, part.mimeType))
                     }
                     contentArray.put(JSONObject().apply {
                         put("type", "text")
@@ -684,6 +766,7 @@ class AnthropicProvider(
 
             messagesArray.put(obj)
         }
+        logWireToolIds("anthropic", wireIds)
         return messagesArray
     }
 
@@ -693,6 +776,29 @@ class AnthropicProvider(
      * For assistant messages, reorder: text/image first, then tool_use (Anthropic
      * rejects text appearing after tool_use in the same message).
      */
+    /**
+     * [T-android-image-upload-format] One inline image as an Anthropic content
+     * block. Format, byte budget and `media_type` all come from
+     * [ImageBudget.prepareForUpload], so the label always matches the bytes;
+     * an image that cannot be made sendable becomes a text block instead of a
+     * request the API rejects on every retry.
+     */
+    private fun imageBlock(data: ByteArray, declaredMime: String?): JSONObject {
+        val upload = ImageBudget.prepareForUpload(data, declaredMime)
+            ?: return JSONObject().apply {
+                put("type", "text")
+                put("text", ImageBudget.UNSENDABLE_IMAGE_PLACEHOLDER)
+            }
+        return JSONObject().apply {
+            put("type", "image")
+            put("source", JSONObject().apply {
+                put("type", "base64")
+                put("media_type", upload.mimeType)
+                put("data", upload.base64())
+            })
+        }
+    }
+
     private fun mergeConsecutiveSameRole(messages: JSONArray): JSONArray {
         if (messages.length() <= 1) return messages
         val result = JSONArray()
@@ -726,6 +832,18 @@ class AnthropicProvider(
                     contentBlocks.addAll(thinking)
                     contentBlocks.addAll(other)
                     contentBlocks.addAll(toolUse)
+                } else if (role == "user" && contentBlocks.any { it.optString("type") == "tool_result" }) {
+                    // [T-404-summary-after-tool-results] tool_result blocks first,
+                    // everything else after, each group in its original order
+                    // (iOS reorderUserContent). Anthropic requires the results to
+                    // lead the user turn that follows tool_use; a text block
+                    // ahead of them (#404: a compaction summary) is a 400. A
+                    // user turn without tool_result is untouched.
+                    val results = contentBlocks.filter { it.optString("type") == "tool_result" }
+                    val rest = contentBlocks.filter { it.optString("type") != "tool_result" }
+                    contentBlocks.clear()
+                    contentBlocks.addAll(results)
+                    contentBlocks.addAll(rest)
                 }
                 val merged = JSONObject().apply {
                     put("role", role)
@@ -774,6 +892,21 @@ class AnthropicProvider(
         }
     }
 
+    /** How "thinking off" goes on the wire; see [Companion.offThinking]. */
+    enum class OffThinking {
+        /** Send no thinking field (legacy models, where off is already the default). */
+        OMIT,
+        /** `thinking: {"type": "disabled"}`. */
+        DISABLED,
+        /** `thinking: {"type": "between_tools"}` — no up-front thinking. Sonnet 5.5 only. */
+        BETWEEN_TOOLS,
+        /**
+         * `thinking: {"type": "adaptive"}` + `output_config.effort: "low"` —
+         * thinking cannot be switched off, so ask for as little as the model allows.
+         */
+        LOW_EFFORT,
+    }
+
     companion object {
         /**
          * Parse the `-<major>-<minor>` (or `/<major>.<minor>`) version out of a Claude id.
@@ -786,12 +919,36 @@ class AnthropicProvider(
          * whole 5-series. The optional group is greedy, so a real pair like
          * claude-3-5-sonnet still wins as (3,5) — never (3,0).
          * Returns null for non-Claude ids or ids without any version digits.
+         *
+         * TWO POSITIONAL BUGS FIXED (mirrored on iOS AnthropicProvider.swift):
+         *
+         * 1. The minor group is capped at 1-2 digits. It was uncapped and
+         *    greedy, so a SINGLE-segment version followed by a snapshot stamp
+         *    swallowed the stamp: `claude-sonnet-4-20250514` (Claude Sonnet 4.0)
+         *    parsed as (4, 20250514) and was therefore treated as >= 4.6 —
+         *    temperature dropped, adaptive effort sent, and
+         *    `thinking.type=disabled` sent, none of which a 4.0 model accepts.
+         *    Two shipping catalog ids hit this (claude-sonnet-4-20250514,
+         *    claude-opus-4-20250514, plus their `anthropic/` forms). No real
+         *    Claude version has ever had a 3+ digit minor, and a version PAIR is
+         *    unaffected either way (`claude-opus-4-8-20260115` -> (4,8)) because
+         *    the pair consumes the separator first.
+         *
+         * 2. The search STARTS AFTER the word "claude". It used to take the
+         *    first version-shaped run anywhere in the id, so a namespace
+         *    carrying digits before the family name won: `v2-gateway/claude-opus-5`
+         *    parsed as (2, 0), and `inst-53/claude-haiku-4-5` as (53, 0). Both
+         *    would then take `temperature` plus legacy budget thinking — the
+         *    exact 400 and silent no-op this commit family exists to prevent.
+         *    Only digits AFTER the family name can be the version.
          */
         private fun parseClaudeVersion(modelId: String): Pair<Int, Int>? {
             val lower = modelId.lowercase()
-            if (!lower.contains("claude")) return null
-            val regex = Regex("""[-/]?(\d+)(?:[-.](\d+))?(?:$|[^0-9])""")
-            val match = regex.find(lower) ?: return null
+            val claudeAt = lower.indexOf("claude")
+            if (claudeAt < 0) return null
+            val afterClaude = lower.substring(claudeAt + "claude".length)
+            val regex = Regex("""[-/]?(\d+)(?:[-.](\d{1,2}))?(?:$|[^0-9])""")
+            val match = regex.find(afterClaude) ?: return null
             val major = match.groupValues[1].toIntOrNull() ?: return null
             val minor = match.groupValues[2].toIntOrNull() ?: 0
             return major to minor
@@ -815,6 +972,46 @@ class AnthropicProvider(
         fun modelUsesAdaptiveThinking(modelId: String): Boolean {
             val (major, minor) = parseClaudeVersion(modelId) ?: return false
             return major > 4 || (major == 4 && minor >= 6)
+        }
+
+        /**
+         * How "thinking off" is encoded on the wire for this model. Port of iOS
+         * `AnthropicProvider.offThinking(for:)` (ef86ed890).
+         *
+         * Per-model vendor contract, from the model table in Anthropic's
+         * "Troubleshooting thinking" doc:
+         *
+         *     model                      no thinking field   type "disabled"   lowest setting
+         *     <= 4.5                     off                 -                 omit the field
+         *     4.6 - 4.x                  off / on            accepted          disabled
+         *     Sonnet 5                   ON                  accepted          disabled
+         *     Sonnet 5.5                 ON                  400               between_tools
+         *     Opus 5                     ON                  accepted <= high  adaptive + low (below)
+         *     Opus 5.5, Fable/Mythos 5+  always on           400               adaptive + low
+         *
+         * [T-android-claude5-thinking-disabled-400] Fable 5 400'd on `disabled`,
+         * which led to sending NO field for every 5+ model. But an absent field is
+         * not off on Claude 5: it is adaptive thinking at the model's default effort
+         * (high; medium on Opus 5.5). [T-claude5-thinking-off] Voice correction on
+         * Sonnet 5.5 thought ~4.4 s with no field and hit its 5 s budget before
+         * emitting a single text token (iOS).
+         *
+         * Opus 5 does accept `disabled`, but the vendor warns that with thinking
+         * disabled it leaks tool calls and `<thinking>` tags into text on tool-heavy
+         * workloads and recommends low effort instead, so it takes LOW_EFFORT. An
+         * unknown future 5+ model takes LOW_EFFORT too: every adaptive model accepts
+         * adaptive thinking, while `disabled` and `between_tools` are per-model and
+         * 400 where unsupported.
+         */
+        fun offThinking(modelId: String): OffThinking {
+            val (major, minor) = parseClaudeVersion(modelId) ?: return OffThinking.OMIT
+            if (major < 4 || (major == 4 && minor < 6)) return OffThinking.OMIT
+            if (major == 4) return OffThinking.DISABLED
+            if (major == 5 && modelId.lowercase().contains("sonnet")) {
+                if (minor == 0) return OffThinking.DISABLED
+                if (minor == 5) return OffThinking.BETWEEN_TOOLS
+            }
+            return OffThinking.LOW_EFFORT
         }
 
         /**
@@ -904,13 +1101,11 @@ class AnthropicProvider(
         // OkHttp forbids multiple values for the same header slot via `.header(...)`,
         // so build a combined anthropic-beta string and set it once.
         //
-        // For OAuth (Claude Code) credentials we mimic the real CLI as closely as
-        // possible — Anthropic's backend uses the *combination* of anthropic-beta,
-        // User-Agent, and X-Stainless-* headers to decide whether the request is
-        // coming from the official CLI or a third-party client. Non-CLI requests
-        // get downgraded (extra-usage billing, silently-disabled thinking on 4.7).
-        // Aligned with sub2api FullClaudeCodeMimicryBetas / DefaultHeaders
-        // (Wei-Shaw/sub2api backend/internal/pkg/claude/constants.go).
+        // OAuth (Claude Code) credentials are served with the Claude CLI's
+        // request profile — the anthropic-beta set, User-Agent and X-Stainless-*
+        // headers. Without it some features (e.g. thinking on 4.7) are not
+        // enabled for these credentials. Values tracked from Wei-Shaw/sub2api
+        // backend/internal/pkg/claude/constants.go.
         //
         // For API-key / custom endpoints we only carry the betas actually needed
         // by the request body; we must NOT include oauth-2025-04-20 or
@@ -919,16 +1114,16 @@ class AnthropicProvider(
         val betaFlags = mutableListOf<String>()
         if (isOAuth) {
             // [T-anthropic-redact-thinking] Deliberately OMIT
-            // "redact-thinking-2026-02-12" from the Claude-Code mimicry betas.
+            // "redact-thinking-2026-02-12" from the Claude Code OAuth betas.
             // When present, Anthropic redacts the plaintext of `thinking` content
             // blocks (returns an empty `thinking` string with only a `signature`),
             // so a reasoning model runs (usage.thinking_tokens > 0) but the App
             // can't show any thinking text. The official Claude Code CLI only adds
-            // this beta when `showThinkingSummaries` is unset/false (confirmed via
-            // CLI de-obfuscation, anthropics/claude-code#31326, and the
+            // this beta when `showThinkingSummaries` is unset/false (per
+            // anthropics/claude-code#31326 and the
             // code.claude.com model-config docs); omitting it is equivalent to
             // `showThinkingSummaries: true` — pure UI visibility, no effect on
-            // reasoning quality or token budget. All other mimicry betas stay.
+            // reasoning quality or token budget. All other OAuth betas stay.
             betaFlags.addAll(listOf(
                 "claude-code-20250219",
                 "oauth-2025-04-20",
@@ -958,8 +1153,28 @@ class AnthropicProvider(
 
         // Stainless / CLI fingerprint headers — only on OAuth; bump in lockstep
         // with sub2api when the real CLI version moves.
+        //
+        // [T-anthropic-fable51-android] 2.1.195 -> 2.1.251. Anthropic gates
+        // models on this version: below 2.1.251 a claude-fable-5-1 request is
+        // refused with "Claude Code <ver> does not support this model; version
+        // 2.1.251 or newer is required." 2.1.251 is the value CLIProxyAPI
+        // adopted for exactly this reason (router-for-me/CLIProxyAPI#5405,
+        // bumping their defaultClaudeFingerprintUserAgent from 2.1.220), not a
+        // number picked to clear the error message.
+        //
+        // [T-anthropic-opus55-catalog] 2.1.251 -> 2.1.280, for the same class
+        // of gate one generation later: Claude Opus 5.5 is refused below
+        // 2.1.280, and the refusal is a plain 400 that reads like a bad model
+        // id rather than a version problem. The floor only ever rises, so
+        // every model that worked at 2.1.251 (Fable 5.1, Sonnet/Opus 4.x, …)
+        // is unaffected — the gate is "at least", not "exactly".
+        //
+        // The X-Stainless-* values below are deliberately NOT touched: they
+        // describe the SDK/runtime, not the CLI, and the backend pairs UA with
+        // them as one registered client identity. Changing them speculatively
+        // is how a working fingerprint gets broken.
         if (isOAuth) {
-            builder.header("User-Agent", "claude-cli/2.1.195 (external, cli)")
+            builder.header("User-Agent", "claude-cli/2.1.280 (external, cli)")
             builder.header("X-Stainless-Lang", "js")
             builder.header("X-Stainless-Package-Version", "0.106.0")
             builder.header("X-Stainless-OS", "Linux")
@@ -989,7 +1204,7 @@ class AnthropicProvider(
         // [T-provider-custom-user-agent] Applied last so a non-blank override
         // wins over the OAuth claude-cli UA above. null/blank → fall back to
         // the branded Minis UA on the regular apiKey path, but on the OAuth
-        // path keep the claude-cli/2.1.195 fingerprint set at line ~779 (the
+        // path keep the claude-cli/2.1.280 fingerprint set above (the
         // Anthropic OAuth backend pairs UA + X-Stainless-* and rejects calls
         // whose UA doesn't match the registered client identity). T-android-
         // default-ua: pass defaultUserAgent=null on OAuth, branded default
@@ -1018,16 +1233,12 @@ class AnthropicProvider(
         return LLMResponse(text, stopReason, usage)
     }
 
-    private fun parseUsage(json: JSONObject): LLMUsage {
-        val inputTokens = json.optInt("input_tokens", 0)
-        return LLMUsage(
-            inputTokens = inputTokens,
-            outputTokens = json.optInt("output_tokens", 0),
-            cacheCreationInputTokens = json.optInt("cache_creation_input_tokens").takeIf { it > 0 },
-            cacheReadInputTokens = json.optInt("cache_read_input_tokens").takeIf { it > 0 },
-            latestContextTokens = inputTokens,
-        )
-    }
+    // [T-usage-step1] Shared parser. Absent fields stay null in the attached
+    // chunk, so a message_delta carrying only output_tokens no longer wipes the
+    // input and cache that message_start reported (the stream consumer merges
+    // with UsageChunkMerger instead of replacing).
+    private fun parseUsage(json: JSONObject): LLMUsage =
+        com.openminis.app.usage.ProviderUsageParser.anthropic(json).toLLMUsage()
 
     private fun mapHttpError(statusCode: Int, body: String): LLMError {
         if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey()
@@ -1045,13 +1256,18 @@ class AnthropicProvider(
 
         val transientCodes = setOf(500, 502, 503, 504, 529)
         if (statusCode in transientCodes) {
-            return LLMError.TransientError(message)
+            // [T-android-503-fallback] See OpenAIProvider.mapHttpError — the
+            // status must survive onto the error so fallback can act on it.
+            return LLMError.TransientError(message, httpStatus = statusCode)
         }
-        return LLMError.ProviderError(message)
+        return LLMError.ProviderError(message, httpStatus = statusCode)
     }
 
     private fun mapError(error: Throwable): LLMError {
         if (error is LLMError) return error
+        // [T-android-tls-trust-error] A rejected certificate is not a network
+        // blip: named, not retried on the same model, explained to the user.
+        com.openminis.app.provider.TlsFailure.toLLMError(error, basePath)?.let { return it }
         if (error is java.io.IOException) return LLMError.NetworkError(error)
         return LLMError.Unknown(error)
     }

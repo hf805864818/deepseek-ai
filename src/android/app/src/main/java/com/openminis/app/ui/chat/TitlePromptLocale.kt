@@ -78,4 +78,8 @@ private val humanReadable: Map<String, String> = mapOf(
     "tr" to "Türkçe / Turkish",
     "nl" to "Nederlands / Dutch",
     "pl" to "Polski / Polish",
+    "hr" to "Hrvatski / Croatian",
+    "hu" to "Magyar / Hungarian",
+    "cs" to "Čeština / Czech",
+    "fa" to "فارسی / Persian",
 )

@@ -15,6 +15,9 @@ struct InlineVoiceInputView: View {
     @Binding var inputText: String
     var onPasteImage: ((UIImage) -> Void)?
     var onPasteFile: ((URL) -> Void)?
+    /// [T-paste-placeholder] Long pasted text → vm stash, returns the
+    /// `[pasted#N]` literal to append to the transcript. See ChatInputBar.
+    var onPasteLongText: ((String) -> String?)?
     /// [voice-correction §6] Supplies the current conversation's recent turns as the
     /// third correction signal.
     ///
@@ -24,6 +27,16 @@ struct InlineVoiceInputView: View {
     /// "张山说食堂今天关门" comes back unchanged; with context, "石塘"→"食堂" is caught
     /// immediately. Context is what makes the feature work on day one.
     var conversationContext: (() -> ConversationContext)?
+    /// [T-ios-context-usage-hint] The composer's context-window usage request
+    /// (AIChatViewModel.contextUsageHint), handed down from AIChatView. The
+    /// voice panel shows it in its status line for a few seconds; see
+    /// `voiceUsageHint` for the display rules.
+    var contextUsageHint: ContextUsageHint? = nil
+    /// The hint currently on the status line, or nil for the normal label.
+    @State private var voiceUsageHint: ContextUsageHint? = nil
+    /// Last hint generation this panel acted on, so re-renders carrying the
+    /// same request are no-ops.
+    @State private var voiceUsageHintGeneration = 0
     /// Tear down voice mode (X button / done).
 
     @FocusState private var editFocused: Bool
@@ -247,23 +260,24 @@ struct InlineVoiceInputView: View {
                     }
                     if UIPasteboard.general.hasStrings {
                         Button {
-                            guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
-                            let asciiLetters = text.unicodeScalars.filter { ($0.value >= 0x41 && $0.value <= 0x5A) || ($0.value >= 0x61 && $0.value <= 0x7A) }.count
-                            let isEnglishDominant = asciiLetters > text.count / 2
-                            let isLong: Bool
-                            if isEnglishDominant {
-                                let wordCount = text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.count
-                                isLong = wordCount > 1000
-                            } else {
-                                isLong = text.count > 1200
-                            }
-                            if isLong, let onPasteFile {
-                                let tmp = FileManager.default.temporaryDirectory
-                                    .appendingPathComponent("pasted_\(UUID().uuidString.prefix(8)).txt")
-                                if let data = text.data(using: .utf8) {
-                                    try? data.write(to: tmp)
-                                    onPasteFile(tmp)
-                                    VoiceLog.log("voice panel paste: long text → file (\(text.count) chars)")
+                            guard var text = UIPasteboard.general.string, !text.isEmpty else { return }
+                            // [T-paste-placeholder] Long paste: stash in the
+                            // vm buffer and append only the `[pasted#N]`
+                            // literal to the transcript (it rides into the
+                            // composer text and expands at send). Replaces
+                            // the old inline copy of the .txt conversion —
+                            // threshold now shared via PastePlaceholder.
+                            if PastePlaceholder.isLong(text), let onPasteLongText {
+                                let chars = text.count
+                                if let placeholder = onPasteLongText(text) {
+                                    VoiceLog.log("voice panel paste: long text (\(chars) chars) → \(placeholder)")
+                                    text = placeholder
+                                } else {
+                                    // [T-paste-huge-to-file] nil = the paste became
+                                    // a .txt attachment. Appending `text` here would
+                                    // dump the whole paste into the transcript, which
+                                    // is exactly what the attachment exists to avoid.
+                                    VoiceLog.log("voice panel paste: huge text (\(chars) chars) → file attachment, transcript unchanged")
                                     return
                                 }
                             }
@@ -549,6 +563,21 @@ struct InlineVoiceInputView: View {
                 withAnimation(.easeInOut(duration: 0.28)) { expanded = true }
             }
         }
+        // [T-voice-asr-failure-retry-prompt] A failed transcription keeps its
+        // audio and asks, one utterance at a time, instead of dropping it.
+        .alert(
+            AppLocalized("Transcription failed"),
+            isPresented: Binding(
+                get: { viewModel.retryPrompt != nil },
+                set: { _ in }
+            ),
+            presenting: viewModel.retryPrompt
+        ) { _ in
+            Button(AppLocalized("Retry")) { viewModel.retryFailedUtterance() }
+            Button(AppLocalized("Discard"), role: .destructive) { viewModel.discardFailedUtterance() }
+        } message: { failed in
+            Text(AppLocalized("\(Int(failed.seconds.rounded())) seconds of speech could not be transcribed (\(failed.reason)). Try again?"))
+        }
         .onChange(of: viewModel.collapseAfterSendToken) { _ in
             // After a recognized utterance is sent, collapse to compact mode.
             // Deferred to the next runloop so a concurrent swipe-to-send drag
@@ -591,7 +620,7 @@ struct InlineVoiceInputView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            micButton
+            micButtonWithSwitch
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -609,7 +638,7 @@ struct InlineVoiceInputView: View {
 
             // ── Status line (with Exit chip while editing). ──
             HStack(spacing: 8) {
-                Text(stateLabel)
+                statusLineText
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -627,6 +656,29 @@ struct InlineVoiceInputView: View {
                     .buttonStyle(.plain)
                 }
             }
+            // [T-ios-context-usage-hint] Debounce + fixed display window for
+            // the usage line, driven by the request's generation. A newer
+            // generation restarts the task (cancelling the old window); the
+            // task owns no stored closure capturing the view.
+            .task(id: contextUsageHint?.generation) {
+                guard let hint = contextUsageHint,
+                      hint.generation != voiceUsageHintGeneration else { return }
+                voiceUsageHintGeneration = hint.generation
+                try? await Task.sleep(nanoseconds: UInt64(Self.usageHintDebounce * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.25)) { voiceUsageHint = hint }
+                try? await Task.sleep(nanoseconds: UInt64(Self.usageHintDuration * 1_000_000_000))
+                guard !Task.isCancelled, voiceUsageHint?.generation == hint.generation else { return }
+                withAnimation(.easeInOut(duration: 0.25)) { voiceUsageHint = nil }
+            }
+            // Starting a recording is the voice-panel analogue of "input
+            // began": the line yields immediately instead of finishing its
+            // window over the live recording tips.
+            .onChange(of: viewModel.state) { newState in
+                if newState == .recording, voiceUsageHint != nil {
+                    withAnimation(.easeInOut(duration: 0.2)) { voiceUsageHint = nil }
+                }
+            }
             .animation(.easeInOut(duration: 0.2), value: viewModel.state)
             .animation(.easeInOut(duration: 0.2), value: viewModel.isEditingTranscript)
 
@@ -642,36 +694,20 @@ struct InlineVoiceInputView: View {
             Spacer(minLength: 0)
                 .frame(maxHeight: Self.expandedStatusSlack)
 
-            // ── Transcription error tip (with retry countdown / manual retry) ──
-            if viewModel.transcribeError != nil || viewModel.retryCountdown != nil {
+            // ── Transcription error tip ──
+            // [T-voice-asr-failure-retry-prompt] Retry is offered by the alert
+            // (see `retryPromptAlert`), which keeps the audio until the user
+            // decides; this pill only states the last error.
+            if let error = viewModel.transcribeError {
                 HStack(spacing: 5) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)
-                    if let countdown = viewModel.retryCountdown {
-                        Text("Network error, retrying in \(countdown)s…")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    } else if viewModel.canManualRetry {
-                        Text(viewModel.transcribeError ?? "")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Button {
-                            viewModel.manualRetry()
-                        } label: {
-                            Text("Retry", comment: "Manual retry transcription")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.orange)
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        Text(viewModel.transcribeError ?? "")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .multilineTextAlignment(.center)
-                    }
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 5)
@@ -687,8 +723,15 @@ struct InlineVoiceInputView: View {
             // ── Central focal mic / waveform button, with a delete control to
             // its right (only when there's text). ──
             ZStack {
-                micButton
-                if !viewModel.transcript.isEmpty {
+                micButtonWithSwitch
+                // [T-voice-asr-stall-skip] Delete and the Switch Model pill
+                // share the right-hand side and are mutually exclusive: both
+                // key off the ONE flag `isASRStalled` (pill when true, delete
+                // when false), so they can never show together. The flag drops
+                // back as soon as the stall ends — the user switched (skip
+                // clears it), the attempt finished or failed on its own, or it
+                // was cancelled — and delete returns with it.
+                if !viewModel.transcript.isEmpty && !viewModel.isASRStalled {
                     HStack {
                         Spacer()
                         VoiceDeleteButton(
@@ -702,6 +745,8 @@ struct InlineVoiceInputView: View {
                     .transition(.opacity)
                 }
             }
+            // Cross-fade the swap (the pill animates on the same flag).
+            .animation(.easeInOut(duration: 0.2), value: viewModel.isASRStalled)
 
             // ── Active ASR model chip. ──
             modelChip
@@ -721,7 +766,6 @@ struct InlineVoiceInputView: View {
                 .background(Circle().fill(ChatColors.inputIconBg))
                 .overlay(Circle().strokeBorder(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
-        .buttonStyle(.plain)
         .accessibilityLabel(expanded
             ? Text("Collapse voice panel", comment: "Voice panel collapse")
             : Text("Expand voice panel", comment: "Voice panel expand"))
@@ -884,7 +928,6 @@ struct InlineVoiceInputView: View {
             .padding(.vertical, 4)
             .background(Capsule().fill(Color.secondary.opacity(0.1)))
         }
-        .buttonStyle(.plain)
     }
 
     /// Recognition-language switcher (options from the system's preferred locales).
@@ -970,7 +1013,6 @@ struct InlineVoiceInputView: View {
             .background(Circle().fill(ChatColors.inputIconBg))
             .overlay(Circle().strokeBorder(ChatColors.inputIconBorder, lineWidth: 0.5))
         }
-        .buttonStyle(.plain)
         .disabled(isCorrecting)
         .accessibilityLabel(Text("Correct transcript with AI", comment: "Voice manual-correction button"))
         .alert(AppLocalized("Improve voice corrections?",
@@ -1011,7 +1053,8 @@ struct InlineVoiceInputView: View {
             let suggestion = await VoiceCorrectionEngine.shared.correct(
                 transcript: text,
                 locale: PhoneticNormalizerRegistry.normalizedLocaleKey(viewModel.language),
-                context: context)
+                context: context,
+                trigger: "manual")
             await MainActor.run {
                 isCorrecting = false
                 // Bail if the transcript changed under us (re-recorded / edited / sent while
@@ -1058,8 +1101,57 @@ struct InlineVoiceInputView: View {
     }
 
     /// True when the spinner is showing but mic is idle — tapping should cancel.
+    ///
+    /// [T-voice-asr-stall-skip] Stays the cancel button even when a
+    /// transcription has stalled: cancelling is how the user throws the take
+    /// away to record it again. Retrying on the next model is a separate
+    /// control beside the button (`switchModelButton`).
     private var showCancelIcon: Bool {
         viewModel.isTranscribing && viewModel.state != .recording
+    }
+
+    /// The mic button plus, once a transcription has stalled, the
+    /// "Switch Model" pill just to its right. The pill is an overlay, so the
+    /// button stays exactly where it was (centered) whether or not it shows.
+    private var micButtonWithSwitch: some View {
+        micButton
+            .overlay(alignment: .leading) {
+                if viewModel.isASRStalled {
+                    switchModelButton
+                        .fixedSize()
+                        .offset(x: micDiameter + 10)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: viewModel.isASRStalled)
+    }
+
+    /// [T-voice-asr-stall-skip] Offered once a transcription has had no result
+    /// for `VoiceInputViewModel.asrStallThreshold` and a next voice model
+    /// exists: abandons the hung attempt and continues the same audio on the
+    /// next model of the voice group (System recognition last). Only skips —
+    /// it does not pause a running capture: the skip re-points later segments
+    /// to the new model as well, so recording can simply continue.
+    private var switchModelButton: some View {
+        Button {
+            viewModel.skipStalledTranscription()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "forward.end.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("Switch Model", comment: "Voice ASR stalled: short label of the button that retries on the next voice model")
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(ChatColors.secondaryText)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(ChatColors.inputIconBg))
+            .overlay(Capsule().strokeBorder(ChatColors.inputIconBorder, lineWidth: 0.5))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Retry with the next voice model", comment: "Voice ASR: skip a stalled model button"))
     }
 
     private var micButton: some View {
@@ -1080,10 +1172,9 @@ struct InlineVoiceInputView: View {
                     TimelineView(.animation) { context in
                         let t = context.date.timeIntervalSinceReferenceDate
                         let angle = Angle(degrees: (t / 0.9).truncatingRemainder(dividingBy: 1) * 360)
-                        Circle()
-                            .trim(from: 0, to: 75.0 / 360.0)
-                            .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                            .frame(width: micDiameter, height: micDiameter)
+                        // [T-voice-ring-inside] Inside the white disc, flush with
+                        // its rim, fading toward its tail - see TranscribingRingArc.
+                        TranscribingRingArc(color: .accentColor, disc: micDiameter)
                             .rotationEffect(angle)
                     }
                 }
@@ -1114,6 +1205,70 @@ struct InlineVoiceInputView: View {
             : Text("Toggle recording", comment: "Inline voice mic"))
     }
 
+    // MARK: - [T-ios-context-usage-hint] Usage line in the status row
+
+    /// The status text: the usage line while one is showing, else `stateLabel`.
+    ///
+    /// Unlike the text composer's placeholder (which now holds the line until
+    /// the user types), the voice panel shows it for a fixed window and then
+    /// returns to whatever `stateLabel` says at that moment — the user may be
+    /// recording or reading a transcript by then, and the label must follow
+    /// `viewModel.state`, not snap back to "Tap to speak". Starting a recording
+    /// cuts the window short (see the onChange below).
+    ///
+    /// Number segments are tinted via AttributedString runs so the rest of the
+    /// line keeps the `.secondary` style of the row. Colours are chosen for the
+    /// panel's DARK surface — the composer's alpha-toned UIColors were tuned
+    /// against a pale glass wall and would go muddy here — kept restrained so
+    /// the line reads as a status note, not an alert.
+    @ViewBuilder
+    private var statusLineText: some View {
+        if let hint = voiceUsageHint {
+            Text(Self.highlightedUsageLine(hint))
+                .transition(.opacity)
+                .id("usage-\(hint.generation)")
+        } else {
+            Text(stateLabel)
+                .transition(.opacity)
+        }
+    }
+
+    /// Fixed display window for the usage line on the voice panel.
+    static let usageHintDuration: TimeInterval = 3.5
+    /// Same debounce as the composer: a burst of quick turns shows one line.
+    static let usageHintDebounce: TimeInterval = 0.4
+
+    /// Applies the panel-side tint to the number segments.
+    static func highlightedUsageLine(_ hint: ContextUsageHint) -> AttributedString {
+        var attributed = AttributedString(hint.text)
+        if let tone = usageTint(for: hint.tier) {
+            for segment in hint.highlights {
+                guard let range = attributed.range(of: segment) else { continue }
+                attributed[range].foregroundColor = tone
+                attributed[range].font = .subheadline.weight(.medium)
+            }
+        }
+        // [T-quota-composer-hint] The quota figure, tinted by its own tier.
+        if let segment = hint.quotaHighlight, let tone = usageTint(for: hint.quotaTier),
+           let range = attributed.range(of: segment, options: .backwards) {
+            attributed[range].foregroundColor = tone
+            attributed[range].font = .subheadline.weight(.medium)
+        }
+        return attributed
+    }
+
+    /// Tints for the dark voice surface. System hues at reduced opacity over
+    /// the dark panel come out as a dimmed, desaturated version of themselves
+    /// — visible, still clearly "warning" vs "danger", not glaring. Red keeps
+    /// a touch more presence than orange so it reads as the more urgent tier.
+    static func usageTint(for tier: ContextUsage.Tier) -> Color? {
+        switch tier {
+        case .normal: return nil
+        case .warning: return Color(UIColor.systemOrange).opacity(0.70)
+        case .critical: return Color(UIColor.systemRed).opacity(0.78)
+        }
+    }
+
     private var stateLabel: String {
         if viewModel.permissionDenied {
             return AppLocalized("Microphone access denied — enable it in Settings", comment: "Inline voice permission denied")
@@ -1123,6 +1278,11 @@ struct InlineVoiceInputView: View {
         }
         if viewModel.isEditingTranscript {
             return AppLocalized("Editing — tap mic to resume", comment: "Inline voice editing state")
+        }
+        // [T-voice-send-lock] Send was tapped; the message goes out as soon as
+        // recognition has finished. Says why the send button is busy.
+        if viewModel.isFinishingForSend {
+            return AppLocalized("Transcribing, then sending…", comment: "Voice input: status while a tapped Send waits for speech recognition to finish")
         }
         switch viewModel.state {
         case .waiting:
@@ -1537,3 +1697,90 @@ private struct PanelDragGestureModifier: ViewModifier {
         }
     }
 }
+
+// BEGIN TranscribingRingGeometry
+/// [T-voice-ring-inside] Where the blue "transcribing" arc sits on the white
+/// mic disc: on the inside, flush with the rim. `.stroke` centres its line on
+/// the path, so the path is the disc minus the line width; the line's outer
+/// edge then coincides with the rim, round caps included (a cap only extends
+/// along the path, never outward).
+///
+/// History: in the very first version the path WAS the rim, so half the line
+/// hung outside the button (an outer ring); 836201306 / d8e937e0e then left a
+/// 3pt / 5pt white gap, which is not what was asked - the arc belongs flush
+/// against the inside of the edge (08a40ddc9). [T-voice-ring-soft] The ends
+/// looked hard at 2.5pt: the line is 3pt (rounder caps). [T-voice-ring-ends]
+/// The arc is solid colour; only a short stretch at each end fades a little
+/// (ec549d0c3 faded the whole arc from tail to head, which was too much).
+enum TranscribingRingGeometry {
+    static let line: CGFloat = 3
+    /// A quarter point, not 0: at 3pt the line's antialiased outer fringe
+    /// crossed the rim by up to 0.17pt (0.5px @3x) at some angles in the
+    /// rendered test. 0.25pt keeps every blue pixel on the disc and still
+    /// reads as flush.
+    static let gap: CGFloat = 0.25
+    /// Arc length; one turn takes 0.9s (the caller's rotation).
+    static let sweepDegrees: Double = 75
+    /// Share of the arc, at EACH end, over which the colour fades out
+    /// (0.1 of 75 degrees = 7.5 degrees); the rest is solid.
+    static let endFadeFraction: Double = 0.1
+    /// Opacity at the very tips of both ends.
+    static let endOpacity: Double = 0.35
+
+    /// Opacity at `fraction` (0 = tail tip, 1 = head tip) along the arc:
+    /// `endOpacity` at the tips, eased (smoothstep) up to 1 over
+    /// `endFadeFraction`, 1 in between. Symmetric.
+    static func opacity(atFraction fraction: Double) -> Double {
+        let fromEnd = min(max(fraction, 0), max(1 - fraction, 0))
+        guard fromEnd < endFadeFraction else { return 1 }
+        let t = fromEnd / endFadeFraction
+        return endOpacity + (1 - endOpacity) * t * t * (3 - 2 * t)
+    }
+
+    /// Fractions where the gradient gets a stop: each fade sampled finely
+    /// enough that the eased curve shows no kinks, plus its two ends.
+    static let stopFractions: [Double] = {
+        let steps = 6
+        let fade = (0...steps).map { endFadeFraction * Double($0) / Double(steps) }
+        return fade + fade.reversed().map { 1 - $0 }
+    }()
+
+    static func pathDiameter(disc: CGFloat) -> CGFloat {
+        disc - 2 * gap - line
+    }
+
+    /// Distance from the disc's rim to the line's outer edge.
+    static func clearance(disc: CGFloat) -> CGFloat {
+        disc / 2 - (pathDiameter(disc: disc) / 2 + line / 2)
+    }
+}
+
+/// [T-voice-ring-soft] The arc itself, unrotated; the caller spins it.
+///
+/// The trimmed circle runs clockwise from 0 degrees (3 o'clock) to
+/// `sweepDegrees`. The AngularGradient spans exactly the arc in the shape's
+/// own coordinates, so it turns with the arc: no seam, no jump. The round
+/// caps reach a little past both ends; SwiftUI fills the angles outside a
+/// partial angular gradient with its end colours, so both caps keep the
+/// `endOpacity` of their tips.
+struct TranscribingRingArc: View {
+    let color: Color
+    let disc: CGFloat
+
+    var body: some View {
+        let d = TranscribingRingGeometry.pathDiameter(disc: disc)
+        Circle()
+            .trim(from: 0, to: TranscribingRingGeometry.sweepDegrees / 360)
+            .stroke(
+                AngularGradient(
+                    stops: TranscribingRingGeometry.stopFractions.map {
+                        .init(color: color.opacity(TranscribingRingGeometry.opacity(atFraction: $0)), location: $0)
+                    },
+                    center: .center,
+                    startAngle: .degrees(0),
+                    endAngle: .degrees(TranscribingRingGeometry.sweepDegrees)),
+                style: StrokeStyle(lineWidth: TranscribingRingGeometry.line, lineCap: .round))
+            .frame(width: d, height: d)
+    }
+}
+// END TranscribingRingGeometry

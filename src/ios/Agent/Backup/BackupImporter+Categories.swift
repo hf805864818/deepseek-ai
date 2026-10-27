@@ -271,11 +271,15 @@ extension BackupImporter {
             // importSkillFromSync preserves the id and applies its own LWW,
             // which is exactly Merge semantics; it also skips markDirty, so the
             // rescan below stages the changes instead.
+            // [T-skill-restore-untitled] Pass the name the backup recorded.
+            // It is only consulted if parsing rec.body fails to yield one —
+            // a skill whose SKILL.md has malformed frontmatter would otherwise
+            // restore as "Untitled Skill" despite the backup knowing better.
             let applied = await MainActor.run {
                 SkillStore.shared.importSkillFromSync(
                     skillId: rec.id, content: rec.body, source: .file,
                     isEnabled: rec.isEnabled, installedAt: rec.installedAt,
-                    updatedAt: rec.updatedAt)
+                    updatedAt: rec.updatedAt, fallbackName: rec.name)
             }
             if applied { report.imported += 1 } else { report.skipped += 1 }
         }
@@ -292,6 +296,36 @@ extension BackupImporter {
         report.filesWritten = files.written
         report.bytesWritten = files.bytes
         report.missingBlobs = files.missingBlobs
+
+        // [T-ios-skill-backup-fakefs] Make the restored bundled files visible
+        // to the guest NOW. restoreFileTree only copies blobs into the App
+        // Group directory; unlike SKILL.md (importSkillFromSync → syncToRootfs
+        // → ensureFakefsMetadata) nothing above registered these paths in
+        // iSH's meta.db. Shared Files can skip that because every mount
+        // re-walks its directory (see importSharedFiles) — but a skill's
+        // scripts have to run right after the restore, not after the next
+        // cold start. Same per-file registration importFromArchive and the
+        // GitHub importer do, batched per skill directory; idempotent, so
+        // skills whose files already had rows are unaffected.
+        if files.written > 0 {
+            let restoredSkillIds = Set(fileIndex.lazy
+                .filter { $0.category == BackupCategory.skills.rawValue }
+                .compactMap { entry -> String? in
+                    let parts = entry.path.split(separator: "/", maxSplits: 2).map(String.init)
+                    guard parts.count >= 3, parts[0] == "skills" else { return nil }
+                    return parts[1]
+                })
+            var registered = 0
+            for skillId in restoredSkillIds.sorted() {
+                let hostDir = AIChatViewModel.minisSkillsPersistentDir
+                    .appendingPathComponent(skillId, isDirectory: true)
+                guard FileManager.default.fileExists(atPath: hostDir.path) else { continue }
+                registered += await ISHExecutionCoordinator.shared.registerFakefsMetadataRecursively(
+                    for: hostDir,
+                    linuxPrefix: "\(AIChatViewModel.minisSkillsLinuxDir)/\(skillId)")
+            }
+            logger.info("[Backup] skills: registered \(registered) meta.db entries for \(restoredSkillIds.count) restored skill dir(s)")
+        }
         return report
     }
 
@@ -305,7 +339,10 @@ extension BackupImporter {
         let dst = AIChatViewModel.minisMemoryPersistentDir
         try fm.createDirectory(at: dst, withIntermediateDirectories: true)
 
-        for name in (try? fm.contentsOfDirectory(atPath: src.path)) ?? [] where name.hasSuffix(".md") {
+        // [T-soul-icon-sidecar] Mirror the exporter: the icon sidecar is not a
+        // .md file but must restore with the persona it belongs to.
+        for name in (try? fm.contentsOfDirectory(atPath: src.path)) ?? []
+        where name.hasSuffix(".md") || name == SoulIconImage.sidecarName {
             let from = src.appendingPathComponent(name)
             let to = dst.appendingPathComponent(name)
 
@@ -375,12 +412,20 @@ extension BackupImporter {
         let merged = await MainActor.run { Self.disambiguateGroupNames(config) }
 
         let before = await MainActor.run { ProviderConfigStore.shared.config.instances.count }
+        let groupsBefore = await MainActor.run { Set(ProviderConfigStore.shared.config.modelGroups.map(\.id)) }
         if #available(iOS 17.0, *) {
             await CloudSyncEngine.mergeProviderConfigForRestore(merged)
         } else {
             await MainActor.run { Self.mergeProviderConfigFallback(merged) }
         }
         let after = await MainActor.run { ProviderConfigStore.shared.config.instances.count }
+        // [T-backup-restore-tombstone] Groups the restore brought back (a
+        // deleted group, or one this device never had). Counted separately
+        // because the instance arithmetic below cannot see them: restoring a
+        // deleted group used to read "Imported 0" even once it worked.
+        let groupsRestored = await MainActor.run {
+            Set(ProviderConfigStore.shared.config.modelGroups.map(\.id)).subtracting(groupsBefore).count
+        }
 
         // Report what the merge actually did, not the package's instance count:
         // an instance already present locally is not a new arrival.
@@ -399,6 +444,7 @@ extension BackupImporter {
         // hash) already reports for an unchanged item.
         report.imported = max(0, after - before)
         report.skipped = max(0, config.instances.count - report.imported)
+        report.imported += groupsRestored
 
         // [T-backup-thinking-rules] AFTER the instance merge, never before: a
         // rule's `instance_id` points at a ProviderInstance, so importing rules
@@ -415,6 +461,18 @@ extension BackupImporter {
             report.skipped += outcome.skipped
         }
 
+        // [T-subagent-own-store] Also after the instance merge: a definition's
+        // modelGroupId points at a model group that the merge above may have
+        // just restored. Absent in packages written before sub agents moved out
+        // of provider_config.json — readJSONL returns [] and that is not an error.
+        let agents = readJSONL(root.appendingPathComponent("data", isDirectory: true),
+                               base: "sub_agents", as: BackupSubAgentRecord.self)
+        if !agents.isEmpty {
+            let outcome = await Self.importSubAgents(agents)
+            report.imported += outcome.written
+            report.skipped += outcome.skipped
+        }
+
         // §3.3: credentials belong to this category and restore with it.
         // Absent for a "share copy" package, which is why nil is not an error.
         if let creds = await MainActor.run(body: { BackupSecretsImporter.restore(from: root) }) {
@@ -423,6 +481,58 @@ extension BackupImporter {
                 + creds.envVarsSkippedExisting + creds.mcpOAuthSkippedExisting
         }
         return report
+    }
+
+    /// [T-subagent-own-store] Merge restored sub agents into SubAgentStore.
+    ///
+    /// Delegates to `SubAgentRoster.merge`, the same function the iCloud
+    /// hydrator uses, rather than writing a second merge. That gives the
+    /// restore the same properties for free:
+    ///   * a LOCAL definition with a newer `updatedAt` wins, so restoring an
+    ///     older package cannot roll back an agent edited since;
+    ///   * a package agent whose NAME collides with a local one collapses
+    ///     deterministically instead of producing two entries the model cannot
+    ///     tell apart;
+    ///   * `normalize` still bounds the count and keeps the built-in first.
+    ///
+    /// Nothing is deleted — merge is a union, which is what the restore
+    /// confirmation promises.
+    @MainActor
+    private static func importSubAgents(
+        _ agents: [BackupSubAgentRecord]
+    ) async -> (written: Int, skipped: Int) {
+        let store = SubAgentStore.shared
+        let before = store.subAgents
+        let incoming = agents.map { r in
+            SubAgentDefinition(
+                id: r.id,
+                name: r.name,
+                description: r.subAgentDescription,
+                instructions: r.instructions,
+                modelGroupId: r.modelGroupId,
+                // [T-subagent-thinking-override] Absent in a package written
+                // before the field existed → nil → "not set".
+                thinkingLevelOverride: r.thinkingLevelOverride
+                    .flatMap { ThinkingLevel.parse($0) },  // Android writes "HIGH"
+                isBuiltIn: false,
+                sortOrder: r.sortOrder,
+                updatedAt: r.updatedAt
+            )
+        }
+        let merged = SubAgentRoster.merge(local: before, remote: incoming) {
+            logger.info("[Restore] sub agents: \($0)")
+        }
+        let beforeIds = Set(before.map(\.id))
+        let written = merged.filter { !beforeIds.contains($0.id) }.count
+        let skipped = max(0, agents.count - written)
+        if merged != before {
+            store.applyMergedFromSync(merged)
+            // Push the restored roster to this device's peers, the same way a
+            // local edit would.
+            store.markAllDirty()
+        }
+        logger.info("[Restore] sub agents: \(written) applied, \(skipped) skipped (local newer or unchanged)")
+        return (written, skipped)
     }
 
     /// [T-backup-thinking-rules] Merge restored thinking rules into the
@@ -583,7 +693,20 @@ extension BackupImporter {
         local.agentLoopGroupIds = Array(
             Set(local.agentLoopGroupIds).union(remote.agentLoopGroupIds))
 
-        store.applyConfig(local)
+        // [T-backup-restore-tombstone] This path already brings a deleted item
+        // back (it appends by id and never consults tombstones), but it left
+        // the item's tombstone in place. Every later run of the shared merger
+        // starts by removing tombstoned ids, so the next restore or legacy
+        // snapshot merge would delete the group again. Clear the tombstones
+        // of everything the package carries, the same rule as the iOS 17 path.
+        local.deletedInstances = ProviderConfigTombstone.survivingRestore(
+            local.deletedInstances, restoring: Set(remote.instances.map(\.id)))
+        local.deletedModelEntries = ProviderConfigTombstone.survivingRestore(
+            local.deletedModelEntries, restoring: Set(remote.modelEntries.map(\.id)))
+        local.deletedModelGroups = ProviderConfigTombstone.survivingRestore(
+            local.deletedModelGroups, restoring: Set(remote.modelGroups.map(\.id)))
+
+        store.applyConfig(local, orderReason: "restore-merge")
         logger.info("[Restore] provider merge (iOS16 path): instances=\(local.instances.count) entries=\(local.modelEntries.count) groups=\(local.modelGroups.count)")
     }
 
@@ -627,12 +750,22 @@ extension BackupImporter {
         let data = try Data(contentsOf: src)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let incoming = try decoder.decode([EnvVarEntry].self, from: data)
+        // [T-envvar-disable] EnvVarBackupEntry reads `enabled` (missing in an
+        // older backup → enabled).
+        let incoming = try decoder.decode([EnvVarBackupEntry].self, from: data)
+
+        // [T-envvar-backup-values] Values first (secrets.json, never
+        // overwriting), so the variables created below pick them up even when
+        // the Providers category - whose credential pass used to be the only
+        // writer of these values - is not part of this restore.
+        await MainActor.run { _ = BackupSecretsImporter.restoreEnvVarValues(from: root) }
 
         await MainActor.run {
             let store = EnvVarStore.shared
             let existing = Set(store.entries.map(\.key))
             for entry in incoming {
+                // An existing variable of that name is left exactly as it is,
+                // its enabled state included (never overwrite).
                 guard !existing.contains(entry.key) else {
                     report.skipped += 1
                     continue
@@ -641,6 +774,10 @@ extension BackupImporter {
                 // value into the Keychain; keep it rather than blanking it.
                 let value = EnvVarStore.loadValueSync(forKey: entry.key) ?? ""
                 store.add(key: entry.key, value: value, note: entry.note)
+                if !entry.enabled,
+                   let created = store.entries.first(where: { $0.key == entry.key.uppercased() }) {
+                    store.setEnabled(id: created.id, false)
+                }
                 report.imported += 1
             }
         }

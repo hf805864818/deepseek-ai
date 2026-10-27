@@ -11,9 +11,11 @@
 import Foundation
 import SQLite3
 import Compression
+import zlib
 
 // MARK: - Skill Model
 
+// BEGIN SkillImportSource
 enum SkillImportSource: Codable, Equatable {
     case url(String)
     case file       // imported via file picker / paste
@@ -40,7 +42,19 @@ enum SkillImportSource: Codable, Equatable {
         }
         return .file
     }
+
+    /// [T-skill-copy-source-url] The source URL as the long-press "Copy Source
+    /// URL" action copies it, or nil when there is nothing worth copying.
+    /// Only URL-installed skills qualify; file / bundled / session skills have
+    /// no source, and a blank stored URL (a bare "url:" row) shows no action
+    /// rather than putting an empty string on the clipboard.
+    var copyableURL: String? {
+        guard case .url(let raw) = self else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
+// END SkillImportSource
 
 struct Skill: Identifiable {
     let id: String
@@ -98,11 +112,6 @@ final class SkillStore: ObservableObject {
         createTables()
         loadSkills()
         installBundledSkills()
-        // [T-deep-mode] Back-fill any missing deep skills at startup WITHOUT
-        // resetting per-skill toggles, so a user's individually-disabled deep
-        // skill stays disabled across relaunches. (The toggle-change path uses
-        // `syncDeepModeSkills()` to reset — see below.)
-        installDeepModeSkills()
         migrateMarkBundledSkillsDirty()
     }
 
@@ -394,322 +403,6 @@ Do not create extraneous files: README.md, INSTALLATION_GUIDE.md, CHANGELOG.md, 
         _ = try? importSkill(content: Self.skillCreatorContent, source: .bundled)
     }
 
-    // MARK: - Deep Mode Skills (深度龙虾Ai 技能包)
-
-    /// [T-deep-mode] The bundled deep-agent skill pack, installed lazily the
-    /// first time the user flips the 深度龙虾Ai toggle on. Each skill is a
-    /// procedural "how to do this class of task well" playbook, mirroring
-    /// TRAE's built-in skills. They are installed with `.bundled` source so
-    /// they rank first in `skillPromptFragment`'s overflow selection AND keep
-    /// the same upgrade path as `skill-creator`.
-    private static let deepSkillDefinitions: [(name: String, version: String, content: String)] = [
-        ("deep-planning", "1.0.0", """
----
-name: deep-planning
-version: 1.0.0
-description: Break complex multi-step tasks into an explicit plan, execute it with tool calls, then self-verify the result. Use when the user's request is broad, ambiguous, or spans multiple steps (build a project, refactor, investigate, produce a multi-part deliverable).
----
-
-# Deep Planning
-
-Turn a complex request into a plan → execute → verify loop.
-
-## When To Use
-- The task has 3+ distinct steps or spans multiple files/tools.
-- The user asked for something "end-to-end", "full", or open-ended.
-
-## Workflow
-1. State a short numbered plan (under 10 steps) before any tool call.
-2. Execute steps in order, calling tools rather than describing intent.
-3. After each milestone, sanity-check the intermediate result.
-4. On completion, re-read the final output and fix any errors.
-5. Conclude with a 2-3 sentence summary of what was done.
-
-## Notes
-- Skip the plan for trivial single-command tasks.
-- If a step blocks on missing info, ask or use available tools to obtain it rather than guessing.
-"""),
-        ("deep-research", "1.0.0", """
----
-name: deep-research
-version: 1.0.0
-description: Conduct thorough evidence-based research and synthesis using web search and source retrieval. Use when the user asks to research, investigate, compare, fact-check, or verify information, especially when citations or sources are expected.
----
-
-# Deep Research
-
-Produce a well-sourced, structured research answer instead of a shallow reply.
-
-## Workflow
-1. Clarify the question and identify the key dimensions to cover.
-2. Search with precise, distinct queries; avoid repeating near-identical searches.
-3. Prefer authoritative primary sources (official docs, vendor sites, RFCs) over secondary write-ups.
-4. Fetch full pages only when snippets are insufficient.
-5. Extract and record key facts before chaining more searches.
-6. Cite sources inline; never fabricate URLs or findings.
-7. Deliver a complete, table/header-organized summary.
-
-## Notes
-- Time-sensitive topics need a time anchor in the query.
-- If a source is unreachable, say so; do not invent its contents.
-"""),
-        ("deep-doc", "1.0.0", """
----
-name: deep-doc
-version: 1.0.0
-description: Write structured documents and reports (PRDs, research reports, competitive analyses, technical proposals) with clear sections, tables, and citations. Use when the user asks for a document, report, spec, proposal, or any structured written deliverable.
----
-
-# Deep Document Writing
-
-Write structured, professional written deliverables.
-
-## Workflow
-1. Confirm the genre (PRD, report, spec, analysis) and audience.
-2. Outline the section structure before drafting body text.
-3. Draft content section by section, keeping paragraphs tight (2-3 sentences with citations where applicable).
-4. Use Markdown tables for multi-dimension comparisons.
-5. Remove fluff: one idea per paragraph, no filler.
-6. Review for completeness against the original request.
-
-## Notes
-- Keep headers short (under 6 words) and unnumbered.
-- Cite sources inline where facts come from retrieval.
-"""),
-        ("deep-data", "1.0.0", """
----
-name: deep-data
-version: 1.0.0
-description: Perform data analysis and produce charts or tables from datasets. Use when the user asks to analyze data, clean data, compute statistics, compare values, or visualize numbers.
----
-
-# Deep Data Analysis
-
-Turn raw data into validated conclusions and visualizations.
-
-## Workflow
-1. Inspect the data first (file_read) — schema, size, sample rows.
-2. Choose the right tool for the job (a short Python script via file_write + shell_execute, or direct shell text-processing).
-3. Compute and validate numbers; cross-check totals and edge cases.
-4. Visualize with a chart or table where it aids understanding.
-5. State conclusions and any caveats (missing data, assumptions).
-
-## Notes
-- For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
-- Never fabricate values; if data is missing, say so.
-"""),
-        ("deep-code", "1.0.0", """
----
-name: deep-code
-version: 1.0.0
-description: Generate, refactor, and debug code with a read-understand-change-verify discipline. Use when the user asks to write code, fix a bug, debug, refactor, or implement a feature in an existing codebase.
----
-
-# Deep Code
-
-Produce working code by understanding context first and verifying after every change.
-
-## When To Use
-- Writing new code, or modifying/extending an existing codebase.
-- The user reports a bug, error, or unexpected behavior.
-
-## Workflow
-1. Read the relevant files first (file_read) to understand structure, dependencies, and conventions.
-2. State a short plan for the change before editing.
-3. Make small, focused edits (file_write / file_edit); avoid sweeping rewrites.
-4. After each change, verify it will compile and behaves as intended (re-read the edited region).
-5. Handle edge cases, errors, and input validation explicitly.
-
-## Notes
-- Follow the surrounding code style; do not silently change unrelated behavior.
-- If unsure about intent, ask or infer minimally rather than guessing wildly.
-"""),
-        ("deep-review", "1.0.0", """
----
-name: deep-review
-version: 1.0.0
-description: Review code for correctness, bugs, security risks, performance, maintainability, and best practices, then give structured actionable feedback. Use when the user asks to review, audit, or critique code or a diff.
----
-
-# Deep Code Review
-
-Give structured, actionable review feedback instead of vague comments.
-
-## Workflow
-1. Read the full file or diff (file_read) before judging.
-2. Assess across: correctness, security, performance, maintainability, and style.
-3. For each issue, report the specific location, the concrete problem, and a suggested fix.
-4. Separate blocking issues from suggestions/nitpicks.
-5. Summarize a prioritized action list at the end.
-
-## Notes
-- Never report an issue without pointing to the offending code.
-- Balance completeness with brevity; focus on the highest-impact findings.
-"""),
-        ("deep-browser", "1.0.0", """
----
-name: deep-browser
-version: 1.0.0
-description: Drive a real web browser to navigate, fill forms, click, screenshot, and scrape content. Use when the user asks to open a website, test a web UI, extract web content, or perform multi-step browser actions.
----
-
-# Deep Browser Automation
-
-Perform multi-step browser tasks with verification at each step.
-
-## Workflow
-1. Clarify the target page and the exact goal sequence.
-2. Navigate, then confirm the page loaded as expected (use read_image on screenshots).
-3. Fill forms, click, and interact step by step, checking results after each action.
-4. Extract or screenshot the final state.
-5. Report what happened and anything that could not be completed.
-
-## Notes
-- Hand control to the user for login, CAPTCHA, or actions requiring human judgment.
-- Prefer visible verification over assuming a click/type action succeeded.
-"""),
-        ("deep-shell", "1.0.0", """
----
-name: deep-shell
-version: 1.0.0
-description: Plan and run shell commands for scripting, data processing, environment setup, and troubleshooting, with explicit safety checks. Use when the user asks to run commands, install tools, process files, or debug the environment.
----
-
-# Deep Shell
-
-Run shell commands deliberately, with a plan and validation.
-
-## Workflow
-1. State the command and its intent before executing.
-2. Prefer non-destructive read/query commands to understand state first.
-3. Execute with shell_execute; inspect the output before the next command.
-4. Validate results and tidy up temporary files/processes when done.
-5. Summarize what changed and any warnings.
-
-## Notes
-- Confirm before destructive or irreversible commands (rm -rf, format, drop, overwrite).
-- Quote paths with spaces; avoid interactive commands unless unavoidable.
-"""),
-        ("deep-memory", "1.0.0", """
----
-name: deep-memory
-version: 1.0.0
-description: Decide what user context is worth persisting and use memory tools to store and retrieve it across sessions. Use for long-term personalization: user preferences, ongoing projects, and recurring facts.
----
-
-# Deep Memory Strategy
-
-Persist durable context so future sessions are smarter, without accumulating noise.
-
-## When To Store (memory_write)
-- Stable user preferences, recurring facts, or ongoing project context.
-- Only when the value clearly helps future requests.
-
-## When To Retrieve (memory_get)
-- Before acting on a request that depends on prior user context.
-- When the user refers to something discussed before ("as we discussed", "my project").
-
-## Rules
-- Prefer updating an existing memory over duplicating it.
-- Do not store transient or trivial details; noise degrades retrieval quality.
-- Store facts, not speculation.
-"""),
-        ("deep-slides", "1.0.0", """
----
-name: deep-slides
-version: 1.0.0
-description: Produce presentation decks from a topic, outline, or document with clear page structure and one idea per slide. Use when the user asks for a presentation, slides, demo, or 汇报材料.
----
-
-# Deep Slides
-
-Turn a topic into a clean, self-contained slide deck.
-
-## Workflow
-1. Confirm the topic, audience, and desired length.
-2. Outline pages: cover, agenda, content pages, and a summary.
-3. Write a self-contained HTML deck (file_write) with one core idea per slide.
-4. Keep visuals simple; use tables or diagrams where they clarify.
-5. Review that every page supports the main message and nothing is missing.
-
-## Notes
-- For charts with CJK text, set the font to 'Noto Sans CJK SC' or 'WenQuanYi Micro Hei'.
-- Prefer HTML output (portable, visually rich); only use other formats when the user explicitly asks.
-"""),
-        ("deep-security", "1.0.0", """
----
-name: deep-security
-version: 1.0.0
-description: Audit code for security vulnerabilities — injection, XSS, hardcoded secrets, unsafe storage, permission bypass, insecure network, dependency CVEs. Use when the user asks for a security review, vulnerability scan, or penetration test of source code.
----
-
-# Deep Security Audit
-
-Scan code for security vulnerabilities, not just bugs.
-
-## When To Use
-- The user asks to "check security", "audit for vulnerabilities", or "is this safe".
-- Code handles user input, authentication, secrets, or network communication.
-
-## Workflow
-1. Read the full source (file_read) before judging — do not audit blindly.
-2. Scan across these vulnerability classes:
-   - Injection (SQL/Command/Path): concatenated queries, shell strings, file paths from user input.
-   - XSS: unescaped user input rendered in HTML/UI.
-   - Hardcoded secrets: API keys, tokens, passwords committed in source.
-   - Unsafe storage: plaintext passwords in UserDefaults/files, unencrypted sensitive data.
-   - Permission bypass: missing auth checks on privileged endpoints or functions.
-   - Insecure network: HTTP (not HTTPS), disabled TLS verification, unvalidated certificates.
-   - Dependency CVEs: known-vulnerable third-party libraries.
-3. For each finding, report: location (file:line), severity (Critical/High/Medium/Low), the attack scenario, and the fix.
-4. Separate critical issues (exploitable now) from informational findings.
-5. Provide a prioritized remediation list at the end.
-
-## Notes
-- Never report a vulnerability without showing the exact code location.
-- Distinguish "could be exploited" from "defensive depth" — prioritize real attack vectors.
-- Check both the code AND configuration (Info.plist, build settings, environment variables).
-"""),
-    ]
-
-    /// [T-deep-mode] Install any *missing* deep-skill definitions without
-    /// touching the enabled state of skills that already exist. Called at
-    /// startup so a newer pack is back-filled, while preserving the user's
-    /// per-skill toggles across relaunches. Newly installed skills are
-    /// initialized to the global 深度龙虾Ai toggle value (importSkill defaults
-    /// to `enabled=true`, so we correct it here when the toggle is off).
-    func installDeepModeSkills() {
-        let enabled = UserDefaults.standard.bool(forKey: "deepMode.enabled")
-        for def in Self.deepSkillDefinitions {
-            let id = Self.slugify(def.name)
-            guard !skills.contains(where: { $0.id == id }) else { continue }
-            try? importSkill(content: def.content, source: .bundled)
-            if skills.first(where: { $0.id == id })?.isEnabled != enabled {
-                setEnabled(id, enabled: enabled)
-            }
-        }
-    }
-
-    /// [T-deep-mode] Install missing deep skills AND force each skill's
-    /// enabled state to the global 深度龙虾Ai toggle. Called when the toggle
-    /// *changes*, so flipping it OFF→ON re-enables every deep skill (a
-    /// "reset"), and ON→OFF freezes them all (disable without uninstalling —
-    /// 方案 A). This is deliberately separate from `installDeepModeSkills()`,
-    /// which does NOT reset state and therefore lets per-skill toggles persist
-    /// across app relaunches.
-    func syncDeepModeSkills() {
-        let enabled = UserDefaults.standard.bool(forKey: "deepMode.enabled")
-        for def in Self.deepSkillDefinitions {
-            let id = Self.slugify(def.name)
-            if !skills.contains(where: { $0.id == id }) {
-                try? importSkill(content: def.content, source: .bundled)
-            }
-            if skills.first(where: { $0.id == id })?.isEnabled != enabled {
-                setEnabled(id, enabled: enabled)
-            }
-        }
-    }
-
     // MARK: - One-time Migration: re-sync skills with bundled files
 
     /// On first launch after the bundle-sync update, mark all skills that have bundled files
@@ -746,8 +439,18 @@ Scan code for security vulnerabilities, not just bugs.
         var body: String = ""
     }
 
-    static func parse(skillMD content: String) -> ParsedSkillMD {
+    static func parse(skillMD rawContent: String) -> ParsedSkillMD {
         var result = ParsedSkillMD()
+        // Normalize line endings before splitting. A SKILL.md written on
+        // Windows uses CRLF (classic Mac editors bare CR); splitting on "\n"
+        // alone left a trailing "\r" on every line, and `.whitespaces` does not
+        // contain CR, so the closing "---\r" never matched and the skill
+        // imported as "Untitled Skill". A leading UTF-8 BOM (Notepad) likewise
+        // hid the opening fence.
+        var content = rawContent
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        if content.first == "\u{FEFF}" { content.removeFirst() }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let lines = content.components(separatedBy: "\n")
@@ -944,10 +647,21 @@ Scan code for security vulnerabilities, not just bugs.
     /// process a bundled-file ZIP (importSkillFromSyncWithAsset) MUST honour
     /// a `false` return and abort the ZIP unpack/prune — otherwise the prune
     /// step would still delete local bundled files against a stale record.
+    ///
+    /// `fallbackName` is a name the CALLER already knows from its own metadata,
+    /// used only when parsing `content` fails to produce one. Backup restore
+    /// passes the name recorded in skills.jsonl: if that skill's SKILL.md has
+    /// malformed frontmatter (no leading `---`, broken YAML), `parse` yields
+    /// `defaultSkillName` and the correct name sitting in the backup record
+    /// would otherwise be thrown away — the skill restores as
+    /// "Untitled Skill" even though the file is intact.
+    /// [T-skill-restore-untitled] Sync callers pass nil and keep today's
+    /// behaviour, since for them the SKILL.md body is the only source of truth.
     @discardableResult
     func importSkillFromSync(
         skillId: String, content: String, source: SkillImportSource,
-        isEnabled: Bool, installedAt: Date, updatedAt: Date
+        isEnabled: Bool, installedAt: Date, updatedAt: Date,
+        fallbackName: String? = nil
     ) -> Bool {
         // [T-icloud-cloud-overwrites-local-edits] Local-newer guard. Skill
         // files (SKILL.md + bundled files) are user-editable; below we
@@ -966,7 +680,21 @@ Scan code for security vulnerabilities, not just bugs.
                 return false
             }
         }
-        let parsed = Self.parse(skillMD: content)
+        var parsed = Self.parse(skillMD: content)
+
+        // [T-skill-restore-untitled] Resolve the name BEFORE it is used, so the
+        // slug below, the Skill struct and the DB row all agree. Only a parse
+        // that fell back to the placeholder defers to the caller's name; a real
+        // parsed name always wins, because the file is the source of truth
+        // whenever it can actually be read.
+        if parsed.name == Self.defaultSkillName,
+           let fallbackName,
+           !fallbackName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           fallbackName != Self.defaultSkillName {
+            AppLogger(category: "SkillSync").info(
+                "[IMPORT] '\(skillId)' SKILL.md parse yielded the placeholder name; using caller-supplied name '\(fallbackName)'")
+            parsed.name = fallbackName
+        }
 
         // If a local skill exists with the same slugified name but a different ID,
         // remove the old one to prevent duplicates.
@@ -1409,6 +1137,14 @@ Scan code for security vulnerabilities, not just bugs.
             try? fm.createDirectory(at: rootfsFile.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? content.write(to: rootfsFile, atomically: true, encoding: .utf8)
 
+            // [T-ios-skill-backup-fakefs] A file at a NEW relative path needs a
+            // meta.db row or the guest cannot see it until the next cold-start
+            // mount walk — the same per-file registration importFromArchive
+            // and the GitHub importer do. No-op for paths already registered.
+            let linuxPath = "/var/minis/skills/\(skillId)/\(relativePath)"
+            ensureParentDirsInMetaDB(for: linuxPath)
+            ensureFakefsMetadata(for: linuxPath, isDirectory: false)
+
             // Update skill's updatedAt and mark dirty so bundled file changes trigger iCloud sync
             if let idx = skills.firstIndex(where: { $0.id == skillId }) {
                 skills[idx].updatedAt = Date()
@@ -1566,32 +1302,10 @@ Scan code for security vulnerabilities, not just bugs.
         return skills.contains(where: { $0.id == candidate }) ? candidate : nil
     }
 
-    // MARK: - Prompt Fragment (Claude Code style: metadata only)
+    // MARK: - Prompt Fragment (progressive disclosure: metadata only)
 
     /// Maximum number of skill metadata entries to include in the prompt.
     private static let maxSkillMetadataCount = 20
-
-    /// [T-deep-mode] The single source of truth for whether the 深度龙虾Ai
-    /// behaviour is active. Deep-mode skills are a *global* capability gated
-    /// by this switch, so their *effective* enabled state must follow the
-    /// switch, NOT the per-skill `isEnabled` bit that iCloud sync replicates
-    /// across devices. Reading UserDefaults live (instead of caching) keeps
-    /// the toggle instantly effective for every subsequent prompt.
-    private var deepModeEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "deepMode.enabled")
-    }
-
-    /// [T-deep-mode] Deep-mode skills are governed by the global switch, so
-    /// exclude them from normal session-override semantics and instead pin
-    /// their effective state to `skill.isEnabled && deepModeEnabled`. This
-    /// guarantees a peer device's stale cloud push (with `isEnabled=true`)
-    /// can never resurrect a deep skill on a device whose switch is off.
-    private func isDeepSkill(_ id: String) -> Bool {
-        // Deep pack uses the same `.bundled` source as other shipped skills;
-        // the id prefix is the unambiguous discriminator.
-        guard id.hasPrefix("deep-") else { return false }
-        return skills.first(where: { $0.id == id })?.importSource == .bundled
-    }
 
     /// Build a discovery-only prompt fragment with priority-based disclosure:
     /// 1. Bundled skills (always included)
@@ -1599,13 +1313,7 @@ Scan code for security vulnerabilities, not just bugs.
     /// 3. Frequently used skills by normalized use count (fill remaining slots)
     func skillPromptFragment(for sessionId: String) -> String? {
         let logger = AppLogger(category: "SkillDisclosure")
-        let enabled = skills.filter { skill in
-            if isDeepSkill(skill.id) {
-                // Switch is the source of truth; ignore cloud-replicated isEnabled.
-                return skill.isEnabled && deepModeEnabled
-            }
-            return isEnabledForSession(skill.id, sessionId: sessionId)
-        }
+        let enabled = skills.filter { isEnabledForSession($0.id, sessionId: sessionId) }
         guard !enabled.isEmpty else { return nil }
 
         let totalCount = enabled.count
@@ -1702,7 +1410,9 @@ Scan code for security vulnerabilities, not just bugs.
             let omitted = enabled.filter { s in !selected.contains(where: { $0.id == s.id }) }
             let maxUndisclosed = 100 - selected.count
             let undisclosedNames = omitted.prefix(maxUndisclosed).map(\.name).joined(separator: ", ")
-            fragment += "\n\n\(omitted.count) more skills not shown above: \(undisclosedNames). List /var/minis/skills/ or grep to search all."
+            // [T-prompt-search-neutral] Names no search tool: "or grep to search all"
+            // was a direct instruction that outweighed the rg guidance.
+            fragment += "\n\n\(omitted.count) more skills not shown above: \(undisclosedNames). List or search /var/minis/skills/ to find the rest."
         }
 
         return fragment
@@ -1839,7 +1549,7 @@ Scan code for security vulnerabilities, not just bugs.
                 let skillFile = skillsDir.appendingPathComponent(id).appendingPathComponent("SKILL.md")
                 var resolvedName = name
                 var resolvedDesc = description
-                let body: String
+                var body: String = ""
                 if let content = try? String(contentsOf: skillFile, encoding: .utf8) {
                     let parsed = Self.parse(skillMD: content)
                     body = parsed.body
@@ -1888,9 +1598,34 @@ Scan code for security vulnerabilities, not just bugs.
                         let parsed = Self.parse(skillMD: rootfsContent)
                         body = parsed.body
                     } else {
-                        // Skill files deleted from both locations — remove from DB
-                        dbDeleteSkill(id: id)
-                        continue
+                        // [T-ios-skill-circuit-breaker] Circuit Breaker:
+                        // Guard against mass pruning when container or rootfs mount is unready on cold start/crash.
+                        var isDir: ObjCBool = false
+                        let storageReady = fm.fileExists(atPath: skillsDir.path, isDirectory: &isDir) && isDir.boolValue
+                        var totalCustom = 0
+                        var missingCustom = 0
+                        let sqlCount = "SELECT id, import_source FROM skills WHERE import_source != 'bundled'"
+                        var cStmt: OpaquePointer?
+                        if sqlite3_prepare_v2(db, sqlCount, -1, &cStmt, nil) == SQLITE_OK {
+                            while sqlite3_step(cStmt) == SQLITE_ROW {
+                                totalCustom += 1
+                                let sId = String(cString: sqlite3_column_text(cStmt, 0))
+                                let f1 = skillsDir.appendingPathComponent(sId).appendingPathComponent("SKILL.md")
+                                let f2 = rootfsSkillsDir.appendingPathComponent(sId).appendingPathComponent("SKILL.md")
+                                if !fm.fileExists(atPath: f1.path) && !fm.fileExists(atPath: f2.path) {
+                                    missingCustom += 1
+                                }
+                            }
+                            sqlite3_finalize(cStmt)
+                        }
+                        let tripped = storageReady && totalCustom >= 3 && missingCustom >= 3 && (Double(missingCustom) / Double(totalCustom) >= 0.40)
+                        if !storageReady || tripped {
+                            AppLogger(category: "SkillStore").error("Circuit breaker tripped or storage unready (\(missingCustom)/\(totalCustom) missing). Aborting dbDeleteSkill for \(id) to prevent mass data wipe.")
+                        } else {
+                            // Skill files deleted from both locations — remove from DB
+                            dbDeleteSkill(id: id)
+                            continue
+                        }
                     }
                 }
 
@@ -2414,70 +2149,30 @@ extension SkillStore {
         return true
     }
 
-    /// Build a ZIP archive of the skill directory for CloudSync.
-    /// Includes SKILL.md and all bundled files, excluding package manager dirs.
-    /// Returns nil if the skill directory doesn't exist or has no files.
-    func buildSkillZipData(_ skillId: String) -> Data? {
-        let syncLogger = AppLogger(category: "SkillSync")
-        let skillDir = skillsDir.appendingPathComponent(skillId)
-        guard fm.fileExists(atPath: skillDir.path) else {
-            syncLogger.info("[ZIP] '\(skillId)' directory missing — cannot build ZIP")
-            return nil
-        }
+    /// [T-skill-zip-off-main] The skill's files as a ZIP on disk, for CloudSync:
+    /// SKILL.md and all bundled files, excluding package manager dirs. nil if
+    /// the skill directory doesn't exist or has no files.
+    ///
+    /// Never runs on the main thread. It used to: both sync engines called the
+    /// builder inside `MainActor.run`, and for a 5 MB skill that was reading
+    /// 106 files, a bit-by-bit CRC over every byte and assembling the archive -
+    /// 2.4 to 2.7 s with no frame drawn, each time a sync batch carried the
+    /// skill (once when a task ended and released the push, then again every
+    /// ~13 s while CloudKit kept failing the batch). Now the work is on a
+    /// background task, the CRC is zlib's, and an unchanged skill reuses the
+    /// file built last time (see SkillZipPackager).
+    nonisolated static func skillZipFile(skillId: String, skillDir: URL) async -> URL? {
+        await Task.detached(priority: .utility) {
+            SkillZipPackager.shared.zipFile(
+                skillId: skillId, skillDir: skillDir,
+                isExcludedDir: { SkillStore.isExcludedDir($0) },
+                log: { AppLogger(category: "SkillSync").info($0) })
+        }.value
+    }
 
-        var files: [(relativePath: String, data: Data)] = []
-        var skippedDirs: [String] = []
-
-        guard let enumerator = fm.enumerator(
-            at: skillDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return nil }
-
-        let dirComponents = skillDir.standardizedFileURL.pathComponents
-
-        for case let fileURL as URL in enumerator {
-            let lastComponent = fileURL.lastPathComponent
-            if Self.isExcludedDir(lastComponent) {
-                enumerator.skipDescendants()
-                skippedDirs.append(lastComponent)
-                continue
-            }
-
-            let isRegular = (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
-            guard isRegular else { continue }
-
-            let fileComponents = fileURL.standardizedFileURL.pathComponents
-            guard fileComponents.count > dirComponents.count else { continue }
-            let rel = fileComponents[dirComponents.count...].joined(separator: "/")
-
-            guard let data = try? Data(contentsOf: fileURL) else { continue }
-            files.append((relativePath: rel, data: data))
-        }
-
-        if !skippedDirs.isEmpty {
-            syncLogger.info("[ZIP] '\(skillId)' excluded dirs: \(skippedDirs.joined(separator: ", "))")
-        }
-
-        guard !files.isEmpty else {
-            syncLogger.info("[ZIP] '\(skillId)' no files found — returning nil")
-            return nil
-        }
-
-        // Sort so SKILL.md comes first
-        files.sort { a, b in
-            if a.relativePath == "SKILL.md" { return true }
-            if b.relativePath == "SKILL.md" { return false }
-            return a.relativePath < b.relativePath
-        }
-
-        let totalBytes = files.reduce(0) { $0 + $1.data.count }
-        let fileList = files.map { "\($0.relativePath) (\($0.data.count)B)" }.joined(separator: ", ")
-        syncLogger.info("[ZIP] '\(skillId)' packing \(files.count) files (\(totalBytes) bytes raw): \(fileList)")
-
-        let zipData = Self.buildZipArchive(files: files)
-        syncLogger.info("[ZIP] '\(skillId)' ZIP built: \(zipData.count) bytes")
-        return zipData
+    /// SKILL.md of the skill at `skillDir`, readable off the main thread.
+    nonisolated static func readSkillContent(in skillDir: URL) -> String? {
+        try? String(contentsOf: skillDir.appendingPathComponent("SKILL.md"), encoding: .utf8)
     }
 
     /// Import a skill from iCloud sync, unpacking bundled files from a ZIP asset.
@@ -2618,13 +2313,172 @@ extension SkillStore {
             RootfsManager.shared.removeFakefsPath(linuxPath)
         }
     }
+}
 
-    // MARK: - Minimal ZIP Writer
+// BEGIN SkillZipPackaging
+// [T-skill-zip-off-main] Self-contained on purpose (Foundation + zlib, the
+// exclusion rule and the logger passed in): MinisTests/Standalone/
+// SkillZipPackagingTests compiles this block as it ships.
+
+/// Packs a skill directory into a ZIP file for CloudSync, off the main thread.
+///
+/// Built once per content: the file is kept in `cacheDirectory` together with
+/// a fingerprint of what went into it (every included file's path, size and
+/// modification time). A later request with the same fingerprint returns the
+/// same file without reading anything - a sync batch that fails and is retried
+/// no longer packs the skill again. The modification time is the signal the
+/// sync's own dirty scanner uses to decide a skill changed at all.
+final class SkillZipPackager: @unchecked Sendable {
+    static let shared = SkillZipPackager(
+        cacheDirectory: FileManager.default.temporaryDirectory
+            .appendingPathComponent("skill-zip", isDirectory: true))
+
+    /// One file that goes into the archive.
+    struct Entry {
+        let relativePath: String
+        let url: URL
+        let size: Int
+        let modified: Date
+    }
+
+    private let cacheDirectory: URL
+    private let lock = NSLock()
+    /// skillId -> what the file in `cacheDirectory` was built from.
+    private var built: [String: (fingerprint: String, size: Int)] = [:]
+
+    init(cacheDirectory: URL) {
+        self.cacheDirectory = cacheDirectory
+    }
+
+    /// The regular files under `skillDir` that are synced, SKILL.md first and
+    /// the rest by path, plus the names of the directories left out.
+    static func listFiles(in skillDir: URL, isExcludedDir: (String) -> Bool) -> (entries: [Entry], skippedDirs: [String]) {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: skillDir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]
+        ) else { return ([], []) }
+
+        let dirComponents = skillDir.standardizedFileURL.pathComponents
+        var entries: [Entry] = []
+        var skippedDirs: [String] = []
+        for case let fileURL as URL in enumerator {
+            let lastComponent = fileURL.lastPathComponent
+            if isExcludedDir(lastComponent) {
+                enumerator.skipDescendants()
+                skippedDirs.append(lastComponent)
+                continue
+            }
+            let values = try? fileURL.resourceValues(forKeys: Set(keys))
+            guard values?.isRegularFile == true else { continue }
+
+            let fileComponents = fileURL.standardizedFileURL.pathComponents
+            guard fileComponents.count > dirComponents.count else { continue }
+            let rel = fileComponents[dirComponents.count...].joined(separator: "/")
+            entries.append(Entry(relativePath: rel, url: fileURL,
+                                 size: values?.fileSize ?? -1,
+                                 modified: values?.contentModificationDate ?? .distantPast))
+        }
+        // Sort so SKILL.md comes first
+        entries.sort { a, b in
+            if a.relativePath == "SKILL.md" { return true }
+            if b.relativePath == "SKILL.md" { return false }
+            return a.relativePath < b.relativePath
+        }
+        return (entries, skippedDirs)
+    }
+
+    /// Changes when a file is added, removed, renamed, resized or rewritten.
+    static func fingerprint(of entries: [Entry]) -> String {
+        entries.map {
+            "\($0.relativePath)|\($0.size)|\($0.modified.timeIntervalSinceReferenceDate.bitPattern)"
+        }.joined(separator: "\n")
+    }
+
+    /// The skill's ZIP file, built or reused. nil when the directory is
+    /// missing, holds no files, or the file could not be written.
+    func zipFile(skillId: String, skillDir: URL,
+                 isExcludedDir: (String) -> Bool, log: (String) -> Void) -> URL? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: skillDir.path) else {
+            log("[ZIP] '\(skillId)' directory missing — cannot build ZIP")
+            return nil
+        }
+        let started = Date()
+        let (entries, skippedDirs) = Self.listFiles(in: skillDir, isExcludedDir: isExcludedDir)
+        if !skippedDirs.isEmpty {
+            log("[ZIP] '\(skillId)' excluded dirs: \(skippedDirs.joined(separator: ", "))")
+        }
+        guard !entries.isEmpty else {
+            log("[ZIP] '\(skillId)' no files found — returning nil")
+            return nil
+        }
+
+        let destination = cacheDirectory.appendingPathComponent("\(skillId).zip")
+        let fingerprint = Self.fingerprint(of: entries)
+        lock.lock()
+        let previous = built[skillId]
+        lock.unlock()
+        // Reuse only a file that is still there at the size it was written:
+        // the temporary directory can be emptied under us.
+        if let previous, previous.fingerprint == fingerprint,
+           let onDisk = (try? fm.attributesOfItem(atPath: destination.path))?[.size] as? Int,
+           onDisk == previous.size {
+            log("[ZIP] '\(skillId)' unchanged since the last build — reusing \(onDisk) bytes (\(entries.count) files)")
+            return destination
+        }
+
+        var files: [(relativePath: String, data: Data)] = []
+        files.reserveCapacity(entries.count)
+        // A file that vanished or changed between the listing and the read
+        // makes the fingerprint describe something else than what was packed:
+        // the archive is still sent, but not remembered.
+        var matchesListing = true
+        for entry in entries {
+            guard let data = try? Data(contentsOf: entry.url) else {
+                matchesListing = false
+                continue
+            }
+            if data.count != entry.size { matchesListing = false }
+            files.append((relativePath: entry.relativePath, data: data))
+        }
+        guard !files.isEmpty else {
+            log("[ZIP] '\(skillId)' no files found — returning nil")
+            return nil
+        }
+
+        let totalBytes = files.reduce(0) { $0 + $1.data.count }
+        let fileList = files.map { "\($0.relativePath) (\($0.data.count)B)" }.joined(separator: ", ")
+        log("[ZIP] '\(skillId)' packing \(files.count) files (\(totalBytes) bytes raw): \(fileList)")
+
+        let zipData = Self.buildZipArchive(files: files)
+        do {
+            try fm.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+            // Atomic: an upload still reading the previous file keeps a whole one.
+            try zipData.write(to: destination, options: .atomic)
+        } catch {
+            log("[ZIP] '\(skillId)' could not write the ZIP: \(error.localizedDescription)")
+            lock.lock()
+            built[skillId] = nil
+            lock.unlock()
+            return nil
+        }
+        lock.lock()
+        built[skillId] = matchesListing ? (fingerprint, zipData.count) : nil
+        lock.unlock()
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        log("[ZIP] '\(skillId)' ZIP built: \(zipData.count) bytes in \(ms)ms")
+        return destination
+    }
+
+    // MARK: Minimal ZIP writer
 
     /// Build a ZIP archive in memory from a list of (relativePath, data) pairs.
     /// Uses Store method (no compression) for simplicity and speed.
-    nonisolated static func buildZipArchive(files: [(relativePath: String, data: Data)]) -> Data {
+    static func buildZipArchive(files: [(relativePath: String, data: Data)]) -> Data {
         var archive = Data()
+        // Headers are 30 + 46 bytes per file plus the name twice; reserving
+        // up front saves regrowing a multi-megabyte buffer file by file.
+        archive.reserveCapacity(files.reduce(22) { $0 + $1.data.count + 76 + 2 * $1.relativePath.utf8.count })
         var centralDirectory = Data()
         var offset: UInt32 = 0
 
@@ -2636,45 +2490,46 @@ extension SkillStore {
 
             // Local file header
             var local = Data()
-            local.appendU32(0x04034B50)           // signature
-            local.appendU16(20)                   // version needed
-            local.appendU16(0)                    // flags
-            local.appendU16(0)                    // method: Store
-            local.appendU16(0)                    // mod time
-            local.appendU16(0)                    // mod date
-            local.appendU32(crc)                  // CRC-32
-            local.appendU32(fileSize)             // compressed size
-            local.appendU32(fileSize)             // uncompressed size
-            local.appendU16(nameLen)              // file name length
-            local.appendU16(0)                    // extra field length
+            local.appendU32(0x04034B50) // signature
+            local.appendU16(20)          // version needed
+            local.appendU16(0)           // flags
+            local.appendU16(0)           // method: Store
+            local.appendU16(0)           // mod time
+            local.appendU16(0)           // mod date
+            local.appendU32(crc)         // CRC-32
+            local.appendU32(fileSize)    // compressed size
+            local.appendU32(fileSize)    // uncompressed size
+            local.appendU16(nameLen)     // file name length
+            local.appendU16(0)           // extra field length
             local.append(nameData)
-            local.append(file.data)
 
             // Central directory entry
             var cd = Data()
-            cd.appendU32(0x02014B50)              // signature
-            cd.appendU16(20)                      // version made by
-            cd.appendU16(20)                      // version needed
-            cd.appendU16(0)                       // flags
-            cd.appendU16(0)                       // method: Store
-            cd.appendU16(0)                       // mod time
-            cd.appendU16(0)                       // mod date
-            cd.appendU32(crc)                     // CRC-32
-            cd.appendU32(fileSize)                // compressed size
-            cd.appendU32(fileSize)                // uncompressed size
-            cd.appendU16(nameLen)                 // file name length
-            cd.appendU16(0)                       // extra field length
-            cd.appendU16(0)                       // comment length
-            cd.appendU16(0)                       // disk number start
-            cd.appendU16(0)                       // internal attributes
-            cd.appendU32(0)                       // external attributes
-            cd.appendU32(offset)                  // local header offset
-
+            cd.appendU32(0x02014B50)     // signature
+            cd.appendU16(20)             // version made by
+            cd.appendU16(20)             // version needed
+            cd.appendU16(0)              // flags
+            cd.appendU16(0)              // method: Store
+            cd.appendU16(0)              // mod time
+            cd.appendU16(0)              // mod date
+            cd.appendU32(crc)            // CRC-32
+            cd.appendU32(fileSize)       // compressed size
+            cd.appendU32(fileSize)       // uncompressed size
+            cd.appendU16(nameLen)        // file name length
+            cd.appendU16(0)              // extra field length
+            cd.appendU16(0)              // comment length
+            cd.appendU16(0)              // disk number start
+            cd.appendU16(0)              // internal attributes
+            cd.appendU32(0)              // external attributes
+            cd.appendU32(offset)         // local header offset
             cd.append(nameData)
 
+            // The file's bytes go straight into the archive (they used to be
+            // copied into the header buffer first, then into the archive).
             archive.append(local)
+            archive.append(file.data)
             centralDirectory.append(cd)
-            offset += UInt32(local.count)
+            offset += UInt32(local.count) + fileSize
         }
 
         let cdOffset = offset
@@ -2683,29 +2538,31 @@ extension SkillStore {
 
         // End of central directory
         var eocd = Data()
-        eocd.appendU32(0x06054B50)               // signature
-        eocd.appendU16(0)                        // disk number
-        eocd.appendU16(0)                        // disk with CD
-        eocd.appendU16(UInt16(files.count))      // entries on disk
-        eocd.appendU16(UInt16(files.count))      // total entries
-        eocd.appendU32(cdSize)                   // CD size
-        eocd.appendU32(cdOffset)                 // CD offset
-        eocd.appendU16(0)                        // comment length
+        eocd.appendU32(0x06054B50)           // signature
+        eocd.appendU16(0)                     // disk number
+        eocd.appendU16(0)                     // disk with CD
+        eocd.appendU16(UInt16(files.count))   // entries on disk
+        eocd.appendU16(UInt16(files.count))   // total entries
+        eocd.appendU32(cdSize)                // CD size
+        eocd.appendU32(cdOffset)              // CD offset
+        eocd.appendU16(0)                     // comment length
         archive.append(eocd)
 
         return archive
     }
 
-    /// CRC-32 (ISO 3309 / ITU-T V.42)
-    nonisolated private static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFFFFFF
-        for byte in data {
-            crc ^= UInt32(byte)
-            for _ in 0..<8 {
-                crc = (crc >> 1) ^ (crc & 1 != 0 ? 0xEDB88320 : 0)
-            }
+    /// CRC-32 (ISO 3309 / ITU-T V.42), by zlib.
+    ///
+    /// Was a Swift loop doing eight shift-and-xor steps per byte - 40 million
+    /// steps for a 5 MB skill, and most of the 2.5 s the main thread lost.
+    /// zlib's is the same polynomial and the same value. Qualified as
+    /// `zlib.crc32` because this type's own `crc32(_:)` would otherwise win.
+    static func crc32(_ data: Data) -> UInt32 {
+        guard !data.isEmpty else { return 0 }
+        return data.withUnsafeBytes { buf -> UInt32 in
+            guard let base = buf.bindMemory(to: Bytef.self).baseAddress else { return 0 }
+            return UInt32(truncatingIfNeeded: zlib.crc32(0, base, uInt(buf.count)))
         }
-        return crc ^ 0xFFFFFFFF
     }
 }
 
@@ -2719,6 +2576,7 @@ private extension Data {
         append(Data(bytes: &v, count: 4))
     }
 }
+// END SkillZipPackaging
 
 // MARK: - Minimal ZIP Reader (in-memory)
 
@@ -2729,7 +2587,7 @@ extension SkillStore {
         let data: Data
     }
 
-    nonisolated static func readZipEntries(data: Data) throws -> [ZipEntry] {
+    static func readZipEntries(data: Data) throws -> [ZipEntry] {
         guard data.count >= 22 else { throw SkillError.invalidArchive }
 
         var eocdOffset = -1
@@ -2794,18 +2652,18 @@ extension SkillStore {
         return entries
     }
 
-    nonisolated private static func readU16(_ data: Data, at offset: Int) -> UInt16 {
+    private static func readU16(_ data: Data, at offset: Int) -> UInt16 {
         UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
     }
 
-    nonisolated private static func readU32(_ data: Data, at offset: Int) -> UInt32 {
+    private static func readU32(_ data: Data, at offset: Int) -> UInt32 {
         UInt32(data[offset]) |
         (UInt32(data[offset + 1]) << 8) |
         (UInt32(data[offset + 2]) << 16) |
         (UInt32(data[offset + 3]) << 24)
     }
 
-    nonisolated private static func decompress(_ data: Data, expectedSize: Int) -> Data? {
+    private static func decompress(_ data: Data, expectedSize: Int) -> Data? {
         guard expectedSize > 0 else { return Data() }
         var decompressed = Data(count: expectedSize)
         let result = decompressed.withUnsafeMutableBytes { destPtr -> Int in

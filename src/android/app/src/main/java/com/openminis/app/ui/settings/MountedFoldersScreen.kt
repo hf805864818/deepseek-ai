@@ -72,7 +72,9 @@ import com.openminis.app.R
 import com.openminis.app.data.MountedFoldersStore
 import com.openminis.app.data.SafMountHelper
 import com.openminis.app.ui.components.DialogTextField
+import com.openminis.app.ui.components.safeLaunchPicker
 import kotlinx.coroutines.launch
+import com.openminis.app.i18n.uppercaseForDisplay
 
 /**
  * Settings → Mount External Folders. Mirrors iOS MountedFoldersSettingsView.
@@ -348,7 +350,19 @@ fun MountedFoldersScreen(
             confirmButton = {
                 MinisTextButton(onClick = {
                     showPickerIntro = false
-                    pickerLauncher.launch(initialPickerUri())
+                    // [T-android-mount-picker-anf] OpenDocumentTree fires
+                    // ACTION_OPEN_DOCUMENT_TREE, and some OEM ROMs ship without a
+                    // resolvable DocumentsUI (field crash: OnePlus 8T / ColorOS,
+                    // ActivityNotFoundException straight out of
+                    // startActivityForResult). safeLaunchPicker catches it and
+                    // tells the user instead of dying; it deliberately does NOT
+                    // pre-check with resolveActivity (see its doc).
+                    pickerLauncher.safeLaunchPicker(
+                        initialPickerUri(),
+                        context,
+                        "MountedFolders",
+                        R.string.mount_picker_unavailable,
+                    )
                 }) {
                     Text(stringResource(R.string.mount_picker_intro_continue))
                 }
@@ -497,7 +511,7 @@ private fun ListHeader(count: Int, atCapacity: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = stringResource(R.string.mount_folders_title).uppercase(),
+            text = stringResource(R.string.mount_folders_title).uppercaseForDisplay(),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontWeight = FontWeight.Medium,
@@ -666,7 +680,7 @@ private fun AddMountSheet(
                     )
                 }
                 Spacer(Modifier.width(12.dp))
-                Switch(checked = allowWrite, onCheckedChange = { allowWrite = it })
+                SettingsSwitch(checked = allowWrite, onCheckedChange = { allowWrite = it })
             }
 
             Spacer(Modifier.height(20.dp))

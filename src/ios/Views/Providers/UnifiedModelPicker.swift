@@ -137,10 +137,10 @@ struct ModelPickerConfig {
 
     /// Whether `model` can serve the voice direction: dedicated voice model OR
     /// multimodal with the required audio modality (chat-based transcription).
+    /// A catalog-tagged OpenRouter model is judged by its voice role
+    /// ([T-openrouter-voice-catalog]); everything else keeps the audio-bit rule.
     private static func canServe(_ model: LLMModel, direction: VoiceDirection) -> Bool {
-        if direction.isVoiceModel(model) { return true }
-        let m = model.capabilities.supportedModalities
-        return direction == .input ? m.contains(.audioInput) : m.contains(.audioOutput)
+        direction == .input ? model.isVoiceInputCandidate : model.isVoiceOutputCandidate
     }
 
     @MainActor
@@ -255,6 +255,15 @@ struct UnifiedModelPicker: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var searchText = ""
+    /// [T-picker-search-debounce] The query the LIST actually filters on (GH#271).
+    ///
+    /// `searchText` follows the keyboard; this trails it by `searchDebounce`.
+    /// Binding the filter straight to `searchText` meant every keystroke ran the
+    /// whole filter+sort pass synchronously during view evaluation — at 7,000+
+    /// models that is a visible freeze per character. Debouncing collapses a
+    /// burst of typing into ONE pass.
+    @State private var debouncedSearch = ""
+    @State private var searchDebounceTask: Task<Void, Never>?
     @State private var selectedEntryIds: Set<String> = []
     @State private var expandedGroupIds: Set<String> = []
     @State private var collapsedInstanceIds: Set<String> = []
@@ -269,6 +278,73 @@ struct UnifiedModelPicker: View {
     /// per-row bolt button so any model — cloud, group member, or System voice —
     /// can be smoke-tested (speak / text output) without leaving the picker.
     @State private var quickTestEntry: ModelEntry?
+    /// [T-picker-provider-edit] The provider whose detail page is open from its
+    /// section header's edit button (nil = none).
+    @State private var editingProvider: ProviderEditTarget?
+    /// [T-quota-badge-ui] The provider whose quota detail sheet is open from its
+    /// header pill. Hosted here like `editingProvider`, not on the header.
+    @State private var quotaDetailProvider: ProviderEditTarget?
+
+    /// [T-picker-provider-edit] Identifiable wrapper so `.sheet(item:)` can drive
+    /// the provider detail page.
+    struct ProviderEditTarget: Identifiable, Equatable { let id: String }
+
+    /// [T-picker-provider-edit] The instance a section header's edit button may
+    /// open, or nil when there is none: only a provider saved in the store has a
+    /// detail page. The built-in System voice section is a synthetic, local-only
+    /// instance (never stored) - `instance(for:)` resolves it, but there is
+    /// nothing to edit, so it is excluded explicitly as well as by the lookup.
+    static func providerEditTarget(forSectionInstanceId id: String,
+                                   storedInstanceIds: [String]) -> ProviderEditTarget? {
+        guard !id.isEmpty,
+              id != SystemVoiceProvider.builtinProviderId,
+              !id.hasPrefix(SystemVoiceProvider.builtinProviderId + "/"),
+              storedInstanceIds.contains(id) else { return nil }
+        return ProviderEditTarget(id: id)
+    }
+
+    // [T-picker-cache-first] The rows this render draws, and where they came
+    // from. `nil` means "nothing computed yet" — only then does the list show a
+    // spinner. A warm cache renders on the FIRST frame, so the sheet is never
+    // waiting on the model list.
+    @State private var sections: [InstanceSection]?
+    /// The `configRevision` the current `sections` were built from, so a refresh
+    /// that produces identical input can skip re-publishing (and re-rendering).
+    @State private var sectionsRevision: UInt?
+    @State private var refreshTask: Task<Void, Never>?
+
+    typealias InstanceSection = (instance: ProviderInstance, entries: [ModelEntry])
+
+    /// Process-wide, keyed by the picker's identity (its config) + the store
+    /// revision. Reopening the same picker while nothing changed is a cache hit,
+    /// which is the common case: the user taps the model button repeatedly.
+    @MainActor
+    private enum SectionCache {
+        static var revision: UInt?
+        static var byKey: [String: [InstanceSection]] = [:]
+
+        static func read(key: String, revision current: UInt) -> [InstanceSection]? {
+            guard revision == current else { return nil }
+            return byKey[key]
+        }
+
+        static func write(key: String, revision current: UInt, value: [InstanceSection]) {
+            // A revision bump invalidates every key at once — entries computed
+            // from older config must never be served.
+            if revision != current { byKey.removeAll(); revision = current }
+            byKey[key] = value
+        }
+    }
+
+    /// Distinguishes the pickers that share this view (session picker, group
+    /// builder, agent-loop add, voice pickers): each filters the pool
+    /// differently, so they cannot share a cache slot.
+    private var cacheKey: String {
+        let prefs = (config.effectivePreferModality ?? []).map { String(describing: $0) }.sorted().joined(separator: ",")
+        let existing = config.existingIds?().sorted().joined(separator: ",") ?? ""
+        let hasFilter = config.candidateFilter != nil ? "f" : "-"
+        return "\(config.title)|\(config.mode)|\(prefs)|\(hasFilter)|\(existing.hashValue)|\(systemVoiceRoster.revision)"
+    }
 
     private var isMulti: Bool { config.mode == .multi }
 
@@ -315,7 +391,11 @@ struct UnifiedModelPicker: View {
         candidateEntries.filter { !VoiceProviderResolver.isSystemEntry($0.providerInstanceId) }
     }
 
-    private var entriesByInstance: [(instance: ProviderInstance, entries: [ModelEntry])] {
+    /// [T-picker-cache-first] The expensive build (whole-table sort + per-entry
+    /// instance lookup + per-section sort). Called ONLY from `loadSections`,
+    /// never from `body` — it used to be a computed property that `body` hit
+    /// several times per render, re-sorting all ~1100 entries each time.
+    private func buildSections() -> [InstanceSection] {
         var result: [(ProviderInstance, [ModelEntry])] = []
         // Built-in System engine FIRST — as its own provider section (Phase C), the
         // same collapsible header treatment as any cloud provider, driven by the
@@ -337,8 +417,8 @@ struct UnifiedModelPicker: View {
         // global array's type-interleaving is invisible there. This picker
         // walked the same array FLAT, which exposed that interleaving and made
         // the two orders disagree (user report: management shows
-        // 球球 → 球球图片 → 球球Grok …, picker shows DeepSeek → 球球 → Codex CPA
-        // → 球球图片 …).
+        // RelayA → RelayA-Image → RelayA-Grok …, picker shows DeepSeek → RelayA → Codex CPA
+        // → RelayA-Image …).
         //
         // Reordering cannot fix this from the data side: `moveInstances`
         // deliberately permutes only WITHIN a type section and pins every other
@@ -370,7 +450,7 @@ struct UnifiedModelPicker: View {
                     // T-model-release-ranking exists to prevent (OpenMinis#83 —
                     // the unusable model's 400 renders as an empty reply and
                     // reads as "the app is broken").
-                    result.append((instance, entries.sorted(by: ProviderConfigStore.releaseRankOrder)))
+                    result.append((instance, ProviderConfigStore.sortedByReleaseRank(entries)))
                 }
             }
         }
@@ -379,27 +459,96 @@ struct UnifiedModelPicker: View {
 
     // MARK: - Search
 
-    private func fuzzyMatch(_ text: String) -> Bool {
-        guard !searchText.isEmpty else { return true }
-        let query = searchText.lowercased()
-        let target = text.lowercased()
-        if target.contains(query) { return true }
-        var idx = target.startIndex
-        for ch in query {
-            guard let found = target[idx...].firstIndex(of: ch) else { return false }
-            idx = target.index(after: found)
-        }
-        return true
+    /// [T-picker-search-debounce] How long typing must settle before the list
+    /// re-filters. 120ms sits inside the 100-150ms the issue suggests: long
+    /// enough that a burst of typing is one pass, short enough to feel
+    /// immediate.
+    private static let searchDebounce: Duration = .milliseconds(120)
+
+    /// [T-picker-search-cap] Rows rendered for one search.
+    ///
+    /// A two-letter query against an aggregator can match thousands of models,
+    /// and mounting that many rows at once stalls the main thread no matter how
+    /// fast the filter is. The cap bounds the WORK, and the footer says the
+    /// result was truncated so it never silently looks like "that's all".
+    private static let maxSearchResults = 150
+
+    /// Match + rank in one pass. 0 = no match.
+    ///
+    /// [T-picker-search-relevance] Replaces the old Bool `fuzzyMatch` (GH#272):
+    /// filtering alone left results in the provider's default order, so a loose
+    /// subsequence hit could outrank an exact one.
+    private func matchScore(_ text: String, query: String) -> Int {
+        ModelSearchScorer.score(text, query: query)
     }
 
-    private var filteredEntriesByInstance: [(instance: ProviderInstance, entries: [ModelEntry])] {
-        guard !searchText.isEmpty else { return entriesByInstance }
-        return entriesByInstance.compactMap { item in
-            let filtered = item.entries.filter { entry in
-                fuzzyMatch(entry.model.displayName) || fuzzyMatch(entry.model.id)
+    /// [T-picker-cache-first] Search filtering runs over the CACHED sections, not
+    /// over the raw store: it is a cheap substring pass on an already-built list,
+    /// and keeping it out of the cache means typing never rebuilds the pool.
+    private var filteredEntriesByInstance: [InstanceSection] {
+        let base = sections ?? []
+        // [T-picker-search-debounce] Filter on the DEBOUNCED query, not on
+        // `searchText` — that is what keeps a keystroke from triggering this
+        // whole pass during view evaluation.
+        let query = debouncedSearch.lowercased()
+        guard !query.isEmpty else { return base }
+        return base.compactMap { item in
+            // [T-picker-search-provider-name] A provider-name hit shows the
+            // instance's WHOLE model list, mirroring visibleGroups where a
+            // group-name hit shows the whole group. Self-hosted instances are
+            // the case that made this gap visible: their label is the only
+            // memorable name ("host.example.com"), while the model ids underneath
+            // are opaque gguf paths that share no substring with it — so
+            // searching the provider name found nothing at all.
+            if matchScore(item.instance.label, query: query) > 0 { return item }
+            // [T-picker-search-relevance] Score once per entry, then sort by it
+            // (GH#272). Ties fall back to `releaseRankOrder`, which is the order
+            // the list already uses when nothing is being searched — so equal
+            // relevance keeps the familiar newest/most-capable-first ordering.
+            let scored: [(entry: ModelEntry, score: Int)] = item.entries.compactMap { entry in
+                let s = ModelSearchScorer.bestScore(
+                    of: [entry.model.displayName, entry.model.id], query: query)
+                return s > 0 ? (entry, s) : nil
             }
-            return filtered.isEmpty ? nil : (item.instance, filtered)
+            guard !scored.isEmpty else { return nil }
+            let ranked = scored.sorted { a, b in
+                if a.score != b.score { return a.score > b.score }
+                return ProviderConfigStore.releaseRankOrder(a.entry, b.entry)
+            }.map(\.entry)
+            return (item.instance, ranked)
         }
+    }
+
+    /// [T-picker-search-cap] `filteredEntriesByInstance`, truncated to
+    /// `maxSearchResults` rows in total (GH#271).
+    ///
+    /// Applied ACROSS sections rather than per section: a single aggregator
+    /// instance holding 7,000 models is the reported case, and a per-section cap
+    /// would not bound it at all. Sections are consumed in their existing order,
+    /// and because entries inside each one are already relevance-sorted, what
+    /// survives truncation is the most relevant part rather than an arbitrary
+    /// slice.
+    private var cappedEntriesByInstance: [InstanceSection] {
+        let all = filteredEntriesByInstance
+        guard !debouncedSearch.isEmpty else { return all }
+        var remaining = Self.maxSearchResults
+        var out: [InstanceSection] = []
+        for section in all {
+            if remaining <= 0 { break }
+            if section.entries.count <= remaining {
+                out.append(section)
+                remaining -= section.entries.count
+            } else {
+                out.append((section.instance, Array(section.entries.prefix(remaining))))
+                remaining = 0
+            }
+        }
+        return out
+    }
+
+    /// Total matches before the cap — drives the "showing N of M" footer.
+    private var totalSearchMatches: Int {
+        filteredEntriesByInstance.reduce(0) { $0 + $1.entries.count }
     }
 
     // MARK: - Groups
@@ -408,14 +557,16 @@ struct UnifiedModelPicker: View {
         switch config.groupScope {
         case .all:
             let groups = store.modelGroups
-            guard !searchText.isEmpty else { return groups }
-            return groups.filter { fuzzyMatch($0.name) }
+            let query = debouncedSearch.lowercased()
+            guard !query.isEmpty else { return groups }
+            return groups.filter { matchScore($0.name, query: query) > 0 }
         case .single(let groupId):
             guard let gid = groupId, let g = store.group(for: gid) else { return [] }
-            guard !searchText.isEmpty else { return [g] }
-            if fuzzyMatch(g.name) { return [g] }
+            let query = debouncedSearch.lowercased()
+            guard !query.isEmpty else { return [g] }
+            if matchScore(g.name, query: query) > 0 { return [g] }
             let memberMatch = g.memberEntryIds.contains { id in
-                store.entry(for: id).map { fuzzyMatch($0.model.displayName) } ?? false
+                store.entry(for: id).map { matchScore($0.model.displayName, query: query) > 0 } ?? false
             }
             return memberMatch ? [g] : []
         case .none:
@@ -479,11 +630,41 @@ struct UnifiedModelPicker: View {
                 }
             }
 
-            ForEach(filteredEntriesByInstance, id: \.instance.id) { item in
+            // [T-picker-search-cap] Render the capped list; the footer below
+            // says so when matches were truncated.
+            ForEach(cappedEntriesByInstance, id: \.instance.id) { item in
                 instanceSection(item)
             }
+            if !debouncedSearch.isEmpty, totalSearchMatches > Self.maxSearchResults {
+                Section {
+                    // Format string, not interpolation into the key: an
+                    // interpolated key would bake runtime numbers into the
+                    // catalog lookup and never resolve.
+                    Text(String(format: AppLocalized("Showing the %d best matches of %d. Type more to narrow the search."),
+                                Self.maxSearchResults, totalSearchMatches))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+            }
 
-            if visibleGroups.isEmpty && filteredEntriesByInstance.isEmpty {
+            // [T-picker-cache-first] Cold path only: no cache yet, first build
+            // still running. A warm open never shows this.
+            if sections == nil {
+                Section {
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 8) {
+                            ProgressView()
+                            Text("Loading models...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
+                }
+            } else if visibleGroups.isEmpty && cappedEntriesByInstance.isEmpty {
                 emptySection
             }
 
@@ -499,11 +680,42 @@ struct UnifiedModelPicker: View {
             }
         }
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search models")
+        // [T-picker-search-debounce] Drive the debounced query (GH#271).
+        //
+        // Each keystroke cancels the pending task, so a burst of typing runs the
+        // filter+sort ONCE instead of once per character. Clearing is applied
+        // immediately — waiting 120ms to restore the full list after the user
+        // empties the field reads as lag, and restoring it costs nothing since
+        // the unsearched path just returns the cached sections.
+        .onChange(of: searchText) { newValue in
+            searchDebounceTask?.cancel()
+            let trimmed = newValue.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                debouncedSearch = ""
+                return
+            }
+            searchDebounceTask = Task { @MainActor in
+                try? await Task.sleep(for: Self.searchDebounce)
+                guard !Task.isCancelled else { return }
+                debouncedSearch = trimmed
+            }
+        }
+        .onDisappear { searchDebounceTask?.cancel() }
         .navigationTitle(config.title)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
+            // [T-picker-cache-first] Cache read is synchronous, so a warm open
+            // already has its rows on this first frame; the rebuild is deferred.
+            loadSections()
             seedCollapse()
             SystemVoiceCatalog.startObservingVoiceChanges()
+        }
+        .onDisappear { refreshTask?.cancel() }
+        .onChange(of: sections == nil) { _ in seedCollapse() }
+        .onChange(of: store.configRevision) { _ in loadSections() }
+        .onChange(of: systemVoiceRoster.revision) { _ in
+            sectionsRevision = nil
+            loadSections()
         }
         .toolbar { toolbarContent }
         .sheet(isPresented: $showCreateGroupSheet) {
@@ -521,6 +733,27 @@ struct UnifiedModelPicker: View {
                     }
             }
         }
+        .sheet(item: $editingProvider) { target in
+            // [T-picker-provider-edit] The provider's own detail page, on top of
+            // the picker (same pattern as the Model Groups "Edit" sheet), so the
+            // user returns to the picker with their place kept. Edits land in the
+            // store and the picker rebuilds from `configRevision`.
+            NavigationStack {
+                ProviderInstanceDetailView(instanceId: target.id)
+                    .toolbar {
+                        // Leading: the detail page's own action owns the trailing slot.
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { editingProvider = nil }
+                        }
+                    }
+            }
+        }
+        .sheet(item: $quotaDetailProvider) { target in
+            // [T-quota-badge-ui] Read-only quota details, on top of the picker.
+            QuotaDetailSheet(instanceId: target.id)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
         .sheet(item: $quickTestEntry) { entry in
             // [T-quicktest-stale-session] .id(entry.id) forces a FRESH view
             // identity per model: @StateObject's initial-value closure only
@@ -533,6 +766,22 @@ struct UnifiedModelPicker: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
+    }
+
+    /// Green "Active" capsule for the model a group is currently using. Sits
+    /// inline after the model name rather than at the row's trailing edge,
+    /// where it took width from the "Provider · model-id" line and made long
+    /// ids wrap. `fixedSize` keeps the capsule whole, so a long name wraps
+    /// beside it exactly as it did before rather than squeezing it.
+    private var activeBadge: some View {
+        Text("Active")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.green)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Color.green.opacity(0.1))
+            .clipShape(Capsule())
+            .fixedSize()
     }
 
     /// Compact per-row Quick Test button — opens the SAME ModelQuickTestSheet used
@@ -665,13 +914,20 @@ struct UnifiedModelPicker: View {
 
             if case .all = config.groupScope,
                store.defaultPrimaryGroupId == group.id {
-                Text("Default")
+                // [T-default-badge-short] Own key, not the shared "Default":
+                // the capsule needs the shortest idiomatic form ("Predet.",
+                // "По умолч."), while the settings rows reusing "Default" keep
+                // the full word. One line, never squeezed: a long translation
+                // narrows the group name beside it instead of wrapping here.
+                Text("Default (badge)", comment: "Short tag on the default model group in the model picker; keep it as short as possible")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.blue)
+                    .lineLimit(1)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(Color.blue.opacity(0.1))
                     .clipShape(Capsule())
+                    .fixedSize()
             }
 
             Button {
@@ -770,6 +1026,13 @@ struct UnifiedModelPicker: View {
         }
         if !entry.displayTraits.requiresCredential { return nil }
         if entry.isHidden { return AppLocalized("Hidden") }
+        // [T-model-absence-grace] The provider has stopped listing this model.
+        // The entry is retained (with its overrides) through the grace window,
+        // but routing must not pick it in the meantime — a request would go to a
+        // model the endpoint no longer serves. Reported like "Hidden" so group
+        // fallback skips it and the row explains itself, rather than the entry
+        // disappearing and taking the user's settings with it.
+        if entry.isUnavailableFromProvider { return AppLocalized("Not listed by provider") }
         guard let instance = store.instance(for: entry.providerInstanceId) else {
             return AppLocalized("Provider not found")
         }
@@ -859,7 +1122,7 @@ struct UnifiedModelPicker: View {
                     expandedEntryRow(systemVirtualEntry(forMemberId: entryId), parentGroup: group)
                         .padding(.leading, 30)
                 } else if let reason = memberUnavailableReason(entryId) {
-                    unavailableMemberRow(entryId: entryId, reason: reason)
+                    unavailableMemberRow(entryId: entryId, reason: reason, group: group)
                         .padding(.leading, 30)
                 } else if let entry = store.entry(for: entryId) {
                     expandedEntryRow(entry, parentGroup: group)
@@ -885,14 +1148,23 @@ struct UnifiedModelPicker: View {
                 .opacity(disabled ? 0.4 : 1)
 
             VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 4) {
-                    Text(entry.model.displayName)
-                        .font(.subheadline)
-                        .foregroundStyle(disabled ? Color(UIColor.tertiaryLabel) : Color(UIColor.label))
-                    if disabled {
-                        Text("unavailable", comment: "Modality-incompatible model tag")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.orange)
+                // [T-model-row-premature-wrap] Name + tags on ONE line whenever
+                // they fit; otherwise the name keeps the full width and the tags
+                // move to their own line. A plain HStack instead wrapped the NAME
+                // to make room for the fixed-size tags ("Claude / Sonnet 5 [pill]
+                // [Active]"), and a wrapped text is only as wide as its longest
+                // line, which left the unused space on the right.
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .quotaCapCenter, spacing: 4) {
+                        memberRowName(entry, disabled: disabled)
+                            .fixedSize(horizontal: true, vertical: false)
+                        memberRowTags(entry, isSystem: isSystem, isActive: isActive, disabled: disabled)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        memberRowName(entry, disabled: disabled)
+                        HStack(alignment: .center, spacing: 4) {
+                            memberRowTags(entry, isSystem: isSystem, isActive: isActive, disabled: disabled)
+                        }
                     }
                 }
                 HStack(spacing: 4) {
@@ -909,18 +1181,11 @@ struct UnifiedModelPicker: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-
-            Spacer()
-
-            if isActive {
-                Text("Active")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.green)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Color.green.opacity(0.1))
-                    .clipShape(Capsule())
-            }
+            // [T-model-row-premature-wrap] The column takes the free width
+            // itself. A bare Spacer() here cost its minimum length plus one
+            // more 10 pt stack gap even with nothing to push apart, which
+            // wrapped the name and the provider · id line early.
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             quickTestButton(entry)
         }
@@ -944,8 +1209,67 @@ struct UnifiedModelPicker: View {
         }
     }
 
+    /// Model name on a group member row.
+    private func memberRowName(_ entry: ModelEntry, disabled: Bool) -> some View {
+        Text(entry.model.displayName)
+            .font(.subheadline)
+            .foregroundStyle(disabled ? Color(UIColor.tertiaryLabel) : Color(UIColor.label))
+            .alignmentGuide(.quotaCapCenter) { $0.quotaCapCenter }
+    }
+
+    /// Tags after a group member's name: quota pill, Active badge, "unavailable".
     @ViewBuilder
-    private func unavailableMemberRow(entryId: String, reason: String) -> some View {
+    private func memberRowTags(_ entry: ModelEntry, isSystem: Bool, isActive: Bool, disabled: Bool) -> some View {
+        // [T-quota-group-member-pill] Group rows have no provider header, so the
+        // model's (or its account's) quota sits right after the name, before the
+        // Active badge; tap → quota sheet.
+        if !isSystem {
+            ModelQuotaMemberPill(instanceId: entry.providerInstanceId,
+                                 modelId: entry.baseModel.id) {
+                quotaDetailProvider = ProviderEditTarget(id: entry.providerInstanceId)
+            }
+        }
+        if isActive {
+            activeBadge
+        }
+        if disabled {
+            Text("unavailable", comment: "Modality-incompatible model tag")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.orange)
+        }
+    }
+
+    /// [T-ios-picker-prune-dangling-member] True when this member refers to an
+    /// entry that no longer exists at all — the "Model not found" case, where
+    /// the row can only render the bare id because there is nothing to resolve.
+    ///
+    /// Deliberately narrower than "unavailable". The other reasons
+    /// (Hidden / Provider disabled / Not signed in / Provider not found) all
+    /// describe a member whose entry is still present and whose row will come
+    /// back the moment the user signs in or re-enables the provider; offering
+    /// to delete those would turn a transient state into permanent config loss.
+    /// Only a member with no entry behind it is safe to offer for removal.
+    private func isDanglingMember(_ entryId: String) -> Bool {
+        store.entry(for: entryId) == nil && Self.systemEntry(for: entryId) == nil
+    }
+
+    /// Drop one dangling member from a group.
+    ///
+    /// Routed through `store.updateGroup`, which diffs the prior member list
+    /// against the new one and stamps `removedMembers[id] = now`. That
+    /// tombstone is what makes the removal survive the inbound union-merge on
+    /// other devices — mutating `memberEntryIds` in place without it would let
+    /// the next sync from a peer resurrect the row.
+    private func removeDanglingMember(_ entryId: String, from group: ModelGroup) {
+        guard var fresh = store.group(for: group.id) else { return }
+        guard fresh.memberEntryIds.contains(entryId) else { return }
+        fresh.memberEntryIds.removeAll { $0 == entryId }
+        store.updateGroup(fresh, orderReason: "user-delete")
+        MinisToast.show(AppLocalized("Removed from group"))
+    }
+
+    @ViewBuilder
+    private func unavailableMemberRow(entryId: String, reason: String, group: ModelGroup) -> some View {
         let entry = store.entry(for: entryId)
         HStack(spacing: 10) {
             Image(systemName: "circle")
@@ -986,6 +1310,28 @@ struct UnifiedModelPicker: View {
             }
 
             Spacer()
+
+            // [T-ios-picker-prune-dangling-member] A one-tap prune for members
+            // whose entry is gone. The loader deliberately PRESERVES unresolved
+            // UUID members (a member missing from the store may just be a
+            // sync gap, not a stale id), so the app cannot prune these on its
+            // own — which leaves the user looking at rows of raw UUIDs with no
+            // way to clear them. This button is that way.
+            //
+            // Only for genuinely dangling members: see `isDanglingMember`.
+            if isDanglingMember(entryId) {
+                Button {
+                    removeDanglingMember(entryId, from: group)
+                } label: {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.system(size: 17))
+                        .foregroundStyle(.red.opacity(0.8))
+                }
+                // The row sits inside a tappable list; without this the button's
+                // tap would also fall through to the row behind it.
+                .buttonStyle(.borderless)
+                .accessibilityLabel(AppLocalized("Remove from group"))
+            }
         }
     }
 
@@ -1031,9 +1377,40 @@ struct UnifiedModelPicker: View {
                 }
             }
         } header: {
-            HStack {
+            HStack(spacing: 8) {
+                // [T-picker-provider-edit] A long provider name truncates rather
+                // than pushing the two fixed-size buttons off the row.
                 Text(item.instance.label)
-                Spacer()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                // [T-provider-quota P2] The account's balance / quota, the only
+                // place a shared pool is shown in the picker. Empty without data.
+                QuotaSectionHeaderBadge(instanceId: item.instance.id) {
+                    quotaDetailProvider = ProviderEditTarget(id: item.instance.id)
+                }
+                Spacer(minLength: 8)
+                if let target = Self.providerEditTarget(forSectionInstanceId: item.instance.id,
+                                                        storedInstanceIds: store.instances.map(\.id)) {
+                    // [T-picker-provider-edit] Edit sits LEFT of the chevron and is
+                    // its own plain button, so a tap here never folds the section.
+                    // [T-picker-provider-edit-text] Styled exactly like the Model
+                    // Groups header's "Edit" link (caption text, tint, plain) so
+                    // the page has one edit idiom; the spoken label still names
+                    // the provider. One line and fixedSize, so a long provider
+                    // name truncates instead of wrapping or hiding it.
+                    Button {
+                        editingProvider = target
+                    } label: {
+                        Text("Edit")
+                            .font(.caption)
+                            .textCase(nil)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+                    .fixedSize()
+                    .accessibilityLabel(Text("Edit \(item.instance.label)"))
+                }
                 if searchText.isEmpty && item.entries.count > 1 {
                     let collapsed = collapsedInstanceIds.contains(item.instance.id)
                     Button {
@@ -1091,50 +1468,46 @@ struct UnifiedModelPicker: View {
                     .frame(width: 14)
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(entry.model.displayName)
-                        .font(.subheadline)
-                        .foregroundStyle(disabled ? Color(UIColor.tertiaryLabel) : Color(UIColor.label))
                     HStack(spacing: 4) {
-                        // Subtitle from traits (e.g. "iOS built-in, works offline")
-                        // for built-ins; the raw model id for cloud models.
-                        Text(traits.subtitle ?? entry.model.id)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        let badges = traits.subtitle == nil ? modalityBadges(entry.model) : []
-                        if !badges.isEmpty {
-                            Text("·")
-                                .font(.caption2)
-                                .foregroundStyle(.quaternary)
-                            ForEach(badges, id: \.self) { badge in
-                                Text(badge)
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 1)
-                                    .background(Color(UIColor.tertiarySystemFill))
-                                    .clipShape(RoundedRectangle(cornerRadius: 3))
-                            }
+                        Text(entry.model.displayName)
+                            .font(.subheadline)
+                            .foregroundStyle(disabled ? Color(UIColor.tertiaryLabel) : Color(UIColor.label))
+                        if !isMulti, config.currentGroupId?() != nil,
+                           config.currentEntryId?() == entry.id {
+                            activeBadge
                         }
-                        if disabled {
-                            Text("unavailable", comment: "Modality-incompatible model tag")
-                                .font(.system(size: 9, weight: .medium))
-                                .foregroundStyle(.orange)
+                    }
+                    // [T-model-row-premature-wrap] The id line has the same trap as
+                    // the group rows' name line: in one HStack the fixed-width tags
+                    // keep their width and the id wraps into the rest, only as wide
+                    // as its longest line ("mimo-v2.6-" / "pro-ultraspeed" in 91 pt
+                    // of a 245 pt column). One line when it all fits; otherwise the
+                    // id keeps the full width and the tags drop below it.
+                    let badges = traits.subtitle == nil ? modalityBadges(entry.model) : []
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 4) {
+                            entryRowSubtitle(entry, traits: traits)
+                                .fixedSize(horizontal: true, vertical: false)
+                            if !badges.isEmpty {
+                                Text("·")
+                                    .font(.caption2)
+                                    .foregroundStyle(.quaternary)
+                            }
+                            entryRowTags(badges, disabled: disabled)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            entryRowSubtitle(entry, traits: traits)
+                            if !badges.isEmpty || disabled {
+                                HStack(spacing: 4) {
+                                    entryRowTags(badges, disabled: disabled)
+                                }
+                            }
                         }
                     }
                 }
-
-                Spacer()
-
-                if !isMulti, config.currentGroupId?() != nil,
-                   config.currentEntryId?() == entry.id {
-                    Text("Active")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.green)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color.green.opacity(0.1))
-                        .clipShape(Capsule())
-                }
+                // [T-model-row-premature-wrap] Same fix as the group rows: the
+                // column takes the free width instead of a Spacer.
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 quickTestButton(entry)
         }
@@ -1156,6 +1529,41 @@ struct UnifiedModelPicker: View {
             } label: {
                 Label(AppLocalized("Copy Shortcut Model ID"), systemImage: "link")
             }
+        }
+    }
+
+    /// Quota hint + the subtitle (built-ins) or raw model id (cloud models).
+    @ViewBuilder
+    private func entryRowSubtitle(_ entry: ModelEntry, traits: ModelDisplayTraits) -> some View {
+        HStack(spacing: 4) {
+            // [T-provider-quota P2] Only a warning on a pool bound to
+            // THIS model; the shared account is on the section header.
+            ModelQuotaHintView(instanceId: entry.providerInstanceId,
+                               modelId: entry.baseModel.id)
+            // Subtitle from traits (e.g. "iOS built-in, works offline")
+            // for built-ins; the raw model id for cloud models.
+            Text(traits.subtitle ?? entry.model.id)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    /// Modality tags and the "unavailable" tag, as HStack children.
+    @ViewBuilder
+    private func entryRowTags(_ badges: [String], disabled: Bool) -> some View {
+        ForEach(badges, id: \.self) { badge in
+            Text(badge)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color(UIColor.tertiarySystemFill))
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+        }
+        if disabled {
+            Text("unavailable", comment: "Modality-incompatible model tag")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.orange)
         }
     }
 
@@ -1220,8 +1628,56 @@ struct UnifiedModelPicker: View {
         }
     }
 
+    // MARK: - Cache-first loading [T-picker-cache-first]
+
+    /// Serve the cache synchronously (so the sheet's FIRST frame already has
+    /// rows), then recompute off the main actor and publish only if the result
+    /// actually differs. With no cache, `sections` stays nil and the list shows
+    /// its loading row until the first compute lands.
+    private func loadSections() {
+        let revision = store.configRevision
+        let key = cacheKey
+
+        // Warm path — no spinner, no work on the presentation frame.
+        if let cached = SectionCache.read(key: key, revision: revision) {
+            if sections == nil { sections = cached; sectionsRevision = revision }
+        }
+        // Already current for this revision: nothing to recompute.
+        if sectionsRevision == revision, sections != nil { return }
+
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor in
+            // Yield first so the sheet's presentation animation gets its frames
+            // before the rebuild runs. This is what keeps "open" feeling instant
+            // even on the cold path.
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            let rebuilt = buildSections()
+            guard !Task.isCancelled else { return }
+            SectionCache.write(key: key, revision: revision, value: rebuilt)
+            // Skip a no-op publish so a refresh that changes nothing does not
+            // re-render the list under the user.
+            if sectionsRevision != revision || !sameSections(sections, rebuilt) {
+                sections = rebuilt
+                sectionsRevision = revision
+            }
+        }
+    }
+
+    private func sameSections(_ a: [InstanceSection]?, _ b: [InstanceSection]) -> Bool {
+        guard let a, a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            if x.instance.id != y.instance.id { return false }
+            if x.entries.count != y.entries.count { return false }
+            if !zip(x.entries, y.entries).allSatisfy({ $0.id == $1.id }) { return false }
+        }
+        return true
+    }
+
     private func seedCollapse() {
-        guard !collapseSeeded else { return }
+        // [T-picker-cache-first] Nothing to seed from until rows exist; on the
+        // cold path this is re-run once the first build publishes.
+        guard !collapseSeeded, sections != nil else { return }
         collapseSeeded = true
         // Voice pickers (Voice Input / Output group binding, or an explicit audio
         // modality preference) exist specifically to browse and add TTS/ASR voices.
@@ -1238,10 +1694,12 @@ struct UnifiedModelPicker: View {
             return
         }
         var ids = Set<String>()
-        // System is now an ordinary entry in entriesByInstance (its synthetic
+        // System is now an ordinary entry in the section list (its synthetic
         // instance), so this single loop collapses it too when it has >1 model
         // (the ~60 voice roster shouldn't fill the list).
-        for item in entriesByInstance where item.entries.count > 1 {
+        // [T-picker-cache-first] Seeds from whatever is loaded now; re-seeded
+        // when the first async build lands (see `.onChange(of: sections)`).
+        for item in (sections ?? []) where item.entries.count > 1 {
             ids.insert(item.instance.id)
         }
         collapsedInstanceIds = ids

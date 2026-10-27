@@ -66,29 +66,70 @@ class BackgroundTaskNotifier(
      * the main thread. No-ops silently if the user has disabled
      * notifications or the app is in foreground.
      */
-    fun notifyTaskCompleted(sessionId: String, isError: Boolean = false) {
+    fun notifyTaskCompleted(sessionId: String, outcome: BackgroundTurnOutcome = BackgroundTurnOutcome.COMPLETED) {
         if (!backgroundSettings.taskNotificationsEnabled.value) return
         if (isAppForeground()) return
 
         scope.launch {
             try {
                 val session = chatRepository.getSession(sessionId)
+                // [T-android-subagent-no-system-notification] A sub agent run
+                // is not a task the user is waiting on — it is one step inside
+                // the parent's turn, and its result is already delivered into
+                // the parent chat as an "代理任务·摘要" card. Posting a system
+                // notification for it interrupts the user to tell them about
+                // work they did not start, and a parent that delegates several
+                // children fires one per child.
+                //
+                // iOS never did this. Its notification has exactly ONE call
+                // site — AIChatViewModel+BackgroundTask, the MAIN chat's
+                // background-completion path — and `HelperRunner` (the sub
+                // agent runner) posts nothing at all; it only reads
+                // SessionActivityTracker for display. Android diverged because
+                // the notifier is wired to SessionActivityTracker's completion
+                // hook, which fires for EVERY session, child sessions included.
+                //
+                // Checked here rather than at the tracker hook because the
+                // session row is already being loaded for the title, so the
+                // parent test is free, and the tracker stays a pure
+                // "is this session streaming" signal with no opinion about
+                // which sessions deserve a notification.
+                if (session?.isChild == true) {
+                    AppLogger.info(
+                        TAG,
+                        "skipping completion notification for sub agent session " +
+                            sessionId.take(8),
+                    )
+                    return@launch
+                }
                 val rawTitle = session?.title?.takeIf { it.isNotBlank() }
                     ?: context.getString(R.string.notif_task_completed_default_title)
-                val title = if (isError) "❌ $rawTitle" else rawTitle
-                val body = if (isError) {
-                    context.getString(R.string.notif_task_failed_body)
-                } else {
-                    context.getString(R.string.notif_task_completed_body)
+                // [T-bgnotif-outcome] A run that did not finish is not "completed".
+                val (title, body) = when (outcome) {
+                    BackgroundTurnOutcome.FAILED ->
+                        "❌ $rawTitle" to context.getString(R.string.notif_task_failed_body)
+                    BackgroundTurnOutcome.INTERRUPTED ->
+                        "⏸ $rawTitle" to context.getString(R.string.notif_task_paused_body)
+                    BackgroundTurnOutcome.COMPLETED ->
+                        rawTitle to context.getString(R.string.notif_task_completed_body)
                 }
-                postNotification(sessionId, title, body)
+                // [T-port-sched-notif-single] A run opened by a scheduled fire
+                // gets one entry per (chat, task) that each run replaces in
+                // place (iOS b0c0c87ea). This is now the ONLY notification a
+                // scheduled run posts: ScheduledAgentRunner used to add a
+                // second, hard-coded English one that ignored this toggle and
+                // the foreground check and was never cleared.
+                val taskId = ScheduledRunNotification.taskIdOpeningTurn { offset ->
+                    chatRepository.dao.messageHeadNewestFirst(sessionId, offset)
+                }
+                postNotification(sessionId, title, body, ScheduledRunNotification.tag(taskId))
             } catch (t: Throwable) {
                 AppLogger.warning(TAG, "notifyTaskCompleted failed: ${t.message}")
             }
         }
     }
 
-    private fun postNotification(sessionId: String, title: String, body: String) {
+    private fun postNotification(sessionId: String, title: String, body: String, tag: String? = null) {
         // Pre-Tiramisu: we don't need the runtime permission, just post.
         // Tiramisu+: NotificationManagerCompat.areNotificationsEnabled
         // is the right gate — POST_NOTIFICATIONS is requested at toggle-on
@@ -127,7 +168,7 @@ class BackgroundTaskNotifier(
             .build()
 
         try {
-            nm.notify(sessionId.hashCode(), notification)
+            nm.notify(tag, sessionId.hashCode(), notification)
         } catch (se: SecurityException) {
             // POST_NOTIFICATIONS not granted — silently no-op rather
             // than crashing the agent-completion path.

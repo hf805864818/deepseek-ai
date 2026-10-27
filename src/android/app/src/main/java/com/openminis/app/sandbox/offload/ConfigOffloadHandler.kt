@@ -25,7 +25,7 @@ import java.io.File
  *     → ModelsCollection.remove(); rejected for non-custom entries.
  *
  * Future: per-entry hide via the existing
- *   set models.<entryId>.isHidden true
+ *   set models.<entry_id>.isHidden true   (entry_id verbatim, dots included)
  * path. Already supported by ModelsCollection.isHiddenField; nothing
  * else needs to change in this handler when the agent picks it up.
  *
@@ -54,6 +54,17 @@ class ConfigOffloadHandler : NativeOffloadHandler {
                 "DISCOVERY:\n" +
                 "  list-topics                  Show all configurable topics.\n" +
                 "  topic-help <topic>           Show fields under one topic.\n" +
+                "                               Besides providers / models / groups, topics\n" +
+                "                               cover app preferences (appearance, chat,\n" +
+                "                               background, speech, scheduled, updates,\n" +
+                "                               backup), the agent's optional tools\n" +
+                "                               (chat.tools.*, agentTools.userAsk.*) and the\n" +
+                "                               sub agent roster (subagents).\n" +
+                "\n" +
+                "PATHS:\n" +
+                "  <topic>.<field> or <topic>.<entry_id>.<field>. Use entry_id exactly as\n" +
+                "  `get <topic>` prints it — dots and slashes are fine, no escaping, e.g.\n" +
+                "    get models.<uuid>/glm-5.1.contextWindow\n" +
                 "\n" +
                 "FIELD I/O:\n" +
                 "  get <path> [--filter <kw>] [--page N] [--page-size N]\n" +
@@ -86,11 +97,13 @@ class ConfigOffloadHandler : NativeOffloadHandler {
                 "                               removed (use `set models.<entryId>.isHidden\n" +
                 "                               true` to hide instead).\n" +
                 "  add <topic> <value-json>     Create a new child in an addable collection\n" +
-                "                               (e.g. providers, groups). The app generates\n" +
+                "                               (e.g. providers, groups, subagents). The app generates\n" +
                 "                               its UUID (returned in applied[0].new). Same\n" +
                 "                               as `set <topic>.append <value-json>`. Supports\n" +
                 "                               --file like `set`. e.g.\n" +
                 "                               add groups '{\"name\":\"Light\",\"entries\":[...]}'\n" +
+                "                               add subagents '{\"name\":\"Translator\",\n" +
+                "                                 \"description\":\"Use for zh/en translation.\"}'\n" +
                 "  set-batch                    Read JSON array of {path,value_json} from\n" +
                 "                               stdin. One confirm dialog for the batch.\n" +
                 "                               Each item may use the .append/.remove suffix.\n" +
@@ -184,6 +197,8 @@ class ConfigOffloadHandler : NativeOffloadHandler {
             put("data", JSONObject().apply {
                 put("topic", topic)
                 put("fields", ConfigBridge.fieldsForTopic(topic))
+                // [T-config-path-dotted-id] Collections say how to spell a child path.
+                ConfigBridge.pathNoteForTopic(topic)?.let { put("path_note", it) }
             })
         }
         return envelopeResult(args, out)

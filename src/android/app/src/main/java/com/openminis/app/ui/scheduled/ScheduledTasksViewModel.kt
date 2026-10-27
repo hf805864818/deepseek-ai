@@ -57,6 +57,12 @@ class ScheduledTasksViewModel(private val appContext: Context) : ViewModel() {
     val tasks: StateFlow<List<ScheduledTask>> = manager.store().observe()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // [T-android-sched-badge-toggle] Home clock-icon count badge on/off.
+    val showHomeBadge: StateFlow<Boolean> = manager.store().observeShowHomeBadge()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), manager.store().showHomeBadge())
+
+    fun setShowHomeBadge(show: Boolean) = manager.store().setShowHomeBadge(show)
+
     // ── [T-android-scheduled-tasks-full] Picker data for the editor ──
 
     /** Lightweight session row for the Follow-up / Re-run session picker. */
@@ -70,9 +76,12 @@ class ScheduledTasksViewModel(private val appContext: Context) : ViewModel() {
 
     suspend fun listSessions(limit: Int = 100): List<SessionOption> = withContext(Dispatchers.IO) {
         if (!ready()) return@withContext emptyList()
+        // [T-child-session-leak] A scheduled task's target picker is a
+        // user-facing session list: hide agent child sessions.
+        val childIds = app.chatRepository.dao.listSessions().filter { it.isChild }.map { it.id }.toSet()
         app.chatRepository.querySessionsMeta(
             sessionIds = null, keywords = null, limit = limit, startMs = null, endMs = null,
-        ).map {
+        ).filter { it.id !in childIds }.map {
             SessionOption(it.id, it.title?.ifBlank { null } ?: "Untitled", it.lastActive)
         }
     }
@@ -129,7 +138,9 @@ class ScheduledTasksViewModel(private val appContext: Context) : ViewModel() {
             }
             sb.toString()
         }.getOrNull() ?: ""
-        return text.trim().replace('\n', ' ').take(80).ifBlank { "(empty)" }
+        // [T-md-inline-html] <br> → space, whitelisted style tags out (code untouched).
+        return com.openminis.app.ui.markdown.InlineHtmlTags.stripForPreview(text)
+            .trim().replace('\n', ' ').take(80).ifBlank { "(empty)" }
     }
 
     private val _runNowState = MutableStateFlow<RunNowState?>(null)

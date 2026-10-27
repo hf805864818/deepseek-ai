@@ -7,6 +7,14 @@ import com.openminis.app.config.ConfigRisk
 import com.openminis.app.config.ConfigSchema
 import com.openminis.app.config.ConfigValue
 import com.openminis.app.config.fields.ClosureField
+import com.openminis.app.config.readable.ConfigReadable
+import com.openminis.app.config.readable.ConfigRefKind
+import com.openminis.app.config.readable.ConfigRefResolver
+import com.openminis.app.config.readable.ConfigValueFormatter
+import com.openminis.app.config.readable.NumberUnit
+import com.openminis.app.config.readable.ReadableArg
+import com.openminis.app.config.readable.ReadableLine
+import com.openminis.app.config.readable.RedactedConfigValue
 import com.openminis.app.config.fields.ReadOnlyField
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.ModelEntry
@@ -14,8 +22,9 @@ import com.openminis.app.data.model.ModelOverrides
 import com.openminis.app.data.repository.ProviderRepository
 
 /**
- * Exposes ModelEntry overrides under `models.<entryUUID>.…`. Mirrors
- * iOS `ModelsCollection`.
+ * Exposes ModelEntry overrides under `models.<entry_id>.…`, where entry_id is
+ * the raw "<instanceUUID>/<modelId>" `get models` prints (dots allowed).
+ * Mirrors iOS `ModelsCollection`.
  *
  * `add` creates a custom entry (`isCustom = true`). `remove` is allowed
  * only for those custom entries — API-reported models can be hidden
@@ -35,24 +44,54 @@ class ModelsCollection(
     override val risk: ConfigRisk get() = ConfigRisk.SENSITIVE
     override val addPayloadSchema: ConfigSchema get() = ConfigSchema.Json
 
+
+    // -- [T-config-path-dotted-id] Entry ids in paths ---------------------------
+    //
+    // OpenMinis#390. A model's config id is the composite
+    // `<instanceUUID>/<modelId>`, and model ids usually contain DOTS (glm-5.1,
+    // gpt-4.1, mimo-v2.6-pro). Paths now carry that id VERBATIM — exactly as
+    // `get models` prints it as `entry_id` — because
+    // ConfigRegistry.splitCollectionPath takes everything between the first
+    // and last dot as the id.
+    //
+    // Before, the resolver cut the id at its first dot, so this collection
+    // escaped dots on the way into a path ("." -> "~d", "~" -> "~~",
+    // [T-android-config-model-id-dot]). That worked, but nothing told a
+    // caller: `get` printed the raw id, the help never mentioned `~d`, and the
+    // reporter of #390 tried four escaping schemes without guessing it. The
+    // escaped form is still ACCEPTED ([lookup]), so audit-log keys and scripts
+    // written against builds 09-19 … #390 keep resolving and reverting.
+    // Same shape as iOS cef38f13b.
+
+    /**
+     * The entry a path id names: the raw id first, then the legacy escaped
+     * form. Raw wins, so an id that literally contains "~d" is never decoded
+     * into a different id.
+     */
+    private fun lookup(idOrSegment: String): ModelEntry? = lookupIn(idOrSegment, ::entry)
+
     override fun childIds(): List<String> =
         repo.config.value.modelEntries.map { it.id }
 
     override fun fields(forId: String): List<ConfigField> {
-        val entry = entry(forId) ?: return emptyList()
+        // Raw id, or the legacy escaped form ([T-config-path-dotted-id]). The
+        // factories build their paths from the entry's RAW id either way.
+        val id = lookup(forId)?.id ?: return emptyList()
         return listOf(
-            providerInstanceId(forId),
-            modelId(forId),
-            isCustom(forId),
-            displayNameField(forId),
-            maxOutputTokensField(forId),
-            isHiddenField(forId),
-            modalitiesField(forId),
-            modalitiesOverrideField(forId),
-            contextWindowField(forId),
-            contextWindowOverrideField(forId),
-            supportsToolsField(forId),
-            supportsVisionField(forId),
+            providerInstanceId(id),
+            modelId(id),
+            isCustom(id),
+            displayNameField(id),
+            maxOutputTokensField(id),
+            isHiddenField(id),
+            modalitiesField(id),
+            modalitiesOverrideField(id),
+            contextWindowField(id),
+            contextWindowOverrideField(id),
+            supportsToolsField(id),
+            supportsVisionField(id),
+            temperatureField(id),
+            topPField(id),
         )
     }
 
@@ -110,26 +149,65 @@ class ModelsCollection(
             userModifiedAt = System.currentTimeMillis(),
         )
         repo.addEntry(entry)
+        // Used verbatim as a path id ([T-config-path-dotted-id]).
         return entry.id
     }
 
     override fun remove(id: String) {
-        val entry = entry(id) ?: throw ConfigError.UnknownPath("models.$id")
+        // Raw id, or the legacy escaped form ([T-config-path-dotted-id]).
+        val entry = lookup(id) ?: throw ConfigError.UnknownPath("models.$id")
         if (!entry.isCustom) {
             throw ConfigError.PermissionDenied(
-                "Only custom-added models can be removed; use `set models.$id.isHidden true` for API-reported models"
+                "Only custom-added models can be removed; use `set models.${entry.id}.isHidden true` for API-reported models"
             )
         }
-        repo.removeEntry(id)
+        repo.removeEntry(entry.id)
+    }
+
+    // -- [T-config-readable] Readable descriptions (mirrors iOS ModelsCollection) --
+
+    override val readableSubjectFormat: String get() = "Model %1\$@ – %2\$@"
+
+    override fun entityLabel(id: String): String? =
+        lookup(id)?.let { ConfigRefResolver.names.modelEntryLabel(it.id) }
+
+    /** Modality names → label keys, for the override list. */
+    private val modalityLabels: Map<String, String> = mapOf(
+        "text_input" to "Text input", "text_output" to "Text output",
+        "image_input" to "Image input", "pdf_input" to "PDF input",
+        "audio_input" to "Audio input", "video_input" to "Video input",
+        "image_output" to "Image output", "audio_output" to "Audio output",
+        "video_output" to "Video output",
+    )
+
+    override fun readableForAdd(payload: RedactedConfigValue): List<ReadableLine> {
+        val d = (payload.value as? ConfigValue.Obj)?.value ?: return emptyList()
+        val modelId = (d["model_id"] as? ConfigValue.Str)?.value ?: "?"
+        val name = (d["display_name"] as? ConfigValue.Str)?.value?.takeIf { it.isNotEmpty() } ?: modelId
+        val instance = ((d["instance_id"] ?: d["provider_id"]) as? ConfigValue.Str)?.value
+        val provider = instance?.let { ConfigRefResolver.name(ConfigRefKind.ProviderInstance, it) } ?: ReadableArg.Text("?")
+        return listOf(ReadableLine("Add custom model %1\$@ to “%2\$@”", listOf(ReadableArg.Text(name), provider)))
+    }
+
+    override fun readableForRemove(id: String): List<ReadableLine> {
+        val e = lookup(id) ?: return emptyList()
+        val label = ConfigRefResolver.names.modelEntryLabel(e.id) ?: e.model.displayName.ifEmpty { e.baseModel.id }
+        val lines = mutableListOf(ReadableLine("Delete custom model %@", listOf(ReadableArg.Text(label))))
+        val groups = ConfigRefResolver.names.groupsContaining(e.id)
+        if (groups.isNotEmpty()) {
+            lines.add(ReadableLine("It is also in: %@", listOf(ReadableArg.Items(groups.map { ReadableArg.Text(it) }))))
+        }
+        return lines
     }
 
     // -- Field factories --
 
+    /** Exact match on the raw entry id. Callers with a path id use [lookup]. */
     private fun entry(id: String): ModelEntry? =
         repo.config.value.modelEntries.firstOrNull { it.id == id }
 
     private fun mutate(id: String, apply: (ModelEntry) -> ModelEntry) {
-        val e = entry(id) ?: throw ConfigError.UnknownPath("models.$id")
+        val e = lookup(id) ?: throw ConfigError.UnknownPath("models.$id")
         repo.updateEntry(apply(e))
     }
 
@@ -177,6 +255,7 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Str(maxLength = 200),
             risk = ConfigRisk.NORMAL,
             revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.Text(empty = "Default")),
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
                 ConfigValue.Str(e.overrides.displayName ?: e.baseModel.displayName)
@@ -198,6 +277,7 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Int(min = 0, max = 1_000_000),
             risk = ConfigRisk.SENSITIVE,
             revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.Number(NumberUnit.TOKENS, zero = "Default")),
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
                 ConfigValue.Int(e.overrides.maxOutputTokens ?: e.baseModel.maxOutputTokens ?: 0)
@@ -218,6 +298,7 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Bool,
             risk = ConfigRisk.SENSITIVE,
             revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.Bool(on = "Hidden", off = "Shown"), label = "Visibility"),
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
                 ConfigValue.Bool(e.isHidden)
@@ -326,6 +407,7 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Array(ConfigSchema.Str()),
             risk = ConfigRisk.SENSITIVE,
             revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.StringList(ordered = false, labels = modalityLabels)),
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
                 val ov = e.overrides
@@ -358,6 +440,69 @@ class ModelsCollection(
             },
         )
 
+    /**
+     * [T-minis-config-coverage] The model's request tuning from its detail
+     * page (ModelOverrides.temperature / topP). null = not set: the parameter
+     * is left out of the request and the provider's default applies - 0 is a
+     * real value (deterministic), so it cannot double as "unset". The other
+     * two overrides on that page, custom headers and extra body parameters,
+     * are not exposed: headers can carry credentials, and raw body JSON would
+     * let a write change any request field.
+     */
+    private fun samplingField(
+        id: String,
+        leaf: String,
+        displayName: String,
+        what: String,
+        max: Double,
+        get: (ModelOverrides) -> Double?,
+        set: (ModelOverrides, Double?) -> ModelOverrides,
+    ): ConfigField =
+        ClosureField(
+            path = "models.$id.$leaf",
+            displayName = displayName,
+            description = "$what 0.0..$max, or null to clear the override (the provider's default applies and the parameter is not sent). Some models reject or ignore it (reasoning models often require the default).",
+            valueSchema = ConfigSchema.Optional(ConfigSchema.Double(min = 0.0, max = max)),
+            risk = ConfigRisk.SENSITIVE,
+            revertable = true,
+            readable = ConfigReadable(
+                ConfigValueFormatter.Custom { v ->
+                    when (v) {
+                        is ConfigValue.Double -> ReadableArg.Text(trimNumber(v.value))
+                        is ConfigValue.Int -> ReadableArg.Text("${v.value}")
+                        else -> ReadableArg.Key("Not set")
+                    }
+                },
+            ),
+            reader = {
+                val e = entry(id) ?: return@ClosureField ConfigValue.Null
+                get(e.overrides)?.let { ConfigValue.Double(it) } ?: ConfigValue.Null
+            },
+            writer = { v ->
+                val d: Double? = when (v) {
+                    ConfigValue.Null -> null
+                    is ConfigValue.Double -> v.value
+                    is ConfigValue.Int -> v.value.toDouble()
+                    else -> throw ConfigError.TypeMismatch("double or null")
+                }
+                mutate(id) { e -> e.copy(overrides = set(e.overrides, d)) }
+            },
+        )
+
+    /** 0.7, not 0.7000000001; 1, not 1.0. */
+    private fun trimNumber(d: Double): String =
+        java.math.BigDecimal(d).setScale(3, java.math.RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
+
+    private fun temperatureField(id: String): ConfigField = samplingField(
+        id, "temperatureOverride", "Temperature", "Sampling temperature sent with every request to this model.", 2.0,
+        get = { it.temperature }, set = { o, d -> o.copy(temperature = d) },
+    )
+
+    private fun topPField(id: String): ConfigField = samplingField(
+        id, "topPOverride", "Top P", "Nucleus-sampling top_p sent with every request to this model.", 1.0,
+        get = { it.topP }, set = { o, d -> o.copy(topP = d) },
+    )
+
     private fun contextWindowField(id: String): ConfigField =
         ReadOnlyField(
             path = "models.$id.contextWindow",
@@ -379,6 +524,7 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Int(min = 0, max = 10_000_000),
             risk = ConfigRisk.SENSITIVE,
             revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.Number(NumberUnit.TOKENS, zero = "Default")),
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
                 ConfigValue.Int(e.overrides.contextWindow ?: 0)
@@ -414,4 +560,42 @@ class ModelsCollection(
                 ConfigValue.Bool("image_input" in effectiveModalities(e))
             },
         )
+
+    companion object {
+        /**
+         * Decode the legacy `~d` / `~~` escape. ONE left-to-right scan,
+         * deliberately — not two `replace` calls: sequential replaces break on
+         * ids that contain the escape text itself (a literal `~d~` round-trips
+         * to the wrong string). One pass consuming the escape and its argument
+         * together has no such ambiguity.
+         */
+        internal fun decodeLegacySegment(segment: String): String {
+            val out = StringBuilder(segment.length)
+            var i = 0
+            while (i < segment.length) {
+                val c = segment[i]
+                if (c == '~' && i + 1 < segment.length) {
+                    when (segment[i + 1]) {
+                        '~' -> { out.append('~'); i += 2; continue }
+                        'd' -> { out.append('.'); i += 2; continue }
+                    }
+                }
+                out.append(c)
+                i++
+            }
+            return out.toString()
+        }
+
+        /**
+         * [lookup]'s rule, with the entry source injected so it can be tested
+         * without a ProviderRepository: [find] on the id as given, then on its
+         * legacy decode if that differs.
+         */
+        internal fun <T : Any> lookupIn(idOrSegment: String, find: (String) -> T?): T? {
+            find(idOrSegment)?.let { return it }
+            val decoded = decodeLegacySegment(idOrSegment)
+            if (decoded == idOrSegment) return null
+            return find(decoded)
+        }
+    }
 }

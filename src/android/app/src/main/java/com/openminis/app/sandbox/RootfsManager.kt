@@ -227,18 +227,27 @@ class RootfsManager private constructor(private val context: Context) {
         Log.i(TAG, "User data restored from $backupDir")
     }
 
-    private fun calculateDirSize(dir: File): Long {
-        var total = 0L
-        val files = dir.listFiles() ?: return 0L
-        for (file in files) {
-            total += if (file.isDirectory) {
-                calculateDirSize(file)
-            } else {
-                file.length()
-            }
-        }
-        return total
-    }
+    /**
+     * [T-android-storage-symlink-inflation] Third copy of the sizing walk —
+     * routed through the shared one instead of keeping a following variant
+     * alive here.
+     *
+     * This was hand-rolled recursion over `listFiles()`, and both `isDirectory`
+     * and `length()` RESOLVE symlinks: a link to a directory was descended into
+     * and its whole subtree counted again (once per link pointing at it), and a
+     * link to a file was counted as a second copy of the target. That is the
+     * same defect 754e65eac fixed in `SessionStorage.directorySize` and
+     * `DebugRPCHandler.dirSize`, and missing it here is why the "Rootfs 管理"
+     * screen still read 40.25 GB after the Storage screen had been corrected —
+     * two screens sizing the same directory and disagreeing by an order of
+     * magnitude.
+     *
+     * It was also the only one of the three with no cycle protection: a
+     * `a/loop -> a` symlink recursed until StackOverflowError rather than
+     * merely over-counting.
+     */
+    private fun calculateDirSize(dir: File): Long =
+        com.openminis.app.data.session.SessionStorage.directorySize(dir)
 
     /**
      * Ensure session-specific directories exist on the host filesystem.
@@ -259,6 +268,19 @@ class RootfsManager private constructor(private val context: Context) {
      */
     fun refreshDns() {
         if (!rootfsDir.exists()) return
+
+        // [T-container-network-dns] (OpenMinis#396) Custom mode: the user's
+        // servers, verbatim, on every call — install, boot and each network
+        // change all land here, so a network switch can no longer wash them
+        // out. Custom with no usable server resolves to System (see
+        // ContainerDns.plan), so this can never write a resolv.conf with no
+        // nameserver. Auto (the default) is the code below, unchanged.
+        val plan = ContainerDns.plan(context)
+        if (plan is ContainerDns.Plan.Custom) {
+            Log.i(TAG, "[DNS] custom mode: ${plan.servers.joinToString(", ")}")
+            writeResolvConf(ContainerDns.customResolvConf(plan.servers))
+            return
+        }
 
         val resolvConf = StringBuilder()
 
@@ -296,11 +318,15 @@ class RootfsManager private constructor(private val context: Context) {
             resolvConf.append("nameserver 8.8.4.4\n")
         }
 
+        writeResolvConf(resolvConf.toString())
+    }
+
+    private fun writeResolvConf(content: String) {
         try {
             val file = File(rootfsDir, "etc/resolv.conf")
             file.parentFile?.mkdirs()
-            file.writeText(resolvConf.toString())
-            Log.i(TAG, "[DNS] resolv.conf updated:\n$resolvConf")
+            file.writeText(content)
+            Log.i(TAG, "[DNS] resolv.conf updated:\n$content")
         } catch (e: Exception) {
             Log.e(TAG, "[DNS] Failed to write resolv.conf: ${e.message}")
         }
@@ -323,6 +349,10 @@ class RootfsManager private constructor(private val context: Context) {
             Log.d(TAG, "[DefaultMount] rootfs missing, skipping overlay")
             return@withContext
         }
+
+        // [T-git-createobject-rename] #409: before any shell can run git,
+        // repair the invalid core.createObject an older minis.sh wrote.
+        migrateSystemGitConfig()
 
         // AssetManager.list() returns an empty array for both "leaf file" and
         // "missing path", so probe for children before recursing — otherwise
@@ -398,6 +428,17 @@ class RootfsManager private constructor(private val context: Context) {
      * RootfsManager.removeExternallyManagedMarker (src/ios/iSH/RootfsManager.swift:228-239).
      * Returns the number of markers removed.
      */
+    /**
+     * [T-git-createobject-rename] openminis/openminis#409: older builds ran
+     * `git config --system core.createObject copy` from minis.sh. `copy` is
+     * not a valid value, so every git command in the sandbox died with
+     * "invalid mode for object creation". Removes that line from the guest's
+     * /etc/gitconfig on the host side (no shell needed). Everything else in
+     * the file is kept byte for byte; running it again changes nothing.
+     * Returns the number of lines removed.
+     */
+    private fun migrateSystemGitConfig(): Int = migrateGitConfigFile(File(rootfsDir, "etc/gitconfig"))
+
     private fun removeExternallyManagedMarker(): Int {
         val usrLib = File(rootfsDir, "usr/lib")
         val children = usrLib.listFiles() ?: return 0
@@ -626,6 +667,87 @@ class RootfsManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "RootfsManager"
+
+        /** [T-git-createobject-rename] Apply [migrateGitConfigText] to [file] in place; 0 when it is absent. */
+        internal fun migrateGitConfigFile(file: File): Int {
+            if (!file.isFile) return 0
+            return try {
+                val (migrated, removed) = migrateGitConfigText(file.readText())
+                if (removed > 0) {
+                    val tmp = File(file.parentFile, "${file.name}.minis-tmp")
+                    tmp.writeText(migrated)
+                    if (!tmp.renameTo(file)) {
+                        file.writeText(migrated)
+                        tmp.delete()
+                    }
+                    Log.i(TAG, "[GitConfigMigration] removed $removed invalid core.createObject line(s) from /etc/gitconfig")
+                }
+                removed
+            } catch (t: Throwable) {
+                Log.w(TAG, "[GitConfigMigration] failed: ${t.message}")
+                0
+            }
+        }
+
+        /**
+         * [T-git-createobject-rename] The /etc/gitconfig text with every
+         * invalid `createObject` entry of a `[core]` section removed, and how
+         * many lines went.
+         *
+         * - The section name and the key are matched case-insensitively, as
+         *   Git does.
+         * - The value is valid only if it is exactly `link` or `rename`: Git
+         *   compares the value case-sensitively (anything else, a missing
+         *   value included, is fatal).
+         * - Quotes and trailing `#` / `;` comments are ignored when reading
+         *   the value.
+         * - Other sections, other keys, comments, blank lines and the line
+         *   endings are kept as they are. An emptied `[core]` header is kept
+         *   too (harmless).
+         */
+        internal fun migrateGitConfigText(text: String): Pair<String, Int> {
+            val lines = text.split("\n")
+            val out = ArrayList<String>(lines.size)
+            var inCore = false
+            var removed = 0
+            val header = Regex("""^\s*\[\s*([A-Za-z0-9.-]+)(\s+"[^"]*")?\s*]\s*([#;].*)?$""")
+            val entry = Regex("""^\s*createobject\s*(=(.*))?$""", RegexOption.IGNORE_CASE)
+            for (line in lines) {
+                val bare = line.removeSuffix("\r")
+                val h = header.find(bare)
+                if (h != null) {
+                    inCore = h.groupValues[1].equals("core", ignoreCase = true) && h.groupValues[2].isEmpty()
+                    out += line
+                    continue
+                }
+                if (inCore) {
+                    val e = entry.find(bare)
+                    if (e != null && gitConfigValue(e.groupValues[2], e.groupValues[1].isNotEmpty()) !in VALID_CREATE_OBJECT) {
+                        removed++
+                        continue
+                    }
+                }
+                out += line
+            }
+            return (if (removed == 0) text else out.joinToString("\n")) to removed
+        }
+
+        private val VALID_CREATE_OBJECT = setOf("link", "rename")
+
+        /** A git-config value without quotes or a trailing comment; null when the key has no `=`. */
+        private fun gitConfigValue(raw: String, hasEquals: Boolean): String? {
+            if (!hasEquals) return null
+            val sb = StringBuilder()
+            var quoted = false
+            for (c in raw) {
+                when {
+                    c == '"' -> quoted = !quoted
+                    !quoted && (c == '#' || c == ';') -> break
+                    else -> sb.append(c)
+                }
+            }
+            return sb.toString().trim()
+        }
         private const val ARCH = "aarch64"
         private const val ROOTFS_ASSET = "alpine-minirootfs.tar.gz"
         private const val ROOTFS_ASSET_TAR = "alpine-minirootfs.tar"

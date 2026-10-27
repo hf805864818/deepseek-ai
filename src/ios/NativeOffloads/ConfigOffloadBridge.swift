@@ -53,6 +53,16 @@ private let logger = AppLogger(category: "ConfigOffload")
         ]
     }
 
+    /// `invalid_args` envelope for a malformed set-batch element. The CLI
+    /// maps it to exit code 1 like any other argument error.
+    private static func invalidBatchEnvelope(_ problem: String) -> NSDictionary {
+        return [
+            "ok": false,
+            "error": "invalid_args",
+            "reason": problem + " Each element must be {\"path\": \"<topic.field>\", \"value_json\": \"<JSON text>\"}.",
+        ]
+    }
+
     // MARK: - Topic / list / help discovery
 
     /// All visible topics in the registry. Sorted alphabetical. The CLI
@@ -92,6 +102,23 @@ private let logger = AppLogger(category: "ConfigOffload")
         }
         sem.wait()
         return out
+    }
+
+    /// [T-config-path-dotted-id] OpenMinis#390. For a collection topic, how to
+    /// write a child path — surfaced by `topic-help` next to the field list,
+    /// whose example paths now carry raw ids. nil for flat topics.
+    @objc public static func pathNoteForTopic(_ topic: String) -> String? {
+        let sem = DispatchSemaphore(value: 0)
+        var note: String?
+        Task.detached { @MainActor in
+            ConfigRegistry.shared.registerBuiltinsIfNeeded()
+            if ConfigRegistry.shared.collection(basePath: topic) != nil {
+                note = "Child paths are \(topic).<entry_id>.<field>. Use entry_id exactly as `minis-config get \(topic)` prints it — dots and slashes need no escaping."
+            }
+            sem.signal()
+        }
+        sem.wait()
+        return note
     }
 
     // MARK: - Read
@@ -269,7 +296,8 @@ private let logger = AppLogger(category: "ConfigOffload")
             return [
                 "ok": false,
                 "error": "unknown_path",
-                "reason": "No registered field at '\(path)'.",
+                // [T-config-path-dotted-id] Says which part was wrong.
+                "reason": ConfigRegistry.shared.explainUnknownPath(path),
             ]
         }
         if field.access == .hidden {
@@ -319,10 +347,20 @@ private let logger = AppLogger(category: "ConfigOffload")
     ///
     /// Blocks the caller until the user resolves the confirmation
     /// sheet or the gate's 30 s timeout fires.
-    @objc public static func writeFields(items: [NSDictionary],
+    ///
+    /// `items` is typed `[Any]`, not `[NSDictionary]`: it arrives as an
+    /// NSArray parsed from the agent's stdin JSON, and a Swift array typed
+    /// `[NSDictionary]` over an NSArray traps on the first element that is
+    /// not a dictionary (`_getElementSlowPath`) - a one-device crash seen
+    /// in 1.15 (8). Every element is checked first (T-config-batch-item-trap).
+    @objc public static func writeFields(items: [Any],
                                          caption: String?,
                                          actorRaw: String,
                                          sessionId: String?) -> NSDictionary {
+        if let problem = ConfigBatchItemRules.firstProblem(items) {
+            return Self.invalidBatchEnvelope(problem)
+        }
+        let items = items.compactMap { $0 as? NSDictionary }
         let sem = DispatchSemaphore(value: 0)
         var result: NSDictionary = [:]
         Task.detached { @MainActor in
@@ -389,6 +427,12 @@ private let logger = AppLogger(category: "ConfigOffload")
         // so the audit/error helpers can pattern-match on it.
         var resolved: [Resolved] = []
         var resolvedItems: [PendingConfigChangeItem] = []
+        // [T-config-readable] One user-facing description per resolved item,
+        // index-aligned with `resolved`. Rendered HERE, before the sheet and
+        // before any write, so a record about to be removed is still named.
+        // Goes to the sheet row and the audit row ONLY — never into the CLI
+        // response.
+        var readables: [ReadableSummary] = []
         for raw in items {
             let rawPath = (raw["path"] as? String) ?? ""
             let valueJSON = (raw["value_json"] as? String) ?? "null"
@@ -446,7 +490,11 @@ private let logger = AppLogger(category: "ConfigOffload")
                             "reason": "'\(rawPath)' expects a JSON string child id (e.g. \"<uuid>\").",
                         ]
                     }
-                    guard collection.childIds().contains(childId) else {
+                    // [T-config-path-dotted-id] A child may also be named in a
+                    // form `childIds()` does not list verbatim (the pre-#390
+                    // `~d`-escaped model id); `fields(for:)` accepts both.
+                    guard collection.childIds().contains(childId)
+                            || !collection.fields(for: childId).isEmpty else {
                         return [
                             "ok": false, "error": "not_found",
                             "reason": "No '\(resolvePath)' child with id '\(childId)'.",
@@ -459,6 +507,8 @@ private let logger = AppLogger(category: "ConfigOffload")
                     }
                     let snapshotJSON = ConfigValue.object(snapshot).jsonString()
                     resolved.append(.collectionRemove(collection: collection, childId: childId, snapshotJSON: snapshotJSON))
+                    let readable = ConfigReadableRenderer.forCollectionRemove(collection, childId: childId)
+                    readables.append(readable)
                     resolvedItems.append(PendingConfigChangeItem(
                         id: UUID().uuidString,
                         displayName: collection.displayName,
@@ -466,7 +516,8 @@ private let logger = AppLogger(category: "ConfigOffload")
                         oldDisplay: childId,
                         newDisplay: "",
                         verb: "remove",
-                        risk: collection.risk
+                        risk: collection.risk,
+                        readable: readable
                     ))
                 } else {
                     guard collection.addable else {
@@ -490,6 +541,9 @@ private let logger = AppLogger(category: "ConfigOffload")
                     // copies are masked. A `$$ENV` reference passes through.
                     let auditedPayload = parsedValue.redactingSecrets()
                     resolved.append(.collectionAdd(collection: collection, payload: parsedValue, payloadJSON: auditedPayload.jsonString()))
+                    let readable = ConfigReadableRenderer.forCollectionAdd(
+                        collection, payload: RedactedConfigValue(payload: parsedValue))
+                    readables.append(readable)
                     resolvedItems.append(PendingConfigChangeItem(
                         id: UUID().uuidString,
                         displayName: collection.displayName,
@@ -497,7 +551,8 @@ private let logger = AppLogger(category: "ConfigOffload")
                         oldDisplay: "",
                         newDisplay: auditedPayload.displayString,
                         verb: "add",
-                        risk: collection.risk
+                        risk: collection.risk,
+                        readable: readable
                     ))
                 }
                 continue
@@ -506,7 +561,8 @@ private let logger = AppLogger(category: "ConfigOffload")
             guard let field = ConfigRegistry.shared.resolveField(path: resolvePath) else {
                 return [
                     "ok": false, "error": "unknown_path",
-                    "reason": "No registered field at '\(rawPath)'.",
+                    // [T-config-path-dotted-id] Says which part was wrong.
+                    "reason": ConfigRegistry.shared.explainUnknownPath(resolvePath),
                 ]
             }
             // Feature-unavailable gate BEFORE access/validation and before the
@@ -524,7 +580,14 @@ private let logger = AppLogger(category: "ConfigOffload")
                     "ok": false, "error": "permission_denied", "reason": reason,
                 ]
             }
-            guard let parsedValue = ConfigValue.decode(json: valueJSON) else {
+            // [T-container-network-dns] A bare word is accepted where a string
+            // is expected (`set network.dnsMode custom`); for .append/.remove
+            // that is the ELEMENT's type.
+            let cliSchema: ConfigValueSchema = {
+                if isAppend || isRemove, case .array(let elem) = field.valueSchema { return elem }
+                return field.valueSchema
+            }()
+            guard let parsedValue = ConfigValue.decode(cliValue: valueJSON, for: cliSchema) else {
                 return [
                     "ok": false, "error": "invalid_value",
                     "reason": "Value JSON is not parseable for '\(rawPath)'.",
@@ -540,10 +603,14 @@ private let logger = AppLogger(category: "ConfigOffload")
                 oldValue = .null
             }
 
-            let newValue: ConfigValue
+            // `var` (not `let`): [T-soul-icon-config-images] rewrites this in
+            // place when an image source resolves to a data URI.
+            var newValue: ConfigValue
             let displayVerb: String
             let displayPath: String
-            let displayOld: String
+            // `var`: [T-soul-icon-config-images] collapses a stored data URI
+            // to "<image>" so the confirm sheet never shows base64.
+            var displayOld: String
             var displayNew: String
             if isAppend {
                 guard case .array(let elemSchema) = field.valueSchema else {
@@ -561,6 +628,12 @@ private let logger = AppLogger(category: "ConfigOffload")
                 let existing: [ConfigValue]
                 if case .array(let arr) = oldValue { existing = arr } else { existing = [] }
                 newValue = .array(existing + [parsedValue])
+                do { try field.validateForWrite(newValue) } catch {
+                    return [
+                        "ok": false, "error": "validation_failed",
+                        "reason": String(describing: error),
+                    ]
+                }
                 displayVerb = "append"
                 displayPath = rawPath
                 displayOld = ""
@@ -588,18 +661,52 @@ private let logger = AppLogger(category: "ConfigOffload")
                 displayNew = ""
             } else {
                 do {
-                    try field.valueSchema.validate(parsedValue)
+                    // [T-container-network-dns] Normalize first (e.g. a
+                    // comma-separated list into an array), then the field's
+                    // full validation — both before the confirmation sheet.
+                    newValue = try field.normalizeForWrite(parsedValue)
+                    try field.validateForWrite(newValue)
                 } catch {
                     return [
                         "ok": false, "error": "validation_failed",
                         "reason": String(describing: error),
                     ]
                 }
-                newValue = parsedValue
                 displayVerb = "set"
                 displayPath = field.path
                 displayOld = oldValue.displayString
                 displayNew = newValue.displayString
+            }
+
+            // [T-soul-icon-config-images] Resolve an image source to its
+            // stored form BEFORE the confirmation sheet.
+            //
+            // Three reasons this belongs here rather than in the writer:
+            //   1. `ConfigField.write` is synchronous and @MainActor; an
+            //      https source needs an await. This function is already async.
+            //   2. The user should confirm a change that has already been
+            //      fetched and validated — otherwise the sheet promises
+            //      something the write may then fail to deliver.
+            //   3. A failed fetch becomes a clean tool error instead of a
+            //      half-applied batch.
+            //
+            // What lands in `newValue` is the finished data URI; what lands in
+            // the sheet and the audit log is the literal "<image>", so neither
+            // ever carries base64.
+            if field.path == "soul.icon", case .string(let rawIcon) = newValue,
+               SoulIconSource.looksLikeImageSource(rawIcon) {
+                do {
+                    let dataURI = try await SoulIconSource.resolveToDataURI(rawIcon)
+                    newValue = .string(dataURI)
+                    displayNew = "<image>"
+                } catch {
+                    let reason = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    return [
+                        "ok": false, "error": "validation_failed",
+                        "reason": "Can't use that image: \(reason)",
+                    ]
+                }
             }
 
             // [T-minis-config-provider-add] If this field holds a credential
@@ -618,7 +725,27 @@ private let logger = AppLogger(category: "ConfigOffload")
                 displayNew = mv.displayString
             }
 
+            // [T-soul-icon-config-images] Keep the encoded icon out of the
+            // audit log and the confirm sheet. `displayString` truncates at 80
+            // chars, which would still splash 75 characters of base64 across
+            // both surfaces — and the audit column stores the value in full.
+            if case .string(let sv) = auditNewValue, SoulIconImage.isDataURI(sv) {
+                auditNewValue = .string("<image>")
+                displayNew = "<image>"
+            }
+            if case .string(let ov) = oldValue, SoulIconImage.isDataURI(ov) {
+                displayOld = "<image>"
+            }
+
             resolved.append(.fieldWrite(field: field, oldValue: oldValue, newValue: newValue, auditNewValue: auditNewValue))
+            // [T-config-readable] Both sides go through RedactedConfigValue —
+            // the same masking as auditNewValue — so no secret can reach the
+            // rendered text.
+            let readable = ConfigReadableRenderer.forFieldWrite(
+                field,
+                old: RedactedConfigValue(fieldLeaf: fieldLeaf, value: oldValue),
+                new: RedactedConfigValue(fieldLeaf: fieldLeaf, value: newValue))
+            readables.append(readable)
             resolvedItems.append(PendingConfigChangeItem(
                 id: UUID().uuidString,
                 displayName: field.displayName,
@@ -626,7 +753,8 @@ private let logger = AppLogger(category: "ConfigOffload")
                 oldDisplay: displayOld,
                 newDisplay: displayNew,
                 verb: displayVerb,
-                risk: field.risk
+                risk: field.risk,
+                readable: readable
             ))
         }
 
@@ -659,14 +787,15 @@ private let logger = AppLogger(category: "ConfigOffload")
             // user see what was attempted even if they missed the
             // sheet.
             let now = Date()
-            for r in resolved {
+            for (i, r) in resolved.enumerated() {
                 let a = auditFields(for: r)
                 audit.append(ConfigAuditEntry(
                     id: UUID().uuidString, at: now, actor: actor,
                     sessionId: sessionId, scope: a.scope, key: a.key,
                     oldValueJSON: a.oldJSON, newValueJSON: a.newJSON,
                     confirmedAt: nil, status: .timeout, revertOf: nil,
-                    caption: caption
+                    caption: caption,
+                    readable: readables.indices.contains(i) ? readables[i] : nil
                 ))
             }
             return [
@@ -677,14 +806,15 @@ private let logger = AppLogger(category: "ConfigOffload")
 
         case .rejected:
             let now = Date()
-            for r in resolved {
+            for (i, r) in resolved.enumerated() {
                 let a = auditFields(for: r)
                 audit.append(ConfigAuditEntry(
                     id: UUID().uuidString, at: now, actor: actor,
                     sessionId: sessionId, scope: a.scope, key: a.key,
                     oldValueJSON: a.oldJSON, newValueJSON: a.newJSON,
                     confirmedAt: now, status: .rejected, revertOf: nil,
-                    caption: caption
+                    caption: caption,
+                    readable: readables.indices.contains(i) ? readables[i] : nil
                 ))
             }
             return [
@@ -701,6 +831,8 @@ private let logger = AppLogger(category: "ConfigOffload")
             var applied: [[String: String]] = []
             var auditIds: [String] = []
             var writeErrors: [[String: String]] = []
+            // [T-envvar-disable] Start this batch's warnings from empty.
+            _ = ConfigWriteWarnings.drain()
             if approvedRows.count != resolved.count {
                 logger.error("confirmation row count mismatch resolved=\(resolved.count) approvedRows=\(approvedRows.count) caption=\(caption ?? "")")
             }
@@ -708,6 +840,7 @@ private let logger = AppLogger(category: "ConfigOffload")
                 guard idx < resolved.count else { continue }
                 let r = resolved[idx]
                 let a = auditFields(for: r)
+                let readable = readables.indices.contains(idx) ? readables[idx] : nil
                 if !row.isApproved {
                     let auditId = UUID().uuidString
                     audit.append(ConfigAuditEntry(
@@ -715,7 +848,8 @@ private let logger = AppLogger(category: "ConfigOffload")
                         sessionId: sessionId, scope: a.scope, key: a.key,
                         oldValueJSON: a.oldJSON, newValueJSON: a.newJSON,
                         confirmedAt: now, status: .rejected, revertOf: nil,
-                        caption: caption
+                        caption: caption,
+                        readable: readable
                     ))
                     continue
                 }
@@ -760,7 +894,8 @@ private let logger = AppLogger(category: "ConfigOffload")
                         sessionId: sessionId, scope: a.scope, key: finalKey,
                         oldValueJSON: a.oldJSON, newValueJSON: a.newJSON,
                         confirmedAt: now, status: .applied, revertOf: nil,
-                        caption: caption
+                        caption: caption,
+                        readable: readable
                     ))
                     auditIds.append(auditId)
                     applied.append(appliedRow)
@@ -785,12 +920,24 @@ private let logger = AppLogger(category: "ConfigOffload")
             if applied.isEmpty {
                 if !writeErrors.isEmpty {
                     logger.warning("write_failed resolved=\(resolved.count) approvedRows=\(approvedRows.count) approvedRowsOn=\(approvedRows.filter { $0.isApproved }.count) errors=\(writeErrors.count) caption=\(caption ?? "")")
+                    let reason = writeErrors.map { "\($0["path"] ?? "?"): \($0["reason"] ?? "unknown error")" }.joined(separator: "; ")
+                    // [T-subagent-config-honesty] A DELIBERATE refusal lands in
+                    // this same branch — renaming or deleting the built-in sub
+                    // agent, for instance. "applying it failed" describes a
+                    // malfunction, so a working rule was reported as an internal
+                    // error. When every entry is a permission_denied, say it was
+                    // refused and carry the reason, which already explains what
+                    // to do instead. Mixed or other errors keep the original
+                    // wording: those really may be failures.
+                    let allDenied = writeErrors.allSatisfy { $0["error"] == "permission_denied" }
                     return [
                         "ok": false,
                         "error": "write_failed",
-                        "reason": writeErrors.map { "\($0["path"] ?? "?"): \($0["reason"] ?? "unknown error")" }.joined(separator: "; "),
+                        "reason": reason,
                         "write_errors": writeErrors,
-                        "user_message": "I confirmed the change, but applying it failed. No settings were updated.",
+                        "user_message": allDenied
+                            ? "That change isn't allowed: \(reason). No settings were updated."
+                            : "I confirmed the change, but applying it failed. No settings were updated.",
                     ]
                 }
                 if approvedRows.count != resolved.count {
@@ -808,8 +955,9 @@ private let logger = AppLogger(category: "ConfigOffload")
                     "user_message": "No changes applied.",
                 ]
             }
+            let warnings = ConfigWriteWarnings.drain()
             if !writeErrors.isEmpty {
-                return [
+                var result: [String: Any] = [
                     "ok": false,
                     "error": "partial_write_failed",
                     "applied": applied,
@@ -818,14 +966,23 @@ private let logger = AppLogger(category: "ConfigOffload")
                     "reason": writeErrors.map { "\($0["path"] ?? "?"): \($0["reason"] ?? "unknown error")" }.joined(separator: "; "),
                     "user_message": "Some settings were updated, but at least one confirmed change failed to apply.",
                 ]
+                if !warnings.isEmpty { result["warnings"] = warnings }
+                return result as NSDictionary
             }
-            return [
+            var result: [String: Any] = [
                 "ok": true,
                 "applied": applied,
                 "audit_ids": auditIds,
                 "audit_url": "minis://settings/logs?tab=config-audit",
                 "user_message": "Settings updated. Review or revert at [Logs → Config Changes](minis://settings/logs?tab=config-audit).",
             ]
+            // [T-envvar-disable] e.g. a $$NAME that resolved to empty because
+            // the variable is disabled - applied, but worth telling the user.
+            if !warnings.isEmpty {
+                result["warnings"] = warnings
+                result["user_message"] = "Settings updated, with a warning: \(warnings.joined(separator: " ")) Review or revert at [Logs → Config Changes](minis://settings/logs?tab=config-audit)."
+            }
+            return result as NSDictionary
         }
     }
 
@@ -964,6 +1121,13 @@ private let logger = AppLogger(category: "ConfigOffload")
         return result
     }
 
+    /// The CLI / agent view of an audit row — an explicit allow-list.
+    ///
+    /// [T-config-readable] `e.readable` (the human-readable description) is
+    /// deliberately NOT emitted: it is for the user only (confirm sheet + Logs
+    /// → Config Changes) and must never reach the model. Keep this a field-by-
+    /// field list; never serialize the whole `ConfigAuditEntry` (it is Codable
+    /// and would carry `readable` along). Guarded by ConfigReadableLeakTests.
     @MainActor
     private static func auditEntryDict(_ e: ConfigAuditEntry) -> NSDictionary {
         let iso = ISO8601DateFormatter()
@@ -1051,3 +1215,40 @@ private let logger = AppLogger(category: "ConfigOffload")
         return result
     }
 }
+
+// BEGIN ConfigBatchItemRules
+/// Shape check for `minis-config set-batch` elements, done before any element
+/// is used as a dictionary.
+enum ConfigBatchItemRules {
+    /// nil when every element is an object whose `path` is a non-empty string
+    /// and whose `value_json`, if present, is a string; otherwise a sentence
+    /// naming the first bad element (1-based, as a person counts).
+    static func firstProblem(_ items: [Any]) -> String? {
+        for (offset, element) in items.enumerated() {
+            let n = offset + 1
+            guard let dict = element as? [String: Any] else {
+                return "Batch element \(n) is \(describe(element)), not an object."
+            }
+            guard let path = dict["path"] as? String,
+                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return "Batch element \(n) has no \"path\" string."
+            }
+            if let value = dict["value_json"], !(value is String) {
+                return "Batch element \(n) (\(path)): \"value_json\" must be a string holding JSON text, not \(describe(value))."
+            }
+        }
+        return nil
+    }
+
+    private static func describe(_ value: Any) -> String {
+        switch value {
+        case is NSNull: return "null"
+        case is String: return "a string"
+        case is NSNumber: return "a number or boolean"
+        case is [Any]: return "an array"
+        case is [String: Any]: return "an object"
+        default: return "a \(type(of: value))"
+        }
+    }
+}
+// END ConfigBatchItemRules

@@ -28,6 +28,68 @@ import Foundation
     /// Sentinel session id for invocations with no active mount.
     private static let unmountedSentinel = "__unmounted__"
 
+    /// [T-browser-cli-timeout-reclaim] OpenMinis#245. Executions whose
+    /// completion has not fired yet, so the ObjC handler can cancel the one it
+    /// stopped waiting for. `tabId` is the tab the command asked for (`nil` =
+    /// implicit tab). The task is filled in right after it is created. The
+    /// entry is inserted before that and removed by the task's own `defer`, so
+    /// a task that finishes early never leaves a stale entry. Lock-protected
+    /// rather than MainActor: both ends are called from the guest thread.
+    private struct InFlight {
+        let sid: String
+        let tabId: Int?
+        var task: Task<Void, Never>?
+    }
+    private static let inFlightLock = NSLock()
+    nonisolated(unsafe) private static var inFlight: [UInt64: InFlight] = [:]
+    /// Starts at 1 so 0 can mean "no execution was registered" (the early
+    /// rejections in `execute`); `cancelAndReclaim(invocation: 0)` is a no-op.
+    nonisolated(unsafe) private static var nextInvocation: UInt64 = 1
+
+    /// Synchronous so the lock is never held across a suspension point.
+    private static func endInvocation(_ invocation: UInt64) {
+        inFlightLock.lock()
+        inFlight.removeValue(forKey: invocation)
+        inFlightLock.unlock()
+    }
+
+    /// [T-browser-cli-timeout-reclaim] OpenMinis#245. Called by the ObjC
+    /// handler when its 90s wait for `execute` runs out. Cancels exactly the
+    /// execution it abandoned, named by the token `execute` returned.
+    ///
+    /// Why: the tab pool's own dead-tab ceiling is 300s, so the abandoned
+    /// action kept the tab's serial slot for another ~210s. Every follow-up
+    /// command on that tab queued behind it and failed its slot wait, which
+    /// made the browser look hung for about 5 minutes.
+    ///
+    /// Cancelling the execution task reaches `BrowserTabPool.withDeadOnTimeout`,
+    /// which fires the same abort `BrowserTabPool.abortAndRebuildTab` does. The
+    /// op task is cancelled, the wedged tab is swapped for a fresh WebView, and
+    /// the slot is released, so the next command runs at once. Cancelling the
+    /// task instead of aborting "whatever runs on tabId" matters here: the pool
+    /// is shared with the agent, and a blind abort could kill an agent action
+    /// that took the slot after ours finished.
+    ///
+    /// [T-browser-cli-reclaim-scope] This used to match by (session id,
+    /// requested tab id). The session id is the process-wide mounted-sid
+    /// snapshot and most commands name no tab, so one CLI timeout cancelled
+    /// every concurrent `minis-browser-use` call (main agent, sub-agents,
+    /// parallel tool calls) and rebuilt their healthy tabs. Keying on the
+    /// per-invocation token scopes the cancel to the one call that timed out.
+    @objc public static func cancelAndReclaim(invocation: UInt64) {
+        inFlightLock.lock()
+        let hit = inFlight.removeValue(forKey: invocation)
+        inFlightLock.unlock()
+
+        guard let hit else {
+            // Completion raced the timeout: nothing left holding the tab.
+            logger.info("[BridgeTiming] cancelAndReclaim invocation=\(invocation): nothing in flight")
+            return
+        }
+        logger.warning("[BridgeTiming] cancelAndReclaim invocation=\(invocation) sid=\(hit.sid.prefix(8)) tab=\(hit.tabId.map(String.init) ?? "nil"): cancelling the abandoned execution — tab will be rebuilt and its slot released")
+        hit.task?.cancel()
+    }
+
     /// Resolve the tab pool for the given session id.
     ///
     /// Resolution order:
@@ -91,12 +153,15 @@ import Foundation
     /// dictionary describing the result; the ObjC caller is responsible
     /// for serializing it to the guest's stdout.
     ///
-    /// Session resolution: reads `ISHExecutionCoordinator.mountedSessionId`
-    /// at the moment the handler fires. Because shell execution is
-    /// serialized by the coordinator actor and the mount-swap happens
-    /// synchronously before the guest command runs, this value is
-    /// guaranteed to be the session that owns the current `/var/minis/`
-    /// bind mount for the lifetime of this CLI invocation.
+    /// Session resolution ([T-browser-pool-caller-session]): `fsContext` is the
+    /// calling guest task's fs_context, read by the ObjC handler on its own
+    /// thread; it maps to the chat that issued the command. This used to read
+    /// `ISHExecutionCoordinator.mountedSessionIdSnapshot` on the assumption
+    /// that shell execution is serialized with one mount at a time. It is not
+    /// any more: shells from different chats run concurrently, and the
+    /// snapshot is just the chat that started a command last. Three chats
+    /// driving xiaohongshu / xiaohongshu / goofish through `minis-browser-use`
+    /// therefore navigated each other's tabs.
     ///
     /// When `withBase64` is false (default), any captured screenshot is
     /// persisted to that session's `/var/minis/browser/` directory and
@@ -108,35 +173,56 @@ import Foundation
     /// minis_url?, image_base64?, fetched_file?, fetched_bytes?,
     /// fetched_path?, fetched_minis_url?.
     /// Keys on failure: text, success=false.
+    ///
+    /// Returns the invocation token to pass to `cancelAndReclaim(invocation:)`
+    /// if the caller stops waiting ([T-browser-cli-reclaim-scope]); 0 when the
+    /// request was rejected before anything was started.
+    @discardableResult
     @objc public static func execute(
         withJson json: String,
         withBase64: Bool,
+        fsContext: UInt64,
         completion: @escaping (NSDictionary) -> Void
-    ) {
+    ) -> UInt64 {
         let bridgeStart = CFAbsoluteTimeGetCurrent()
+
+        // [T-tools-master-switch] minis-browser-use is the browser_use tool
+        // behind a CLI; the same switch closes both.
+        guard AgentToolSwitch.browser.isEnabled else {
+            completion([
+                "text": "Error: Browser Use is turned off in Settings › Agent Tools. Ask the user to enable it there.",
+                "success": false,
+            ] as NSDictionary)
+            return 0
+        }
 
         guard let input = BrowserActionInput.parse(from: json) else {
             completion([
                 "text": "Error: Invalid browser_use input. Required: 'action' parameter.",
                 "success": false,
             ] as NSDictionary)
-            return
+            return 0
         }
 
-        logger.info("[BridgeTiming] enter action=\(input.action.rawValue) tab_id=\(input.tabId.map(String.init) ?? "nil") url=\(input.url?.prefix(80) ?? "nil")")
+        // Resolve the owning session synchronously, BEFORE hopping to
+        // MainActor. Awaiting the coordinator actor here used to deadlock
+        // under shell pressure: the guest task thread sits on
+        // `dispatch_semaphore_wait`, and this task's MainActor hop has to beat
+        // every `dispatch_async(main_queue, ^{ ctx.lineCallback(line) })`
+        // coming out of ISHShellExecutor. The fs_context lookup is a locked
+        // dictionary read, so it keeps that property.
+        let caller = ISHExecutionCoordinator.callerSessionId(fsContext: fsContext)
+        let sid = caller.sid ?? Self.unmountedSentinel
+        logger.info("[BridgeTiming] enter action=\(input.action.rawValue) tab_id=\(input.tabId.map(String.init) ?? "nil") url=\(input.url?.prefix(80) ?? "nil") sid=\(sid.prefix(8)) via=\(caller.source)")
 
-        // Resolve the owning session via the lock-protected snapshot BEFORE
-        // hopping to MainActor. Awaiting the coordinator actor here used to
-        // deadlock under shell pressure: the guest task thread sits on
-        // `dispatch_semaphore_wait`, and this task's MainActor hop has to
-        // beat every `dispatch_async(main_queue, ^{ ctx.lineCallback(line) })`
-        // coming out of ISHShellExecutor to get picked up. Reading the
-        // nonisolated snapshot synchronously avoids both the coordinator
-        // actor suspension and one MainActor ordering hop.
-        let sid = ISHExecutionCoordinator.mountedSessionIdSnapshot
-                  ?? Self.unmountedSentinel
+        inFlightLock.lock()
+        let invocation = nextInvocation
+        nextInvocation &+= 1
+        inFlight[invocation] = InFlight(sid: sid, tabId: input.tabId, task: nil)
+        inFlightLock.unlock()
 
-        Task { @MainActor in
+        let task = Task { @MainActor in
+            defer { endInvocation(invocation) }
             guard let pool = await Self.pool(for: sid) else {
                 let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - bridgeStart) * 1000)
                 logger.info("[BridgeTiming] pool_not_found elapsed=\(elapsedMs)ms sid=\(sid.prefix(8))")
@@ -174,6 +260,10 @@ import Foundation
                 ] as NSDictionary)
             }
         }
+        inFlightLock.lock()
+        inFlight[invocation]?.task = task
+        inFlightLock.unlock()
+        return invocation
     }
 
     private static func encode(_ r: BrowserActionResult, withBase64: Bool, sid: String) -> NSDictionary {

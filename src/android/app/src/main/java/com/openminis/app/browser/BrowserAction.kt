@@ -51,7 +51,7 @@ enum class BrowserAction(val value: String) {
          * fan out to a fresh tab when an implicit (tab_id-less) call lands while
          * the previously-used tab is still inside its inUse grace window. The
          * grace-based fan-out exists so N back-to-back *navigates* open N
-         * distinct tabs instead of trampling tab 0 (issue #595).
+         * distinct tabs instead of trampling tab 0.
          *
          * Every other action operates on the CURRENT page (read DOM, click,
          * scroll, screenshot, …). For those, fanning out to a fresh/other tab
@@ -105,5 +105,19 @@ enum class UserAgentProfile(val value: String) {
 
     companion object {
         fun fromString(s: String): UserAgentProfile? = entries.find { it.value == s }
+
+        /**
+         * [ISS-033] A user_agent argument: case-insensitive, "-" read as "_",
+         * and "desktop" / "mobile" accepted as aliases. Null when unknown - it
+         * used to fall back to mobile silently, so "desktop" switched to MOBILE.
+         */
+        fun parse(raw: String?): UserAgentProfile? {
+            val s = raw?.trim()?.lowercase()?.replace('-', '_') ?: return null
+            return when (s) {
+                "desktop" -> DESKTOP_CHROME
+                "mobile" -> MOBILE_CHROME
+                else -> fromString(s)
+            }
+        }
     }
 }

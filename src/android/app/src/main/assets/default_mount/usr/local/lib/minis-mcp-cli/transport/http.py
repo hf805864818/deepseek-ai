@@ -12,6 +12,7 @@ Errors are raised as `MCPError(code, message)`; main.py renders the unified
 """
 
 import json
+import sys
 import os
 import re
 
@@ -29,6 +30,35 @@ TIMEOUT_SECONDS = 300  # 5 min
 _ENV_RE = re.compile(r"\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
+# [FEAT-261021-14 G3] Settings > Network "MCP" scope. While its local entry
+# runs, the app exports MINIS_MCP_PROXY = the entry's HTTP front with the
+# `mcp` tag (http://mcp:<password>@127.0.0.1:<port>); the entry then sends
+# each request direct, through the tailnet or through a proxy, as the MCP
+# route says. The shell's own proxy variables are ignored for MCP traffic
+# then: the MCP scope decides, not the shell's. Unset (the entry is off, or
+# an older app) = exactly as before. A server on this device's loopback is
+# never proxied.
+MCP_PROXY_ENV = "MINIS_MCP_PROXY"
+
+
+def proxy_kwargs(url, env=None):
+    """httpx keyword arguments routing a request to `url` per the MCP scope."""
+    proxy = (os.environ if env is None else env).get(MCP_PROXY_ENV, "").strip()
+    if not proxy:
+        return {}
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host in ("localhost", "::1") or host.startswith("127."):
+        return {"trust_env": False}
+    version = tuple(int(p) for p in re.findall(r"\d+", getattr(httpx, "__version__", "0"))[:2]) if httpx else (0,)
+    # `proxy=` since httpx 0.26; `proxies=` before (removed in 0.28).
+    key = "proxy" if version >= (0, 26) else "proxies"
+    return {key: proxy, "trust_env": False}
+
+
 class MCPError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -36,12 +66,34 @@ class MCPError(Exception):
         self.message = message
 
 
+_warned_unset = set()
+
+
 def expand_env(value):
     """Replace $VAR / ${VAR} / $$VAR / $${VAR} with the environment value (empty
-    if unset)."""
+    if unset).
+
+    An unset name - missing, or disabled in Settings -> Environment Variables,
+    which keeps it out of the environment - still expands to "" so the call
+    goes ahead, but says so once per name on stderr instead of failing later
+    with a puzzling 401."""
     if not isinstance(value, str):
         return value
-    return _ENV_RE.sub(lambda m: os.environ.get(m.group(1), ""), value)
+
+    def _sub(m):
+        name = m.group(1)
+        found = os.environ.get(name)
+        if found is None:
+            if name not in _warned_unset:
+                _warned_unset.add(name)
+                sys.stderr.write(
+                    "minis-mcp: warning: $%s is not set (missing, or disabled in "
+                    "Settings -> Environment Variables); using an empty string\n" % name
+                )
+            return ""
+        return found
+
+    return _ENV_RE.sub(_sub, value)
 
 
 def _expand_headers(headers):
@@ -113,10 +165,45 @@ def _authorize_deeplink(server_name):
 
 
 def _load_oauth_tokens(server_name):
+    """Read the host-written OAuth bridge file for `server_name`.
+
+    [issue #380] The three ways this returns None are NOT equivalent, and
+    collapsing them is what made the bug invisible:
+
+      * FileNotFoundError - genuinely not authorized yet, or the host wrote into
+        an App Group this sandbox cannot see because /var/minis/mcp-servers is a
+        local placeholder directory shadowing the symlink. Identical from here,
+        so the absolute path is logged: an empty real directory at that path is
+        the tell.
+      * OSError - permission/IO. The file is there and unreadable, which is a
+        very different problem from "not authorized" and used to look the same.
+      * ValueError - present but corrupt (a truncated or partial write).
+
+    Diagnostics go to stderr, never stdout: stdout carries the JSON the agent
+    parses.
+    """
+    path = _oauth_token_path(server_name)
     try:
-        with open(_oauth_token_path(server_name), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        sys.stderr.write(
+            "[minis-mcp-cli] no OAuth token for %r at %s "
+            "(not authorized yet, or the host directory is not reachable from the sandbox)\n"
+            % (server_name, path)
+        )
+        return None
+    except OSError as exc:
+        sys.stderr.write(
+            "[minis-mcp-cli] OAuth token for %r at %s is unreadable: %s\n"
+            % (server_name, path, exc)
+        )
+        return None
+    except ValueError as exc:
+        sys.stderr.write(
+            "[minis-mcp-cli] OAuth token for %r at %s is corrupt: %s\n"
+            % (server_name, path, exc)
+        )
         return None
 
 
@@ -204,7 +291,8 @@ class HTTPTransport:
         if tokens.get("resource"):
             form["resource"] = tokens["resource"]
         try:
-            resp = httpx.post(token_endpoint, data=form, timeout=30)
+            resp = httpx.post(token_endpoint, data=form, timeout=30,
+                              **proxy_kwargs(token_endpoint))
         except httpx.HTTPError:
             return None
         if resp.status_code >= 400:
@@ -261,7 +349,8 @@ class HTTPTransport:
             headers["Mcp-Session-Id"] = self._session_id
         try:
             resp = httpx.post(
-                self.url, json=body, headers=headers, timeout=TIMEOUT_SECONDS
+                self.url, json=body, headers=headers, timeout=TIMEOUT_SECONDS,
+                **proxy_kwargs(self.url)
             )
         except httpx.TimeoutException:
             raise MCPError("TIMEOUT", "request timed out after %ds" % TIMEOUT_SECONDS)

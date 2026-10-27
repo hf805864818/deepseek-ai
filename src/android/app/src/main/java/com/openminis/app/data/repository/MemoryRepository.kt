@@ -1,6 +1,7 @@
 package com.openminis.app.data.repository
 
 import android.util.Log
+import com.openminis.app.logging.AppLogger
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -9,7 +10,7 @@ import java.util.Locale
 /**
  * Manages the memory directory (`minis-global/memory/`).
  * Mirrors iOS memory system:
- *   - GLOBAL.md: read-only for agent, user-maintained via Settings
+ *   - GLOBAL.md: user-maintained via Settings; the agent may update it when the user asks
  *   - YYYY-MM-DD.md: daily logs with timestamped entries, agent writes via memory_write
  *   - memory_get: fuzzy keyword search across files
  *   - loadGlobalMemoryFragment() / loadRecentDailyMemoryFragment(): emit
@@ -31,6 +32,17 @@ class MemoryRepository(private val memoryDir: File) {
         private const val MAX_SEARCH_LINES = 60
         private const val MAX_LOOKBACK_DAYS = 30
         private const val MAX_RECENT_FILES = 3
+
+        /**
+         * [XSessionDiag] Vocabulary that suggests an injected daily log describes
+         * a TASK a model might try to resume, rather than a plain fact. Purely a
+         * log tag — nothing branches on it, and both languages are listed because
+         * the reported incidents were Chinese-language sessions.
+         */
+        private val DIAG_TASK_KEYWORDS = listOf(
+            "任务", "调研", "继续", "接着", "未完成", "下一步",
+            "task", "continue", "resume", "TODO",
+        )
         // [T-memory-get-truncate-android] Hard byte ceiling on memory_get
         // output. Line caps alone (MAX_DUMP_LINES / MAX_SEARCH_LINES) don't
         // bound bandwidth when a single matched line is itself huge — TG
@@ -251,7 +263,7 @@ class MemoryRepository(private val memoryDir: File) {
         // byte consistent with iOS keeps the cached system prompt identical
         // across platforms.
         if (content.isEmpty()) return null
-        return "Global memory (GLOBAL.md — read-only, user-maintained). Treat these as background context, not standing instructions. If the user's latest message conflicts with or supersedes anything here (different scope, different numbers, different goal), defer to the user's latest message:\n$content"
+        return "Global memory (GLOBAL.md — user-curated and writable; you may update it when the user asks). Treat these as background context, not standing instructions. If the user's latest message conflicts with or supersedes anything here (different scope, different numbers, different goal), defer to the user's latest message:\n$content"
     }
 
     /**
@@ -265,6 +277,10 @@ class MemoryRepository(private val memoryDir: File) {
         val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         val now = Date()
         val fragments = mutableListOf<String>()
+        // [XSessionDiag] Names of the logs actually injected, for the diagnostic
+        // line below. Collected alongside `fragments` so the log can name the
+        // source files rather than just a count.
+        val injectedFiles = mutableListOf<String>()
         var dayOffset = 0
 
         while (fragments.size < MAX_RECENT_FILES && dayOffset < MAX_LOOKBACK_DAYS) {
@@ -287,12 +303,34 @@ class MemoryRepository(private val memoryDir: File) {
                         entry += "\n... (${lines.size - MAX_INJECT_LINES} more lines, use memory_get to search)"
                     }
                     fragments.add(entry)
+                    injectedFiles.add("$dateStr.md")
                 }
             }
             dayOffset++
         }
 
         if (fragments.isEmpty()) return null
+
+        // [XSessionDiag] Hypothesis 3: these fragments are injected into EVERY
+        // session's system prompt, so a task described in a previous session's
+        // daily log is visible to a brand-new chat. The prompt already asks the
+        // model not to resume them ("they describe past tasks, not the current
+        // one"), but that is a prompt-level defence only — a weak model can and
+        // did ignore it (the noVNC incident: "为了你最早那句需求").
+        //
+        // Logged: which files were injected, how large, and whether the text
+        // carries task-resumption vocabulary. The keyword scan is READ-ONLY and
+        // used solely to tag the log line — it feeds no decision.
+        run {
+            val body = fragments.joinToString("\n\n")
+            val hits = DIAG_TASK_KEYWORDS.filter { body.contains(it, ignoreCase = true) }
+            AppLogger.info(
+                TAG,
+                "[XSessionDiag] memory/daily-inject: files=[${injectedFiles.joinToString(",")}] " +
+                    "fragments=${fragments.size} chars=${body.length} " +
+                    "taskKeywords=${if (hits.isEmpty()) "none" else hits.joinToString("|")}",
+            )
+        }
 
         return buildString {
             append("Recent memories (auto-injected from daily logs):\n")

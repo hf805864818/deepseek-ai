@@ -30,7 +30,7 @@
                                        filter:(NSString * _Nullable)filter
                                          page:(NSInteger)page
                                      pageSize:(NSInteger)pageSize;
-+ (NSDictionary * _Nonnull)writeFieldsWithItems:(NSArray<NSDictionary *> * _Nonnull)items
++ (NSDictionary * _Nonnull)writeFieldsWithItems:(NSArray * _Nonnull)items
                                         caption:(NSString * _Nullable)caption
                                        actorRaw:(NSString * _Nonnull)actorRaw
                                       sessionId:(NSString * _Nullable)sessionId;
@@ -65,6 +65,11 @@ static NSString *const HELP_TEXT =
      "DISCOVERY:\n"
      "  list-topics                  Show all configurable topics.\n"
      "  topic-help <topic>           Show fields under one topic.\n"
+     "\n"
+     "PATHS:\n"
+     "  <topic>.<field> or <topic>.<entry_id>.<field>. Use entry_id exactly as\n"
+     "  `get <topic>` prints it — dots and slashes are fine, no escaping, e.g.\n"
+     "    get models.<uuid>/glm-5.1.contextWindow\n"
      "\n"
      "FIELD I/O:\n"
      "  get <path> [--filter <kw>] [--page N] [--page-size N]\n"
@@ -177,8 +182,11 @@ static int cmd_topic_help(int argc, char **argv, int stdout_fd, int stderr_fd,
         return EXIT_PERMISSION_DENIED;
     }
     NSArray *fields = [ConfigOffloadBridge fieldsForTopic:topic];
-    NSDictionary *result = noff_json_envelope(TOOL_NAME, @"topic-help",
-                                              @{@"topic": topic, @"fields": fields});
+    NSMutableDictionary *payload = [@{@"topic": topic, @"fields": fields} mutableCopy];
+    // [T-config-path-dotted-id] Collections say how to spell a child path.
+    NSString *pathNote = [ConfigOffloadBridge pathNoteForTopic:topic];
+    if (pathNote) payload[@"path_note"] = pathNote;
+    NSDictionary *result = noff_json_envelope(TOOL_NAME, @"topic-help", payload);
     noff_emit_json(stdout_fd, result, compact, quiet);
     return NOFF_EXIT_SUCCESS;
 }

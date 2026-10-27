@@ -20,7 +20,6 @@ import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.RestartAlt
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -41,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.openminis.app.R
+import com.openminis.app.ui.components.MinisTextButton
 import com.openminis.app.accessibility.AccessibilityRecoveryManager
 import com.openminis.app.accessibility.MinisAccessibilityService
 import com.openminis.app.accessibility.RestrictedSettingsManager
@@ -76,22 +76,12 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
     var shizukuReady by remember { mutableStateOf(false) }
     var repairing by remember { mutableStateOf(false) }
     var repairFailed by remember { mutableStateOf(false) }
-    // [T-android-restricted-settings] Shown ONLY when the OS has
-    // actually flagged this install (appop ACCESS_RESTRICTED_SETTINGS
-    // == MODE_ERRORED) and the service is still off — i.e. exactly the
-    // state where tapping the row above leads to a dead, greyed-out
-    // toggle. Without this the user sees "tap to enable in system
-    // Settings", follows it, and hits a wall with no explanation.
-    //
-    // We cannot clear the flag ourselves: it is set on our own uid and
-    // clearing needs the signature permission MANAGE_APP_OPS_MODES.
-    // That is deliberate — the policy exists to stop a sideloaded app
-    // from talking the user into granting it screen-reading power — so
-    // the manual route is the primary affordance and stays visible even
-    // when the Shizuku shortcut is offered.
-    var a11yRestricted by remember {
-        mutableStateOf(RestrictedSettingsManager.isRestricted(context))
-    }
+    // [T-android-restricted-settings] Android 13+ flags installs whose
+    // installer declared a local/downloaded-file package source and refuses to
+    // arm the accessibility toggle until the user allows restricted settings.
+    // Only meaningful while the service is still off — once it is enabled the
+    // user has clearly already gotten past the gate.
+    var a11yRestricted by remember { mutableStateOf(false) }
     var unrestricting by remember { mutableStateOf(false) }
     var unrestrictFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -109,10 +99,10 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
             a11yRevoked = !inSettings && !connected &&
                 AccessibilityRecoveryManager.hasEverBeenGranted(context)
             shizukuReady = ShizukuManager.isReady()
-            // Restricted-settings detection keys on the install source, which
-            // never changes — but the Shizuku clear path flips an in-memory
-            // latch that this re-check must observe to drop the section.
-            a11yRestricted = RestrictedSettingsManager.isRestricted(context)
+            // Re-probed each tick so the section disappears by itself the
+            // moment the user allows restricted settings in system Settings
+            // and comes back.
+            a11yRestricted = !a11yEnabled && RestrictedSettingsManager.isRestricted(context)
             delay(1000)
         }
     }
@@ -347,7 +337,7 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
                     onDismissRequest = { showClearCorrectionConfirm = false },
                     title = { Text(stringResource(R.string.voice_correction_clear_title)) },
                     confirmButton = {
-                        TextButton(onClick = {
+                        MinisTextButton(onClick = {
                             showClearCorrectionConfirm = false
                             com.openminis.app.speech.correction.VoiceCorrection
                                 .clearAllData(context)
@@ -364,7 +354,7 @@ fun SystemPermissionsScreen(onBack: () -> Unit) {
                         }
                     },
                     dismissButton = {
-                        TextButton(onClick = { showClearCorrectionConfirm = false }) {
+                        MinisTextButton(onClick = { showClearCorrectionConfirm = false }) {
                             Text(stringResource(R.string.voice_correction_consent_not_now))
                         }
                     },

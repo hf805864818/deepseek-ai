@@ -143,8 +143,8 @@ class TerminalEmulator(cols: Int = 80, rows: Int = 24) {
      * Extract text from the viewport for the given selection rect, in the
      * order start → end. Coordinates are clamped to [0,cols) × [0,rows). If
      * start is after end (in reading order), they are swapped automatically.
-     * Trailing spaces on each line are trimmed (matches Termux behaviour and
-     * what users expect when they grab a URL by long-pressing).
+     * Trailing spaces on each line are trimmed (what users expect
+     * when they grab a URL by long-pressing).
      */
     fun getSelectedText(col1: Int, row1: Int, col2: Int, row2: Int): String {
         val lines = visibleLines()
@@ -167,19 +167,20 @@ class TerminalEmulator(cols: Int = 80, rows: Int = 24) {
             val w = row.size
             val cStart = if (r == ry1) sx.coerceIn(0, w) else 0
             val cEnd = if (r == ry2) (ex + 1).coerceIn(0, w) else w
-            val lineSb = StringBuilder()
-            for (c in cStart until cEnd) {
-                val cp = row[c].char
-                if (cp != 0) lineSb.appendCodePoint(cp)
-            }
-            // Trim trailing spaces on each line (Termux behaviour).
-            var end = lineSb.length
-            while (end > 0 && lineSb[end - 1] == ' ') end--
-            sb.append(lineSb, 0, end)
+            // Trailing spaces trimmed; wide-character trailers skipped (they
+            // used to add a space after every CJK character).
+            TerminalBuffer.appendRowText(sb, row, cStart, cEnd)
             if (r < ry2) sb.append('\n')
         }
         return sb.toString()
     }
+
+    /**
+     * [#451 Copy All] Everything the terminal holds as plain text: the active
+     * buffer's scrollback and screen (in vim / less, the alternate screen,
+     * which has no scrollback — same as iOS).
+     */
+    fun copyableText(): String = activeBuffer.plainText()
 
     // ────────────────────────────────────────────────────────────────────────
     private fun handleAction(action: ParsedAction) {

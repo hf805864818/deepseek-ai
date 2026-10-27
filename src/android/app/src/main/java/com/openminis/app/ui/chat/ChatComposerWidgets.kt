@@ -61,6 +61,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.text.BasicTextField
@@ -180,6 +182,9 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onPlaced
@@ -272,9 +277,10 @@ import com.openminis.app.data.repository.MemoryRepository
 import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.ui.browser.BrowserSheet
 import com.openminis.app.ui.theme.ChatColors
+import com.openminis.app.ui.DisplayBitmapLimits
 import com.openminis.app.ui.components.MinisTextButton
+import com.openminis.app.ui.components.DecorativeSpinner
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun AttachmentChip(
     attachment: InputAttachment,
@@ -447,6 +453,86 @@ internal fun MicButton(
 
 // ─── Tool Preview Thumbnail (iOS: ToolPreviewThumbnail — tool-specific preview) ──
 
+/**
+ * [T-android-agent-inner-tool-front] The tool a SUB AGENT is running right now,
+ * observed from the parent's preview.
+ *
+ * Android port of iOS `liveChildToolBlock` (ToolLiveSheet.swift:696). The child
+ * runs its own ChatViewModel in the shared process store, so the parent can read
+ * its transcript directly rather than waiting for the once-a-second mirror —
+ * which only ever carried the tool's NAME (HelperRunner.progressJson), never its
+ * content. That is why the preview showed "Agent · Shell" instead of the shell
+ * output the child was actually producing.
+ *
+ * Two details are load-bearing:
+ *  - `existing()` never CONSTRUCTS a view model. Building one here would both
+ *    race the child's own construction and resurrect a finished session.
+ *  - the streaming side-channel must be merged in. While the child's turn is in
+ *    flight its tool blocks live ONLY in `streamingById`; reading `messages`
+ *    alone shows nothing until the turn ends (the same trap documented on
+ *    ChatViewModel.childLiveMessages).
+ *
+ * Returns null when there is no child, no live view model, or the child is
+ * between tools — the caller then falls back to the agent card, exactly as iOS
+ * does.
+ */
+@Composable
+internal fun rememberChildLiveToolBlock(childSessionId: String?): AssistantBlock? {
+    if (childSessionId.isNullOrEmpty()) return null
+    val vm = remember(childSessionId) {
+        runCatching { ChatViewModelStore.existing(childSessionId) }.getOrNull()
+    } ?: return null
+    // Plain collectAsState, not the lifecycle-aware variant: this tile only
+    // exists while the floating bar is composed, and the module does not
+    // already depend on lifecycle-runtime-compose — not worth a new dependency
+    // for a subscription whose own composition is the lifetime bound.
+    val msgs by vm.messages.collectAsState()
+    val streaming by vm.streamingById.collectAsState()
+    return remember(msgs, streaming) {
+        // [T-android-stream-overlay-subset] The child tile only wants the live
+        // tool on the newest assistant turn; the subset carries exactly that
+        // without copying the child's whole history each token.
+        val merged = if (streaming.isEmpty()) msgs else streamingOverlaySubset(msgs, streaming)
+        (merged.lastOrNull { it.role == "assistant" }
+            ?: msgs.lastOrNull { it.role == "assistant" })
+            ?.toolBlocks
+            ?.lastOrNull {
+                it.kind == "tool_use" && (
+                    it.toolStatus == ToolBlockStatus.RUNNING ||
+                        it.toolStatus == ToolBlockStatus.STREAMING ||
+                        it.toolStatus == ToolBlockStatus.PENDING
+                    )
+            }
+    }
+}
+
+/** The generic tool tile: the output tail, or the tool's icon while there is none. */
+@Composable
+private fun GenericThumbContent(block: AssistantBlock, toolAccent: Color) {
+    if (block.content.isNotEmpty()) {
+        Column(modifier = Modifier.padding(horizontal = 6.dp, vertical = 5.dp)) {
+            Text(
+                // [T-android-tile-tail-memo] Split the tail only when
+                // content changes, not on every recompose. During a
+                // streaming shell the tile recomposes per delta, and an
+                // unmemoized lines()+takeLast()+joinToString on a growing
+                // string is O(n) each time — a measurable slice of the
+                // per-token allocation churn.
+                text = remember(block.content) { ToolTextTail.lastLines(block.content, 12) },
+                fontSize = 5.5.sp,
+                fontFamily = FontFamily.Monospace,
+                color = toolAccent.copy(alpha = 0.85f),
+                maxLines = 12,
+                lineHeight = 6.5.sp,
+            )
+        }
+    } else {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Icon(toolIconFor(block.toolName), contentDescription = null, tint = toolAccent.copy(alpha = 0.5f), modifier = Modifier.size(20.dp))
+        }
+    }
+}
+
 @Composable
 private fun ToolPreviewThumbnail(
     block: AssistantBlock,
@@ -458,6 +544,21 @@ private fun ToolPreviewThumbnail(
     // semantics the expanded detail sheet uses. Resolved at the call site
     // because toolBlocks isn't in scope here.
     fallbackImagePath: String? = null,
+    /**
+     * [T-android-agent-inner-tool-front] How many sub-agent levels this tile has
+     * already punched through. A sub agent can itself delegate, so without a cap
+     * the substitution below would recurse for as long as the chain is deep.
+     * iOS is bounded structurally — `liveChildToolBlock` resolves only the
+     * DIRECT child — so one level is the behaviour to match.
+     */
+    punchThroughDepth: Int = 0,
+    /**
+     * [T-tool-preview-longpress-close] Long-press handler from the mount site.
+     * The menu itself lives there, not here: this view renders itself again
+     * for a sub agent's inner tool, and a menu inside would nest. Passed down
+     * that recursion only so a long-press on the inner tile still reaches it.
+     */
+    onLongClick: (() -> Unit)? = null,
 ) {
     val args = remember(block.toolArgs) {
         try { org.json.JSONObject(block.toolArgs) } catch (_: Exception) { org.json.JSONObject() }
@@ -474,6 +575,25 @@ private fun ToolPreviewThumbnail(
     val resourceMonitor = rememberSystemResourceMonitor(active = isShellTool && isLive)
 
     val thumbnailShape = RoundedCornerShape(8.dp)
+    // [T-android-agent-thumbnail-accent] A sub agent's tile is marked while
+    // the child is inside a tool — the tap goes to work happening one level
+    // down, not to the parent's own tool. Same predicate iOS
+    // ToolPreviewThumbnail.isSubAgentTool uses ("is this agent inside a tool
+    // right now"), read here from the block's live progress payload; an agent
+    // that is starting up or has finished needs no marking.
+    //
+    // [T-android-agent-inner-tool-front] Two ways to be a sub agent's tile now.
+    // Once the punch-through above substitutes the CHILD's block, `block` is the
+    // child's shell_execute / browser_use — its toolName is no longer the agent
+    // tool, so the original predicate would go false exactly when the glow is
+    // most warranted. `punchThroughDepth > 0` says "this tile is already showing
+    // work one level down", which is the same question the ring is asking.
+    val subAgentLive = punchThroughDepth > 0 ||
+        (
+            block.toolName == com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME &&
+                (remember(block.content, block.toolStatus, block.toolTitle) { parseHelperBlock(block) }.phase as? HelperPhase.Running)?.tool != null
+            )
+    val subAgentGlow = helperAccent()
     Box(
         modifier = Modifier
             .size(width = 100.dp, height = 65.dp)
@@ -487,7 +607,86 @@ private fun ToolPreviewThumbnail(
                 }
             )
             .border(0.5.dp, ChatColors.thumbnailBorder, thumbnailShape)
-            .clickable(onClick = onClick),
+            .drawWithContent {
+                drawContent()
+                if (!subAgentLive) return@drawWithContent
+                // An INNER glow: concentric strokes walking inward from the
+                // edge, drawn after the content and inside the clip so the
+                // preview stays legible and the rounded corners are not
+                // smeared square. Hand-drawn because Modifier.blur needs API
+                // 31 and minSdk here is lower.
+                //
+                // [T-android-agent-glow-soften] Reworked from the original
+                // port of iOS's 6pt/0.55-alpha inset stroke, which on a 100x65
+                // tile read as a hard bright ring hugging the rim rather than
+                // a glow. Three changes, all pulling the same direction:
+                //
+                //   band  10dp -> 22dp   reaches a third of the way into the
+                //                        tile's short side, so the colour
+                //                        diffuses instead of outlining.
+                //   alpha 0.55  -> 0.22  the peak sits at the very edge, where
+                //                        it also overlaps the hairline border,
+                //                        so it was the most saturated part of
+                //                        the whole tile.
+                //   falloff (1-t)^2 -> (1-t)^3
+                //                        a cubic curve spends less of its
+                //                        opacity near the edge and carries a
+                //                        faint tail further in, which is what
+                //                        makes a wide band read as diffuse
+                //                        rather than as a thicker ring.
+                //
+                // Strokes overlap: each is drawn 2x the spacing. Ring n and
+                // ring n+1 sit `step` apart on the axes but `step * sqrt(2)`
+                // apart along the diagonals, so equal-width strokes leave a
+                // ~0.2dp gap at every corner and the glow bands there. The 10dp
+                // band was opaque enough to hide it; a 22dp one is not.
+                //
+                // Overlapping doubles how much colour each pixel receives, so
+                // the peak alpha is halved to 0.11 to pay for it — the tuning
+                // target is the INTEGRAL over the band, not the per-stroke
+                // value.
+                //
+                // The corner radius stays `radius - inset`, floored at zero.
+                // That is not an approximation to fix: a rounded rect inset by
+                // more than its own radius genuinely has square corners, and
+                // every ring is concentric with the tile because the offset
+                // from each edge is constant. (Scaling the radius
+                // proportionally instead was tried and is wrong — it bulges the
+                // corners outward by up to 5dp mid-band and draws visible arcs.)
+                // [T-android-agent-glow-32dp] Band widened 22dp -> 32dp on
+                // request: the visible tint now reaches ~15dp in instead of
+                // ~11dp. On the 65dp tile the top and bottom bands meet in the
+                // middle (2 x 32 = 64dp), so the tint covers the whole height
+                // and fades to near zero at the centre line. Peak alpha and the
+                // cubic falloff are unchanged, so the edge is no brighter.
+                val band = 32.dp.toPx()
+                val step = 0.5.dp.toPx()
+                val radius = 8.dp.toPx()
+                var inset = 0f
+                while (inset < band) {
+                    val t = inset / band
+                    val fade = (1f - t)
+                    val alpha = 0.11f * fade * fade * fade
+                    val w = size.width - inset * 2
+                    val h = size.height - inset * 2
+                    // Stop before the rect degenerates. A 32dp band just clears
+                    // the 65dp tile this draws on today, but the size comes from
+                    // the layout and is not this draw's to assume.
+                    if (w <= 0f || h <= 0f) break
+                    drawRoundRect(
+                        color = subAgentGlow.copy(alpha = alpha),
+                        topLeft = Offset(inset, inset),
+                        size = Size(w, h),
+                        cornerRadius = CornerRadius((radius - inset).coerceAtLeast(0f)),
+                        style = Stroke(width = step * 2f),
+                    )
+                    inset += step
+                }
+            }
+            .then(
+                if (onLongClick == null) Modifier.clickable(onClick = onClick)
+                else Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick),
+            ),
     ) {
         when (block.toolName) {
             "shell_execute" -> {
@@ -495,7 +694,9 @@ private fun ToolPreviewThumbnail(
                 val command = extractShellCommand(args, block)
                 Column(modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
                     Text(
-                        text = "$ $command",
+                        // [T-android-tool-text-line-cap] A heredoc or inline
+                        // script can make the command itself one huge line.
+                        text = "$ ${ToolTextTail.head(command)}",
                         fontSize = 7.sp,
                         lineHeight = 8.sp,
                         fontWeight = FontWeight.Bold,
@@ -506,7 +707,13 @@ private fun ToolPreviewThumbnail(
                     )
                     if (block.content.isNotEmpty()) {
                         Text(
-                            text = block.content.lines().takeLast(12).joinToString("\n"),
+                            // [T-android-tile-tail-memo] Split the tail only when
+                            // content changes, not on every recompose. During a
+                            // streaming shell the tile recomposes per delta, and an
+                            // unmemoized lines()+takeLast()+joinToString on a growing
+                            // string is O(n) each time — a measurable slice of the
+                            // per-token allocation churn.
+                            text = remember(block.content) { ToolTextTail.lastLines(block.content, 12) },
                             fontSize = 5.5.sp,
                             fontFamily = FontFamily.Monospace,
                             color = toolAccent.copy(alpha = 0.85f),
@@ -525,7 +732,7 @@ private fun ToolPreviewThumbnail(
                     .ifEmpty { extractPartialJsonString("new_string", block.toolArgs) ?: "" }
                 Column(modifier = Modifier.padding(horizontal = 6.dp, vertical = 5.dp)) {
                     if (oldStr.isNotEmpty()) {
-                        oldStr.lines().takeLast(5).forEach { line ->
+                        remember(oldStr) { ToolTextTail.lastLines(oldStr, 5).lines() }.forEach { line ->
                             Text(
                                 text = "- $line",
                                 fontSize = 5.sp,
@@ -538,7 +745,7 @@ private fun ToolPreviewThumbnail(
                         }
                     }
                     if (newStr.isNotEmpty()) {
-                        newStr.lines().takeLast(5).forEach { line ->
+                        remember(newStr) { ToolTextTail.lastLines(newStr, 5).lines() }.forEach { line ->
                             Text(
                                 text = "+ $line",
                                 fontSize = 5.sp,
@@ -589,9 +796,8 @@ private fun ToolPreviewThumbnail(
                         overflow = TextOverflow.Ellipsis,
                     )
                     if (displayText.isNotEmpty()) {
-                        val lines = displayText.lines()
                         Text(
-                            text = lines.takeLast(12).joinToString("\n"),
+                            text = remember(displayText) { ToolTextTail.lastLines(displayText, 12) },
                             fontSize = 5.5.sp,
                             fontFamily = FontFamily.Monospace,
                             color = toolAccent.copy(alpha = 0.85f),
@@ -635,7 +841,7 @@ private fun ToolPreviewThumbnail(
                     )
                     if (displayText.isNotEmpty()) {
                         Text(
-                            text = displayText.lines().takeLast(12).joinToString("\n"),
+                            text = remember(displayText) { ToolTextTail.lastLines(displayText, 12) },
                             fontSize = 5.5.sp,
                             fontFamily = FontFamily.Monospace,
                             color = toolAccent.copy(alpha = 0.85f),
@@ -659,7 +865,8 @@ private fun ToolPreviewThumbnail(
                 ) {
                     val path = block.imageFilePath
                     value = if (path == null) null else withContext(Dispatchers.IO) {
-                        try { android.graphics.BitmapFactory.decodeFile(path) } catch (_: Exception) { null }
+                        // [T-android-tool-thumb-fullres-decode] thumbnail-bounded decode.
+                        DisplayBitmapLimits.decodeFileBounded(path, DisplayBitmapLimits.MAX_THUMBNAIL_EDGE_PX)
                     }
                 }
                 val bmp = bitmap
@@ -702,7 +909,8 @@ private fun ToolPreviewThumbnail(
                     // the thumb doesn't degrade to the globe placeholder.
                     val path = block.imageFilePath ?: fallbackImagePath
                     value = if (path == null) null else withContext(Dispatchers.IO) {
-                        try { android.graphics.BitmapFactory.decodeFile(path) } catch (_: Exception) { null }
+                        // [T-android-tool-thumb-fullres-decode] thumbnail-bounded decode.
+                        DisplayBitmapLimits.decodeFileBounded(path, DisplayBitmapLimits.MAX_THUMBNAIL_EDGE_PX)
                     }
                 }
                 val bitmap = liveBitmap ?: savedBitmap
@@ -725,25 +933,43 @@ private fun ToolPreviewThumbnail(
                 }
             }
 
-            else -> {
-                // Generic: icon or content preview
-                if (block.content.isNotEmpty()) {
-                    Column(modifier = Modifier.padding(horizontal = 6.dp, vertical = 5.dp)) {
-                        Text(
-                            text = block.content.lines().takeLast(12).joinToString("\n"),
-                            fontSize = 5.5.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = toolAccent.copy(alpha = 0.85f),
-                            maxLines = 12,
-                            lineHeight = 6.5.sp,
-                        )
-                    }
+            // [T-p2-delegate-render] Helper: title + phase, never the raw JSON.
+            // [T-android-agent-inner-tool-front] …except while the child is
+            // inside a tool, when the tile shows THAT tool exactly as the
+            // parent's own tools are shown — the shell output, the diff, the
+            // browser page. Port of iOS ToolLiveSheet.swift:2720.
+            //
+            // Recursing into ToolPreviewThumbnail is what makes every existing
+            // renderer apply to the child for free; the depth cap stops a chain
+            // of delegations from nesting without bound.
+            com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME -> {
+                val childId = remember(block.content, block.toolStatus, block.toolTitle) {
+                    parseHelperBlock(block).childSessionId
+                }
+                val inner = if (punchThroughDepth < 1) {
+                    rememberChildLiveToolBlock(childId)
                 } else {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Icon(toolIconFor(block.toolName), contentDescription = null, tint = toolAccent.copy(alpha = 0.5f), modifier = Modifier.size(20.dp))
-                    }
+                    null
+                }
+                if (inner != null) {
+                    ToolPreviewThumbnail(
+                        block = inner,
+                        toolAccent = toolAccentColor(inner.toolName),
+                        onClick = onClick,
+                        punchThroughDepth = punchThroughDepth + 1,
+                        onLongClick = onLongClick,
+                    )
+                } else {
+                    HelperThumbContent(block)
                 }
             }
+
+            // [T-android-user-ask-tile] A miniature of the question card, not a
+            // wrench (iOS T-user-ask-tile-rich).
+            com.openminis.app.agent.userask.UserAskPromptText.TOOL_NAME ->
+                UserAskThumbContent(block) { GenericThumbContent(block, toolAccent) }
+
+            else -> GenericThumbContent(block, toolAccent)
         }
 
         // T141: live CPU/MEM HUD ribbon. Sits at the thumbnail's bottom edge,
@@ -776,11 +1002,39 @@ private fun ToolPreviewThumbnail(
 
 // ─── Floating Tool Status Bar (iOS: thumbnail + status capsule + pagination) ─
 
-@OptIn(ExperimentalMaterial3Api::class)
+// [T-android-tool-pager-longpress] ExperimentalFoundationApi is for
+// combinedClickable on the pager chevrons.
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+/**
+ * [T-android-toolbar-gap] The floating tool bar's geometry, shared with the
+ * chat list's bottom reserve so the two cannot drift apart.
+ *
+ * The reserve used to be pinned to the thumbnail's 65dp whenever the bar was
+ * mounted. With Tool preview OFF no thumbnail is drawn and the bar is only
+ * 38dp, so the last row sat 27dp (the thumbnail overhang) further from the bar
+ * than it sits from the thumbnail with preview ON.
+ */
+internal object FloatingToolBarMetrics {
+    val BAR_HEIGHT = 38.dp
+    val THUMBNAIL_HEIGHT = 65.dp
+    /** ChatScreen's wrapper padding below the bar (above the composer). */
+    val WRAPPER_BOTTOM_PADDING = 6.dp
+    /**
+     * List bottom padding beyond the overlay's visible top. 8dp keeps the
+     * reserve the preview-ON state always had (6 + 65 + 8 = 79dp).
+     */
+    val ROW_GAP = 8.dp
+
+    /** How far the bar's visible top (the thumbnail's, when shown) sits above the list's bottom edge. */
+    fun visibleTop(previewEnabled: Boolean) =
+        WRAPPER_BOTTOM_PADDING + if (previewEnabled) THUMBNAIL_HEIGHT else BAR_HEIGHT
+}
+
 @Composable
 internal fun FloatingToolStatusBar(
     toolBlocks: List<AssistantBlock>,
-    onStop: (() -> Unit)? = null,
+    // [T-android-stop-late-write] Per-tool: called with the shown block's id.
+    onStop: ((blockId: String) -> Unit)? = null,
     modifier: Modifier = Modifier,
     onOpenTerminalWithCommand: (String) -> Unit = {},
     // T261: detail open routes through ChatViewModel state so this bar
@@ -791,12 +1045,37 @@ internal fun FloatingToolStatusBar(
 ) {
     var currentIndex by remember { mutableStateOf(toolBlocks.lastIndex.coerceAtLeast(0)) }
     val lastIndex = toolBlocks.lastIndex
-    LaunchedEffect(lastIndex) {
-        val block = toolBlocks.getOrNull(currentIndex)
-        val isCurrentActive = block?.toolStatus == ToolBlockStatus.RUNNING ||
-            block?.toolStatus == ToolBlockStatus.STREAMING ||
-            block?.toolStatus == ToolBlockStatus.PENDING
-        if (!isCurrentActive) currentIndex = lastIndex.coerceAtLeast(0)
+    // [T-android-tool-bar-stuck-on-finished] The follow rule below is keyed on
+    // the DISPLAYED block's status, not on lastIndex alone.
+    //
+    // Keying on lastIndex meant this only ever re-ran when a tool was ADDED.
+    // A background sub agent finishes without adding one: writeDelegateBlock
+    // rewrites its existing block in place (blocks.map { it.copy(...) }), so
+    // the list length is unchanged and the status flip from RUNNING to
+    // FAILED/SUCCESS produced no recomposition key change. The bar stayed on
+    // the finished agent until the parent happened to start another tool —
+    // and with a background delegation that gap is exactly the period the
+    // parent is idle waiting for the callback, so it is long and very visible.
+    //
+    // Including the status makes the flip itself the trigger. Manual paging is
+    // preserved: parking on a still-running block keeps its status stable, so
+    // the effect does not re-fire and does not yank the view away.
+    val currentStatus = toolBlocks.getOrNull(currentIndex)?.toolStatus
+    LaunchedEffect(lastIndex, currentStatus) {
+        val isCurrentActive = currentStatus == ToolBlockStatus.RUNNING ||
+            currentStatus == ToolBlockStatus.STREAMING ||
+            currentStatus == ToolBlockStatus.PENDING
+        if (!isCurrentActive) {
+            // Prefer the newest STILL-ACTIVE tool; only fall back to the last
+            // block when nothing is running, which is the idle case where the
+            // most recent result is the right thing to show.
+            val newestActive = toolBlocks.indexOfLast {
+                it.toolStatus == ToolBlockStatus.RUNNING ||
+                    it.toolStatus == ToolBlockStatus.STREAMING ||
+                    it.toolStatus == ToolBlockStatus.PENDING
+            }
+            currentIndex = if (newestActive >= 0) newestActive else lastIndex.coerceAtLeast(0)
+        }
     }
     val block = toolBlocks.getOrNull(currentIndex) ?: return
     // T261: sheet is hoisted to ChatScreen top-level; this bar only emits
@@ -814,13 +1093,29 @@ internal fun FloatingToolStatusBar(
         block.toolStatus == ToolBlockStatus.PENDING
     val toolAccent = toolAccentColor(block.toolName)
     val previewEnabled = LocalToolPreviewEnabled.current
+    // [T-tool-preview-longpress-close] Long-press shortcuts for the Appearance
+    // setting (port of iOS 277d5ce1b / b556ea8f8): the title area toggles the
+    // preview window, the thumbnail closes it. The pager chevrons keep their
+    // own long-press (first / last tool).
+    val context = LocalContext.current
+    var showBarMenu by remember { mutableStateOf(false) }
+    var showThumbMenu by remember { mutableStateOf(false) }
+    fun setToolPreview(on: Boolean) {
+        com.openminis.app.ui.settings.getAppearancePrefs(context).edit()
+            .putBoolean(com.openminis.app.ui.settings.KEY_TOOL_PREVIEW, on).apply()
+        if (!on) {
+            android.widget.Toast.makeText(
+                context, context.getString(R.string.tool_preview_closed_toast), android.widget.Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
 
     // iOS layout: ZStack(alignment: .bottomLeading)
     // Thumbnail (100×65dp) floats ABOVE the status bar (38dp tall)
     val thumbnailWidth = 100.dp
-    val thumbnailHeight = 65.dp
-    val barHeight = 38.dp
-    val thumbnailOverhang = thumbnailHeight - barHeight  // 14dp above bar
+    val thumbnailHeight = FloatingToolBarMetrics.THUMBNAIL_HEIGHT
+    val barHeight = FloatingToolBarMetrics.BAR_HEIGHT
+    val thumbnailOverhang = thumbnailHeight - barHeight  // 27dp above bar
     val thumbnailInset = 10.dp
     val barStartPadding = if (previewEnabled) thumbnailWidth + thumbnailInset + 8.dp else 12.dp
 
@@ -843,9 +1138,14 @@ internal fun FloatingToolStatusBar(
         ) {
             // Status icon
             if (isRunning) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(15.dp),
+                // [T-android-decorative-anim-perf] Clock-driven arc, not
+                // Material's spinner. A layer boundary alone still left the
+                // screen at 87 fps: Material's private InfiniteTransition asks
+                // for every frame regardless of who wraps it. This records the
+                // arc once and rotates a layer at ~30 fps.
+                DecorativeSpinner(
                     color = toolAccent,
+                    modifier = Modifier.size(15.dp),
                     strokeWidth = 1.5.dp,
                 )
             } else {
@@ -867,20 +1167,33 @@ internal fun FloatingToolStatusBar(
             // stays clean.
 
             // Tool title
-            Text(
-                text = block.toolTitle.ifEmpty { block.toolName },
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                color = ChatColors.primaryText,
-                maxLines = 1,
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable(
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                    ) { onOpenCurrentDetail() },
-                overflow = TextOverflow.Ellipsis,
-            )
+            Box(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = displayToolTitle(block),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = ChatColors.primaryText,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onLongClick = { showBarMenu = true },
+                        ) { onOpenCurrentDetail() },
+                    overflow = TextOverflow.Ellipsis,
+                )
+                DropdownMenu(expanded = showBarMenu, onDismissRequest = { showBarMenu = false }) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.appearance_tool_preview_title)) },
+                        trailingIcon = { if (previewEnabled) Icon(Icons.Default.Check, contentDescription = null) },
+                        onClick = {
+                            showBarMenu = false
+                            setToolPreview(!previewEnabled)
+                        },
+                    )
+                }
+            }
 
             // Pagination
             if (toolBlocks.size > 1) {
@@ -895,11 +1208,24 @@ internal fun FloatingToolStatusBar(
                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
                         modifier = Modifier
                             .size(18.dp)
-                            .clickable(
+                            // [T-android-tool-pager-longpress] Long-press jumps
+                            // to the first call. A turn can carry 60+ tool
+                            // calls, and stepping back one at a time is the
+                            // only way to reach the start otherwise. The
+                            // enabled guard already blocks both gestures at
+                            // index 0, so neither can move out of range.
+                            .combinedClickable(
                                 enabled = currentIndex > 0,
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() },
-                            ) { if (currentIndex > 0) currentIndex-- },
+                                onLongClick = { currentIndex = 0 },
+                                onClick = { if (currentIndex > 0) currentIndex-- },
+                            ),
+                    )
+                    val positionLabel = stringResource(
+                        R.string.tool_pager_position,
+                        currentIndex + 1,
+                        toolBlocks.size,
                     )
                     Text(
                         "${currentIndex + 1}/${toolBlocks.size}",
@@ -907,6 +1233,16 @@ internal fun FloatingToolStatusBar(
                         fontWeight = FontWeight.Medium,
                         fontFamily = FontFamily.Monospace,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        // [T-android-tool-pager-a11y] Say what this counts.
+                        // It sits immediately right of the tool TITLE, so when
+                        // that title belongs to a sub agent the bare "3/12"
+                        // reads as that agent's progress. It is neither — it
+                        // pages the whole conversation's tool calls. Sighted
+                        // users can infer this by paging; a screen reader
+                        // otherwise announces only two numbers.
+                        modifier = Modifier.semantics {
+                            contentDescription = positionLabel
+                        },
                     )
                     Icon(
                         Icons.Default.ChevronRight,
@@ -915,11 +1251,17 @@ internal fun FloatingToolStatusBar(
                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
                         modifier = Modifier
                             .size(18.dp)
-                            .clickable(
+                            // [T-android-tool-pager-longpress] Long-press jumps
+                            // to the last call — the live one while a turn is
+                            // still running, which is the position this bar
+                            // resets to on its own.
+                            .combinedClickable(
                                 enabled = currentIndex < toolBlocks.lastIndex,
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() },
-                            ) { if (currentIndex < toolBlocks.lastIndex) currentIndex++ },
+                                onLongClick = { currentIndex = toolBlocks.lastIndex },
+                                onClick = { if (currentIndex < toolBlocks.lastIndex) currentIndex++ },
+                            ),
                     )
                 }
             }
@@ -955,7 +1297,19 @@ internal fun FloatingToolStatusBar(
                     toolAccent = toolAccent,
                     onClick = { onOpenCurrentDetail() },
                     fallbackImagePath = fallbackImagePath,
+                    onLongClick = { showThumbMenu = true },
                 )
+                DropdownMenu(expanded = showThumbMenu, onDismissRequest = { showThumbMenu = false }) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(stringResource(R.string.tool_preview_close_menu), color = MaterialTheme.colorScheme.error)
+                        },
+                        onClick = {
+                            showThumbMenu = false
+                            setToolPreview(false)
+                        },
+                    )
+                }
             }
         }
     }

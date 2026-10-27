@@ -3,7 +3,6 @@ package com.openminis.app.auth
 import android.content.Context
 import android.net.Uri
 import android.util.Log
-import androidx.browser.customtabs.CustomTabsIntent
 import com.openminis.app.data.repository.ProviderRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -17,6 +16,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * OpenRouter OAuth manager using PKCE flow.
@@ -58,7 +58,13 @@ object OpenRouterOAuthManager {
 
         val apiKey = withContext(Dispatchers.IO) {
             val code = suspendCancellableCoroutine { cont ->
-                val server = OAuthCallbackServer(CALLBACK_PORT, FALLBACK_PORTS) { receivedCode, _ ->
+                val server = OAuthCallbackServer(
+                    CALLBACK_PORT,
+                    FALLBACK_PORTS,
+                    // [T-oauth-callback-double-resume] Denied / failed on the
+                    // provider's page: end the sign-in now with its reason.
+                    onError = { err -> if (cont.isActive) cont.resumeWithException(err.toException(context)) },
+                ) { receivedCode, _ ->
                     if (cont.isActive) {
                         cont.resume(receivedCode)
                     }
@@ -80,14 +86,11 @@ object OpenRouterOAuthManager {
                     .appendQueryParameter("code_challenge_method", "S256")
                     .appendQueryParameter("_nc", System.currentTimeMillis().toString()) // cache-bust
                     .build()
-                Log.d(TAG, "Auth URL: $authUrl")
+                // [T-android-oauth-log-redact] code_challenge masked.
+                Log.d(TAG, "Auth URL: ${OAuthLogRedaction.url(authUrl.toString())}")
 
                 // Open in Chrome Custom Tab (in-app browser, like iOS SFSafariViewController)
-                val customTabsIntent = CustomTabsIntent.Builder()
-                    .setShowTitle(true)
-                    .build()
-                customTabsIntent.intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                customTabsIntent.launchUrl(context, authUrl)
+                OAuthTabLauncher.launch(context, authUrl, newTask = true)
                 Log.i(TAG, "Opened Custom Tab for OpenRouter authorization")
             }
 
@@ -96,7 +99,12 @@ object OpenRouterOAuthManager {
             Log.i(TAG, "Callback received — code length: ${code.length}")
 
             // Exchange code for permanent API key
-            exchangeCode(code, verifier)
+            // [T-android-oauth-foreground-exchange] The callback lands while the
+            // user is still in the Custom Tab, i.e. with Minis in the background,
+            // where the OS blocks this app's network (DNS answers "no address").
+            // Exchange only once the user is back.
+            OAuthForegroundGate.awaitForeground(TAG)
+            exchangeCode(code, verifier, com.openminis.app.network.NetworkRuntime.providerTag(instanceId))
         }
 
         // Store the API key
@@ -123,8 +131,9 @@ object OpenRouterOAuthManager {
         val hash = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.UTF_8))
         val challenge = standardBase64ToUrlSafe(hash)
 
-        Log.d(TAG, "PKCE verifier (${verifier.length} chars): ${verifier.take(20)}...")
-        Log.d(TAG, "PKCE challenge (${challenge.length} chars): $challenge")
+        // [T-android-oauth-log-redact] Length + first 4 chars only.
+        Log.d(TAG, "PKCE verifier ${OAuthLogRedaction.secret(verifier)}")
+        Log.d(TAG, "PKCE challenge ${OAuthLogRedaction.secret(challenge)}")
 
         return verifier to challenge
     }
@@ -145,15 +154,16 @@ object OpenRouterOAuthManager {
         .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
-    private fun exchangeCode(code: String, verifier: String): String {
+    /** [FEAT-261021-16] [netTag]: the instance's Settings > Network tag. */
+    private fun exchangeCode(code: String, verifier: String, netTag: String): String {
         val body = JSONObject()
         body.put("code", code)
         body.put("code_verifier", verifier)
         body.put("code_challenge_method", "S256")
 
-        Log.d(TAG, "Exchange request body: ${body.toString()}")
-        Log.d(TAG, "Code: $code")
-        Log.d(TAG, "Verifier (${verifier.length} chars): ${verifier.take(20)}...${verifier.takeLast(10)}")
+        // [T-android-oauth-log-redact] The request body holds the authorization
+        // code and the PKCE verifier — log only redacted forms of each.
+        Log.d(TAG, "Exchange request: code=${OAuthLogRedaction.secret(code)} verifier=${OAuthLogRedaction.secret(verifier)}")
 
         val request = Request.Builder()
             .url(KEYS_URL)
@@ -163,7 +173,7 @@ object OpenRouterOAuthManager {
             .header("X-Title", "Minis App")
             .build()
 
-        val response = client.newCall(request).execute()
+        val response = com.openminis.app.network.NetworkHttp.client(netTag, client).newCall(request).execute()
         val responseBody = response.body?.string() ?: ""
         Log.i(TAG, "Response status: ${response.code}")
         // [T-android-oauth-log-redaction] SUCCESS body carries the live API key

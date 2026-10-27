@@ -70,6 +70,8 @@ import java.io.RandomAccessFile
 fun LogManagementScreen(
     onBack: () -> Unit,
     onLogFileClick: (fileName: String) -> Unit = {},
+    /** [T-config-readable] Opens a Config Changes record's detail page. */
+    onConfigAuditEntryClick: (auditId: String) -> Unit = {},
 ) {
     val context = LocalContext.current
     // T-logs-perf: capped, separated daily/crash lists. Pre-T-logs-perf the
@@ -86,6 +88,7 @@ fun LogManagementScreen(
     var loading by remember { mutableStateOf(true) }
     var showDeleteAllConfirm by remember { mutableStateOf(false) }
     var loggingEnabled by remember { mutableStateOf(AppLogger.isEnabled(context)) }
+    var loggingVerbose by remember { mutableStateOf(AppLogger.isVerbose(context)) }
 
     // T-config: Logs / Config Changes segmented control. Default to
     // "logs"; a `?tab=config-audit` deep-link query lands users straight
@@ -93,7 +96,9 @@ fun LogManagementScreen(
     val initialTab = remember {
         com.openminis.app.deeplink.DeepLinkCoordinator.consumePendingLogsTab() ?: "logs"
     }
-    var tab by remember { mutableStateOf(initialTab) }
+    // rememberSaveable: coming back from a Config Changes record's detail
+    // page [T-config-readable] must land on the same tab.
+    var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(initialTab) }
 
     val refreshTrigger = remember { mutableStateOf(0) }
     LaunchedEffect(refreshTrigger.value) {
@@ -149,7 +154,7 @@ fun LogManagementScreen(
 
         if (tab == "config-audit") {
             // Audit body. Owns its own scrolling.
-            ConfigAuditScreen(modifier = Modifier.fillMaxSize())
+            ConfigAuditScreen(modifier = Modifier.fillMaxSize(), onOpenEntry = onConfigAuditEntryClick)
         } else {
             // Logs body — original layout. The LazyColumn picks up
             // viewport height since the scaffold gave us a Column slot.
@@ -163,6 +168,11 @@ fun LogManagementScreen(
                 onToggleLogging = {
                     loggingEnabled = it
                     AppLogger.setEnabled(context, it)
+                },
+                loggingVerbose = loggingVerbose,
+                onSetVerbose = {
+                    loggingVerbose = it
+                    AppLogger.setVerbose(context, it)
                 },
                 onLogFileClick = onLogFileClick,
                 onDeleteAll = { showDeleteAllConfirm = true },
@@ -205,6 +215,8 @@ private fun LogsBody(
     loading: Boolean,
     loggingEnabled: Boolean,
     onToggleLogging: (Boolean) -> Unit,
+    loggingVerbose: Boolean,
+    onSetVerbose: (Boolean) -> Unit,
     onLogFileClick: (fileName: String) -> Unit,
     onDeleteAll: () -> Unit,
 ) {
@@ -225,6 +237,26 @@ private fun LogsBody(
                 onCheckedChange = onToggleLogging,
                 showDivider = false,
             )
+        }
+
+        // [T-android-log-level] Mirrors iOS's "Detail Level" picker.
+        if (loggingEnabled) {
+            SettingsSection(
+                header = stringResource(R.string.log_section_detail_level),
+                footer = stringResource(R.string.log_detail_level_footer),
+            ) {
+                SettingsChoiceRow(
+                    title = stringResource(R.string.log_detail_level_info),
+                    selected = !loggingVerbose,
+                    onSelect = { onSetVerbose(false) },
+                )
+                SettingsChoiceRow(
+                    title = stringResource(R.string.log_detail_level_verbose),
+                    selected = loggingVerbose,
+                    onSelect = { onSetVerbose(true) },
+                    showDivider = false,
+                )
+            }
         }
 
         // While the IO load is in flight (single frame in practice, but the

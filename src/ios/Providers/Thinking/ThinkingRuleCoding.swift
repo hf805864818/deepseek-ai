@@ -20,6 +20,7 @@ extension ThinkingWireFormat {
         case reasoningEffortNested
         case deepSeekSibling
         case qwenDual
+        case qwenRootOnly
         case anthropicThinking
         case geminiBudget
         case geminiThinkingLevel
@@ -41,6 +42,8 @@ extension ThinkingWireFormat {
             return ["kind": Kind.deepSeekSibling.rawValue]
         case .qwenDual:
             return ["kind": Kind.qwenDual.rawValue]
+        case .qwenRootOnly:
+            return ["kind": Kind.qwenRootOnly.rawValue]
         case .anthropicThinking(let style):
             return ["kind": Kind.anthropicThinking.rawValue,
                     "style": style == .adaptive ? "adaptive" : "budgetTokens"]
@@ -69,6 +72,7 @@ extension ThinkingWireFormat {
         case .reasoningEffortNested: return .reasoningEffortNested(offValue: obj["offValue"] as? String)
         case .deepSeekSibling:       return .deepSeekSibling
         case .qwenDual:              return .qwenDual
+        case .qwenRootOnly:          return .qwenRootOnly
         case .anthropicThinking:
             let style: AnthropicThinkingStyle = (obj["style"] as? String) == "adaptive" ? .adaptive : .budgetTokens
             return .anthropicThinking(style: style)
@@ -86,7 +90,7 @@ extension ThinkingWireFormat {
             guard let p = obj["path"] as? String else { return nil }
             var values: [ThinkingLevel: String] = [:]
             for (k, v) in (obj["values"] as? [String: String] ?? [:]) {
-                if let lvl = ThinkingLevel(rawValue: k) { values[lvl] = v }
+                if let lvl = ThinkingLevel.parse(k) { values[lvl] = v }
             }
             return .customPath(path: p, values: values, offValue: obj["offValue"] as? String)
         }
@@ -107,6 +111,8 @@ extension ThinkingWireFormat {
             return AppLocalized("thinking + reasoning_effort (root siblings)")
         case .qwenDual:
             return AppLocalized("enable_thinking + budget (root & extra_body)")
+        case .qwenRootOnly:
+            return AppLocalized("enable_thinking only (no budget)")
         case .anthropicThinking(let style):
             return style == .adaptive ? AppLocalized("thinking: adaptive")
                                       : AppLocalized("thinking: budget_tokens")

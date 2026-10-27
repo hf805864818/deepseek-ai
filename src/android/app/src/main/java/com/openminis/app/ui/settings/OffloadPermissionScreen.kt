@@ -1,16 +1,14 @@
 package com.openminis.app.ui.settings
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.provider.Settings
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Accessibility
-import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
@@ -36,7 +34,6 @@ import com.openminis.app.accessibility.RestrictedSettingsManager
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.offload.OffloadPermissionManager
 import com.openminis.app.offload.ShizukuManager
-import com.openminis.app.power.PowerOptimizationManager
 import com.openminis.app.ui.components.MinisMenu
 import com.openminis.app.ui.components.MinisTextButton
 import kotlinx.coroutines.delay
@@ -65,13 +62,10 @@ fun OffloadPermissionScreen(
     val context = LocalContext.current
 
     var a11yEnabled by remember { mutableStateOf(isA11yServiceEnabled(context)) }
-    // [T-android-restricted-settings] Same restricted-settings latch as
-    // SystemPermissionsScreen: when the OS has flagged this install, the
-    // "open system settings" row above dead-ends into a greyed-out toggle,
-    // so surface the Shizuku / manual routes here too.
-    var a11yRestricted by remember {
-        mutableStateOf(RestrictedSettingsManager.isRestricted(context))
-    }
+    // [T-android-restricted-settings] Android 13+ refuses to arm the
+    // accessibility toggle for installs flagged as restricted; surfaced below
+    // so the "Open accessibility settings" action doesn't dead-end.
+    var a11yRestricted by remember { mutableStateOf(false) }
     var unrestricting by remember { mutableStateOf(false) }
     var unrestrictFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -80,7 +74,9 @@ fun OffloadPermissionScreen(
         // settings flips the row without a manual refresh.
         while (true) {
             a11yEnabled = isA11yServiceEnabled(context) || MinisAccessibilityService.getInstance() != null
-            a11yRestricted = RestrictedSettingsManager.isRestricted(context)
+            // Re-probed each tick so the section disappears by itself once the
+            // user allows restricted settings and returns.
+            a11yRestricted = !a11yEnabled && RestrictedSettingsManager.isRestricted(context)
             delay(1000)
         }
     }
@@ -142,11 +138,23 @@ fun OffloadPermissionScreen(
             onSystemAction = { openAccessibilitySettings(context) },
         )
 
-        // [T-android-restricted-settings] Shown ONLY when the OS has flagged
-        // this install — exactly the state where the "open settings" row
-        // above leads to a greyed-out toggle. Mirrors the section on
-        // SystemPermissionsScreen (same strings, same Shizuku / manual
-        // routes) so the two permission surfaces stay consistent.
+        // [T-android-restricted-settings] Shown ONLY when the OS has actually
+        // flagged this install (appop ACCESS_RESTRICTED_SETTINGS ==
+        // MODE_ERRORED) and the service is still off. That is precisely the
+        // state where the "Open accessibility settings" action right above
+        // leads to a toggle the user cannot move: Android 13+ blocks the
+        // accessibility toggle for packages installed by an installer that
+        // declared PACKAGE_SOURCE_LOCAL_FILE / _DOWNLOADED_FILE, which is what
+        // a browser or file manager opening a downloaded APK does. Without
+        // this the user follows our own instruction into a dead end with no
+        // explanation — the reported HyperOS / Android 14 case.
+        //
+        // We cannot clear the flag ourselves: it is set on our own uid and
+        // clearing it needs the signature permission MANAGE_APP_OPS_MODES.
+        // That is deliberate, since the policy exists to stop a sideloaded app
+        // from talking the user into granting it screen-reading power. So the
+        // manual route is the primary affordance and stays visible even when
+        // the Shizuku one-tap shortcut is also offered.
         if (a11yRestricted) {
             SettingsSection(
                 header = stringResource(R.string.system_permissions_a11y_restricted_header),
@@ -154,8 +162,6 @@ fun OffloadPermissionScreen(
             ) {
                 if (shizukuSnap.state == ShizukuManager.State.READY) {
                     SettingsRow(
-                        icon = Icons.Outlined.LockOpen,
-                        iconColor = Color(0xFF34C759),
                         title = stringResource(R.string.system_permissions_a11y_restricted_shizuku),
                         subtitle = when {
                             unrestricting ->
@@ -180,15 +186,11 @@ fun OffloadPermissionScreen(
                     )
                 }
                 SettingsRow(
-                    icon = Icons.Outlined.Info,
-                    iconColor = Color(0xFFFF9500),
                     title = stringResource(R.string.system_permissions_a11y_restricted_manual),
                     subtitle = stringResource(R.string.system_permissions_a11y_restricted_manual_sub),
-                    onClick = {
-                        (context as? Activity)?.let {
-                            PowerOptimizationManager.openAppDetailsSettings(it)
-                        }
-                    },
+                    // Lands on Minis' own App info page, where "Allow
+                    // restricted settings" lives in the overflow menu.
+                    onClick = { openAppDetailsSettings(context) },
                     showDivider = false,
                 )
             }
@@ -488,6 +490,30 @@ private fun openAccessibilitySettings(context: Context) {
     try {
         context.startActivity(
             Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        )
+    } catch (_: Throwable) {
+        try {
+            context.startActivity(
+                Intent(Settings.ACTION_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        } catch (_: Throwable) {}
+    }
+}
+
+/**
+ * [T-android-restricted-settings] Open Minis' own App info page — "Allow
+ * restricted settings" lives in that page's overflow (⋮) menu, and there is no
+ * public intent that opens the menu item directly.
+ */
+private fun openAppDetailsSettings(context: Context) {
+    try {
+        context.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", context.packageName, null)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         )

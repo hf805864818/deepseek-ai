@@ -5,8 +5,11 @@ import com.openminis.app.data.db.ChatDao
 import com.openminis.app.data.db.ChatSessionEntity
 import com.openminis.app.data.db.FolderEntity
 import com.openminis.app.data.db.MessageEntity
+import com.openminis.app.data.db.MessageHeadRow
 import com.openminis.app.data.model.ModelAttributionSnapshot
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.UUID
 
 class ChatRepository(internal val dao: ChatDao) {
@@ -22,12 +25,17 @@ class ChatRepository(internal val dao: ChatDao) {
         // here; existing call sites that omit it keep the prior
         // memoryEnabled=1 behavior (legacy default).
         memoryEnabled: Boolean = true,
+        // [T-p1-delegate-task] Non-null makes this a hidden child session.
+        parentSessionId: String? = null,
+        parentToolUseId: String? = null,
     ): ChatSessionEntity {
         val now = System.currentTimeMillis()
         val session = ChatSessionEntity(
             id = UUID.randomUUID().toString(),
             title = title,
             modelId = modelId,
+            parentSessionId = parentSessionId,
+            parentToolUseId = parentToolUseId,
             createdAt = now,
             updatedAt = now,
             memoryEnabled = if (memoryEnabled) 1 else 0,
@@ -90,12 +98,25 @@ class ChatRepository(internal val dao: ChatDao) {
         }
     }
 
+    /**
+     * [T-android-chat-title-follows-store] The session's stored title and
+     * category, once now and again whenever either changes - whoever wrote it
+     * (the list's Regenerate Title or rename, auto-title, sync).
+     */
+    fun observeSessionTitle(id: String): Flow<com.openminis.app.data.db.SessionTitleRow> =
+        dao.observeSessionTitle(id).filterNotNull().distinctUntilChanged()
+
     suspend fun updateSessionTitle(id: String, title: String) {
         dao.updateSessionTitle(id, title, System.currentTimeMillis())
     }
 
     suspend fun updateSessionTitleAndCategory(id: String, title: String, category: String?) {
         dao.updateSessionTitleAndCategory(id, title, category, System.currentTimeMillis())
+    }
+
+    /** [T-sessions-cli-update] Set the icon (category); null = the default icon. */
+    suspend fun updateSessionCategory(id: String, category: String?) {
+        dao.updateSessionCategory(id, category, System.currentTimeMillis())
     }
 
     suspend fun updateSessionModel(sessionId: String, modelId: String) {
@@ -106,7 +127,33 @@ class ChatRepository(internal val dao: ChatDao) {
         dao.updateSessionBinding(sessionId, binding, modelId)
     }
 
+    /**
+     * [T-android-child-session-delete-storage] Self + every descendant child
+     * session, deepest first (root last). The one place the tree is walked.
+     */
+    suspend fun sessionSubtreeIds(rootId: String): List<String> =
+        com.openminis.app.data.session.SessionTree.subtreeDeepestFirst(rootId) { dao.childSessionIds(it) }
+
+    /**
+     * DB-level delete of the whole tree: rows and messages for [id] and every
+     * descendant, children first, with any running helper job cancelled.
+     *
+     * This is the DB half only. App code must delete a session through
+     * [com.openminis.app.data.session.SessionDeleter], which also removes the
+     * session's files, ViewModel and badges — a repository has no filesDir.
+     * Kept for callers that own the file side themselves (backup restore
+     * rollback, tests).
+     */
     suspend fun deleteSession(id: String) {
+        for (sid in sessionSubtreeIds(id)) {
+            com.openminis.app.agent.jobs.AgentJobRegistry.jobForSession(sid)
+                ?.let { com.openminis.app.agent.jobs.AgentJobRegistry.cancel(it.id, "parent-deleted") }
+            deleteSessionOnly(sid)
+        }
+    }
+
+    /** Rows + messages of exactly one session — NO cascade. Funnel primitive. */
+    suspend fun deleteSessionOnly(id: String) {
         dao.deleteMessages(id)
         dao.deleteSession(id)
     }
@@ -193,6 +240,12 @@ class ChatRepository(internal val dao: ChatDao) {
 
     suspend fun sessionIdsInFolder(folderId: String): List<String> = dao.sessionIdsInFolder(folderId)
 
+    /** [T-autogroup-folder-titles] Group id → newest member activity and newest-first titles. */
+    internal suspend fun recentSessionTitlesByFolder(
+        perFolder: Int = com.openminis.app.ui.chat.FolderOfferFormat.FETCH_PER_FOLDER,
+    ): Map<String, com.openminis.app.ui.chat.FolderOfferFormat.Recent> =
+        com.openminis.app.ui.chat.FolderOfferFormat.group(dao.titledFolderMembers(), perFolder)
+
     /**
      * Move sessions into a group, or out of one when [folderId] is null.
      *
@@ -225,8 +278,91 @@ class ChatRepository(internal val dao: ChatDao) {
         return dao.listFolders().firstOrNull { it.name.trim().lowercase() == needle }
     }
 
-    suspend fun searchSessions(query: String): List<ChatSessionEntity> =
-        dao.searchSessions("%$query%")
+    /**
+     * [T-android-search-visible-only] One session-list search result: the
+     * session, the line that shows why it matched (null for a title-only
+     * match), and whether the title matched.
+     */
+    data class SessionSearchResult(
+        val session: ChatSessionEntity,
+        val snippet: String?,
+        val titleMatched: Boolean,
+    )
+
+    /**
+     * [T-android-search-visible-only] Sessions whose title holds [query], or
+     * that hold it in a message field the user can see, newest first; each
+     * with the line of its NEWEST such message. Port of iOS
+     * `ChatStore.searchSessions` (bbd21900a, 6b0ee14c1).
+     *
+     *  - Only text parts, tool inputs and tool outputs count
+     *    ([SessionSearch.VISIBLE_HIT_CLAUSE]); hits inside tool-call ids or
+     *    thought signatures no longer make a session a result.
+     *  - When the newest matching message shows no line (its hit was inside a
+     *    `<system-reminder>`, say), up to [SessionSearch.OLDER_LOOKBACK] older
+     *    matches are tried — for the [SessionSearch.OLDER_LOOKBACK_SESSIONS]
+     *    newest such sessions only, so a query like "text" stays cheap.
+     *  - A session with neither a title hit nor a line is dropped: every
+     *    result shows why it is one.
+     *  - On an SQLite without JSON functions the raw-JSON query runs instead;
+     *    its rows are still subject to the drop rule.
+     *  - [T-search-multi-keyword] (iOS b09df3824) Whitespace separates
+     *    keywords ([SessionSearch.searchTerms], at most 10) and a session
+     *    holding ANY of them is a result; `%` and `_` match literally. One
+     *    keyword gives the sessions the whole-string search always gave.
+     */
+    suspend fun searchSessionsWithHits(query: String): List<SessionSearchResult> {
+        val terms = SessionSearch.searchTerms(query)
+        if (terms.isEmpty()) return emptyList()
+        val args = SessionSearch.searchArgs(terms)
+        var visibleOnly = true
+        val rows = try {
+            dao.runSessionSearchQuery(androidx.sqlite.db.SimpleSQLiteQuery(SessionSearch.visibleSearchSql(terms.size), args))
+        } catch (e: android.database.sqlite.SQLiteException) {
+            android.util.Log.w("ChatRepository", "[Search] visible-field query unavailable (${e.message}) — raw-JSON fallback")
+            visibleOnly = false
+            dao.runSessionSearchQuery(androidx.sqlite.db.SimpleSQLiteQuery(SessionSearch.legacySearchSql(terms.size), args))
+        }
+        var lookbackBudget = SessionSearch.OLDER_LOOKBACK_SESSIONS
+        var dropped = 0
+        val out = ArrayList<SessionSearchResult>(rows.size)
+        for (row in rows) {
+            val title = row.session.title
+            val titleMatched = title != null && SessionSearch.firstHit(title, terms) != null
+            var snippet = row.hitPartsJson?.let { SessionSearch.searchSnippet(it, terms) }
+            if (snippet == null && row.hitPartsJson != null && lookbackBudget > 0) {
+                lookbackBudget--
+                snippet = olderSearchSnippet(row.session.id, terms, visibleOnly)
+            }
+            if (!titleMatched && snippet == null) {
+                dropped++
+                continue
+            }
+            out.add(SessionSearchResult(row.session, snippet, titleMatched))
+        }
+        if (dropped > 0) {
+            android.util.Log.i(
+                "ChatRepository",
+                "[Search] dropped $dropped session(s) with no visible hit (visibleOnly=$visibleOnly, budgetLeft=$lookbackBudget)",
+            )
+        }
+        return out
+    }
+
+    /** The newest match was already tried; look through the next few. */
+    private suspend fun olderSearchSnippet(sessionId: String, terms: List<String>, visibleOnly: Boolean): String? {
+        val older = try {
+            dao.runPartsJsonQuery(
+                androidx.sqlite.db.SimpleSQLiteQuery(
+                    SessionSearch.olderMatchesSql(visibleOnly, terms.size),
+                    SessionSearch.searchArgs(terms) + sessionId,
+                ),
+            )
+        } catch (e: android.database.sqlite.SQLiteException) {
+            return null
+        }
+        return older.drop(1).firstNotNullOfOrNull { SessionSearch.searchSnippet(it.partsJson, terms) }
+    }
 
     fun observeMessages(sessionId: String): Flow<List<MessageEntity>> =
         dao.observeMessages(sessionId)
@@ -335,6 +471,84 @@ class ChatRepository(internal val dao: ChatDao) {
     suspend fun updateLastAssistantError(sessionId: String, errorInfo: String?) =
         dao.updateLastAssistantError(sessionId, errorInfo)
 
+    /** [T-android-error-persist-current-turn] Where [persistTurnError] put the sticker. */
+    sealed class TurnErrorWrite {
+        /** Stamped onto an assistant row the failing turn already persisted. */
+        data class Stamped(val messageId: String) : TurnErrorWrite()
+        /** The turn had no assistant row; a minimal carrier row was inserted. */
+        data class Carrier(val messageId: String) : TurnErrorWrite()
+        /** Nothing written (no rows at all, or the scan ran past its cap). */
+        data class Skipped(val reason: String) : TurnErrorWrite()
+    }
+
+    /**
+     * [T-android-error-persist-current-turn] GH#263, parity with iOS
+     * `persistErrorInfo` (fd7ec79a2 / 910708619). Persist a terminal error onto
+     * the CURRENT turn only.
+     *
+     * The old write went through [updateLastAssistantError], i.e. the session's
+     * newest assistant row. When a turn died before persisting any output (a
+     * network error, a provider 4xx, an empty turn on turn 2+), that row was
+     * the PREVIOUS turn's successful reply — so after a reload the error banner
+     * sat under an answer that had worked.
+     *
+     * Walks back from the newest row (see [errorTargetStep]): the first
+     * assistant row reached before a turn-starting user row belongs to this
+     * turn and gets the sticker. Reaching a turn-starting user row first means
+     * this turn has no assistant row, so a minimal empty assistant CARRIER row
+     * is inserted to hold the error — otherwise the only copy of the error
+     * would be in memory and a reload would lose it (iOS does the same). The
+     * carrier is:
+     *  - rendered by the load path as an error-only bubble (and skipped again
+     *    once its error is cleared, so a successful retry leaves no empty
+     *    bubble behind);
+     *  - never sent to the model ([isEmptyAssistantCarrier] rows are left out
+     *    of agentHistory on every rebuild);
+     *  - the newest assistant row, so the existing clear path
+     *    ([updateLastAssistantError] with null, used by retry) finds it, and a
+     *    second failure of the same turn re-stamps it instead of adding another.
+     *
+     * Clears are NOT routed through here — they keep [updateLastAssistantError].
+     */
+    suspend fun persistTurnError(sessionId: String, errorInfo: String): TurnErrorWrite {
+        var offset = 0
+        while (offset < MAX_TURN_ERROR_SCAN) {
+            val row = dao.messageHeadNewestFirst(sessionId, offset)
+                ?: return if (offset == 0) {
+                    TurnErrorWrite.Skipped("no rows")
+                } else {
+                    // Every row so far was a tool-result row with no assistant
+                    // row before it — no turn start, no reply: carry it.
+                    insertErrorCarrier(sessionId, errorInfo)
+                }
+            when (errorTargetStep(row.role, row.partsJson)) {
+                ErrorTargetStep.TARGET -> {
+                    dao.updateMessageErrorInfo(row.id, errorInfo)
+                    return TurnErrorWrite.Stamped(row.id)
+                }
+                ErrorTargetStep.TURN_START -> return insertErrorCarrier(sessionId, errorInfo)
+                ErrorTargetStep.SKIP -> offset += 1
+            }
+        }
+        return TurnErrorWrite.Skipped("scan cap $MAX_TURN_ERROR_SCAN reached")
+    }
+
+    private suspend fun insertErrorCarrier(sessionId: String, errorInfo: String): TurnErrorWrite {
+        val carrier = MessageEntity(
+            id = UUID.randomUUID().toString(),
+            sessionId = sessionId,
+            role = "assistant",
+            partsJson = ERROR_CARRIER_PARTS_JSON,
+            createdAt = System.currentTimeMillis(),
+            sortOrder = dao.nextSortOrder(sessionId),
+            errorInfo = errorInfo,
+        )
+        // Deliberately not appendMessage(): the carrier has no preview and must
+        // not touch the session's last_message / ordering.
+        dao.insertMessage(carrier)
+        return TurnErrorWrite.Carrier(carrier.id)
+    }
+
     /**
      * [T-token-attribution-snapshot] `modelSnapshot` records which model
      * ACTUALLY produced this message.
@@ -423,6 +637,9 @@ class ChatRepository(internal val dao: ChatDao) {
         dao.updateLastMessage(sessionId, preview, System.currentTimeMillis())
     }
 
+
+
+
     // ───────────────── T188: minis-sessions-cli backend ─────────────────
     //
     // Three high-level queries surfaced to SessionsOffloadHandler. The DAO
@@ -450,9 +667,25 @@ class ChatRepository(internal val dao: ChatDao) {
         limit: Int,
         startMs: Long?,
         endMs: Long?,
+        /**
+         * [T-sessions-cli-update] `list --group`: null = no filter; an empty
+         * list = ungrouped sessions only (no folder, or a folder that is not
+         * here - the list renders those as ungrouped too); otherwise members
+         * of any of these folder ids.
+         */
+        folderIds: List<String>? = null,
     ): List<SessionMeta> {
         val conditions = mutableListOf<String>()
         val args = mutableListOf<Any>()
+
+        if (folderIds != null) {
+            if (folderIds.isEmpty()) {
+                conditions += "(s.folder_id IS NULL OR s.folder_id NOT IN (SELECT id FROM folders))"
+            } else {
+                conditions += "s.folder_id IN (${folderIds.joinToString(",") { "?" }})"
+                args.addAll(folderIds)
+            }
+        }
 
         if (!sessionIds.isNullOrEmpty()) {
             conditions += "s.id IN (${sessionIds.joinToString(",") { "?" }})"
@@ -483,7 +716,8 @@ class ChatRepository(internal val dao: ChatDao) {
                     WHERE m2.session_id = s.id AND m2.role = 'user'
                     ORDER BY m2.sort_order ASC LIMIT 1) AS first_user_msg,
                    s.source, s.created_at, s.updated_at,
-                   (SELECT COUNT(*) FROM messages m3 WHERE m3.session_id = s.id) AS msg_count
+                   (SELECT COUNT(*) FROM messages m3 WHERE m3.session_id = s.id) AS msg_count,
+                   s.folder_id, s.category
             FROM sessions s
             $where
             ORDER BY s.updated_at DESC
@@ -506,6 +740,8 @@ class ChatRepository(internal val dao: ChatDao) {
                 startedAt = r.createdAt,
                 lastActive = r.updatedAt,
                 messageCount = r.msgCount,
+                folderId = r.folderId,
+                category = r.category,
             )
         }
     }
@@ -590,6 +826,10 @@ class ChatRepository(internal val dao: ChatDao) {
         // side, so existing callers keep the previous behaviour untouched.
         startMs: Long? = null,
         endMs: Long? = null,
+        // [T-android-sessions-cli-tool-calls] Also decode each message's
+        // toolUse / toolResult parts UNSUMMARIZED (iOS 7af22b59f). `text` and
+        // the skip rule are unchanged either way; the lists stay empty when off.
+        includeTools: Boolean = false,
     ): List<MessagePageItem> {
         val rows = if (startMs == null && endMs == null) {
             dao.loadMessagesPage(sessionId, offset, limit)
@@ -599,11 +839,14 @@ class ChatRepository(internal val dao: ChatDao) {
         return rows.mapNotNull { e ->
             val text = extractTextForOffload(e.partsJson)
             if (text.isBlank()) return@mapNotNull null
+            val tools = if (includeTools) decodeToolParts(e.partsJson) else null
             MessagePageItem(
                 e.id, e.role, e.createdAt, text.take(maxChars),
                 // Mark messages that exceeded the cap so the caller can emit
                 // "truncated": true (mirrors iOS SessionsOffloadBridge).
                 truncated = text.length > maxChars,
+                toolUses = tools?.first.orEmpty(),
+                toolResults = tools?.second.orEmpty(),
             )
         }
     }
@@ -712,95 +955,90 @@ class ChatRepository(internal val dao: ChatDao) {
     }
 
     companion object {
-        // <system-reminder>...</system-reminder> blocks are runtime nudges
-        // injected into user-role messages by the harness (e.g. task-tracker
-        // reminders). They never represent what the user actually typed, so
-        // they must not show up in the session-list "last message" preview.
-        // DOTALL flag covers multi-line reminder bodies; reluctant
-        // quantifier so back-to-back reminders don't merge into one match.
-        private val SYSTEM_REMINDER_RE =
-            Regex("""<system-reminder>.*?</system-reminder>""", RegexOption.DOT_MATCHES_ALL)
+        /** [T-android-error-persist-current-turn] parts_json of an error-carrier row. */
+        internal const val ERROR_CARRIER_PARTS_JSON = "[]"
 
-        internal fun stripSystemReminders(raw: String): String =
-            SYSTEM_REMINDER_RE.replace(raw, "").trim()
+        /** Upper bound on rows [persistTurnError] walks back; the answer is normally at offset 0-2. */
+        private const val MAX_TURN_ERROR_SCAN = 500
 
-        // T188: snippet/length caps mirror iOS SessionsOffload.m. 600 chars
-        // is a balance between giving the agent enough context to
-        // disambiguate similar messages and not blowing past the agent's
-        // context budget on a long search result.
-        internal const val SNIPPET_MAX = 600
-        internal const val MESSAGE_TEXT_MAX = 600
-        // [T-android-sessions-cli-full] Per-message cap when the caller passes
-        // `--full` — matches iOS SessionsOffloadBridge's 50_000 and the CLI
-        // help's documented upper bound. A single message beyond this is still
-        // truncated and flagged with "truncated": true.
-        internal const val MESSAGE_TEXT_MAX_FULL = 50_000
+        /** [T-android-error-persist-current-turn] One step of the newest-first walk. */
+        internal enum class ErrorTargetStep { TARGET, TURN_START, SKIP }
 
-        // Issue #17 — page size for the chat loader. 200 rows per query
-        // keeps a normal-shaped CursorWindow well under 2 MB while
-        // still amortising query overhead for long sessions.
-        private const val LOAD_PAGE_SIZE = 200
+        /**
+         * [T-android-error-persist-current-turn] Classify one row of the
+         * newest-first walk in [persistTurnError]:
+         *  - an assistant row → TARGET (the newest assistant row of this turn);
+         *  - a user row that starts a turn → TURN_START (this turn has no
+         *    assistant row of its own);
+         *  - a tool-result user row → SKIP (it continues the turn).
+         * "Starts a turn" matches iOS `currentTurnStartIndex`: a user row with at
+         * least one part that is not a tool result. An empty `[]` user row does
+         * not start one (same as iOS). An UNPARSEABLE user row counts as a turn
+         * start: walking past it could reach the previous turn's reply, which is
+         * exactly the row this fix must never stamp.
+         */
+        internal fun errorTargetStep(role: String, partsJson: String): ErrorTargetStep {
+            if (role == "assistant") return ErrorTargetStep.TARGET
+            if (role != "user") return ErrorTargetStep.SKIP
+            return if (isTurnStartingUserParts(partsJson)) ErrorTargetStep.TURN_START else ErrorTargetStep.SKIP
+        }
 
-        // Issue #17 — hard cap on a single message's parts_json. 500_000
-        // chars ≈ 500 KB ASCII (worst case ~2 MB UTF-8 for 4-byte runs;
-        // still small enough that any single resulting row fits inside
-        // a single CursorWindow). New oversize payloads (browser_use
-        // dumps, paste-bomb tool_results) are truncated at insert time
-        // and replaced with a single text part carrying a marker, so
-        // they remain JSON-parseable downstream.
-        internal const val MAX_MESSAGE_PARTS_JSON_LENGTH = 500_000
-
-        internal fun buildTruncatedPartsJson(original: String): String {
-            val keep = original.take(MAX_MESSAGE_PARTS_JSON_LENGTH)
-            val marker = "\n\n[Content truncated at " +
-                "${MAX_MESSAGE_PARTS_JSON_LENGTH / 1000} KB — original length " +
-                "${original.length} chars]"
-            val combined = keep + marker
-            // Wrap in a single text part so JSONArray parsers (preview
-            // extractor, search, exporter) see a well-formed payload.
-            val textObj = org.json.JSONObject()
-                .put("type", "text")
-                .put("value", combined)
-            return org.json.JSONArray().put(textObj).toString()
+        /** Whether a user row's parts contain anything other than tool results. */
+        internal fun isTurnStartingUserParts(partsJson: String): Boolean {
+            val arr = runCatching { org.json.JSONArray(partsJson) }.getOrNull() ?: return true
+            for (i in 0 until arr.length()) {
+                val type = arr.optJSONObject(i)?.optString("type") ?: return true
+                if (type != "toolResult") return true
+            }
+            return false
         }
 
         /**
-         * [T-android-restore-preview] Recompute a session preview from a
-         * message's parts_json. `internal` so the backup restore path
-         * (`ChatRepository.extractTextPreview`) can rebuild previews after an
-         * import — mirrors upstream, where these helpers live on the
-         * companion so they are reachable without an instance.
+         * [T-android-error-persist-current-turn] Pure form of the
+         * [persistTurnError] walk over rows given newest-first: the id to stamp,
+         * or null when the current turn has no assistant row (→ carrier).
          */
-        internal fun extractTextPreview(partsJson: String): String? {
-            try {
-                val array = org.json.JSONArray(partsJson)
-                var hasMedia = false
-                // T-android-session-last-message-tool-call: also track the most
-                // recent tool_use so a mid-tool-call assistant turn (no text yet)
-                // renders as a short tool summary instead of falling through to
-                // "No messages yet" in the session list.
-                var lastToolUse: org.json.JSONObject? = null
-                for (i in 0 until array.length()) {
-                    val obj = array.getJSONObject(i)
-                    val type = obj.optString("type")
-                    if (type == "text") {
-                        val text = obj.optString("value", "")
-                        if (text.isNotBlank()) {
-                            return cleanPreview(text)
-                        }
-                    } else if (type == "mediaRef") {
-                        hasMedia = true
-                    } else if (type == "toolUse") {
-                        val v = obj.optJSONObject("value")
-                        if (v != null) lastToolUse = v
-                    }
+        internal fun currentTurnErrorRowId(rowsNewestFirst: List<MessageHeadRow>): String? {
+            for (row in rowsNewestFirst) {
+                when (errorTargetStep(row.role, row.partsJson)) {
+                    ErrorTargetStep.TARGET -> return row.id
+                    ErrorTargetStep.TURN_START -> return null
+                    ErrorTargetStep.SKIP -> Unit
                 }
-                if (hasMedia) return "[Image]"
-                if (lastToolUse != null) return summarizeToolUse(lastToolUse)
-            } catch (_: Exception) {
-                if (partsJson.isNotBlank()) return cleanPreview(partsJson)
             }
             return null
+        }
+
+        /**
+         * [T-android-error-persist-current-turn] True for an assistant row with
+         * no parts — the error carrier [persistTurnError] inserts (no other
+         * writer persists an empty assistant row: persistAssistantTurn drops
+         * them). Such a row must never reach the model: an empty assistant
+         * message is rejected by Anthropic and breaks role alternation.
+         */
+        internal fun isEmptyAssistantCarrier(role: String, partsJson: String): Boolean =
+            role == "assistant" && partsJson.trim() == ERROR_CARRIER_PARTS_JSON
+
+        private fun cleanPreview(raw: String): String {
+            // [T-preview-scheduled-tag-leak] Every internal envelope out, not
+            // only the reminders (InternalTags): an attached-file listing and
+            // the attachment captions used to show in the list as raw text.
+            // [T-md-inline-html] <br> → space, whitelisted style tags out, before
+            // the regexes below and code-aware (code keeps its `<br>`).
+            return com.openminis.app.ui.markdown.InlineHtmlTags.stripForPreview(InternalTags.stripForPreview(raw))
+                .replace(Regex("[\r\n]+"), " ")      // newlines → space
+                .replace(Regex("#{1,6}\\s"), "")      // headings: ## Title → Title
+                .replace(Regex("\\*{1,3}|_{1,3}"), "")// bold/italic markers
+                .replace(Regex("~~"), "")              // strikethrough
+                .replace(Regex("`{1,3}"), "")          // inline/fenced code markers
+                .replace(Regex("^\\s*[-*+]\\s", RegexOption.MULTILINE), "") // list bullets
+                .replace(Regex("^\\s*\\d+\\.\\s", RegexOption.MULTILINE), "") // ordered list
+                .replace(Regex("^>\\s?", RegexOption.MULTILINE), "")       // blockquote
+                .replace(Regex("\\[([^]]+)]\\([^)]+\\)"), "$1") // [text](url) → text
+                .replace(Regex("!\\[([^]]*)]\\([^)]+\\)"), "$1") // ![alt](url) → alt
+                .replace(Regex("\\s{2,}"), " ")        // collapse whitespace
+                .trim()
+                .take(100)
         }
 
         /**
@@ -814,7 +1052,7 @@ class ChatRepository(internal val dao: ChatDao) {
          *   3. Else fall back to `🔧 <toolName>`.
          * Output capped at 100 chars to match cleanPreview's text ceiling.
          */
-        internal fun summarizeToolUse(value: org.json.JSONObject): String {
+        private fun summarizeToolUse(value: org.json.JSONObject): String {
             val toolName = value.optString("name", "")
             // `description` is where ChatViewModel persists the captured
             // tool_title (see writeAssistantParts / writeAssistantPartsForLive
@@ -879,21 +1117,132 @@ class ChatRepository(internal val dao: ChatDao) {
             return cap("🔧 ${toolName.ifBlank { "tool" }}")
         }
 
-        internal fun cleanPreview(raw: String): String {
-            return stripSystemReminders(raw)
-                .replace(Regex("[\r\n]+"), " ")      // newlines → space
-                .replace(Regex("#{1,6}\\s"), "")      // headings: ## Title → Title
-                .replace(Regex("\\*{1,3}|_{1,3}"), "")// bold/italic markers
-                .replace(Regex("~~"), "")              // strikethrough
-                .replace(Regex("`{1,3}"), "")          // inline/fenced code markers
-                .replace(Regex("^\\s*[-*+]\\s", RegexOption.MULTILINE), "") // list bullets
-                .replace(Regex("^\\s*\\d+\\.\\s", RegexOption.MULTILINE), "") // ordered list
-                .replace(Regex("^>\\s?", RegexOption.MULTILINE), "")       // blockquote
-                .replace(Regex("\\[([^]]+)]\\([^)]+\\)"), "$1") // [text](url) → text
-                .replace(Regex("!\\[([^]]*)]\\([^)]+\\)"), "$1") // ![alt](url) → alt
-                .replace(Regex("\\s{2,}"), " ")        // collapse whitespace
-                .trim()
-                .take(100)
+        // `internal` so the restore path can rebuild a session's preview from the
+        // messages it just imported — see BackupImporter [T-android-restore-preview].
+        internal fun extractTextPreview(partsJson: String): String? {
+            try {
+                val array = org.json.JSONArray(partsJson)
+                var hasMedia = false
+                // T-android-session-last-message-tool-call: also track the most
+                // recent tool_use so a mid-tool-call assistant turn (no text yet)
+                // renders as a short tool summary instead of falling through to
+                // "No messages yet" in the session list.
+                var lastToolUse: org.json.JSONObject? = null
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    val type = obj.optString("type")
+                    if (type == "text") {
+                        val text = obj.optString("value", "")
+                        if (text.isNotBlank()) {
+                            // [T-p2-agent-callback] An agent's report reads as
+                            // "Agent result · title · status", never as raw XML.
+                            com.openminis.app.agent.jobs.AgentCallback.parse(text)?.let { cb ->
+                                return com.openminis.app.agent.jobs.AgentCallbackLabels.previewLine(cb)
+                            }
+                            // [T-preview-scheduled-tag-leak] A scheduled fire's
+                            // row is its <scheduled_task …> envelope: preview it
+                            // as "定时任务 · <label>", never the raw tag.
+                            InternalTags.scheduledPreviewLine(
+                                text,
+                                com.openminis.app.agent.jobs.AgentCallbackLabels.scheduled,
+                                ::cleanPreview,
+                            )?.let { return it.take(100) }
+                            val cleaned = cleanPreview(text)
+                            // A row that was only envelopes (a lone reminder)
+                            // previews as nothing, not as an empty line.
+                            if (cleaned.isEmpty()) continue
+                            return cleaned
+                        }
+                    } else if (type == "mediaRef") {
+                        hasMedia = true
+                    } else if (type == "toolUse") {
+                        val v = obj.optJSONObject("value")
+                        if (v != null) lastToolUse = v
+                    }
+                }
+                if (hasMedia) return "[Image]"
+                if (lastToolUse != null) return summarizeToolUse(lastToolUse)
+            } catch (_: Exception) {
+                if (partsJson.isNotBlank()) return cleanPreview(partsJson)
+            }
+            return null
+        }
+        // <system-reminder>...</system-reminder> blocks are runtime nudges
+        // injected into user-role messages by the harness (e.g. task-tracker
+        // reminders). They never represent what the user actually typed, so
+        // they must not show up in the session-list "last message" preview.
+        // DOTALL flag covers multi-line reminder bodies; reluctant
+        // quantifier so back-to-back reminders don't merge into one match.
+        // [T-preview-scheduled-tag-leak] Now case-insensitive and tolerant
+        // of an unclosed tag; see InternalTags.
+        internal fun stripSystemReminders(raw: String): String =
+            InternalTags.stripSystemReminders(raw)
+
+        /**
+         * [T-android-sessions-cli-tool-calls] Every toolUse / toolResult part
+         * of [partsJson], in order, with nothing summarized: the full input
+         * JSON string and the full output. [extractTextForOffload] cannot serve
+         * this — it drops tool calls whenever the message has text, reduces a
+         * tool-only message to its tool_title (100 chars), and keeps a 200-char
+         * result preview. Malformed JSON yields empty lists.
+         */
+        internal fun decodeToolParts(partsJson: String): Pair<List<OffloadToolUse>, List<OffloadToolResult>> {
+            val uses = mutableListOf<OffloadToolUse>()
+            val results = mutableListOf<OffloadToolResult>()
+            val arr = try { org.json.JSONArray(partsJson) } catch (_: Exception) { return uses to results }
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val v = o.optJSONObject("value") ?: continue
+                when (o.optString("type")) {
+                    "toolUse" -> uses.add(
+                        OffloadToolUse(v.optString("toolUseId"), v.optString("name"), v.optString("input")),
+                    )
+                    "toolResult" -> results.add(
+                        OffloadToolResult(v.optString("toolUseId"), v.optBoolean("success"), v.optString("output")),
+                    )
+                }
+            }
+            return uses to results
+        }
+
+        // T188: snippet/length caps mirror iOS SessionsOffload.m. 600 chars
+        // is a balance between giving the agent enough context to
+        // disambiguate similar messages and not blowing past the agent's
+        // context budget on a long search result.
+        internal const val SNIPPET_MAX = 600
+        internal const val MESSAGE_TEXT_MAX = 600
+        // [T-android-sessions-cli-full] Per-message cap when the caller passes
+        // `--full` — matches iOS SessionsOffloadBridge's 50_000 and the CLI
+        // help's documented upper bound. A single message beyond this is still
+        // truncated and flagged with "truncated": true.
+        internal const val MESSAGE_TEXT_MAX_FULL = 50_000
+
+        // Issue #17 — page size for the chat loader. 200 rows per query
+        // keeps a normal-shaped CursorWindow well under 2 MB while
+        // still amortising query overhead for long sessions.
+        private const val LOAD_PAGE_SIZE = 200
+
+        // Issue #17 — hard cap on a single message's parts_json. 500_000
+        // chars ≈ 500 KB ASCII (worst case ~2 MB UTF-8 for 4-byte runs;
+        // still small enough that any single resulting row fits inside
+        // a single CursorWindow). New oversize payloads (browser_use
+        // dumps, paste-bomb tool_results) are truncated at insert time
+        // and replaced with a single text part carrying a marker, so
+        // they remain JSON-parseable downstream.
+        internal const val MAX_MESSAGE_PARTS_JSON_LENGTH = 500_000
+
+        internal fun buildTruncatedPartsJson(original: String): String {
+            val keep = original.take(MAX_MESSAGE_PARTS_JSON_LENGTH)
+            val marker = "\n\n[Content truncated at " +
+                "${MAX_MESSAGE_PARTS_JSON_LENGTH / 1000} KB — original length " +
+                "${original.length} chars]"
+            val combined = keep + marker
+            // Wrap in a single text part so JSONArray parsers (preview
+            // extractor, search, exporter) see a well-formed payload.
+            val textObj = org.json.JSONObject()
+                .put("type", "text")
+                .put("value", combined)
+            return org.json.JSONArray().put(textObj).toString()
         }
     }
 }
@@ -907,6 +1256,9 @@ data class SessionMeta(
     val startedAt: Long,    // ms — sessions.created_at
     val lastActive: Long,   // ms — sessions.updated_at
     val messageCount: Int,
+    /** [T-sessions-cli-update] Group id (null = ungrouped) and icon (category). */
+    val folderId: String? = null,
+    val category: String? = null,
 )
 
 /** T188: a single matching message returned by `minis-sessions-cli search`. */
@@ -928,4 +1280,13 @@ data class MessagePageItem(
     // [T-android-sessions-cli-full] True when the stored text exceeded the
     // requested cap and [text] is a prefix. Surfaced as "truncated": true.
     val truncated: Boolean = false,
+    // [T-android-sessions-cli-tool-calls] Filled only for `messages --tools`.
+    val toolUses: List<OffloadToolUse> = emptyList(),
+    val toolResults: List<OffloadToolResult> = emptyList(),
 )
+
+/** [T-android-sessions-cli-tool-calls] A tool call as stored: [input] is the raw input JSON string. */
+data class OffloadToolUse(val toolUseId: String, val name: String, val input: String)
+
+/** [T-android-sessions-cli-tool-calls] A tool result as stored, output unsummarized. */
+data class OffloadToolResult(val toolUseId: String, val success: Boolean, val output: String)

@@ -47,6 +47,9 @@ static NSString *const HELP_TEXT =
      "  hover           --selector <css>\n"
      "  get_readable\n"
      "  set_user_agent  --user-agent mobile_safari|desktop_safari|custom\n"
+     "                  Switch the target tab only (--tab-id, else the current\n"
+     "                  tab). Temporary: other tabs are untouched, new tabs use\n"
+     "                  the Browser Settings default, and nothing is saved.\n"
      "  set_viewport    --width <n> --height <n> | --reset\n"
      "                  Override the viewport for this session only. Without\n"
      "                  --reset it shadows the app-wide default from Browser\n"
@@ -313,8 +316,15 @@ static int browser_use_handler(int argc, char **argv,
 
     __block NSDictionary *resultDict = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [BrowserUseOffloadBridge executeWithJson:jsonStr
+    // [T-browser-cli-reclaim-scope] execute returns a token naming this one
+    // invocation, so a timeout below cancels only the call it abandons. The
+    // old (session id, tab id) key matched every concurrent CLI call, since
+    // the session id is process-wide and most commands name no tab.
+    // [T-browser-pool-caller-session] Which chat issued this command, read on
+    // this guest thread: the bridge picks THAT chat's tab pool.
+    uint64_t invocation = [BrowserUseOffloadBridge executeWithJson:jsonStr
                                   withBase64:withBase64
+                                   fsContext:noff_current_fs_context()
                                   completion:^(NSDictionary *data) {
         resultDict = data;
         dispatch_semaphore_signal(sem);
@@ -323,9 +333,20 @@ static int browser_use_handler(int argc, char **argv,
     // Give the bridge a generous window.
     long waitErr = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_SEC));
     if (waitErr != 0 || resultDict == nil) {
+        // [T-browser-cli-timeout-reclaim] OpenMinis#245. Giving up here used
+        // to leave the action running natively. It kept holding the tab's
+        // serial slot until the pool's 300s dead-tab ceiling, so for ~5
+        // minutes every later command on that tab failed its slot wait. Tell
+        // the bridge to cancel it now: the pool rebuilds the wedged tab and
+        // frees the slot, so the next command starts on a fresh WebView.
+        if (waitErr != 0) {
+            [BrowserUseOffloadBridge cancelAndReclaimWithInvocation:invocation];
+        }
         NSDictionary *err = noff_json_error(TOOL_NAME, @"execute",
                                             NOFF_ERR_INTERNAL_ERROR,
-                                            @"browser action timed out after 90s");
+                                            waitErr != 0
+                                                ? @"browser action timed out after 90s; the stuck action was cancelled and, if its tab had hung, the tab was replaced — run list_tabs, then retry"
+                                                : @"browser action timed out after 90s");
         noff_emit_json(stdout_fd, err, compact, quiet);
         return NOFF_EXIT_ERROR;
     }

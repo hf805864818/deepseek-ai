@@ -20,6 +20,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.BatteryFull
 import androidx.compose.material.icons.outlined.Bolt
@@ -58,6 +63,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.openminis.app.MinisApp
 import com.openminis.app.R
 import com.openminis.app.power.PowerOptimizationManager
+import com.openminis.app.i18n.uppercaseForDisplay
 
 /**
  * T50 settings screen — surfaces the two pieces of background-keep-alive
@@ -92,6 +98,7 @@ fun BackgroundSettingsScreen(onBack: () -> Unit) {
     val backgroundOverlayEnabled by backgroundRepo.backgroundOverlayEnabled.collectAsState()
     // [T-android-dynamic-island] Live-Updates toggle + device capability.
     val dynamicIslandEnabled by backgroundRepo.dynamicIslandEnabled.collectAsState()
+    val scheduledCountdownLead by backgroundRepo.scheduledCountdownLead.collectAsState()
 
     var ignoringOptimizations by remember {
         mutableStateOf(PowerOptimizationManager.isIgnoringBatteryOptimizations(context))
@@ -120,6 +127,10 @@ fun BackgroundSettingsScreen(onBack: () -> Unit) {
                 canDrawOverlays =
                     Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
                         Settings.canDrawOverlays(context)
+                // [T-android-island-capability-ttl] The user may have just
+                // flipped Live Updates in system settings: drop the cached
+                // answer so this re-probe really asks the platform.
+                com.openminis.app.service.DynamicIslandSupport.invalidateCapabilityCache()
                 dynamicIslandCapable =
                     com.openminis.app.service.DynamicIslandSupport.isDynamicIslandCapable(context)
             }
@@ -174,7 +185,19 @@ fun BackgroundSettingsScreen(onBack: () -> Unit) {
                 icon = Icons.Outlined.Layers,
                 iconColor = Color(0xFF5856D6),
                 title = stringResource(R.string.settings_bg_overlay),
-                checked = backgroundOverlayEnabled && canDrawOverlays,
+                // [T-android-overlay-toggle-reflects-intent] Reflect the user's
+                // PERSISTED intent, not the derived ready-state. Previously this
+                // was `backgroundOverlayEnabled && canDrawOverlays`, so a user
+                // who tapped ON but never granted SYSTEM_ALERT_WINDOW (or later
+                // had it revoked) came back to a switch that read OFF — they
+                // concluded the toggle "won't stay on" and never connected it to
+                // the missing permission, so the overlay silently never showed.
+                // Showing ON here surfaces the real state: the switch is on, and
+                // the footer below says a permission is still needed, which is
+                // the actionable signal. canDrawOverlays still gates whether the
+                // overlay actually renders (AgentForegroundService checks the
+                // grant independently and posts a permission nudge).
+                checked = backgroundOverlayEnabled,
                 onCheckedChange = { wanted ->
                     if (wanted && !canDrawOverlays) {
                         try {
@@ -230,6 +253,43 @@ fun BackgroundSettingsScreen(onBack: () -> Unit) {
                 },
             )
 
+            // [FIX-261025-03] When a waiting scheduled task's chat becomes
+            // active again: the ongoing notification, the capsule / Live
+            // Updates countdown and the keep-alive (ScheduledSessionHold).
+            Spacer(Modifier.size(8.dp))
+            val countdownLabels = listOf(
+                stringResource(R.string.settings_scheduled_countdown_off),
+                pluralStringResource(R.plurals.settings_scheduled_countdown_minutes, 1, 1),
+                pluralStringResource(R.plurals.settings_scheduled_countdown_minutes, 5, 5),
+                pluralStringResource(R.plurals.settings_scheduled_countdown_minutes, 15, 15),
+                stringResource(R.string.settings_scheduled_countdown_always),
+            )
+            var countdownMenu by remember { mutableStateOf(false) }
+            Box {
+                BgRow(
+                    icon = Icons.Outlined.Timer,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.settings_scheduled_countdown),
+                    subtitle = countdownLabels.getOrNull(scheduledCountdownLead),
+                    onClick = { countdownMenu = true },
+                )
+                DropdownMenu(expanded = countdownMenu, onDismissRequest = { countdownMenu = false }) {
+                    countdownLabels.forEachIndexed { i, label ->
+                        DropdownMenuItem(
+                            text = { Text(label) },
+                            trailingIcon = {
+                                if (i == scheduledCountdownLead) Icon(Icons.Default.Check, contentDescription = null)
+                            },
+                            onClick = {
+                                countdownMenu = false
+                                backgroundRepo.setScheduledCountdownLead(i)
+                            },
+                        )
+                    }
+                }
+            }
+            BgFooter(stringResource(R.string.settings_scheduled_countdown_footer))
+
             Spacer(Modifier.size(16.dp))
             BgSectionTitle(stringResource(R.string.battery_opt_section_title))
             BgRow(
@@ -280,7 +340,7 @@ fun BackgroundSettingsScreen(onBack: () -> Unit) {
 @Composable
 private fun BgSectionTitle(text: String) {
     Text(
-        text = text.uppercase(),
+        text = text.uppercaseForDisplay(),
         fontSize = 12.sp,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 6.dp),
@@ -341,7 +401,7 @@ private fun BgToggleRow(
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = rowAlpha),
             modifier = Modifier.weight(1f),
         )
-        Switch(
+        SettingsSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
             enabled = enabled,

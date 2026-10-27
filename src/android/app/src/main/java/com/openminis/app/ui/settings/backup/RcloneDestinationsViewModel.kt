@@ -42,6 +42,12 @@ class RcloneDestinationsViewModel(app: Application) : AndroidViewModel(app) {
         val remote: RcloneRemoteStore.Remote,
         val path: String,
         val entries: List<RcloneBrowser.Entry>,
+        /**
+         * [T-android-backup-dest-edit] Re-pointing a SAVED destination rather
+         * than choosing the folder for a new one: "Use This Folder" then
+         * updates the stored path instead of adding a remote.
+         */
+        val existing: Boolean = false,
     )
 
     /**
@@ -64,6 +70,220 @@ class RcloneDestinationsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun remove(name: String) {
         store.remove(name); refresh()
+    }
+
+    // MARK: - [T-android-backup-dest-edit] Editing a saved destination
+
+    /** Whether [name] has a stored secret — drives the editor's footer, never shows it. */
+    fun hasSecret(name: String): Boolean = store.hasSecret(name)
+
+    /**
+     * Rename a destination. History records follow the new name, and the old
+     * rclone section is dropped so its credential does not linger under a name
+     * nothing refers to any more.
+     */
+    fun rename(name: String, newName: String, onDone: (RcloneRemoteStore.Remote) -> Unit) {
+        if (_busy.value) return
+        _busy.value = true
+        _error.value = null
+        viewModelScope.launch {
+            try {
+                val updated = withContext(Dispatchers.IO) {
+                    val r = store.update(name = name, newName = newName)
+                    if (r.name != name) {
+                        com.openminis.app.backup.BackupHistory.get(getApplication())
+                            .renameDestination(name, r.name)
+                        if (!RcloneRemoteStore.isLocalFolder(r.backend)) {
+                            store.dropRcloneSection(name)
+                            store.syncToRclone()
+                        }
+                    }
+                    r
+                }
+                refresh()
+                onDone(updated)
+            } catch (e: Exception) {
+                _error.value = e.message ?: "Couldn't rename the destination."
+            } finally {
+                _busy.value = false
+            }
+        }
+    }
+
+    /**
+     * Save edited connection settings — only if they connect.
+     *
+     * [values] are the form's non-secret fields. The candidate is probed under a
+     * throwaway rclone section first ([RcloneRemoteStore.probeConnection]); on
+     * failure nothing is written and the destination keeps working with its old
+     * settings and password.
+     */
+    fun saveConnection(
+        name: String,
+        values: Map<String, String>,
+        secret: RcloneRemoteStore.SecretEdit,
+        allowInsecureTLS: Boolean,
+        onDone: (RcloneRemoteStore.Remote) -> Unit,
+    ) {
+        if (_busy.value) return
+        _busy.value = true
+        _error.value = null
+        viewModelScope.launch {
+            try {
+                val updated = withContext(Dispatchers.IO) {
+                    val r = store.update(
+                        name = name,
+                        newParams = values,
+                        secret = secret,
+                        allowInsecureTLS = allowInsecureTLS,
+                        verify = { candidate, candidateSecret ->
+                            try {
+                                store.probeConnection(candidate, candidateSecret)
+                            } catch (e: Exception) {
+                                throw ProbeFailed(e)
+                            }
+                        },
+                    )
+                    store.syncToRclone()
+                    r
+                }
+                _certificateRejected.value = false
+                refresh()
+                onDone(updated)
+            } catch (e: ProbeFailed) {
+                val msg = e.cause?.message ?: "Could not connect to the server."
+                AppLogger.error(TAG, "[Rclone] edit of '$name' not saved, connection failed: $msg")
+                _error.value = getApplication<Application>()
+                    .getString(com.openminis.app.R.string.backup_dest_edit_failed, msg)
+                if (!allowInsecureTLS && RcloneRemoteStore.looksLikeCertificateFailure(msg)) {
+                    _certificateRejected.value = true
+                }
+            } catch (e: Exception) {
+                _error.value = e.message ?: "Couldn't save the connection."
+            } finally {
+                _busy.value = false
+            }
+        }
+    }
+
+    /** Wraps a failed connection probe so it is told apart from a store error. */
+    private class ProbeFailed(cause: Exception) : Exception(cause.message, cause)
+
+    /** List [name]'s backup folder; reports "Connected." or the rclone error. */
+    fun testConnection(name: String, onResult: (ok: Boolean, message: String?) -> Unit) {
+        val r = store.remote(name) ?: return
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    store.syncToRclone()
+                    RcloneBrowser.listDirectories(r, r.listRoot)
+                }
+            }
+            onResult(
+                result.isSuccess,
+                result.exceptionOrNull()?.let { it.message ?: it.javaClass.simpleName },
+            )
+        }
+    }
+
+    /** Open the folder browser on a saved server, starting at its current folder. */
+    fun browseExisting(name: String) {
+        val r = store.remote(name) ?: return
+        if (_busy.value) return
+        _busy.value = true
+        _error.value = null
+        viewModelScope.launch {
+            try {
+                val entries = withContext(Dispatchers.IO) {
+                    store.syncToRclone()
+                    RcloneBrowser.listDirectories(r, r.listRoot)
+                }
+                _browse.value = BrowseState(r, r.listRoot, entries, existing = true)
+            } catch (e: Exception) {
+                _error.value = e.message ?: "Could not open that folder."
+            } finally {
+                _busy.value = false
+            }
+        }
+    }
+
+    /** Store the folder picked in [browseExisting]'s browser. */
+    fun applyFolder(path: String, onDone: (RcloneRemoteStore.Remote) -> Unit) {
+        val b = _browse.value ?: return
+        _busy.value = true
+        viewModelScope.launch {
+            try {
+                val updated = withContext(Dispatchers.IO) {
+                    store.update(name = b.remote.name, newPath = path)
+                }
+                refresh()
+                _browse.value = null
+                onDone(updated)
+            } catch (e: Exception) {
+                _error.value = e.message ?: "Could not save the folder."
+            } finally {
+                _busy.value = false
+            }
+        }
+    }
+
+    /**
+     * [T-android-backup-local-folder] Save a SAF-picked folder as a
+     * destination. Returns the name it was saved under, or null when the save
+     * was rejected (duplicate name, same folder already added) — the error is
+     * published on [error] for the UI to show.
+     *
+     * The caller has already taken the persistable permission; this only
+     * records the destination.
+     */
+    fun addLocalFolder(treeUri: String, displayPath: String): String? {
+        val pretty = prettyTreePath(displayPath)
+        val name = uniqueLocalName(pretty)
+        return try {
+            store.addLocalFolder(name = name, treeUri = treeUri, displayPath = pretty)
+            refresh()
+            name
+        } catch (e: Exception) {
+            _error.value = e.message ?: "Couldn't add that folder."
+            null
+        }
+    }
+
+    /**
+     * Turn a SAF tree document id into something worth showing in a row.
+     *
+     * The raw ids are provider-internal: `primary:Documents/Backups` for
+     * internal storage, `1A2B-3C4D:Backups` for an SD card. The volume prefix
+     * before the colon is not a folder the user has ever seen, and the row
+     * template already prefixes a `/`, so "primary:Documents" would render as
+     * "/primary:Documents". Keep the part after the colon.
+     *
+     * A non-externalstorage provider (Drive, Dropbox) uses an opaque id with no
+     * colon at all; those pass through unchanged rather than being mangled,
+     * since anything is better than an empty subtitle.
+     */
+    private fun prettyTreePath(treeDocumentId: String): String =
+        treeDocumentId.substringAfter(':', treeDocumentId).trim('/')
+            .ifBlank { treeDocumentId }
+
+    /**
+     * A display name for a picked folder: the last path segment, made unique
+     * against what is already saved.
+     *
+     * Destination names are the identity of a record (they key removal and the
+     * enable switch), so a user who adds "Documents" on internal storage and
+     * "Documents" on an SD card must not end up with one entry. Rather than
+     * making them type a name for something they just picked visually, the
+     * collision is resolved with a numeric suffix.
+     */
+    private fun uniqueLocalName(displayPath: String): String {
+        val base = displayPath.trimEnd('/').substringAfterLast('/')
+            .ifBlank { "Folder" }
+        val taken = store.remotes.map { it.name }.toSet()
+        if (base !in taken) return base
+        var n = 2
+        while ("$base $n" in taken) n++
+        return "$base $n"
     }
 
     /**

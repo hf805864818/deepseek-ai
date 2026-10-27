@@ -45,33 +45,105 @@ object RcloneBridge {
         Gomobile.rcloneInitialize()
         initialised = true
         applyGlobalOptions()
+        applyNetworkProxy()
         AppLogger.info(TAG, "[Rclone] initialised")
+    }
+
+    /**
+     * [T-net-android-phase3] Settings > Network, "Backup" scope (iOS
+     * `RcloneBridge.applyNetworkProxy`, a1cf633da..b379a4e6f).
+     *
+     * rclone's global HTTPProxy (fs/fshttp/http.go) is set to the local SOCKS5
+     * entry with the backup tag, or cleared when the route is direct or the
+     * entry is down. It covers HTTP-based backends (WebDAV, S3). A remote
+     * rclone already built keeps its transport until its fs cache entry
+     * expires. Never called with "" before a proxy was set, so an
+     * unconfigured app sends rclone exactly the options it did before.
+     *
+     * [FEAT-261021-19, iOS d72a2b261 G2] SFTP and FTP dial through rclone's
+     * own dialer, not an http.Transport, so HTTPProxy never reached them. The
+     * same entry is now their `socks_proxy` (deps/rclone-mobile/rcloneroute,
+     * as `--sftp-socks-proxy` would set it), and a change clears rclone's fs
+     * cache so built remotes reconnect on the new route. SMB has no proxy
+     * option in rclone and stays direct (owner's decision, 2026-10-21).
+     */
+    @Synchronized
+    fun applyNetworkProxy() {
+        val ep = com.openminis.app.network.NetworkRuntime.endpoint(com.openminis.app.network.NetworkScope.BACKUP.tag)
+        applySocksProxy(ep?.let { "${it.tag}:${it.password}@${it.host}:${it.port}" } ?: "")
+        val proxy = ep?.let { "socks5://${it.tag}:${it.password}@${it.host}:${it.port}" } ?: ""
+        if (proxy == lastAppliedProxy) return
+        try {
+            rpcUnchecked("options/set", mapOf("main" to mapOf("HTTPProxy" to proxy)))
+            lastAppliedProxy = proxy
+            AppLogger.info(TAG, "[Net][Backup] rclone HTTPProxy ${if (proxy.isEmpty()) "cleared (direct)" else "-> local entry (backup)"}")
+        } catch (e: Exception) {
+            AppLogger.warning(TAG, "[Net][Backup] couldn't set rclone HTTPProxy: ${e.message}")
+        }
+    }
+
+    private var lastAppliedProxy = ""
+
+    /**
+     * SFTP / FTP `socks_proxy`: "user:pass@host:port", "" = unset (direct).
+     * Only calls Go when the value changes, so an unconfigured app never
+     * touches rclone's backend options.
+     */
+    private fun applySocksProxy(socks: String) {
+        if (socks == lastAppliedSocks) return
+        val reply = runCatching { Gomobile.rcloneSetSocks(socks) }.getOrElse { "{\"ok\":false,\"error\":\"${it.javaClass.simpleName}\"}" }
+        if (!reply.startsWith("{\"ok\":true")) {
+            AppLogger.warning(TAG, "[Net][Backup] couldn't set rclone SFTP/FTP socks_proxy: $reply")
+            return
+        }
+        lastAppliedSocks = socks
+        val snap = com.openminis.app.network.NetworkRuntime.snapshot
+        AppLogger.info(TAG, "[Net][Backup] rclone SFTP/FTP socks_proxy " +
+            (if (socks.isEmpty()) "unset (direct)" else "-> backup:<password>@127.0.0.1:${snap.port} route=${snap.route(com.openminis.app.network.NetworkScope.BACKUP.tag).raw}") +
+            "; fs cache cleared")
+    }
+
+    private var lastAppliedSocks = ""
+
+    /** Re-applies the backup route after a Settings > Network change, only if rclone already runs. */
+    fun applyNetworkProxyIfInitialised() {
+        if (initialised) applyNetworkProxy()
     }
 
     /** How long to wait for a server to accept a connection. */
     const val CONNECT_TIMEOUT_SECONDS = 20L
 
     /**
-     * How long a single transfer may STALL before it is treated as dead.
+     * [T-android-backup-webdav-deadline] rclone's `Timeout`, which becomes Go's
+     * `http.Transport.ResponseHeaderTimeout` (fs/fshttp/http.go).
      *
-     * This is an inactivity timeout, not a cap on total transfer time: rclone
-     * resets it whenever bytes move, so a multi-hundred-megabyte upload over a
-     * slow home link is unaffected as long as it is making progress. That is
-     * what lets the same value protect a list call and a large upload without
-     * a separate budget for each.
+     * It is NOT a stall timeout, whatever this comment used to say. The timer
+     * starts once the request body has been fully WRITTEN and is a flat
+     * deadline that never resets while the server works. For a WebDAV `PUT`
+     * to a gateway in front of a cloud drive (AList/OpenList), the server
+     * re-uploads the whole file to the cloud before it answers, so 45 s meant
+     * "must answer within 45 s after receiving everything", and those servers
+     * failed EVERY backup even at full speed.
      *
-     * Applies PER ATTEMPT, so the worst-case wait is roughly this times the
-     * retry count — which is why the retry counts come down with it.
+     * Measured on a Pixel 4a against a WebDAV server that stalls 60 s after the
+     * body arrives: 45 s failed each attempt 46 s after the body landed ("i/o
+     * timeout"), twice, 92 s in all; 300 s succeeds at 60 s. Same finding and
+     * value as iOS (ceac9df0b). 300 s is rclone's own default.
+     *
+     * A per-size value is no fix: the delay follows the BACKEND (a local disk
+     * answers at once, a cloud relay takes minutes), not the byte count.
+     * What bounds a server that is down is [CONNECT_TIMEOUT_SECONDS]; what
+     * ends a genuinely wedged transfer is Stop, which reaches an upload in
+     * flight through `job/stop` (RcloneChunkedUpload).
      */
-    const val IO_TIMEOUT_SECONDS = 45L
+    const val IO_TIMEOUT_SECONDS = 300L
 
     /**
      * Low-level and high-level retry budgets.
      *
-     * Retries MULTIPLY the visible freeze because the timeout above is applied
-     * per attempt. rclone's defaults (10 low-level) would turn a 45s stall into
-     * minutes of apparent hang against a server that accepts a connection and
-     * then says nothing.
+     * Kept at one each: retries multiply every wait above, and rclone's
+     * defaults (10 low-level) would turn one slow server into minutes of
+     * apparent hang. The uploader adds its own single, backed-off retry.
      */
     const val LOW_LEVEL_RETRIES = 1L
     const val RETRIES = 1L
@@ -159,7 +231,7 @@ object RcloneBridge {
      */
     private fun rpcUnchecked(method: String, params: Map<String, Any?>): JSONObject {
         val input = JSONObject(params.mapValues { toJsonValue(it.value) }).toString()
-        val result = Gomobile.rcloneRPC(method, input)
+        val result = RcloneRpcTracker.track(method) { Gomobile.rcloneRPC(method, input) }
         val output = result.output ?: ""
         if (result.status != 200L) throw RPCException(result.status.toInt(), output)
         return runCatching { JSONObject(output) }.getOrDefault(JSONObject())
@@ -174,7 +246,9 @@ object RcloneBridge {
     fun rpc(method: String, params: Map<String, Any?> = emptyMap()): JSONObject {
         initializeIfNeeded()
         val input = JSONObject(params.mapValues { toJsonValue(it.value) }).toString()
-        val result = Gomobile.rcloneRPC(method, input)
+        // [T-rclone-rpc-concurrency-diag] Counted, never serialised: a lock here
+        // would let a call stalled for IO_TIMEOUT_SECONDS hold back job/stop.
+        val result = RcloneRpcTracker.track(method) { Gomobile.rcloneRPC(method, input) }
         val output = result.output ?: ""
         // gobind maps Go's int to a Java long here.
         if (result.status != 200L) throw RPCException(result.status.toInt(), output)

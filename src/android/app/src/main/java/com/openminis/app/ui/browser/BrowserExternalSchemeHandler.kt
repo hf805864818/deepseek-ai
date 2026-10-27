@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.core.net.toUri
+import com.openminis.app.R
 import com.openminis.app.logging.AppLogger
 
 /**
@@ -48,6 +49,10 @@ object BrowserExternalSchemeHandler {
      * `ACTION_VIEW` (the system will resolve to dialer / mail / maps /
      * Play Store etc.). `intent`/`android-app` are NOT in this list —
      * they need `parseUri`.
+     *
+     * [T-android-user-initiated-scheme-dispatch] This list now only gates the
+     * [Origin.AGENT_BACKGROUND] path. A user-initiated tap dispatches ANY
+     * scheme, so the list never has to grow to keep up with new apps.
      */
     private val EXTERNAL_VIEW_SCHEMES = setOf(
         "tel", "mailto", "sms", "smsto", "mms", "mmsto",
@@ -145,31 +150,40 @@ object BrowserExternalSchemeHandler {
      * an external Activity. Returns `true` when the WebView should NOT
      * load the URL itself.
      */
-    fun handle(context: Context, url: String?): Boolean {
+    fun handle(
+        context: Context,
+        url: String?,
+        origin: Origin = Origin.USER_INITIATED,
+    ): Boolean {
         if (url.isNullOrBlank()) return false
         val uri = runCatching { url.toUri() }.getOrNull() ?: return false
-        return handle(context, uri)
+        return handle(context, uri, origin)
     }
 
-    fun handle(context: Context, uri: Uri?): Boolean {
+    fun handle(
+        context: Context,
+        uri: Uri?,
+        origin: Origin = Origin.USER_INITIATED,
+    ): Boolean {
         if (uri == null) return false
         val scheme = uri.scheme?.lowercase() ?: return false
         if (scheme in INTERNAL_SCHEMES) return false
 
-        return when (scheme) {
-            INTENT_SCHEME, ANDROID_APP_SCHEME -> handleIntentScheme(context, uri.toString())
-            in EXTERNAL_VIEW_SCHEMES -> handleViewIntent(context, uri)
-            else -> {
-                // T318: Unknown app schemes (e.g. `toutiao://`, `snssdk141://`,
-                // `weibo://`) used to fall through to ACTION_VIEW, which jumps
-                // the user out into the matching app and breaks the agent's
-                // browsing context (and surprises users who tapped a link
-                // inside our in-app browser). Block them: swallow the load
-                // and surface a Toast so the page still feels handled.
-                AppLogger.info(TAG, "blocked unknown scheme: $scheme (uri=$uri)")
+        return when (route(scheme, origin)) {
+            Route.PARSE_URI -> handleIntentScheme(context, uri.toString())
+            Route.VIEW_INTENT -> handleViewIntent(context, uri)
+            Route.LOAD_IN_WEBVIEW -> false
+            Route.BLOCK -> {
+                // T318: the agent is driving a background WebView and the PAGE
+                // decided to navigate (`toutiao://`, `snssdk141://`, `weibo://`
+                // and friends). Firing ACTION_VIEW here would throw the user
+                // out of Minis into another app mid-task, for something they
+                // never asked for, and would destroy the agent's browsing
+                // context. Swallow it.
+                AppLogger.info(TAG, "blocked unknown scheme: $scheme (uri=$uri, origin=$origin)")
                 Toast.makeText(
                     context,
-                    "Blocked link to external app ($scheme)",
+                    context.getString(R.string.external_link_blocked, scheme),
                     Toast.LENGTH_SHORT,
                 ).show()
                 true
@@ -218,7 +232,7 @@ object BrowserExternalSchemeHandler {
 
         Toast.makeText(
             context,
-            "No app available to open this link.",
+            context.getString(R.string.external_link_no_app),
             Toast.LENGTH_SHORT,
         ).show()
         return true
@@ -233,7 +247,7 @@ object BrowserExternalSchemeHandler {
         } catch (_: ActivityNotFoundException) {
             Toast.makeText(
                 context,
-                "No app available to open this link.",
+                context.getString(R.string.external_link_no_app),
                 Toast.LENGTH_SHORT,
             ).show()
         } catch (e: Exception) {

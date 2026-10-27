@@ -3,6 +3,7 @@ package com.openminis.app.sandbox.offload
 import android.content.Context
 import android.util.Base64
 import android.util.Log
+import com.openminis.app.logging.AppLogger
 import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.ModelEntry
 import com.openminis.app.data.model.ProviderType
@@ -113,6 +114,18 @@ class ModelUseOffloadHandler(
     }
 
     private fun cmdRun(args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        // [T-offload-caller-session] The chat this run belongs to: the session
+        // whose /var/minis this shell sees, i.e. the PARENT for a sub agent
+        // (iOS resolves the caller from the task's fs_context, which a helper
+        // shares with its parent; b99e4da87). Used for the provider's session
+        // header and for where generated media and --output files are written.
+        // The raw MINIS_CHAT_SESSION_ID is the helper's own hidden session, so
+        // its images landed in minis-sessions/<helperId>/attachments: not at
+        // the /var/minis/attachments path the guest was told, and never
+        // visible from the parent chat.
+        val caller = OffloadCallerSession.resolve(request.sessionId)
+        val callerSid = caller.sid
+        AppLogger.info(TAG, "[ModelUse] run caller=${callerSid?.take(8) ?: "nil"} via=${caller.source}")
         val modelArg = args.get("model")
             ?: return NativeOffloadResult(2, "--model is required. Usage: minis-model-use run --model <id_or_name>\n")
 
@@ -262,16 +275,27 @@ class ModelUseOffloadHandler(
 
         // Build provider + call — runBlocking is acceptable here: this handler
         // is invoked off the main thread by the offload server.
-        val apiKey = providerRepository.loadApiKey(entry.providerInstanceId)
+        val instance = providerRepository.instance(entry.providerInstanceId)
+            ?: return NativeOffloadResult(2, "minis-model-use run: provider instance not found\n")
+        // [T-android-provider-entry-rules] Same credential rule as every other
+        // entry: refreshed OAuth token, keyless/OAuth-held credentials allowed.
+        val apiKey = kotlinx.coroutines.runBlocking { providerRepository.requestCredential(instance) }
             ?: return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "missing_api_key")
                     .put("message", "No API key configured for provider ${entry.model.provider}.")
                     .toString() + "\n",
             )
-        val instance = providerRepository.instance(entry.providerInstanceId)
-            ?: return NativeOffloadResult(2, "minis-model-use run: provider instance not found\n")
-        val provider = ProviderFactory.create(instance, apiKey, entry.model, context)
+        // [T-android-opencode-subtask-session] The calling chat's id, so an
+        // OpenCode Go model gets its required `x-opencode-session` header and
+        // does not answer 400 "Request is missing x-opencode-session". This
+        // run is that chat's traffic (iOS b99e4da87 / 4d002af1c tag it the
+        // same way). The header itself is still gated on the OpenCode host and
+        // on a persisted id inside the provider, so no other endpoint sees it.
+        val provider = ProviderFactory.create(
+            instance, apiKey, entry.model, context,
+            sessionId = callerSid, overrides = entry.overrides,
+        )
 
         // [GH#67] input_audio serialization is implemented for the OpenAI
         // chat/completions + responses paths only. Other provider types would
@@ -317,7 +341,7 @@ class ModelUseOffloadHandler(
                 messages = messages,
                 maxTokens = maxTokens,
                 outputPath = outputPath,
-                sessionId = request.sessionId,
+                sessionId = callerSid,
             )
         }
 
@@ -371,7 +395,7 @@ class ModelUseOffloadHandler(
             inputImages = imageParts,
             outputPath = outputPath,
             outputExt = outputExt,
-            sessionId = request.sessionId,
+            sessionId = callerSid,
             callWarnings = callWarnings,
         )
         if (imageRouted != null) return attachCallFeedback(imageRouted, callWarnings, appliedExtras)
@@ -401,7 +425,19 @@ class ModelUseOffloadHandler(
         // Write output — media-first if the model returned image/audio/video and
         // --output has a media extension, else fall back to text. Mirrors iOS
         // ModelUseOffloadBridge.performRun (non-streaming branch).
-        val sessionId = request.sessionId
+        val sessionId = callerSid
+        // [T-android-model-use-no-media-fails] A run that had to produce media
+        // — the caller asked for a .png/.mp3/... output, or the model can only
+        // output images — and got none must FAIL, not exit 0. Otherwise the
+        // agent reads success, writes ![](minis://attachments/...) for a file
+        // that was never written, and the user sees an image that "exists"
+        // but cannot be opened. That included writing the model's text reply
+        // INTO the requested out.png, so the phantom even had a file.
+        val mediaRequired = (outputPath != null && (isImageExt(outputExt) || isAudioExt(outputExt) || isVideoExt(outputExt))) ||
+            ("image" in outputs && "text" !in outputs)
+        if (mediaRequired && response.mediaAttachments.isEmpty()) {
+            return noMediaResult(entry, response.text, outputPath, endpoint = "chat")
+        }
         val mediaFiles = JSONArray()
         val ts = System.currentTimeMillis() / 1000
         val modelSlug = entry.model.id.replace("/", "_")
@@ -565,7 +601,7 @@ class ModelUseOffloadHandler(
      *   • Explicit envelope: `extra_body` (object), `extra_headers` (string map),
      *     `endpoint_path` (string). Unambiguous; recommended in help.
      *   • Implicit: any TOP-LEVEL key not in [imageReservedKeys] is folded into
-     *     the body — so `{"prompt":..,"image":"data:..","watermark":false}` just
+     *     the body — so `{"prompt":..,"image":"data:..","size":"2K"}` just
      *     works for Seedream-style image-to-image without an envelope.
      * Explicit `extra_body` wins over implicit keys on conflict. Values are kept
      * as raw org.json types so JSONObject.put() re-serializes them faithfully.
@@ -1195,6 +1231,12 @@ class ModelUseOffloadHandler(
     ): NativeOffloadResult {
         val mediaFiles = JSONArray()
         val firstMedia = response.mediaAttachments.firstOrNull()
+        // [T-android-model-use-no-media-fails] The image endpoint exists to
+        // return an image; an empty list (content filter, quota, provider
+        // quirk) is a failure, never a success with a warning attached.
+        if (firstMedia == null) {
+            return noMediaResult(entry, response.text, outputPath, endpoint = endpointUsed)
+        }
         val ts = System.currentTimeMillis() / 1000
         val modelSlug = entry.model.id.replace("/", "_")
         if (outputPath != null) {
@@ -1251,9 +1293,36 @@ class ModelUseOffloadHandler(
             put("image_endpoint", endpointUsed)
             if (outputPath != null) put("output_file", outputPath)
             if (mediaFiles.length() > 0) put("media_files", mediaFiles)
-            if (firstMedia == null) put("warning", "Image endpoint returned no image data.")
         }
         return NativeOffloadResult(0, body.toString(2) + "\n")
+    }
+
+    /**
+     * [T-android-model-use-no-media-fails] Exit 1 with a machine-readable
+     * error and the model's own text (usually the refusal / moderation
+     * reason), and no file written — so neither the exit code nor the disk
+     * suggests an image exists.
+     */
+    private fun noMediaResult(
+        entry: ModelEntry,
+        text: String,
+        outputPath: String?,
+        endpoint: String,
+    ): NativeOffloadResult {
+        Log.w(TAG, "[ModelUseNoMedia] model=${entry.model.id} endpoint=$endpoint output=$outputPath textLen=${text.length}")
+        val body = JSONObject().apply {
+            put("error", "no_media_generated")
+            put(
+                "message",
+                "The model returned no image/media (often a content-policy refusal or quota limit). " +
+                    "Nothing was saved" + (outputPath?.let { " to $it" } ?: "") +
+                    ". Do not reference a generated file; tell the user it failed and why.",
+            )
+            put("model", entry.model.id)
+            put("endpoint", endpoint)
+            if (text.isNotBlank()) put("model_text", text.take(2000))
+        }
+        return NativeOffloadResult(1, body.toString(2) + "\n")
     }
 
     /**
@@ -1291,7 +1360,7 @@ class ModelUseOffloadHandler(
         Log.i(
             "ModelUseImage",
             "[ModelUseWrite] path=$responsePath hostFile=${hostFile.absolutePath} " +
-                "sessionId=$sessionId globalAttachMount=${PRootKernel.bindMounts["/var/minis/attachments"]}",
+                "sessionId=$sessionId",
         )
     }
 
@@ -1314,8 +1383,8 @@ class ModelUseOffloadHandler(
                   {"messages":[{"role":"user","content":"<prompt>"}],
                    "generation_config":{"aspect_ratio":"16:9","image_size":"2K"}}
             """.trimIndent()
-            // [T-android-provider-type-parity] openAIResponses routes through
-            // the same OpenAI-compatible /images/generations surface.
+            // [T-android-provider-type-parity] Same /v1/images/generations
+            // shape as OpenAI.
             ProviderType.openAI, ProviderType.openRouter, ProviderType.openAIResponses -> """
                 Hint — ${entry.model.displayName} is an OpenAI-compatible image model. Pass image params at the top level of the input JSON (matches /v1/images/generations):
                   n         integer, number of images (default 1)
@@ -1325,21 +1394,23 @@ class ModelUseOffloadHandler(
                 Example:
                   {"prompt":"<prompt>","size":"1792x1024","quality":"hd","n":1}
 
-                Passthrough (topics: image-to-image, extra_body, extra_headers, endpoint_path) — any field our schema doesn't model is forwarded VERBATIM into the /images/generations JSON body, so you can drive provider-specific params (e.g. Volcengine Seedream image-to-image via an `image` field, `watermark`, `tools`). Two ways, both optional & additive:
+                Passthrough (topics: image-to-image, extra_body, extra_headers, endpoint_path) — any field our schema doesn't model is forwarded VERBATIM into the /images/generations JSON body, so you can drive provider-specific params (e.g. Volcengine Seedream image-to-image via an `image` field, `seed`, `tools`). Two ways, both optional & additive:
                   • implicit: any unknown TOP-LEVEL key → request body
                   • explicit: `extra_body` (object, merged into body), `extra_headers` (string map, added to request headers), `endpoint_path` (string, overrides "/images/generations" for non-standard endpoints)
                 Your keys win over our defaults; `model` is always forced to the resolved id. If you set `response_format`, the b64_json auto-probe is skipped.
                 Image-to-image example (Seedream — image goes in the BODY, not messages):
-                  {"prompt":"make the eyes blue","image":"data:image/png;base64,<...>","size":"2K","watermark":false}
+                  {"prompt":"make the eyes blue","image":"data:image/png;base64,<...>","size":"2K"}
                 Explicit-envelope example:
                   {"messages":[{"role":"user","content":"<prompt>"}],"extra_body":{"image":"<url-or-data-uri>","seed":42},"extra_headers":{"X-Custom":"1"},"endpoint_path":"/api/v3/images/generations"}
             """.trimIndent()
             // xAI (Grok) / Kimi Coding have no image-output models in the
             // current catalog — fall through to empty hint like Anthropic.
-            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode, null -> ""
-            // [T-android-provider-type-parity] Decode-only types can carry a
-            // restored image model; no image-params schema exists to hint about.
-            ProviderType.antigravity, ProviderType.unsupported -> ""
+            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode,
+            // [T-copilot-provider] Copilot exposes no image-output model.
+            ProviderType.githubCopilot,
+            // [T-android-provider-type-parity] No image-param hint for types
+            // this build cannot drive.
+            ProviderType.antigravity, ProviderType.unsupported, null -> ""
         }
     }
 

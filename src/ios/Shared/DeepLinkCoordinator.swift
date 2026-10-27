@@ -12,6 +12,13 @@ enum SettingsDeepLinkTarget: Equatable {
     case modelGroupDetail(groupId: String)
     case usage
     case skills
+    /// [T-ios-assistant-header-open-soul] Soul settings (SOUL.md identity:
+    /// name, icon, style, personality body). Reachable as
+    /// `minis://settings/soul`, and used by the assistant identity row in the
+    /// chat transcript.
+    case soul
+    // [T-tools-master-switch] minis://settings/tools
+    case tools
     case memory
     case storage
     case mountedFolders
@@ -26,9 +33,6 @@ enum SettingsDeepLinkTarget: Equatable {
     /// edit form (where the Authorize button lives).
     case mcpIntegrations
     case mcpServerDetail(serverId: String)
-    /// [T-deep-mode-phase-e] Scheduled Tasks management screen
-    /// (`minis://settings/scheduled-tasks`).
-    case scheduledTasks
 }
 
 @MainActor

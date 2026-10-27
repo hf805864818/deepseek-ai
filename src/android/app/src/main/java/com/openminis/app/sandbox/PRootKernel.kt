@@ -8,6 +8,7 @@ import android.os.Environment
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.util.Log
+import kotlinx.coroutines.sync.withLock
 import com.openminis.app.data.FileMentionIndex
 import com.openminis.app.data.MountedFoldersStore
 import java.io.File
@@ -41,11 +42,54 @@ object PRootKernel {
 
     private lateinit var rootfsManager: RootfsManager
 
+    /**
+     * [T-android-env-first-turn] Guards [boot]. See the comment there: the
+     * `isBooted` flag alone is a check-then-act race because it flips only
+     * after the slow install work has finished.
+     */
+    private val bootMutex = kotlinx.coroutines.sync.Mutex()
+
     /** Custom environment variables injected into every proot command. */
     val customEnvironment: MutableMap<String, String> = mutableMapOf()
 
-    /** Bind mounts: Linux path -> host filesystem path. */
+    /**
+     * Bind mounts: Linux path -> host filesystem path. GLOBAL mounts only —
+     * `memory`, `skills`, `shared`, `mcp-servers` and `mounts/<name>`.
+     *
+     * [T-android-session-private-mounts] Per-session directories (workspace,
+     * attachments, offloads, browser) must never be in here: this map is
+     * process-wide, so a session dir written into it is whichever session
+     * wrote last. Those mounts live in each shell's own argv
+     * ([SessionMounts]); [addBindMount] refuses them.
+     */
     val bindMounts: MutableMap<String, String> = linkedMapOf()
+
+    /**
+     * [T-android-session-private-mounts] LEGACY fallback for readers that
+     * resolve a per-session `/var/minis/...` path with no session id through
+     * [resolveHostPath]. It reproduces exactly what they got before (the
+     * session that most recently built a shell), but as an explicit, logged
+     * hint instead of a side effect on the mount table. Session-aware callers
+     * use [resolveSessionHostPath] and never read it.
+     */
+    @Volatile
+    private var legacySessionId: String? = null
+
+    @Volatile
+    private var legacyFilesDir: File? = null
+
+    fun noteLegacySession(context: Context, sessionId: String) = noteLegacySession(context.filesDir, sessionId)
+
+    internal fun noteLegacySession(filesDir: File, sessionId: String) {
+        legacyFilesDir = filesDir
+        legacySessionId = sessionId
+    }
+
+    /** How many times the legacy fallback answered (diagnostics / tests). */
+    @Volatile
+    var legacyResolveCount: Long = 0
+        private set
+
 
     /**
      * Initialize the PRoot environment: install rootfs and proot binary.
@@ -55,7 +99,25 @@ object PRootKernel {
             Log.d(TAG, "Already booted")
             return
         }
+        // [T-android-env-first-turn] Serialize boot. `isBooted` is only set at
+        // the END of this function, so a bare check-then-act let a second
+        // caller walk straight past it while the first was still suspended
+        // inside installIfNeeded(). Both then raced on, and whoever spawned a
+        // shell first did it with nativeLibDir/prootLoaderPath still empty —
+        // proot then bare-execve'd the rootfs busybox and SELinux killed it
+        // with `execve("/bin/sh"): Permission denied`.
+        bootMutex.withLock {
+            // Re-check under the lock: the caller we queued behind may have
+            // completed the boot while we waited.
+            if (isBooted) {
+                Log.d(TAG, "Already booted (post-lock)")
+                return@withLock
+            }
+            bootLocked(context)
+        }
+    }
 
+    private suspend fun bootLocked(context: Context) {
         rootfsManager = RootfsManager.getInstance(context)
         rootfsManager.installIfNeeded()
         rootfsManager.installProotIfNeeded()
@@ -133,6 +195,21 @@ object PRootKernel {
         // Mirrored in default_mount/etc/profile.d/minis.sh for login shells.
         customEnvironment.putIfAbsent("UV_LINK_MODE", "symlink")
 
+        // [T-git-createobject-rename] openminis/openminis#375 / #409: Git's
+        // default core.createObject=link makes gc / repack / commit call
+        // link(), which link2symlink turns into .l2s.* sentinels inside
+        // .git/objects (undeletable once Git chmods the pack dir 0555).
+        // `rename` keeps Git off link() entirely. The old `copy` written by
+        // minis.sh is not a valid value and made every git command fatal.
+        // Injected as environment config so non-login shells get it too, and
+        // only when nothing has claimed GIT_CONFIG_COUNT already, so a
+        // user-supplied GIT_CONFIG_* set is never clobbered.
+        if (!customEnvironment.containsKey("GIT_CONFIG_COUNT")) {
+            customEnvironment.putIfAbsent("GIT_CONFIG_COUNT", "1")
+            customEnvironment.putIfAbsent("GIT_CONFIG_KEY_0", "core.createObject")
+            customEnvironment.putIfAbsent("GIT_CONFIG_VALUE_0", "rename")
+        }
+
         // Inject device timezone so Alpine userspace sees local time.
         // Mirrors iOS ISHShellExecutor.m:335-353 — uses POSIX TZ format with a
         // fixed name ("LCL") to avoid abbreviations like "GMT+8" which contain
@@ -179,7 +256,19 @@ object PRootKernel {
     }
 
     fun addBindMount(linuxPath: String, hostPath: String) {
+        if (isPerSessionPath(linuxPath)) {
+            // Would reintroduce last-writer-wins for every global reader.
+            Log.e(TAG, "refusing per-session bind mount in the global table: $linuxPath -> $hostPath")
+            return
+        }
         bindMounts[linuxPath] = hostPath
+    }
+
+    /** True for `/var/minis/<attachments|offloads|workspace|browser>` and below. */
+    fun isPerSessionPath(linuxPath: String): Boolean {
+        if (!linuxPath.startsWith("/var/minis/")) return false
+        val sub = linuxPath.removePrefix("/var/minis/").substringBefore('/')
+        return sub in perSessionSubdirs
     }
 
     /**
@@ -647,9 +736,39 @@ object PRootKernel {
         // Native offload: route registered handler names to the host-side
         // NativeOffloadServer over the abstract unix socket.
         val handlers = NativeOffloadServer.registeredHandlers
-        if (handlers.isNotEmpty()) {
+        // [T-native-offload-bind] Only when our server is listening: otherwise
+        // the handler stubs run and report the CLI unavailable, instead of
+        // proot connecting to a name another process holds (and hanging).
+        if (handlers.isNotEmpty() && NativeOffloadServer.awaitListening()) {
             cmd.add("--native-offload=${NativeOffloadServer.socketName}:${handlers.joinToString(",")}")
         }
+
+        // [T-android-fake-netlink] Emulate rtnetlink inside the sandbox.
+        //
+        // Android's untrusted_app SELinux domain may not create an
+        // AF_NETLINK/NETLINK_ROUTE socket, and the refusal comes from the real
+        // kernel — so anything that enumerates interfaces dies on startup.
+        // Go's net.Interfaces() reports
+        //   route ip+net: netlinkrib: permission denied
+        // which is what takes tailscale/tsnet-based tools out of service.
+        // With this flag proot answers rtnetlink itself with an EMPTY
+        // interface list, which is enough for those callers to start.
+        //
+        // ⚠️ INTERNAL TESTING ONLY, currently unconditional and with no user
+        // control. Before this ships it needs a decision on exposure, because
+        // it is a deliberate lie to guest programs about the machine they run
+        // on: "no interfaces at all" satisfies a caller that only needs the
+        // enumeration to succeed, but a caller that then picks a source
+        // interface or binds a local address fails LATER instead of at
+        // startup — a worse failure, not a better one.
+        cmd.add("--fake-netlink")
+
+        // [FEAT-261021-11] Transparent forwarding of TCP connections that
+        // ignore proxy variables (ssh, nc, ...) per Settings > Network. proot
+        // reads the routes file on each connect(); while the app keeps it
+        // deleted (the default) nothing is touched. Passed only to a proot
+        // that knows the option - an older binary would reject it.
+        cmd.addAll(com.openminis.app.network.ShellTransparentNet.prootArgs(rootfsManager.prootBinary))
 
         // Shell command
         cmd.add("/bin/sh")
@@ -661,7 +780,7 @@ object PRootKernel {
     }
 
     /** Subdirs that live under `minis-sessions/<sessionId>/` rather than the global pool. */
-    private val perSessionSubdirs = setOf("attachments", "offloads", "workspace", "browser")
+    private val perSessionSubdirs = SessionMounts.SESSION_SUBDIRS.toSet()
 
     /**
      * Resolve a `/var/minis/...` Linux path directly against a specific session's
@@ -703,6 +822,20 @@ object PRootKernel {
             }
         }
 
+        // [T-android-session-private-mounts] Per-session path with no session
+        // context: the legacy "most recent session" answer (see
+        // [legacySessionId]). Logged so the remaining callers stay findable.
+        if (isPerSessionPath(linuxPath)) {
+            val sid = legacySessionId
+            val filesDir = legacyFilesDir
+            if (sid != null && filesDir != null) {
+                legacyResolveCount++
+                val rest = linuxPath.removePrefix("/var/minis/")
+                Log.d(TAG, "legacy session resolve $linuxPath -> session $sid")
+                return File(filesDir, "minis-sessions/$sid/$rest")
+            }
+        }
+
         // Fallback: resolve relative to rootfs
         if (!::rootfsManager.isInitialized) return null
         val stripped = linuxPath.removePrefix("/")
@@ -719,14 +852,28 @@ object PRootKernel {
         val binDir = File(rootfsDir, "usr/local/bin").also { it.mkdirs() }
         var created = 0
         var existed = 0
+        var upgraded = 0
         for (name in NativeOffloadServer.registeredHandlers) {
             val stub = File(binDir, name)
-            if (stub.exists()) { existed++; continue }
-            stub.writeText("#!/bin/sh\nexit 0\n")
+            val want = HandlerStub.content(name)
+            if (stub.exists()) {
+                // [T-native-offload-bind] Upgrade only our own earlier stub; a
+                // file the user replaced is left alone.
+                val have = runCatching { stub.readText() }.getOrNull()
+                if (have == HandlerStub.LEGACY_CONTENT) {
+                    stub.writeText(want)
+                    stub.setExecutable(true, false)
+                    upgraded++
+                } else {
+                    existed++
+                }
+                continue
+            }
+            stub.writeText(want)
             stub.setExecutable(true, false)
             created++
         }
-        Log.d(TAG, "installHandlerStubs dir=${binDir.absolutePath} created=$created existed=$existed")
+        Log.d(TAG, "installHandlerStubs dir=${binDir.absolutePath} created=$created upgraded=$upgraded existed=$existed")
 
         installShellWrappers(binDir)
     }

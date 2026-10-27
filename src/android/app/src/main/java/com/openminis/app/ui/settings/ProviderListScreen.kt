@@ -52,12 +52,13 @@ import androidx.compose.runtime.key
 import sh.calvin.reorderable.ReorderableColumn
 import com.openminis.app.data.model.ProviderInstance
 import com.openminis.app.data.repository.ProviderRepository
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Delete
 import com.openminis.app.ui.components.MinisAlertDialog
 import com.openminis.app.ui.components.SwipeRowAction
 import com.openminis.app.ui.components.SwipeRowActions
+import com.openminis.app.ui.components.safeLaunchPicker
 import com.openminis.app.logging.AppLogger
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Delete
 import com.openminis.app.R
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -75,7 +76,6 @@ fun ProviderListScreen(
     val context = LocalContext.current
 
     var showMenu by remember { mutableStateOf(false) }
-
     // [T-android-swipe-row-actions] Pending swipe-delete target. Held here
     // rather than per-row so the confirmation survives the row being
     // recomposed/reordered underneath it.
@@ -216,64 +216,80 @@ fun ProviderListScreen(
                                 // configured-by-definition (mirrors iOS).
                                 !apiKey.isNullOrBlank() || instance.allowsEmptyAPIKey
                             }
+                            // [T-oauth-keep-credentials] Refresh rejected: the
+                            // credential is kept but the row renders red.
+                            val needsReauth = instance.credentialType ==
+                                com.openminis.app.data.model.ProviderCredential.oauth &&
+                                com.openminis.app.auth.OAuthManager.needsReauth(context, instance.id)
                             // Lift the dragged row above its neighbours so it
                             // reads as "picked up" (matches ModelGroupsScreen).
                             val elevation by animateDpAsState(
                                 targetValue = if (isDragging) 4.dp else 0.dp,
                                 label = "provider_drag_elevation",
                             )
-                            Surface(
-                                shadowElevation = elevation,
-                                color = Color.Transparent,
-                                modifier = Modifier.longPressDraggableHandle(),
-                            ) {
-                                // [T-android-swipe-row-actions] Swipe left for
-                                // Edit / Delete. Edit reuses the same
-                                // onProviderClick the tap already uses, and
-                                // Delete routes through the SAME confirmation +
-                                // removeInstance() the detail screen's "Delete
-                                // Provider" button uses — no second delete path.
-                                //
-                                // Sits INSIDE longPressDraggableHandle, not
-                                // around it: the handle needs to stay attached
-                                // to the row the user presses, and the two
-                                // gestures separate by axis (see SwipeRowActions).
-                                SwipeRowActions(
-                                    actions = listOf(
-                                        SwipeRowAction(
-                                            label = stringResource(R.string.common_edit),
-                                            icon = Icons.Filled.Edit,
-                                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                                            onClick = { onProviderClick(instance.id) },
-                                        ),
-                                        SwipeRowAction(
-                                            label = stringResource(R.string.common_delete),
-                                            icon = Icons.Filled.Delete,
-                                            containerColor = MaterialTheme.colorScheme.errorContainer,
-                                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                                            onClick = { instanceToDelete = instance },
-                                        ),
-                                    ),
-                                ) {
-                                    ProviderInstanceRow(
-                                        instance = instance,
-                                        modelCount = modelCount,
-                                        apiKey = apiKey,
-                                        isConfigured = isConfigured,
-                                        onClick = { onProviderClick(instance.id) },
+                            // [ISS-040b] One Column per row: ReorderableColumn wraps each
+                            // item in Box(contentAlignment = TopStart) (reorderable 2.4.0,
+                            // checked in its bytecode), so a divider emitted next to the
+                            // Surface was stacked ON TOP of the row's first pixel line
+                            // instead of below it - a line over the card's top edge, and
+                            // none before the last row. The divider now sits above every
+                            // row but the first (as in ModelGroupsScreen), giving exactly
+                            // N-1 lines between N rows.
+                            Column {
+                                if (providerRowHasDividerAbove(index)) {
+                                    val divider = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(start = 38.dp, end = 14.dp)
+                                            .height(0.5.dp)
+                                            .background(divider),
                                     )
                                 }
-                            }
-                            if (index < localOrder.size - 1) {
-                                val divider = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(start = 38.dp, end = 14.dp)
-                                        .height(0.5.dp)
-                                        .background(divider),
-                                )
+                                Surface(
+                                    shadowElevation = elevation,
+                                    color = Color.Transparent,
+                                    modifier = Modifier.longPressDraggableHandle(),
+                                ) {
+                                    // [T-android-swipe-row-actions] Swipe left for
+                                    // Edit / Delete. Edit reuses the same
+                                    // onProviderClick the tap already uses, and
+                                    // Delete routes through the SAME confirmation +
+                                    // removeInstance() the detail screen's "Delete
+                                    // Provider" button uses — no second delete path.
+                                    //
+                                    // Sits INSIDE longPressDraggableHandle, not
+                                    // around it: the handle needs to stay attached
+                                    // to the row the user presses, and the two
+                                    // gestures separate by axis (see SwipeRowActions).
+                                    SwipeRowActions(
+                                        actions = listOf(
+                                            SwipeRowAction(
+                                                label = stringResource(R.string.common_edit),
+                                                icon = Icons.Filled.Edit,
+                                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                onClick = { onProviderClick(instance.id) },
+                                            ),
+                                            SwipeRowAction(
+                                                label = stringResource(R.string.common_delete),
+                                                icon = Icons.Filled.Delete,
+                                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                                onClick = { instanceToDelete = instance },
+                                            ),
+                                        ),
+                                    ) {
+                                        ProviderInstanceRow(
+                                            instance = instance,
+                                            modelCount = modelCount,
+                                            apiKey = apiKey,
+                                            isConfigured = isConfigured,
+                                            needsReauth = needsReauth,
+                                            onClick = { onProviderClick(instance.id) },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -342,12 +358,14 @@ fun ProviderListScreen(
                         .fillMaxWidth()
                         .clickable {
                             showMenu = false
-                            importLauncher.launch(
+                            importLauncher.safeLaunchPicker(
                                 arrayOf(
                                     "application/json",
                                     "application/zip",
                                     "application/x-zip-compressed",
                                 ),
+                                context,
+                                "ProviderList",
                             )
                         }
                         .padding(horizontal = 20.dp, vertical = 14.dp),
@@ -392,6 +410,7 @@ private fun ProviderInstanceRow(
     modelCount: Int,
     apiKey: String?,
     isConfigured: Boolean,
+    needsReauth: Boolean = false,
     onClick: () -> Unit,
 ) {
     val isActive = isConfigured && instance.isEnabled
@@ -407,7 +426,9 @@ private fun ProviderInstanceRow(
             modifier = Modifier
                 .size(8.dp)
                 .background(
-                    color = if (isActive) Color(0xFF34C759) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f),
+                    color = if (needsReauth) MaterialTheme.colorScheme.error
+                        else if (isActive) Color(0xFF34C759)
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f),
                     shape = CircleShape,
                 ),
         )
@@ -441,11 +462,13 @@ private fun ProviderInstanceRow(
                 Text(
                     // [T-empty-key-compat-endpoints] Keyless compatible endpoint:
                     // say so instead of the alarming "No API key".
-                    text = if (!apiKey.isNullOrBlank()) maskKey(apiKey)
+                    text = if (needsReauth) stringResource(R.string.provider_oauth_sign_in_expired)
+                        else if (!apiKey.isNullOrBlank()) maskKey(apiKey)
                         else if (instance.allowsEmptyAPIKey) stringResource(R.string.provider_no_key_required)
-                        else "No API key",
+                        else stringResource(R.string.provider_no_api_key),
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (needsReauth) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                 )
             }
@@ -541,3 +564,9 @@ private fun ShadowVoiceRow(
         )
     }
 }
+
+/**
+ * [ISS-040b] Whether a provider row draws the separator above itself: every
+ * row but the first, so N rows get exactly N-1 lines, all between rows.
+ */
+internal fun providerRowHasDividerAbove(index: Int): Boolean = index > 0

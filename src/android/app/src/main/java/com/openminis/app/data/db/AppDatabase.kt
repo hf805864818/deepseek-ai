@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WebAppShortcutEntity::class,
         FolderEntity::class,
     ],
-    version = 13,
+    version = 15,
     // [T-android-downgrade-compat] Kept ON so MigrationTestHelper and CI can
     // validate every migration (and its downgrade counterpart) against the
     // committed schema json. Without it the upgrade/downgrade chain has no
@@ -315,6 +315,38 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // 13 → 14: parent_session_id / parent_tool_use_id (upstream sub-agent child sessions).
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+                db.execSQL("ALTER TABLE sessions ADD COLUMN parent_tool_use_id TEXT")
+            }
+        }
+
+        // 14 → 13: no-op downgrade (columns stay, bound by name).
+        val MIGRATION_14_13 = object : Migration(14, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Intentionally empty.
+            }
+        }
+
+        // 14 → 15: index sessions.updated_at (upstream perf).
+        val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_sessions_updated_at " +
+                        "ON sessions(updated_at)",
+                )
+            }
+        }
+
+        // 15 → 14: drop the index (derived data, safe to undo).
+        val MIGRATION_15_14 = object : Migration(15, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP INDEX IF EXISTS index_sessions_updated_at")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -325,7 +357,7 @@ abstract class AppDatabase : RoomDatabase() {
                     // MIGRATION_13_12 is the downgrade counterpart of
                     // MIGRATION_12_13 — registering it is what lets an older
                     // build open a newer database instead of failing to start.
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_12)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_12, MIGRATION_13_14, MIGRATION_14_13, MIGRATION_14_15, MIGRATION_15_14)
                     .build()
                     .also { INSTANCE = it }
             }

@@ -28,6 +28,7 @@ struct ThinkingRuleEditorView: View {
         case extraBodyToggle
         case deepSeekSibling
         case qwenDual
+        case qwenRootOnly
         case customPath
 
         var id: String { rawValue }
@@ -41,6 +42,7 @@ struct ThinkingRuleEditorView: View {
             case .extraBodyToggle:      return AppLocalized("extra_body toggle")
             case .deepSeekSibling:      return AppLocalized("thinking + reasoning_effort")
             case .qwenDual:             return AppLocalized("enable_thinking + budget")
+            case .qwenRootOnly:         return AppLocalized("enable_thinking only")
             case .customPath:           return AppLocalized("Custom field path")
             }
         }
@@ -62,7 +64,9 @@ struct ThinkingRuleEditorView: View {
             case .deepSeekSibling:
                 return AppLocalized("DeepSeek's shape: a thinking switch and reasoning_effort as sibling root fields.")
             case .qwenDual:
-                return AppLocalized("Qwen/DashScope: enable_thinking and a token budget, sent at the root and in extra_body.")
+                return AppLocalized("Qwen/DashScope: enable_thinking and a token budget, sent at the root and in extra_body. Use ONLY for DashScope itself — other gateways reject the unknown extra_body field with a 400.")
+            case .qwenRootOnly:
+                return AppLocalized("Qwen on a third-party gateway: a bare root-level enable_thinking, with no extra_body wrapper and no thinking_budget. Relays commonly reject both of those with a 400, so this is the safe choice for self-hosted vLLM/SGLang and OpenAI-compatible relays serving qwen models.")
             case .customPath:
                 return AppLocalized("Advanced: write a value at a dotted field path. Not validated by Minis.")
             }
@@ -175,7 +179,7 @@ struct ThinkingRuleEditorView: View {
                 .textInputAutocapitalization(.never)
             TextField("Value at High", text: $customHighValue)
                 .autocorrectionDisabled()
-        case .omitEverything, .deepSeekSibling, .qwenDual:
+        case .omitEverything, .deepSeekSibling, .qwenDual, .qwenRootOnly:
             EmptyView()
         }
     }
@@ -196,6 +200,7 @@ struct ThinkingRuleEditorView: View {
         case .extraBodyToggle:       return .extraBodyToggle(path: extraBodyPath)
         case .deepSeekSibling:       return .deepSeekSibling
         case .qwenDual:              return .qwenDual
+        case .qwenRootOnly:          return .qwenRootOnly
         case .customPath:
             return .customPath(path: customPath,
                                values: [.high: customHighValue],
@@ -245,6 +250,7 @@ struct ThinkingRuleEditorView: View {
         case .extraBodyToggle(let p): choice = .extraBodyToggle; extraBodyPath = p
         case .deepSeekSibling: choice = .deepSeekSibling
         case .qwenDual: choice = .qwenDual
+        case .qwenRootOnly: choice = .qwenRootOnly
         case .customPath(let p, let vals, let off):
             choice = .customPath; customPath = p
             customHighValue = vals[.high] ?? ""

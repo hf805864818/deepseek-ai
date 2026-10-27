@@ -130,12 +130,15 @@ enum DeepLinkRouter {
         case "skills":
             coord.pendingSettingsTarget = .skills
 
-        // [T-deep-mode-phase-e] minis://settings/scheduled-tasks — jump
-        // straight to the Scheduled Tasks management screen (the LLM's
-        // "manage in Settings → Agent Runtime → Scheduled Tasks" hint links
-        // here, instead of silently landing on the Settings home).
-        case "scheduled-tasks", "scheduled_tasks", "scheduled":
-            coord.pendingSettingsTarget = .scheduledTasks
+        // [T-ios-assistant-header-open-soul] Previously fell through to the
+        // `default` branch and landed on Settings home, even though the Soul
+        // screen exists — so a `minis://settings/soul` link (or the agent
+        // generating one) quietly under-delivered.
+        case "soul":
+            coord.pendingSettingsTarget = .soul
+
+        case "tools":
+            coord.pendingSettingsTarget = .tools
 
         // [T-mcp-oauth-deeplink] minis://settings/mcp-servers/<serverId> —
         // jump straight to the server's edit form (Authorize button). The

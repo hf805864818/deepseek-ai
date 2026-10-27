@@ -91,8 +91,6 @@ E5IFW001 /* InputFieldOrWaveformView.swift in Sources */ = {isa = PBXBuildFile; 
 		E5DEEP001 /* DeepModeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5DEEP101 /* DeepModeStore.swift */; };
 		E5RULE001 /* DeepModeRule.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5RULE101 /* DeepModeRule.swift */; };
 		E5SMEM001 /* StructuredMemoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SMEM101 /* StructuredMemoryStore.swift */; };
-		E5SUB001 /* SubagentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SUB101 /* SubagentSession.swift */; };
-		E5SUB002 /* SubagentCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SUB102 /* SubagentCard.swift */; };
 		E5MPATH001 /* MultiPathPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5MPATH101 /* MultiPathPlanner.swift */; };
 		E5COG9001 /* CognitiveLoadMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5COG9101 /* CognitiveLoadMonitor.swift */; };
 		E5SEQ9001 /* SequentialThinkingTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SEQ9101 /* SequentialThinkingTool.swift */; };
@@ -731,8 +729,6 @@ E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKno
 		E5DEEP101 /* DeepModeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeStore.swift; sourceTree = "<group>"; };
 		E5RULE101 /* DeepModeRule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepModeRule.swift; sourceTree = "<group>"; };
 		E5SMEM101 /* StructuredMemoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StructuredMemoryStore.swift; sourceTree = "<group>"; };
-		E5SUB101 /* SubagentSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentSession.swift; sourceTree = "<group>"; };
-		E5SUB102 /* SubagentCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentCard.swift; sourceTree = "<group>"; };
 		E5MPATH101 /* MultiPathPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiPathPlanner.swift; sourceTree = "<group>"; };
 		E5COG9101 /* CognitiveLoadMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CognitiveLoadMonitor.swift; sourceTree = "<group>"; };
 		E5SEQ9101 /* SequentialThinkingTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SequentialThinkingTool.swift; sourceTree = "<group>"; };
@@ -2196,7 +2192,6 @@ E5IFW101 /* InputFieldOrWaveformView.swift */ = {isa = PBXFileReference; lastKno
 				E5RULE101 /* DeepModeRule.swift */,
 				E5XSES101 /* CrossSessionContextStore.swift */,
 				E5SMEM101 /* StructuredMemoryStore.swift */,
-				E5SUB101 /* SubagentSession.swift */,
 			);
 			path = Session;
 			sourceTree = "<group>";
@@ -2321,7 +2316,6 @@ E5POP101 /* InputPopupOverlayView.swift */,
 E5FTP101 /* FloatingToolPreviewView.swift */,
 E5IBR101 /* InputBottomRowView.swift */,
 E5IFW101 /* InputFieldOrWaveformView.swift */,
-E5SUB102 /* SubagentCard.swift */,
 E5PHD0101 /* RenderWidgetView.swift */,
 			);
 			path = Chat;
@@ -2891,8 +2885,6 @@ E5PHD0101 /* RenderWidgetView.swift */,
 				E5DEEP001 /* DeepModeStore.swift in Sources */,
 				E5RULE001 /* DeepModeRule.swift in Sources */,
 				E5SMEM001 /* StructuredMemoryStore.swift in Sources */,
-				E5SUB001 /* SubagentSession.swift in Sources */,
-				E5SUB002 /* SubagentCard.swift in Sources */,
 				E5MPATH001 /* MultiPathPlanner.swift in Sources */,
 				E5COG9001 /* CognitiveLoadMonitor.swift in Sources */,
 				E5SEQ9001 /* SequentialThinkingTool.swift in Sources */,

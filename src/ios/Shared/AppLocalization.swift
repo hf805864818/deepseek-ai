@@ -43,29 +43,6 @@
 
 import Foundation
 
-// MARK: - Format specifier detection
-
-/// Detects whether a string contains unsubstituted `printf`-style format
-/// specifiers of any common variant.
-///
-/// Covers plain (`%lld`), positional (`%1$lld`), width/precision (`%.1f`,
-/// `%3$@`) and length-modifier forms (`%zd`, `%tu`) so the hybrid fallback
-/// triggers for every interpolated string, not just the single-`lld` case.
-/// Translators routinely reorder arguments with `%1$… / %2$…` when the
-/// target-language word order differs from English — a naive
-/// `contains("%lld")` misses those entirely, which is why the first fix
-/// (commit 439ca80) only partially worked.
-private func hasUnsubstitutedFormatSpecifiers(_ string: String) -> Bool {
-    // %  →  (positional index like "1$")?  →  (width)?  →  (precision like ".2")?
-    //    →  (length like ll / l / z / t)?  →  (conversion: @ d i u f e g x c p s …)
-    let pattern = "%(?:[0-9]+\\$)?[0-9]*(?:\\.[0-9]+)?(?:ll|l|z|t|h|j)?[@dfiufegxcpsOX]"
-    guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-        return false
-    }
-    let range = NSRange(string.startIndex..., in: string)
-    return regex.firstMatch(in: string, range: range) != nil
-}
-
 /// The bundle localized lookups should read from.
 ///
 /// Mirrors `Bundle.main.languageBundle` (set by `Bundle.setLanguage(_:)`), so
@@ -73,23 +50,8 @@ private func hasUnsubstitutedFormatSpecifiers(_ string: String) -> Bool {
 /// active. Falls back to `Bundle.main` when no in-app override is set, which is
 /// the normal case — the system language then applies exactly as before.
 enum AppBundle {
-    /// Memoized override bundle. Populated lazily on first use and cleared by
-    /// `Bundle.setLanguage(_:)` via `resetCache()`, so a language change in-app
-    /// still takes effect immediately without re-reading the ObjC associated
-    /// object on every localized lookup during first-frame render.
-    private static var cachedBundle: Bundle?
-
-    /// Call whenever the in-app language override changes so the next lookup
-    /// re-reads `Bundle.main.languageBundle`.
-    static func resetCache() {
-        cachedBundle = nil
-    }
-
     static var current: Bundle {
-        if let cachedBundle { return cachedBundle }
-        let resolved = (Bundle.main.languageBundle ?? Bundle.main)
-        cachedBundle = resolved
-        return resolved
+        Bundle.main.languageBundle ?? Bundle.main
     }
 }
 
@@ -108,65 +70,73 @@ enum AppBundle {
 ///   - key: the localization key, i.e. the English source string.
 ///   - comment: translator context, kept so `genstrings`-style extraction and
 ///     the String Catalog continue to see it.
-///
-/// [T-ios-lld-bundle-substitution] `String(localized:bundle:)` retrieves the
-/// correct translation for the override bundle but does NOT substitute format
-/// specifiers (`%lld`, `%d`, `%@`, `%.1f`, …) at runtime — the translated
-/// format string is returned verbatim with placeholders intact. The no-bundle
-/// form `String(localized:)` DOES substitute them correctly because it
-/// resolves through Foundation's native path. So we use the explicit-bundle
-/// form first (for language correctness), then fall back to the no-bundle
-/// form when any unsubstituted format specifier is detected in the result.
-/// This means interpolated strings (timestamps, model counts, token counts,
-/// file sizes, etc.) render in the system language rather than the in-app
-/// override — but showing "3 小时前" is strictly better than showing
-/// "%lld 小时前". Non-interpolated strings are unaffected and still honour the
-/// in-app language setting.
-///
-/// Detection uses a regex (not `contains("%lld")`) because translators
-/// routinely reorder arguments with positional forms like `%1$lld / %2$@`
-/// when the target-language word order differs from English. A literal
-/// `%lld` check missed those entirely — that was the gap in the first fix
-/// (commit 439ca80).
+@_disfavoredOverload
 func AppLocalized(_ key: String.LocalizationValue, comment: StaticString? = nil) -> String {
-    let result = String(localized: key, bundle: AppBundle.current, comment: comment)
-    if hasUnsubstitutedFormatSpecifiers(result) {
-        return String(localized: key, comment: comment)
+    // Interpolated keys ("\(n) chats") and LocalizationValue variables land
+    // here; plain literals take the cached StaticString overload below.
+    String(localized: key, bundle: AppBundle.current, comment: comment)
+}
+
+/// [T-composer-typing-lag] Plain-literal keys — the vast majority of call
+/// sites — resolve here and are memoized per bundle. On iOS 16 each
+/// `String(localized:)` re-resolves the bundle and re-reads the strings table
+/// (NSBundle initWithPath / preferredLocalizations / localizedStringForKey…),
+/// ~25% of the main thread in a Time Profiler trace while a reply streamed,
+/// mostly from ToolCapsuleView / AIChatView bodies re-running per token.
+///
+/// The `LocalizationValue` overload is `@_disfavoredOverload`, so a literal
+/// without interpolation picks this one at compile time and the key is known
+/// exactly. (A first attempt recovered the key from a `LocalizationValue` by
+/// reflection; its layout differs on iOS 16, so the cache never hit there.)
+func AppLocalized(_ key: StaticString, comment: StaticString? = nil) -> String {
+    let bundle = AppBundle.current
+    let plain = key.description
+    if let hit = LocalizedStringCache.lookup(plain, bundle: bundle) { return hit }
+    let value = String(localized: String.LocalizationValue(plain), bundle: bundle, comment: comment)
+    LocalizedStringCache.store(value, for: plain, bundle: bundle)
+    return value
+}
+
+/// [T-composer-typing-lag] Process-wide memo for `AppLocalized`, keyed by the
+/// localization key and scoped to the bundle it was resolved from, so an
+/// in-app language switch (a different `.lproj` bundle) starts a fresh table.
+enum LocalizedStringCache {
+    private static let lock = NSLock()
+    private static var table: [String: String] = [:]
+    private static var tableBundle: ObjectIdentifier?
+    /// Bounds memory if a caller ever feeds unbounded distinct keys.
+    static let capacity = 4096
+
+    static func lookup(_ key: String, bundle: Bundle) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard tableBundle == ObjectIdentifier(bundle) else { return nil }
+        return table[key]
     }
-    return result
+
+    static func store(_ value: String, for key: String, bundle: Bundle) {
+        lock.lock(); defer { lock.unlock() }
+        let id = ObjectIdentifier(bundle)
+        if tableBundle != id || table.count >= capacity {
+            table.removeAll(keepingCapacity: true)
+            tableBundle = id
+        }
+        table[key] = value
+    }
 }
 
 /// `LocalizedStringResource` overload, for call sites that already hold a
 /// resource (App Intents build these) rather than a literal key.
 ///
-/// [T-ios-crash-applocalized-recursion] Previous implementation called
-/// `AppLocalized(resource)` from its own body, i.e. unbounded self-recursion
-/// on the `LocalizedStringResource` overload — any call site that reached this
-/// overload spun the main thread indefinitely, which is what surfaced in the
-/// scene-create watchdog stack (the top app frame was `AppLocalized`).
-/// A `LocalizedStringResource` carries its own bundle reference, so it cannot
-/// be re-pointed the way a literal key can. Resolve it as-is — extracting the
-/// `String.LocalizationValue` (the key) and re-using the literal-key path so
-/// the in-app override still applies to the active bundle.
-///
-/// Same hybrid fallback as the literal-key overload: `Bundle.localizedString`
-/// returns the translated format string verbatim without substituting `%lld`
-/// / `%d` / `%@` / positional variants, so if we detect any unsubstituted
-/// format specifier we fall back to `String(localized:)` which goes through
-/// Foundation's native path and does the substitution correctly.
-func AppLocalized(_ resource: LocalizedStringResource) -> String {
-    // LocalizedStringResource.key is a plain String on the current SDK (it was
-    // String.LocalizationValue on older ones), so plumbing it through
-    // String(localized:bundle:) is not type-stable across SDKs. Resolve via
-    // Bundle.localizedString(forKey:value:table:), which is the same seam the
-    // language-override swizzle already patches — `AppBundle.current` +
-    // `overrideLocalizedString` honor the in-app language and need no generic
-    // key-typed re-construction.
-    let result = AppBundle.current.localizedString(
-        forKey: resource.key, value: resource.key, table: nil
-    )
-    if hasUnsubstitutedFormatSpecifiers(result) {
-        return String(localized: resource)
-    }
-    return result
+/// [T-composer-typing-lag] Labeled on purpose. Unlabeled, a string literal can
+/// convert to `LocalizedStringResource` too, and overload resolution picked
+/// THIS overload for every `AppLocalized("…")` written without `comment:` —
+/// most call sites. That bypassed the StaticString cache (the iOS 16 trace
+/// still showed AppLocalized at 18% of the main thread while merely typing)
+/// and the in-app language bundle alike. With the label, literals can only
+/// reach the StaticString (plain) or LocalizationValue (interpolated) forms.
+func AppLocalized(resource: LocalizedStringResource) -> String {
+    // A LocalizedStringResource carries its own bundle reference, so it cannot
+    // be re-pointed the way a literal key can. Resolve it as-is rather than
+    // pretending the override applies.
+    String(localized: resource)
 }

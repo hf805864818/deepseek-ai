@@ -21,7 +21,7 @@ import SwiftUI
 /// "truncated" preview on long assistant messages. It now renders the FULL
 /// message content inside a vertical ScrollView: short messages size to their
 /// content, long ones are capped to a fraction of the screen height and scroll
-/// inside the platter (Telegram/iMessage-style), so the preview is both opaque
+/// inside the platter, so the preview is both opaque
 /// and complete. An explicit measured height is required because a ScrollView
 /// has no intrinsic height — without it the context-menu platter would collapse.
 struct MessageContextMenuPreview: View {
@@ -39,8 +39,38 @@ struct MessageContextMenuPreview: View {
 
     @State private var contentSize: CGSize = .zero
 
+    /// [T-ios-ctxmenu-preview-watchdog] Hard cap on the characters handed to
+    /// the preview's `Text`.
+    ///
+    /// This platter is a lift-to-peek preview: it is capped to 55% of screen
+    /// height and scrolls, so only the first screenful is ever readable. But
+    /// the `Text` was given the WHOLE reply, and the `GeometryReader` below
+    /// forces SwiftUI to typeset all of it through CoreText — on the main
+    /// thread — just to produce `contentSize`. Cost is super-linear in length.
+    /// Measured at this exact font (16.5pt) and wrap width (360 - 2*16 = 328pt):
+    ///
+    ///      4,000 chars   0.25s
+    ///      8,000 chars   0.98s
+    ///     12,000 chars   1.63s
+    ///     20,000 chars   4.50s
+    ///     24,000 chars   6.48s     <- the reported 5591ms hang lands here
+    ///     30,000 chars  10.14s
+    ///     40,000 chars  17.96s
+    ///
+    /// which is the issue #284 foreground SIGKILL: a long reply, a main-thread
+    /// hang of 5591ms in CTLineCreateWithAttributedString ->
+    /// ResolvedStyledText.draw, watchdog kill, memory normal (not an OOM).
+    ///
+    /// Note the cost is driven by LENGTH, not by LaTeX: raw LaTeX source
+    /// measured FASTER than prose at equal length (40,000 chars of formula
+    /// source = 0.178s), because its long unspaced backslash runs produce far
+    /// fewer line-break opportunities than CJK, where nearly every character is
+    /// a break candidate. The reporter's LaTeX-heavy reply was simply a long
+    /// one. Capping the string keeps this flat at ~0.06s for any input size.
+    private static let maxPreviewChars = 2000
+
     var body: some View {
-        let shown = text.isEmpty ? " " : text
+        let shown = text.isEmpty ? " " : String(text.prefix(Self.maxPreviewChars))
         ScrollView(.vertical, showsIndicators: true) {
             // No `.frame(maxWidth: .infinity)` here — the Text must report its
             // NATURAL width so short messages yield a narrow platter. The wrap
@@ -126,8 +156,23 @@ private struct ContextMenuPreviewSurface: ViewModifier {
 /// keeps it above the material: `.glassEffect` composites the material over the
 /// view it modifies, so an overlaid label would be painted underneath it and
 /// disappear (the FAB regression).
+/// [T-multi-select-share] True while chat rows are drawn for the share picker or an
+/// export: surfaces that only the live compositor can draw (Liquid Glass) fall back
+/// to their plain fill, so an offscreen `layer.render` still shows them.
+private struct ChatSnapshotRenderingKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var chatSnapshotRendering: Bool {
+        get { self[ChatSnapshotRenderingKey.self] }
+        set { self[ChatSnapshotRenderingKey.self] = newValue }
+    }
+}
+
 private struct UserBubbleSurface: ViewModifier {
     let isQueued: Bool
+    @Environment(\.chatSnapshotRendering) private var snapshotRendering
 
     /// Matches `.contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 18))`
     /// on the row exactly — including the default (non-`.continuous`) corner
@@ -147,7 +192,7 @@ private struct UserBubbleSurface: ViewModifier {
                         .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
                         .foregroundStyle(ChatColors.secondaryText.opacity(0.5))
                 )
-        } else if #available(iOS 26.0, *) {
+        } else if #available(iOS 26.0, *), !snapshotRendering {
             content.glassEffect(.regular, in: shape)
         } else {
             content.background(shape.fill(ChatColors.userBubble))
@@ -182,7 +227,7 @@ struct ChatMessageRow: View {
     var canResume: Bool = false
     var onResume: (() -> Void)?
     var onCompact: (() -> Void)?
-    var onCopyScreenshot: (() -> Void)?
+    var onShareMessages: (() -> Void)?
     /// Read this whole reply aloud from the start (clears any in-progress TTS).
     /// Wired from AIChatView (which owns the view model). Disabled while the
     /// message is still streaming to avoid fighting the live streaming TTS.
@@ -209,6 +254,14 @@ struct ChatMessageRow: View {
     /// The tool block whose detail sheet is currently presented.
     /// Lifted out of ToolCapsuleView so ForEach item changes don't reset it.
     @State private var detailBlock: AssistantBlock?
+    /// [T-in-chat-search] Highlights and the "Search in Chat" opener; nil
+    /// outside the message list.
+    @Environment(\.chatSearchHighlights) private var searchHighlights
+
+    /// [T-in-chat-search] Key of this message's text for the search.
+    private func searchKey(_ field: ChatSearchField = .body) -> ChatSearchUnitKey {
+        ChatSearchUnitKey(messageId: message.id, blockId: nil, field: field)
+    }
 
     /// All text block contents joined, for "Copy All".
     private var fullReplyText: String {
@@ -247,10 +300,13 @@ struct ChatMessageRow: View {
                 parts.append("Image: \(path)")
             case .memoryTool(let action):
                 parts.append("Memory: \(action)\n\(block.content)")
+            case .delegateTool(let title):
+                parts.append("Agent: \(title)\n\(block.content)")
+            case .userAskTool:
+                // [T-user-ask] Copy the questions and the result, not the UI.
+                parts.append("Asked: \(UserAskCardModel.questionsSummary(block))\n\(block.content)")
             case .thinking:
                 if !block.content.isEmpty { parts.append("[Thinking]\n\(block.content)") }
-            case .visualization:
-                if !block.content.isEmpty { parts.append("[Inline visualization]\n\(block.content)") }
             case .info:
                 if !block.content.isEmpty { parts.append(block.content) }
             }
@@ -261,8 +317,14 @@ struct ChatMessageRow: View {
     var body: some View {
         switch message.role {
         case .user:
-            userRow
-                .opacity(message.isCompactedHistory ? 0.5 : 1.0)
+            if let callback = message.agentCallback {
+                AgentCallbackCellView(callback: callback, sessionId: nil)
+                    .environment(\.chatSearchMessageId, message.id)
+                    .opacity(message.isCompactedHistory ? 0.5 : 1.0)
+            } else {
+                userRow
+                    .opacity(message.isCompactedHistory ? 0.5 : 1.0)
+            }
         case .assistant:
             assistantRow
                 .opacity(message.isCompactedHistory ? 0.5 : 1.0)
@@ -288,7 +350,7 @@ struct ChatMessageRow: View {
                     Image(systemName: "arrow.down.right.and.arrow.up.left")
                         .font(.system(size: 10))
                 }
-                Text(message.content)
+                SearchHighlightText(message.content, key: searchKey())
                     .font(.system(size: 12, weight: .medium))
                 if !message.isCompactLoading && message.compactSummary != nil {
                     Button {
@@ -332,7 +394,7 @@ struct ChatMessageRow: View {
                     Image(systemName: icon)
                         .font(.system(size: 10))
                 }
-                Text(message.content)
+                SearchHighlightText(message.content, key: searchKey())
                     .font(.system(size: 12, weight: .medium))
                     .multilineTextAlignment(.center)
             }
@@ -354,16 +416,13 @@ struct ChatMessageRow: View {
 
     // MARK: User Row
 
-    /// User message text with `<user-attached-files>` metadata stripped out.
+    /// User message text without the `<user-attached-files>` metadata and
+    /// without any `<system-reminder>` note meant for the model (e.g. the
+    /// answer to a deferred user_ask) - [T-user-bubble-reminder-strip].
     private var userDisplayText: String {
-        var text = message.content
-        if let start = text.range(of: "<user-attached-files>") {
-            let end = text.range(of: "</user-attached-files>")
-            let endBound = end?.upperBound ?? text.endIndex
-            text = String(text[text.startIndex..<start.lowerBound] + text[endBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return text
+        // [T-in-chat-search] The search reads the bubble through this same
+        // function (ChatSearchDisplayText.userBubble).
+        SystemReminderStripper.userBubbleText(message.content)
     }
 
     private var userRow: some View {
@@ -373,7 +432,7 @@ struct ChatMessageRow: View {
             VStack(alignment: .trailing, spacing: 6) {
                 // User-attached files above the text bubble
                 if !message.attachments.isEmpty {
-                    UserAttachmentList(attachments: message.attachments)
+                    UserAttachmentList(attachments: message.attachments, searchMessageId: message.id)
                 } else if !message.inputAttachments.isEmpty {
                     // Queued message: show previews from cache before queue drain
                     QueuedAttachmentPreview(attachments: message.inputAttachments)
@@ -381,7 +440,7 @@ struct ChatMessageRow: View {
 
                 if !userDisplayText.isEmpty {
                     HStack(spacing: 6) {
-                        Text(userDisplayText)
+                        SearchHighlightText(userDisplayText, key: searchKey())
                             .font(.system(size: FontSettings.shared.scaledMessage(16.5)))
                             .foregroundStyle(message.isQueued ? ChatColors.secondaryText : ChatColors.primaryText)
                             .padding(.horizontal, 14)
@@ -397,7 +456,6 @@ struct ChatMessageRow: View {
                                         .font(.system(size: 22))
                                         .foregroundStyle(.red)
                                 }
-                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -418,13 +476,6 @@ struct ChatMessageRow: View {
                 } label: {
                     Label("Copy", systemImage: "doc.on.doc")
                 }
-                if let onCopyScreenshot {
-                    Button {
-                        onCopyScreenshot()
-                    } label: {
-                        Label(AppLocalized("Copy Screenshot"), systemImage: "camera.viewfinder")
-                    }
-                }
                 if let onEdit {
                     Button {
                         onEdit()
@@ -437,6 +488,25 @@ struct ChatMessageRow: View {
                         onRetry()
                     } label: {
                         Label("Retry", systemImage: "arrow.counterclockwise")
+                    }
+                }
+                // [T-multi-select-share] Copy / Edit / Retry, a divider, then Share
+                // Chat… on its own; the destructive items stay last.
+                if let onShareMessages {
+                    Divider()
+                    Button {
+                        onShareMessages()
+                    } label: {
+                        Label(AppLocalized("Share Chat…"), systemImage: "square.and.arrow.up")
+                    }
+                }
+                // [T-in-chat-search]
+                if let open = searchHighlights?.openSearch {
+                    if onShareMessages == nil { Divider() }
+                    Button {
+                        open(nil)
+                    } label: {
+                        Label(AppLocalized("Search in Chat"), systemImage: "magnifyingglass")
                     }
                 }
                 if onDeleteFrom != nil || onCompact != nil {
@@ -525,7 +595,7 @@ struct ChatMessageRow: View {
                             }
                         }
                     } : nil,
-                    onCopyScreenshot: onCopyScreenshot,
+                    onShareMessages: onShareMessages,
                     browserPool: browserPool,
                     toolSnapshots: toolSnapshots,
                     highlightedBlockId: $highlightedBlockId,
@@ -550,16 +620,29 @@ struct ChatMessageRow: View {
             }
 
             // Token usage — two-phase reveal: space expands first, then content fades in
-            if message.streamInterruptCount > 0 || showUsage {
+            // [T-retry-log-sheet] The "↻ N" interrupt badge is gone (in step
+            // with BridgedAssistantFooterV3): retries show as a marker in the
+            // typing row, only while one is under way.
+            if showUsage {
                 HStack(spacing: 6) {
-                    if message.streamInterruptCount > 0 {
-                        streamInterruptBadge(message.streamInterruptCount)
-                    }
-                    if showUsage, let usage = message.usage {
+                    if let usage = message.usage {
                         usageCapsule(usage)
                             .opacity(usageContentVisible ? 1 : 0)
                     }
                     Spacer()
+                    // [T-usage-capsule-time] Right-aligned, outside the
+                    // capsule. Kept byte-for-byte in step with the SAME row in
+                    // BridgedAssistantFooterV3 (CollectionViewMessageListV3),
+                    // which is the copy an ASSISTANT reply actually renders —
+                    // this one only ever draws user / compactDivider /
+                    // systemInfo rows. Editing one without the other is how
+                    // the clock shipped twice without ever being on screen.
+                    if showUsage, let completedAt = message.completedAt {
+                        Text(Self.completedAtFormatter.string(from: completedAt))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(ChatColors.tertiaryText)
+                            .opacity(usageContentVisible ? 1 : 0)
+                    }
                 }
             }
         }
@@ -593,9 +676,10 @@ struct ChatMessageRow: View {
                     EquatableMenuGate(key: AssistantMenuKey(
                         messageId: message.id,
                         hasReadAloud: onReadAloud != nil,
-                        hasCopyScreenshot: onCopyScreenshot != nil,
+                        hasShareMessages: onShareMessages != nil,
                         hasCompact: onCompact != nil,
-                        isActive: isActiveMessage
+                        isActive: isActiveMessage,
+                        hasSearchInChat: searchHighlights?.openSearch != nil
                     )) {
                         Button {
                             UIPasteboard.general.string = fullReplyText
@@ -605,7 +689,7 @@ struct ChatMessageRow: View {
                         Button {
                             UIPasteboard.general.string = fullReplyText
                         } label: {
-                            Label("Copy Markdown", systemImage: "text.quote")
+                            Label(AppLocalized("Copy as Markdown"), systemImage: "text.quote")
                         }
                         if let onReadAloud {
                             Button {
@@ -617,11 +701,19 @@ struct ChatMessageRow: View {
                             // live streaming TTS of the same reply.
                             .disabled(isActiveMessage)
                         }
-                        if let onCopyScreenshot {
+                        if let onShareMessages {
                             Button {
-                                onCopyScreenshot()
+                                onShareMessages()
                             } label: {
-                                Label(AppLocalized("Copy Screenshot"), systemImage: "camera.viewfinder")
+                                Label(AppLocalized("Share Chat…"), systemImage: "square.and.arrow.up")
+                            }
+                        }
+                        // [T-in-chat-search]
+                        if let open = searchHighlights?.openSearch {
+                            Button {
+                                open(nil)
+                            } label: {
+                                Label(AppLocalized("Search in Chat"), systemImage: "magnifyingglass")
                             }
                         }
                         if let onCompact {
@@ -642,11 +734,30 @@ struct ChatMessageRow: View {
                 }
         }
         .sheet(item: $detailBlock) { block in
+            // [T-agent-tool-sheet-unified] The agent block takes the same
+            // live sheet as every other tool.
             ToolLiveSheet(toolBlocks: message.blocks.filter { $0.toolStatus != nil },
                           initialIdx: message.blocks.filter({ $0.toolStatus != nil }).firstIndex(where: { $0.id == block.id }) ?? 0,
                           toolSnapshots: toolSnapshots, browserPool: browserPool)
         }
     }
+
+    /// [T-usage-capsule-time] 24-hour HH:mm for the capsule's completion clock.
+    ///
+    /// `en_US_POSIX` is not cosmetic: a bare `dateFormat = "HH:mm"` is still
+    /// resolved against the device locale, and a region on a 12-hour clock
+    /// renders it as 12-hour — so on those devices "22:30" would come out
+    /// "10:30" with no AM/PM to tell them apart. Pinning the locale is what
+    /// makes 24-hour actually mean 24-hour.
+    ///
+    /// Static because a DateFormatter is expensive to build and this runs per
+    /// message per render pass.
+    private static let completedAtFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 
     @ViewBuilder
     private func usageCapsule(_ usage: TokenUsage) -> some View {
@@ -662,21 +773,6 @@ struct ChatMessageRow: View {
         .background(ChatColors.userBubble.opacity(0.6))
         .clipShape(Capsule())
         .transition(.opacity.combined(with: .scale(scale: 0.8)))
-    }
-
-    @ViewBuilder
-    private func streamInterruptBadge(_ count: Int) -> some View {
-        HStack(spacing: 3) {
-            Image(systemName: "arrow.clockwise")
-                .font(.system(size: 9, weight: .semibold))
-            Text("\(count)")
-                .font(.system(size: 10, design: .monospaced))
-        }
-        .foregroundStyle(Color.orange.opacity(0.8))
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background(Color.orange.opacity(0.12))
-        .clipShape(Capsule())
     }
 
     private func usageSummary(_ u: TokenUsage) -> String {
@@ -695,14 +791,10 @@ struct ChatMessageRow: View {
         return parts.joined(separator: " ")
     }
 
+    /// [T-ios-context-usage-hint] Shared with the composer usage line; see
+    /// TokenCountFormatter.
     private func formatTokenCount(_ count: Int) -> String {
-        if count >= 1000 {
-            let k = Double(count) / 1000.0
-            return k.truncatingRemainder(dividingBy: 1) == 0
-                ? "\(Int(k))k"
-                : String(format: "%.1fk", k)
-        }
-        return "\(count)"
+        TokenCountFormatter.short(count)
     }
 
     @ViewBuilder
@@ -712,10 +804,28 @@ struct ChatMessageRow: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
+                // [T-error-detail-visible issue #368] Was lineLimit(2), which
+                // could not show the reason at all: a group failure composes one
+                // "⚠️ <model> (<instance>): <reason>" line per attempted entry and
+                // appends the real upstream description LAST
+                // (groupExhaustedError, AIChatViewModel+Fallback.swift). Two lines
+                // were spent on trail lines, so an upstream 400 such as
+                // "reasoning_text … must be passed back" was always clipped —
+                // measured on-simulator at 280pt and 340pt, where even a
+                // single-entry trail cut the sentence mid-phrase.
+                //
+                // 8 lines fits a 3-4 entry trail plus the description at .caption.
+                // Not tap-to-expand: these rows live in a self-sizing collection
+                // view whose layout caches heights, so growing a cell in place
+                // needs an explicit invalidateHeight round trip (see the
+                // stale-height family in CollectionViewMessageListV3). A static
+                // limit is measured correctly at first layout and cannot desync.
                 Text(error)
                     .font(.caption)
                     .foregroundStyle(.red)
-                    .lineLimit(2)
+                    .lineLimit(8)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
             .contentShape(Rectangle())
             .contextMenu {
@@ -750,7 +860,6 @@ struct ChatMessageRow: View {
                     .background(ChatColors.primaryText.opacity(0.15))
                     .clipShape(Capsule())
                 }
-                .buttonStyle(.plain)
             }
         }
         .padding(10)
@@ -786,7 +895,6 @@ struct ChatMessageRow: View {
                     .background(Color.orange)
                     .clipShape(Capsule())
                 }
-                .buttonStyle(.plain)
             }
         }
         .padding(10)

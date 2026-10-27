@@ -1,7 +1,7 @@
 # MinisApp shell configuration
 # Loaded by /etc/profile via the profile.d mechanism (login shells only).
 
-# T294: prompt parity with iOS — `root@minis:/var/minis#`. iOS bakes the
+# Prompt parity with iOS — `root@minis:/var/minis#`. iOS bakes the
 # literal "minis" into PS1 (deps/prepare_alpine_rootfs.sh) rather than
 # relying on \h, so the prompt is stable regardless of what /etc/hostname
 # happens to contain. We do the same on Android so a fresh install
@@ -27,9 +27,20 @@ export PAGER=less
 # boot.
 export BROWSER=/usr/local/bin/minis-open
 
-# T222: PRoot's link2symlink extension creates .l2s.* sentinel files alongside
+# PRoot's link2symlink extension creates .l2s.* sentinel files alongside
 # every hardlinked file. uv's default `hardlink` mode tries to re-link these
 # sentinels when populating site-packages, which PRoot rejects with EPERM.
 # Force uv to symlink package files instead — the sentinels are then never
 # touched as link sources. Reported as openminis/openminis#7.
 export UV_LINK_MODE=symlink
+
+# openminis/openminis#375: same failure family as UV_LINK_MODE above, via Git.
+# `git gc` / `repack` / `clone --local` create objects with link(), which
+# link2symlink turns into .l2s.* sentinels written INTO .git/objects/pack/.
+# openminis/openminis#409: this used to run
+# `git config --system core.createObject copy`, but `copy` is not a valid
+# value (only `link` and `rename` are), so every git command died with
+# "invalid mode for object creation". Git is now told
+# core.createObject=rename through GIT_CONFIG_COUNT / GIT_CONFIG_KEY_0 /
+# GIT_CONFIG_VALUE_0, injected by PRootKernel into every shell (login or
+# not), and RootfsManager removes the invalid line from /etc/gitconfig at boot.

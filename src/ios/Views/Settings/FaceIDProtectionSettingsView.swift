@@ -26,7 +26,7 @@ struct FaceIDProtectionSettingsView: View {
                 Toggle(isOn: $appLockEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Lock App")
-                        Text("Require \(BiometricAuth.biometryDisplayName) to open Minis.", comment: "Face ID lock description")
+                        Text("Require \(BiometricAuth.biometryDisplayName) to open Minis.")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                     }

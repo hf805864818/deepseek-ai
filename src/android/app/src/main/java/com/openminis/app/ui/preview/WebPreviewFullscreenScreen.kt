@@ -99,8 +99,6 @@ fun WebPreviewFullscreenScreen(
             onDispose { }
         } else {
             val controller = WindowInsetsControllerCompat(window, view)
-            val previousLightStatus = controller.isAppearanceLightStatusBars
-            val previousLightNav = controller.isAppearanceLightNavigationBars
             controller.isAppearanceLightStatusBars = false
             controller.isAppearanceLightNavigationBars = false
             controller.systemBarsBehavior =
@@ -108,8 +106,20 @@ fun WebPreviewFullscreenScreen(
             controller.hide(WindowInsetsCompat.Type.systemBars())
             onDispose {
                 controller.show(WindowInsetsCompat.Type.systemBars())
-                controller.isAppearanceLightStatusBars = previousLightStatus
-                controller.isAppearanceLightNavigationBars = previousLightNav
+                // [T-android-preview-statusbar-leak] Restore to what the THEME
+                // implies rather than to a value captured on entry — see the
+                // matching note in WebPreviewBottomSheet.
+                //
+                // The capture was actively harmful here: the bottom sheet sets
+                // this same activity-window flag to `!darkTheme`, and tapping
+                // "fullscreen" swaps sheet → dialog in one recomposition with
+                // no guaranteed ordering between the sheet's onDispose and this
+                // effect's enter. In light theme this could snapshot the
+                // sheet's `true`, then write it back on dismiss, leaving DARK
+                // status-bar icons over the app's dark chrome — the reported
+                // "顶部状态条变成白色，系统状态条看不清楚".
+                controller.isAppearanceLightStatusBars = !darkTheme
+                controller.isAppearanceLightNavigationBars = !darkTheme
             }
         }
     }

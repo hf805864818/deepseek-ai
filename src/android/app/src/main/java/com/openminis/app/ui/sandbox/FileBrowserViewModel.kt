@@ -103,6 +103,15 @@ data class FileItem(
     val isJsonFile: Boolean
         get() = file.extension.lowercase() == "json"
 
+    /**
+     * [T-android-apk-preview] An APK is technically a ZIP, but listing its 282
+     * internal entries answers a question nobody asked. What someone who taps
+     * an APK wants is the package it represents — and a way to install or
+     * hand it to another app. Checked BEFORE [isArchiveFile] at the call site.
+     */
+    val isApkFile: Boolean
+        get() = file.extension.lowercase() in setOf("apk", "apks", "xapk")
+
     val isArchiveFile: Boolean
         get() = file.extension.lowercase() in setOf("zip", "jar", "apk", "aar")
 
@@ -187,6 +196,11 @@ data class FileBrowserUiState(
      * (/var/minis/…), not the opaque Android host path.
      */
     val currentLinuxPath: String? = null,
+    /**
+     * [T-filebrowser-delete-symlink-target] Name of a row whose delete was
+     * refused because PRoot binds a folder there; the screen explains it.
+     */
+    val refusedMountPointName: String? = null,
 )
 
 class FileBrowserViewModel(
@@ -357,13 +371,21 @@ class FileBrowserViewModel(
     }
 
     fun deleteItem(item: FileItem) {
+        // [T-filebrowser-delete-symlink-target] A link to a folder used to be
+        // deleteRecursively()'d, which follows links and so deleted the
+        // folder's contents. A link now loses only the link, a folder never
+        // follows the links inside it, and PRoot's bind targets are refused.
+        val action = FileBrowserDeletePolicy.action(
+            linuxPath = FileBrowserDeletePolicy.rowLinuxPath(_uiState.value.currentLinuxPath, item.name),
+            isSymlink = Files.isSymbolicLink(item.file.toPath()),
+        )
+        if (action == FileBrowserDeletePolicy.Action.REFUSE_MOUNT_POINT) {
+            _uiState.value = _uiState.value.copy(refusedMountPointName = item.name)
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                if (item.isDirectory) {
-                    item.file.deleteRecursively()
-                } else {
-                    item.file.delete()
-                }
+                FileBrowserDeletePolicy.delete(item.file, action)
                 loadItems()
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(errorMessage = e.message)
@@ -372,7 +394,7 @@ class FileBrowserViewModel(
     }
 
     fun dismissError() {
-        _uiState.value = _uiState.value.copy(errorMessage = null)
+        _uiState.value = _uiState.value.copy(errorMessage = null, refusedMountPointName = null)
     }
 
     fun setSort(

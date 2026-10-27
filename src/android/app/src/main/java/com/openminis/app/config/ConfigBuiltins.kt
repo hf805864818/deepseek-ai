@@ -15,7 +15,17 @@ import com.openminis.app.config.fields.PrefsIntField
 import com.openminis.app.config.fields.PrefsLongField
 import com.openminis.app.config.fields.PrefsStringField
 import com.openminis.app.config.fields.ReadOnlyField
+import com.openminis.app.config.readable.ConfigReadable
+import com.openminis.app.config.readable.ConfigReadableRenderer
+import com.openminis.app.config.readable.ConfigReadableStrings
+import com.openminis.app.config.readable.ConfigRefKind
+import com.openminis.app.config.readable.ConfigRefResolver
+import com.openminis.app.config.readable.ConfigValueFormatter
+import com.openminis.app.config.readable.ReadableArg
+import com.openminis.app.config.readable.ReadableThinkingLabels
+import com.openminis.app.data.repository.BackgroundSettingsRepository
 import com.openminis.app.data.repository.ChatRepository
+import com.openminis.app.sandbox.ContainerDns
 import com.openminis.app.data.repository.EnvVarRepository
 import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.data.model.ThinkingLevel
@@ -40,16 +50,283 @@ internal object ConfigBuiltins {
         envVarRepo: EnvVarRepository,
         chatRepo: ChatRepository,
     ) {
+        installReadable(context, providerRepo)
         registerSelfMeta(r)
         registerSession(r, providerRepo, chatRepo)
         registerAppearance(r, context)
         registerChat(r, context)
         registerBackground(r, context)
         registerLogs(r, context)
-        registerProviderCollections(r, providerRepo, envVarRepo)
+        registerProviderCollections(r, context, providerRepo, envVarRepo)
         registerDefaults(r, providerRepo)
         registerSoul(r, context)
         registerMemory(r, context)
+        registerNetwork(r, context, envVarRepo)
+        registerAgentTools(r, context)
+        registerSpeech(r, context)
+        registerScheduled(r, context)
+        registerUpdates(r, context)
+        registerBackup(r, context)
+        registerFiles(r, context)
+    }
+
+    // -- [T-config-readable] Readable descriptions --
+
+    /**
+     * Points the renderer at the live stores (id → name) and at the in-app
+     * UI language (LocaleWrap), so the text frozen with an audit row is in
+     * the language the user reads the app in.
+     */
+    private fun installReadable(context: Context, providerRepo: ProviderRepository) {
+        val app = context.applicationContext
+        ConfigRefResolver.names = com.openminis.app.config.readable.ProviderRepositoryNames(providerRepo)
+        ConfigReadableRenderer.localizerFactory = {
+            val ctx = com.openminis.app.i18n.LocaleWrap.wrap(app)
+            val lookup: (String) -> String? = { key -> ConfigReadableStrings.lookup(ctx, key) }
+            lookup
+        }
+        ConfigReadableRenderer.currentLocale = {
+            com.openminis.app.i18n.LocaleWrap.wrap(app).resources.configuration.locales[0] ?: Locale.getDefault()
+        }
+        ConfigReadableRenderer.currentLanguage = { ConfigReadableRenderer.currentLocale().toLanguageTag() }
+    }
+
+    /** Token → label key; tokens as in [fontScaleField]. */
+    private val fontScaleLabels: Map<String, String> = mapOf(
+        "xSmall" to "Extra small", "small" to "Small", "default" to "Default",
+        "medium" to "Medium", "large" to "Large", "extraLarge" to "Extra large",
+    )
+
+    /** BCP-47 code → the language's name in the UI language; "" = system. */
+    private fun languagePhrase(v: ConfigValue): ReadableArg {
+        val code = (v as? ConfigValue.Str)?.value ?: return ConfigReadableRenderer.genericPhrase(v)
+        if (code.isEmpty()) return ReadableArg.Key("System")
+        val name = Locale.forLanguageTag(code.replace('_', '-')).getDisplayName(ConfigReadableRenderer.currentLocale())
+        return ReadableArg.Text(name.ifBlank { code })
+    }
+
+    // -- Network — the sandbox's DNS (Container Network) --
+    //
+    // [T-container-network-dns] (OpenMinis#396) Same prefs + keys as the
+    // Settings > Rootfs > Container Network section (ContainerDns), so the
+    // agent and the UI read and write one source of truth. Both writers
+    // re-apply the sandbox resolv.conf at once: waiting for the next network
+    // change or reboot would leave a "set but not in effect" gap.
+
+    private fun registerNetwork(r: ConfigRegistry, context: Context, envVarRepo: EnvVarRepository) {
+        val fields = com.openminis.app.config.fields.ContainerDnsFields.build(ContainerDns.PrefsStore(context)) {
+            runCatching { com.openminis.app.sandbox.RootfsManager.getInstance(context).refreshDns() }
+        }
+        fields.forEach { r.register(it) }
+        // [FEAT-261021-03] Settings > Network: routing, Tailscale and proxies.
+        com.openminis.app.config.fields.NetworkConfigFields.build(envVarRepo).forEach { r.register(it) }
+        r.register(com.openminis.app.config.collections.ProxiesCollection(envVarRepo))
+    }
+
+    // -- [T-minis-config-coverage] Settings added to the app that the
+    // registry did not cover yet. Each one binds to the store its Settings
+    // row writes, so the UI and minis-config read one value. --
+
+    /**
+     * `agentTools.userAsk.*` - the user_ask tool and its timeout /
+     * notification settings (Settings > Agent Tools); same paths, defaults
+     * and range as iOS. Nothing here can answer or approve for the user.
+     */
+    private fun registerAgentTools(r: ConfigRegistry, context: Context) {
+        val spec = com.openminis.app.agent.userask.UserAskSettingsSpec
+        val prefs = context.getSharedPreferences(
+            com.openminis.app.tools.AgentToolSwitch.PREFS,
+            Context.MODE_PRIVATE,
+        )
+        r.register(
+            PrefsBoolField(
+                path = "agentTools.userAsk.enabled",
+                displayName = "User interaction tool (user_ask)",
+                description = "Whether the assistant may ask you structured questions (choices, or a confirmation before a risky action) on an in-chat card. Never offered to sub agents. In a run you are not watching, the card stays open and your answer is sent as your next message. When off, the tool is removed.",
+                prefs = prefs,
+                key = spec.ENABLED_KEY,
+                defaultValue = spec.DEFAULT_ENABLED,
+            )
+        )
+        r.register(
+            PrefsIntField(
+                path = "agentTools.userAsk.timeoutMinutes",
+                displayName = "Question timeout (minutes)",
+                description = "Minutes the assistant waits for an answer. After that the question is returned to the assistant as timed out - nothing is applied, approved or cancelled on your behalf. 0 = wait indefinitely. Default ${spec.DEFAULT_TIMEOUT_MINUTES}.",
+                prefs = prefs,
+                key = spec.TIMEOUT_MINUTES_KEY,
+                defaultValue = spec.DEFAULT_TIMEOUT_MINUTES,
+                minValue = 0,
+                maxValue = spec.MAX_TIMEOUT_MINUTES,
+                zeroLabel = "Wait indefinitely",
+            )
+        )
+        r.register(
+            PrefsBoolField(
+                path = "agentTools.userAsk.notifyInBackground",
+                displayName = "Notify about questions in the background",
+                description = "Post a notification when the assistant asks while Minis is in the background. The question can be answered from the notification.",
+                prefs = prefs,
+                key = spec.NOTIFY_IN_BACKGROUND_KEY,
+                defaultValue = spec.DEFAULT_NOTIFY_IN_BACKGROUND,
+            )
+        )
+    }
+
+    /**
+     * `speech.volume` - the read-aloud volume slider. Written through
+     * VoiceOutputState so a reply being read follows the change at once, as
+     * with the slider. The other iOS `speech.*` keys have no Android
+     * counterpart with the same meaning (speed is a multiplier here, voices
+     * are engine-specific), so they are not registered.
+     */
+    private fun registerSpeech(r: ConfigRegistry, context: Context) {
+        val state = com.openminis.app.speech.VoiceOutputState
+        r.register(
+            ClosureField(
+                path = "speech.volume",
+                displayName = "Speech volume",
+                description = "Read-aloud volume, 0.0 (mute) to 2.0 (200%); 1.0 (default) is the system media volume as is. Applied to both the system voice and provider TTS; above 1.0 a limiter-backed loudness boost makes quiet voices louder.",
+                valueSchema = ConfigSchema.Double(min = 0.0, max = 2.0),
+                risk = ConfigRisk.NORMAL,
+                revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Number()),
+                reader = {
+                    state.init(context)
+                    // Two decimals: the stored float reads back as 0.3, not 0.30000001.
+                    ConfigValue.Double(Math.round(state.volume.value * 100.0) / 100.0)
+                },
+                writer = { v ->
+                    val d = when (v) {
+                        is ConfigValue.Double -> v.value
+                        is ConfigValue.Int -> v.value.toDouble()
+                        else -> throw ConfigError.TypeMismatch("double")
+                    }
+                    state.init(context)
+                    state.setVolume(d.toFloat())
+                },
+            )
+        )
+    }
+
+    /** `scheduled.showHomeBadge` - the switch in the Scheduled Tasks screen's menu. */
+    private fun registerScheduled(r: ConfigRegistry, context: Context) {
+        val store = com.openminis.app.scheduled.ScheduledTaskStore(context.applicationContext)
+        r.register(
+            ClosureField(
+                path = "scheduled.showHomeBadge",
+                displayName = "Show scheduled task count on Home",
+                description = "Whether the clock icon on the home screen shows the number of enabled scheduled tasks. Default true. It only hides the count; tasks keep running. Tasks themselves are managed with the minis-scheduled command, not here.",
+                valueSchema = ConfigSchema.Bool,
+                risk = ConfigRisk.NORMAL,
+                revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Bool()),
+                reader = { ConfigValue.Bool(store.showHomeBadge()) },
+                writer = { v ->
+                    val b = (v as? ConfigValue.Bool)?.value ?: throw ConfigError.TypeMismatch("bool")
+                    store.setShowHomeBadge(b)
+                },
+            )
+        )
+    }
+
+    /**
+     * `updates.*` - Settings > About > Check for Updates. Both writes go
+     * through UpdateStateStore, so the cached result of the old channel is
+     * dropped and the badge follows, exactly as with the picker; a channel
+     * change then starts the same check the picker starts. Nothing is
+     * downloaded or installed from here.
+     */
+    private fun registerUpdates(r: ConfigRegistry, context: Context) {
+        val app = context.applicationContext
+        val store = com.openminis.app.data.UpdateStateStore
+        val channels = com.openminis.app.data.UpdatePolicy.Channel.entries
+        r.register(
+            ClosureField(
+                path = "updates.channel",
+                displayName = "Update channel",
+                description = "Which releases the in-app updater offers: stable (tested releases, recommended) or beta (earlier builds with new features; may be less stable). Switching back to stable keeps the installed beta until a newer stable release exists. Changing it only changes what is OFFERED - installing an update is always the user's own tap.",
+                valueSchema = ConfigSchema.StrEnum(channels.map { it.id }),
+                // Sensitive: beta builds are less stable, and Settings asks before switching to them.
+                risk = ConfigRisk.SENSITIVE,
+                revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.EnumLabels(mapOf("stable" to "Stable", "beta" to "Beta"))),
+                reader = {
+                    store.init(app)
+                    ConfigValue.Str(store.channel.value.id)
+                },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    val ch = channels.firstOrNull { it.id == s }
+                        ?: throw ConfigError.InvalidValue("must be one of: ${channels.joinToString(", ") { it.id }}")
+                    store.setChannel(app, ch)
+                    runCatching { com.openminis.app.data.UpdateAutoChecker.maybeCheck(app, "channel") }
+                },
+            )
+        )
+        val autoCheck = ClosureField(
+            path = "updates.autoCheck",
+            displayName = "Check for updates automatically",
+            description = "Whether Minis looks for a new version by itself when it comes to the foreground (at most once a day on stable, every 6 hours on beta). false stops those requests and hides the update badges; Check for Updates in Settings still works.",
+            valueSchema = ConfigSchema.Bool,
+            risk = ConfigRisk.NORMAL,
+            revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.Bool()),
+            reader = {
+                store.init(app)
+                ConfigValue.Bool(store.autoEnabled.value)
+            },
+            writer = { v ->
+                val b = (v as? ConfigValue.Bool)?.value ?: throw ConfigError.TypeMismatch("bool")
+                store.setAutoEnabled(app, b)
+            },
+        )
+        // Settings hides this row on a build without automatic checks, so the
+        // path stays documented there but refuses reads and writes.
+        r.register(
+            if (com.openminis.app.BuildConfig.AUTO_UPDATE_CHECK) {
+                autoCheck
+            } else {
+                UnavailableField(autoCheck, "This build of Minis does not check for updates by itself.")
+            }
+        )
+    }
+
+    /** `files.showHidden` - the file browser's "Show Hidden Files" menu item; same path as iOS. */
+    private fun registerFiles(r: ConfigRegistry, context: Context) {
+        val vm = com.openminis.app.ui.sandbox.FileBrowserViewModel
+        r.register(
+            PrefsBoolField(
+                path = "files.showHidden",
+                displayName = "Show Hidden Files",
+                description = "Whether the in-app file browser lists dot-files and dot-folders (.git, .env, …). Default false. Only changes what the browser shows; the shell always sees them. A file browser that is already open picks it up the next time it is opened.",
+                prefs = context.getSharedPreferences(vm.PREFS_NAME, Context.MODE_PRIVATE),
+                key = vm.PREF_KEY_SHOW_HIDDEN,
+                defaultValue = false,
+            )
+        )
+    }
+
+    /** `backup.deviceName` - Settings > Backup > Device Name. */
+    private fun registerBackup(r: ConfigRegistry, context: Context) {
+        val app = context.applicationContext
+        val identity = com.openminis.app.data.DeviceIdentity
+        r.register(
+            ClosureField(
+                path = "backup.deviceName",
+                displayName = "Backup device name",
+                description = "The name that leads every backup file name and is recorded in the backup, so two devices backing up into one folder can be told apart. Empty string (default) = automatic: the device's own name. At most ${identity.CUSTOM_NAME_MAX_LENGTH} characters. Backup destinations and their credentials are not configurable here.",
+                valueSchema = ConfigSchema.Str(maxLength = identity.CUSTOM_NAME_MAX_LENGTH),
+                risk = ConfigRisk.NORMAL,
+                revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Text(empty = "Automatic")),
+                reader = { ConfigValue.Str(identity.customName(app) ?: "") },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    identity.setCustomName(app, s)
+                },
+            )
+        )
     }
 
     // -- Memory — global default toggle for the persistent memory feature --
@@ -92,6 +369,7 @@ internal object ConfigBuiltins {
                 access = ConfigAccess.READONLY,
                 risk = ConfigRisk.DESTRUCTIVE,
                 revertable = false,
+                readable = ConfigReadable.notWritable,
                 reader = { ConfigValue.Bool(MinisConfigPermissionStore.isEnabled) },
                 writer = { _ ->
                     throw ConfigError.PermissionDenied(
@@ -124,6 +402,7 @@ internal object ConfigBuiltins {
                 ),
                 risk = ConfigRisk.NORMAL,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.EnumLabels(ReadableThinkingLabels.levels)),
                 reader = {
                     val sid = ChatViewModelStore.activeSessionId
                     if (sid == null) ConfigValue.Null
@@ -131,7 +410,7 @@ internal object ConfigBuiltins {
                         val session = runBlocking { chatRepo.dao.getSession(sid) }
                         val raw = session?.thinkingOverride
                         val token = if (raw == null) "off" else thinkingLevelToToken(
-                            runCatching { ThinkingLevel.valueOf(raw) }.getOrDefault(ThinkingLevel.OFF)
+                            ThinkingLevel.parseOrNull(raw) ?: ThinkingLevel.OFF
                         )
                         ConfigValue.Str(token)
                     }
@@ -155,6 +434,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Str(maxLength = 200),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Ref(ConfigRefKind.ModelSource)),
                 reader = {
                     val sid = ChatViewModelStore.activeSessionId
                     if (sid == null) ConfigValue.Str("")
@@ -276,6 +556,7 @@ internal object ConfigBuiltins {
                 prefs = prefs,
                 key = "theme_mode",
                 cases = listOf("system", "light", "dark"),
+                valueLabels = mapOf("system" to "System", "light" to "Light", "dark" to "Dark"),
                 defaultIndex = 0,
             )
         )
@@ -302,8 +583,18 @@ internal object ConfigBuiltins {
                 key = "app_language",
                 defaultValue = "",
                 maxLength = 16,
+                readable = ConfigReadable(ConfigValueFormatter.Custom(::languagePhrase)),
             )
         )
+        // [T-minis-config-coverage] Settings > Appearance > app font size; the
+        // third font axis, same path and tokens as iOS.
+        r.register(fontScaleField(
+            path = "appearance.appFontSize",
+            displayName = "App font size",
+            description = "Base font size for the app's own UI (lists, settings, titles). The chat text has its own two settings: chat.messageFontSize and chat.inputFontSize.",
+            prefs = prefs,
+            key = com.openminis.app.ui.settings.KEY_FONT_APP_BASE,
+        ))
     }
 
     // -- Chat / input --
@@ -333,6 +624,7 @@ internal object ConfigBuiltins {
                 prefs = appearancePrefs,
                 key = com.openminis.app.ui.settings.KEY_RETURN_KEY_BEHAVIOR,
                 cases = listOf("newline", "send"),
+                valueLabels = mapOf("newline" to "New line", "send" to "Send"),
                 defaultIndex = 0,
             )
         )
@@ -366,6 +658,110 @@ internal object ConfigBuiltins {
                 prefs = appearancePrefs,
                 key = com.openminis.app.ui.settings.KEY_TOOL_PREVIEW,
                 defaultValue = true,
+            )
+        )
+        // [T-minis-config-coverage] Settings > Appearance > Expand Thinking
+        // While Streaming; also toggled by long-pressing a thinking block.
+        r.register(
+            PrefsBoolField(
+                path = "chat.autoExpandThinking",
+                displayName = "Expand Thinking While Streaming",
+                description = "true (default): a new thinking block opens while the model reasons and collapses when it finishes. false: thinking blocks stay collapsed until tapped. Long-pressing a thinking block switches it too.",
+                prefs = appearancePrefs,
+                key = com.openminis.app.ui.settings.KEY_AUTO_EXPAND_THINKING,
+                defaultValue = true,
+            )
+        )
+        // [T-minis-config-coverage] Settings > Appearance > Auto-Grouping.
+        r.register(
+            PrefsBoolField(
+                path = "chat.autoGrouping",
+                displayName = "Auto-Grouping",
+                description = "When a chat's title is first generated, also file the chat into a matching existing group. Runs once per chat, only uses groups that already exist, and leaves the chat ungrouped when none fits. Default true.",
+                prefs = appearancePrefs,
+                key = com.openminis.app.ui.settings.KEY_AUTO_GROUPING,
+                defaultValue = true,
+            )
+        )
+        // [T-minis-config-coverage] The model menu's Speed setting (Standard /
+        // Fast / Ultrafast). Through FastModePrefs, not the raw key: it keeps
+        // the request builders' cache and the legacy fast-mode flag in step.
+        // Tokens as on iOS; Android stores Standard as "off".
+        val speedNames = linkedMapOf(
+            com.openminis.app.data.SpeedTier.STANDARD to "standard",
+            com.openminis.app.data.SpeedTier.FAST to "fast",
+            com.openminis.app.data.SpeedTier.ULTRAFAST to "ultrafast",
+        )
+        r.register(
+            ClosureField(
+                path = "chat.speedTier",
+                displayName = "Speed",
+                description = "Response speed tier requested from models that offer one (ChatGPT sign-in / OpenAI and compatible providers). standard (default) = normal; fast = priority processing; ultrafast = fastest tier, only on models that support it - other models fall back to fast. Faster tiers use more of the account's quota. Applies from the next request.",
+                valueSchema = ConfigSchema.StrEnum(speedNames.values.toList()),
+                risk = ConfigRisk.NORMAL,
+                revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.EnumLabels(mapOf("standard" to "Standard", "fast" to "Fast", "ultrafast" to "Ultrafast"))),
+                reader = { ConfigValue.Str(speedNames[com.openminis.app.data.FastModePrefs.tier()] ?: "standard") },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    val tier = speedNames.entries.firstOrNull { it.value == s }?.key
+                        ?: throw ConfigError.InvalidValue("must be one of: ${speedNames.values.joinToString(", ")}")
+                    com.openminis.app.data.FastModePrefs.setTier(context.applicationContext, tier)
+                },
+            )
+        )
+        // [T-minis-config-coverage] The two optional-tool switches of Settings
+        // > Agent Tools, same paths as iOS. Bound to the store and keys
+        // AgentToolSwitch reads at every request, so a write takes effect on
+        // the next turn. user_ask's switch is agentTools.userAsk.enabled.
+        val toolPrefs = context.getSharedPreferences(
+            com.openminis.app.tools.AgentToolSwitch.PREFS,
+            Context.MODE_PRIVATE,
+        )
+        r.register(
+            PrefsBoolField(
+                path = "chat.tools.browserUse",
+                displayName = "Browser Use tool",
+                description = "Whether the assistant is offered browser_use. When off the tool is removed from the schema and the system prompt no longer mentions it — the model never learns it exists. Each tool that is on adds its schema and its prompt section to every request.",
+                prefs = toolPrefs,
+                key = com.openminis.app.tools.AgentToolSwitch.BROWSER.key,
+                defaultValue = com.openminis.app.tools.AgentToolSwitch.BROWSER.defaultValue,
+            )
+        )
+        r.register(
+            PrefsBoolField(
+                path = "chat.tools.subAgents",
+                displayName = "Sub Agents tool",
+                description = "Whether the assistant is offered subagent_task. When off that tool and the sub agent roster both leave the request. Configure the agents themselves under `subagents`.",
+                prefs = toolPrefs,
+                key = com.openminis.app.tools.AgentToolSwitch.AGENTS.key,
+                defaultValue = com.openminis.app.tools.AgentToolSwitch.AGENTS.defaultValue,
+            )
+        )
+        // [T-port-fold-tools] Settings → Appearance → Tool Calls
+        // (`chat.foldTools`, iOS userDefaults chat.foldConsecutiveTools).
+        // [PAR-261022-05] On by default on every platform.
+        r.register(
+            PrefsBoolField(
+                path = "chat.foldTools",
+                displayName = "Fold Consecutive Tool Calls",
+                description = "Show consecutive tool calls as one tappable line.",
+                prefs = appearancePrefs,
+                key = com.openminis.app.ui.settings.KEY_FOLD_TOOLS,
+                defaultValue = com.openminis.app.ui.settings.FOLD_TOOLS_DEFAULT,
+            )
+        )
+        // [T-stop-mode-longpress] Settings → Appearance → Confirm Before
+        // Stopping; same store and key the stop button's long-press writes,
+        // same path and default as iOS.
+        r.register(
+            PrefsBoolField(
+                path = "chat.confirmBeforeStopping",
+                displayName = "Confirm before stopping",
+                description = "What tapping the composer's stop button does while a task runs. false (default) = stop immediately; true = ask \"Stop this task?\" first. Long-pressing the stop button switches it too. Stopping a conversation with scheduled tasks always asks, either way.",
+                prefs = appearancePrefs,
+                key = com.openminis.app.ui.chat.StopConfirmPolicy.SETTINGS_KEY,
+                defaultValue = com.openminis.app.ui.chat.StopConfirmPolicy.DEFAULT_ENABLED,
             )
         )
         // [T-keyboard-auto-pop default flip] On by default — iOS gates
@@ -421,6 +817,7 @@ internal object ConfigBuiltins {
             valueSchema = ConfigSchema.StrEnum(cases),
             risk = ConfigRisk.NORMAL,
             revertable = true,
+            readable = ConfigReadable(ConfigValueFormatter.EnumLabels(fontScaleLabels)),
             reader = {
                 val level = prefs.getInt(key, 0)
                 val token = when (level) {
@@ -454,7 +851,7 @@ internal object ConfigBuiltins {
     // -- Background --
 
     private fun registerBackground(r: ConfigRegistry, context: Context) {
-        val prefs = context.getSharedPreferences("background_settings", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences(BackgroundSettingsRepository.PREFS_NAME, Context.MODE_PRIVATE)
         r.register(
             PrefsBoolField(
                 path = "background.enhanced",
@@ -472,8 +869,14 @@ internal object ConfigBuiltins {
                 displayName = "Background notifications",
                 description = "Post a system notification when long-running tasks complete.",
                 prefs = prefs,
-                key = "background_notifications_enabled",
-                defaultValue = true,
+                // [T-android-config-prefs-mismatch] The key Settings ->
+                // Background's "Task Notifications" switch and the notifier
+                // read. This wrote "background_notifications_enabled", which
+                // nothing reads, so `minis-config set background.notifications`
+                // reported ok and changed nothing (found verifying
+                // FIX-261021-02 on a Pixel 4a).
+                key = BackgroundSettingsRepository.KEY_TASK_NOTIFICATIONS,
+                defaultValue = BackgroundSettingsRepository.DEFAULT_TASK_NOTIFICATIONS,
             )
         )
         // [T-android-config-feature-unavailable] Live Updates / "dynamic
@@ -499,7 +902,7 @@ internal object ConfigBuiltins {
             displayName = "Live Updates (dynamic island)",
             description = "Show agent progress in the Android 16 Live Updates status chip.",
             prefs = prefs,
-            key = "dynamicIslandEnabled",
+            key = BackgroundSettingsRepository.KEY_DYNAMIC_ISLAND_ENABLED,
             defaultValue = false,
         )
         r.register(
@@ -512,6 +915,25 @@ internal object ConfigBuiltins {
                         "Live Updates permission; this device doesn't support it.",
                 )
             }
+        )
+        // [FIX-261025-03] Settings > Background > Scheduled Task Countdown:
+        // how long before a waiting scheduled task's next run its chat shows the
+        // countdown and keeps the service. Same prefs file + key the repository
+        // reads; its listener picks a write up at once.
+        r.register(
+            PrefsIntCodedEnumField(
+                path = "background.scheduledCountdown",
+                displayName = "Scheduled task countdown",
+                description = "How long before a scheduled task's next run its chat shows the countdown in the notification and keeps running in the background.",
+                prefs = prefs,
+                key = BackgroundSettingsRepository.KEY_SCHEDULED_COUNTDOWN_LEAD,
+                cases = BackgroundSettingsRepository.SCHEDULED_COUNTDOWN_CASES,
+                valueLabels = mapOf(
+                    "off" to "Off", "1m" to "1 minute before", "5m" to "5 minutes before",
+                    "15m" to "15 minutes before", "always" to "Whole wait",
+                ),
+                defaultIndex = BackgroundSettingsRepository.DEFAULT_SCHEDULED_COUNTDOWN_LEAD,
+            )
         )
     }
 
@@ -532,6 +954,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Bool,
                 risk = ConfigRisk.NORMAL,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Bool()),
                 reader = {
                     ConfigValue.Bool(com.openminis.app.logging.AppLogger.isEnabled(context))
                 },
@@ -548,10 +971,17 @@ internal object ConfigBuiltins {
 
     private fun registerProviderCollections(
         r: ConfigRegistry,
+        context: Context,
         providerRepo: ProviderRepository,
         envVarRepo: EnvVarRepository,
     ) {
-        r.register(ProvidersCollection(providerRepo, envVarRepo))
+        r.register(ProvidersCollection(providerRepo, envVarRepo, context.applicationContext))
+        // [T-minis-config-coverage] Sub agents are global, so the collection
+        // keys its children by id and needs one flat `order` field. The
+        // summary is what `get subagents` returns. Same surface as iOS.
+        r.register(com.openminis.app.config.collections.SubAgentsCollection(providerRepo))
+        r.register(com.openminis.app.config.collections.SubAgentsCollection.orderField(providerRepo))
+        r.register(com.openminis.app.config.collections.SubAgentsCollection.summaryField(providerRepo))
         r.register(ModelsCollection(providerRepo))
         r.register(GroupsCollection(providerRepo))
         r.register(EnvVarsCollection(envVarRepo))
@@ -634,7 +1064,7 @@ internal object ConfigBuiltins {
             ReadOnlyField(
                 path = "envvars",
                 displayName = "Environment variables (summary)",
-                description = "Read-only list of env var keys with note and createdAt. Values are never exposed.",
+                description = "Read-only list of env var keys with note, createdAt and enabled. Values are never exposed.",
                 valueSchema = ConfigSchema.Json,
                 reader = {
                     ConfigValue.Arr(
@@ -644,6 +1074,7 @@ internal object ConfigBuiltins {
                                     "key" to ConfigValue.Str(e.key),
                                     "note" to ConfigValue.Str(e.note),
                                     "created_at" to ConfigValue.Str(isoFormatter.format(Date(e.createdAt))),
+                                    "enabled" to ConfigValue.Bool(e.enabled),
                                 )
                             )
                         }
@@ -667,6 +1098,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Bool,
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Bool()),
                 reader = { ConfigValue.Bool(com.openminis.app.data.EnvVarPrivacyStore.isEnabled) },
                 writer = { v ->
                     val b = (v as? ConfigValue.Bool)?.value
@@ -743,6 +1175,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Str(maxLength = 200),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Ref(ConfigRefKind.Group)),
                 reader = { ConfigValue.Str(repo.defaultPrimaryGroupId ?: "") },
                 writer = { v ->
                     val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
@@ -765,6 +1198,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Str(maxLength = 200),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Ref(ConfigRefKind.Group)),
                 reader = { ConfigValue.Str(repo.defaultSubGroupId ?: "") },
                 writer = { v ->
                     val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
@@ -787,6 +1221,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Array(ConfigSchema.Str()),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.RefList(ConfigRefKind.ModelEntry, ordered = false)),
                 reader = {
                     // [T-android-agentloop-dirty-data-skip] Filter out ids that no
                     // longer match a real model entry (legacy bare-UUID / deleted
@@ -828,6 +1263,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Array(ConfigSchema.Str()),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.RefList(ConfigRefKind.Group, ordered = false)),
                 reader = {
                     // [T-android-agentloop-dirty-data-skip] Skip ids that no
                     // longer match a real group (deleted / legacy bare UUID).
@@ -869,6 +1305,77 @@ internal object ConfigBuiltins {
     // unrelated fields (incl. the on-disk `emoji` value that survives
     // for round-trip) are preserved when one field changes.
 
+    /**
+     * [T-android-soul-icon-config-images] Resolve a config-supplied image
+     * source to the stored inline data URI.
+     *
+     * Throws [ConfigError.InvalidValue] with actionable text on every failure
+     * path — this runs on behalf of a model, and "invalid value" with no
+     * detail just produces another wrong guess.
+     */
+    private fun resolveSoulIconImage(context: Context, raw: String): String {
+        val icon = com.openminis.app.agent.SoulIcon
+        val bytes: ByteArray = when (val src = icon.classifySource(raw)) {
+            is com.openminis.app.agent.SoulIcon.Source.Unsupported ->
+                throw ConfigError.InvalidValue(src.reason)
+
+            is com.openminis.app.agent.SoulIcon.Source.Bytes -> src.data
+
+            is com.openminis.app.agent.SoulIcon.Source.LinuxPath -> {
+                val root = icon.ALLOWED_LINUX_ROOTS.firstOrNull {
+                    src.path == it || src.path.startsWith("$it/")
+                } ?: throw ConfigError.InvalidValue(
+                    "path must be inside one of ${icon.ALLOWED_LINUX_ROOTS.joinToString(", ")}",
+                )
+                // resolveSessionHostPath, NOT resolveHostPath: the global
+                // bindMounts map is only populated once a shell has booted
+                // this session (and is last-writer-wins across sessions), so
+                // resolving through it fails outright when the user hasn't
+                // run a command yet — which is exactly the state a config
+                // write from the UI arrives in.
+                val sid = ChatViewModelStore.activeSessionId
+                    ?: throw ConfigError.InvalidValue(
+                        "no active session — open a chat first, or pass the image inline as a data URI",
+                    )
+                val kernel = com.openminis.app.sandbox.PRootKernel
+                val hostRoot = kernel.resolveSessionHostPath(sid, root, context)
+                    ?: throw ConfigError.InvalidValue("could not resolve $root on this device")
+                val hostFile = kernel.resolveSessionHostPath(sid, src.path, context)
+                    ?: throw ConfigError.InvalidValue("could not resolve ${src.path}")
+                // Canonicalise BOTH sides before comparing, so a symlink
+                // inside an allowed directory cannot point out of it and a
+                // `..` segment cannot walk out of the sandbox.
+                if (!icon.isContained(hostFile, hostRoot)) {
+                    throw ConfigError.InvalidValue("${src.path} resolves outside $root")
+                }
+                if (!hostFile.isFile) {
+                    throw ConfigError.InvalidValue("${src.path} does not exist")
+                }
+                runCatching { hostFile.readBytes() }.getOrElse {
+                    throw ConfigError.InvalidValue("could not read ${src.path}")
+                }
+            }
+        }
+
+        val bitmap = runCatching {
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull() ?: throw ConfigError.InvalidValue(
+            "that data isn't a decodable image (png / jpeg / webp / gif are supported; svg is not)",
+        )
+
+        // Same encoder the Settings picker uses, so crop / downscale / size
+        // rules are shared by construction rather than by copy.
+        return when (val r = icon.encode(bitmap)) {
+            is com.openminis.app.agent.SoulIcon.EncodeResult.Success -> r.dataUri
+            is com.openminis.app.agent.SoulIcon.EncodeResult.Failure -> when (r.reason) {
+                com.openminis.app.agent.SoulIcon.Rejection.TOO_LARGE ->
+                    throw ConfigError.InvalidValue("that image is too large to store inline")
+                com.openminis.app.agent.SoulIcon.Rejection.UNREADABLE ->
+                    throw ConfigError.InvalidValue("that image could not be processed")
+            }
+        }
+    }
+
     private fun registerSoul(r: ConfigRegistry, context: Context) {
         // Length cap is language-aware now (Chinese ≤ 800 chars OR
         // English ≤ 500 words); see [com.openminis.app.agent.SoulStore.isOverLimit].
@@ -898,6 +1405,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Str(maxLength = 64),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Text()),
                 reader = {
                     val meta = loadCurrent().metadata
                     ConfigValue.Str(meta.name)
@@ -914,6 +1422,93 @@ internal object ConfigBuiltins {
             )
         )
 
+        // [T-android-soul-custom-icon][T-android-soul-icon-config-images]
+        //
+        // Accepts an emoji OR an image, matching iOS `fe2f3ae8b`. An address
+        // (minis:// or a /var/minis path) is only an import source: it is
+        // resolved, re-encoded through the SAME SoulIcon.encode the Settings
+        // picker uses, and only the RESULT is stored inline — so the source
+        // file can be deleted afterwards and the icon survives attachment
+        // cleanup and syncing to another device.
+        //
+        // Reading is summarized, never dumped: a stored image reports as
+        // "<image>" so `minis-config get` cannot flood the context with
+        // base64. For the same reason the field is NOT revertable — the audit
+        // log holds "<image>" rather than the bytes, so there is nothing to
+        // restore from and offering a revert button would be a lie.
+        r.register(
+            ClosureField(
+                path = "soul.icon",
+                displayName = "Soul icon",
+                // The description IS the API doc — `minis-config topic-help
+                // soul` prints it verbatim. It leads with every word a user
+                // might use for this (icon / avatar / persona image /
+                // 角色形象 / 头像) because they are all this ONE field, and a
+                // model that doesn't match the wording will otherwise report
+                // the capability as missing.
+                description = "The Soul's identity icon — also called its avatar, its persona image, or its " +
+                    "character image (中文：角色形象 / 图标 / 头像). All of those refer to THIS one setting; " +
+                    "there is no separate avatar field. Shown beside the assistant name in the chat header " +
+                    "and on the Soul settings card.\n" +
+                    "\n" +
+                    "EMOJI\n" +
+                    "  A single emoji, e.g. \"⚡\". An empty string \"\" restores the default sparkle.\n" +
+                    "\n" +
+                    "IMAGE — any of these forms:\n" +
+                    "  • data URI: data:image/png;base64,iVBORw0KGgo...\n" +
+                    "  • bare base64 (no data: prefix) — auto-detected\n" +
+                    "  • minis:// resource, e.g. minis://attachments/icon.png\n" +
+                    "  • a path inside the minis directories, e.g. /var/minis/attachments/icon.png\n" +
+                    "  Remote http(s) URLs are NOT supported on Android — download the file first, " +
+                    "then pass its path.\n" +
+                    "\n" +
+                    "TRANSPARENCY — not required. Opaque images (a JPEG, a flattened PNG) are fine; " +
+                    "the icon renders with rounded corners, so it still reads as a normal small avatar. " +
+                    "Transparency is preserved when the source has it.\n" +
+                    "\n" +
+                    "PROCESSING — identical to picking an image in Settings → Soul: centre-cropped to a " +
+                    "square, downscaled to ${com.openminis.app.agent.SoulIcon.STORED_PIXELS}×" +
+                    "${com.openminis.app.agent.SoulIcon.STORED_PIXELS}, re-encoded as PNG and stored inline.\n" +
+                    "\n" +
+                    "READING — `get soul.icon` returns \"<image>\" for an image, never the base64.\n" +
+                    "\n" +
+                    "EXAMPLES (the value is JSON, so the string needs its own quotes)\n" +
+                    "  minis-config set soul.icon '\"⚡\"'\n" +
+                    "  minis-config set soul.icon '\"minis://attachments/icon.png\"'\n" +
+                    "  minis-config set soul.icon '\"\"'   # back to the default sparkle",
+                // No maxLength: an inline data URI is far longer than any cap
+                // that would make sense stated in characters. The real bound
+                // is SoulIcon.MAX_DATA_URI_CHARS, enforced by the encoder.
+                valueSchema = ConfigSchema.Str(),
+                risk = ConfigRisk.SENSITIVE,
+                revertable = false,
+                readable = ConfigReadable(ConfigValueFormatter.Image),
+                reader = {
+                    val raw = loadCurrent().metadata.icon
+                    ConfigValue.Str(
+                        if (com.openminis.app.agent.SoulIcon.isDataUri(raw)) "<image>" else raw,
+                    )
+                },
+                writer = { v ->
+                    val raw = (v as? ConfigValue.Str)?.value
+                        ?: throw ConfigError.TypeMismatch("string")
+                    val trimmed = raw.trim()
+                    val cur = loadCurrent()
+                    val next = when {
+                        // Empty clears back to the default sparkle.
+                        trimmed.isEmpty() -> ""
+
+                        // A single emoji stays verbatim.
+                        com.openminis.app.agent.SoulIcon.graphemeClusters(trimmed).size == 1 &&
+                            com.openminis.app.agent.SoulIcon.isEmojiGlyph(trimmed) -> trimmed
+
+                        else -> resolveSoulIconImage(context, trimmed)
+                    }
+                    saveCurrent(cur.copy(metadata = cur.metadata.copy(icon = next)))
+                },
+            )
+        )
+
         r.register(
             ClosureField(
                 path = "soul.style",
@@ -922,6 +1517,7 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.Str(maxLength = 256),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.Text(preview = 60)),
                 reader = {
                     val meta = loadCurrent().metadata
                     ConfigValue.Str(meta.style)
@@ -944,6 +1540,11 @@ internal object ConfigBuiltins {
                 valueSchema = ConfigSchema.StrEnum(listOf("auto", "zh", "en")),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                // Label = the iOS key for the same field, so both read alike.
+                readable = ConfigReadable(
+                    ConfigValueFormatter.EnumLabels(mapOf("auto" to "Automatic", "zh" to "Chinese", "en" to "English")),
+                    label = "Soul language preference",
+                ),
                 reader = {
                     val cur = loadCurrent()
                     // Older files may be missing the lang frontmatter
@@ -967,14 +1568,14 @@ internal object ConfigBuiltins {
             ClosureField(
                 path = "soul.body",
                 displayName = "Soul personality prompt",
-                description = "Personality / voice instructions injected as a block in the system prompt. Recommended length is language-aware (advisory, not enforced): Chinese ≤ ${com.openminis.app.agent.SoulStore.CHINESE_CHAR_LIMIT} chars OR English ≤ ${com.openminis.app.agent.SoulStore.ENGLISH_WORD_LIMIT} words (rule picked by the majority language). The writer still rejects prompt-injection patterns (\"ignore previous instructions\" etc.) — keep this to genuine character / tone guidance.",
+                description = "Personality / voice instructions injected as a block in the system prompt. Length cap is language-aware: Chinese ≤ ${com.openminis.app.agent.SoulStore.CHINESE_CHAR_LIMIT} chars OR English ≤ ${com.openminis.app.agent.SoulStore.ENGLISH_WORD_LIMIT} words (rule picked by the majority language). The writer also rejects prompt-injection patterns (\"ignore previous instructions\" etc.) — keep this to genuine character / tone guidance.",
                 // No schema maxLength because either character or word
-                // count is wrong for the *other* language. The injection
-                // check runs in the writer below; the length check is
-                // advisory only (logged, not rejected).
+                // count is wrong for the *other* language. Both checks
+                // (length + injection) run in the writer below.
                 valueSchema = ConfigSchema.Str(),
                 risk = ConfigRisk.SENSITIVE,
                 revertable = true,
+                readable = ConfigReadable(ConfigValueFormatter.LongText, label = "Soul personality body"),
                 reader = {
                     ConfigValue.Str(loadCurrent().body)
                 },
@@ -988,14 +1589,17 @@ internal object ConfigBuiltins {
                             "Body contains a prompt-injection pattern (\"ignore/disregard/forget … previous/prior instructions\"). SOUL.md is for personality, not instructions to the model."
                         )
                     }
-                    // The token length is a soft hint, not a hard gate: over-limit
-                    // bodies are saved and injected, with a warning logged for
-                    // diagnostics (mirrors the Settings UI's advisory-only footer).
                     val check = com.openminis.app.agent.SoulStore.isOverLimit(raw)
-                    if (check.isOverLimit) {
-                        com.openminis.app.logging.AppLogger.warning(
-                            "MinisConfig", "soul.body is over the recommended length ($check) — saving anyway."
-                        )
+                    when (check) {
+                        is com.openminis.app.agent.SoulBodyLimitCheck.Ok -> Unit
+                        is com.openminis.app.agent.SoulBodyLimitCheck.OverLimitChinese ->
+                            throw ConfigError.InvalidValue(
+                                "Over limit: ${check.chars} Chinese chars exceeds cap of ${check.cap}. Either trim to ≤ ${check.cap} chars, or rewrite mostly in English to use the ≤ ${com.openminis.app.agent.SoulStore.ENGLISH_WORD_LIMIT}-word cap."
+                            )
+                        is com.openminis.app.agent.SoulBodyLimitCheck.OverLimitEnglish ->
+                            throw ConfigError.InvalidValue(
+                                "Over limit: ${check.words} English words exceeds cap of ${check.cap}. Either trim to ≤ ${check.cap} words, or rewrite mostly in Chinese to use the ≤ ${com.openminis.app.agent.SoulStore.CHINESE_CHAR_LIMIT}-char cap."
+                            )
                     }
                     val cur = loadCurrent()
                     saveCurrent(cur.copy(body = raw))
