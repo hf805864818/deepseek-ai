@@ -1061,3 +1061,7 @@ internal fun SwipeToSendHint(
     }
 }
 // Sun May 24 10:16:43 CST 2026
+
+internal fun isModelSwitchNotice(block: AssistantBlock): Boolean =
+    block.kind == "info" && block.toolName.isEmpty() &&
+        (block.toolTitle == "Switched model" || block.content.lineSequence().any { it.startsWith("⚠️") })

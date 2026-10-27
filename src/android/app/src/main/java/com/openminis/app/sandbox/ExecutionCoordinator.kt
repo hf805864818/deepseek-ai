@@ -30,6 +30,12 @@ object ExecutionCoordinator {
 
     private const val TAG = "ExecutionCoordinator"
 
+    // [fork] EnvProfile shell integration: set by MinisApp on startup, read
+    // when building the per-session shell environment.
+    var envVarRepository: EnvVarRepository? = null
+    var envProfileRepository: com.openminis.app.data.repository.EnvProfileRepository? = null
+    var chatDao: com.openminis.app.data.db.ChatDao? = null
+
     data class CommandResult(
         val output: String,
         val exitCode: Int,

@@ -124,6 +124,11 @@ object Routes {
     const val SKILL_DETAIL = "skill/{skillId}"
     const val SKILL_FILE = "skill_file/{skillId}/{relativePath}"
     const val MINIS_SKILLS_BROWSER = "minis_skills_browser"
+    // [FEAT-261021-04] The other pages of Settings > Network.
+    const val NETWORK = "network"
+    const val NETWORK_TAILSCALE = "network_tailscale"
+    const val NETWORK_PROXIES = "network_proxies"
+    const val CONTAINER_DNS = "container_dns"
 
     fun skillDetail(skillId: String) = "skill/$skillId"
     fun skillFile(skillId: String, relativePath: String = "SKILL.md"): String {
