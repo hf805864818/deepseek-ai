@@ -224,6 +224,7 @@ object Routes {
 /** Holder for file preview navigation state (not serializable via nav args). */
 internal object FilePreviewHolder {
     var currentItem: FileItem? = null
+    var currentSessionId: String? = null
     var fileBrowserViewModel: FileBrowserViewModel? = null
 }
 
