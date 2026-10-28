@@ -790,6 +790,23 @@ actor ISHExecutionCoordinator {
 
     // MARK: - Batch Fakefs Metadata
 
+    /// Walk a host directory tree and register every file's linux path in
+    /// meta.db in one batch. Returns the number of paths registered.
+    func registerFakefsMetadataRecursively(for hostDir: URL, linuxPrefix: String) -> Int {
+        let fm = FileManager.default
+        var metaEntries: [(path: String, isDirectory: Bool)] = [(linuxPrefix, true)]
+        if let enumerator = fm.enumerator(at: hostDir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+            while let itemURL = enumerator.nextObject() as? URL {
+                let relativePath = itemURL.path.dropFirst(hostDir.path.count + 1) // strip prefix + "/"
+                let linuxFilePath = "\(linuxPrefix)/\(relativePath)"
+                let isDir = (try? itemURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                metaEntries.append((linuxFilePath, isDir))
+            }
+        }
+        batchEnsureFakefsMetadata(metaEntries)
+        return metaEntries.count
+    }
+
     /// Register multiple paths in meta.db within a single SQLite connection and transaction.
     /// Much faster than calling `ensureFakefsMetadata` per-file for large directories.
     private func batchEnsureFakefsMetadata(_ entries: [(path: String, isDirectory: Bool)]) {

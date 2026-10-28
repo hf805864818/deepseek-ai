@@ -29,6 +29,25 @@ enum SyncDirtyReason: String {
 /// the `SyncTransport` protocol.
 @MainActor
 final class SyncCore {
+    /// [T-scroll-sync-pause] Longest an inbound batch waits for the chat list
+    /// to stop moving, in total, before applying anyway.
+    static let scrollPauseBudget: TimeInterval = 20
+
+    /// Sleeps in quiet-interval steps while the chat list is being scrolled,
+    /// up to `budget` seconds; returns what is left of the budget.
+    static func waitWhileChatScrolls(budget: TimeInterval) async -> TimeInterval {
+        var left = budget
+        let step = ChatScrollActivity.quietInterval
+        while left > 0, ChatScrollActivity.isMoving {
+            try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+            left -= step
+        }
+        if left < budget {
+            logger.info("[SyncCore] inbound apply paused \(String(format: "%.1f", budget - left))s for chat scroll\(left <= 0 ? " — budget spent, applying" : "")")
+        }
+        return left
+    }
+
     static let shared = SyncCore()
     private init() {}
 
@@ -78,30 +97,16 @@ final class SyncCore {
     /// .cellular adds a 0.5× multiplier on top of the foreground throttle.
     enum NetworkClass { case wifi, cellular, other }
     private(set) var networkClass: NetworkClass = .wifi
+    /// [T-icloud-migration-keeps-going] Whether the current network path can
+    /// reach anything. The migration drain treats "offline" as a wait, not a
+    /// stall. True until the monitor reports otherwise.
+    private(set) var isNetworkSatisfied: Bool = true
     private var pathMonitor: NWPathMonitor?
-
-    // [T-ios-icloud-thermal-throttle] Thermal state awareness.
-    // When the device runs hot, we back off sync intensity to reduce CPU
-    // usage and let the device cool down. iPhone 14 Pro is known to run
-    // warm during sustained iCloud sync of large histories.
-    enum ThermalLevel: Sendable {
-        case nominal    // normal temperature — full sync speed
-        case fair       // slightly warm — mild backoff
-        case serious    // noticeably hot — significant backoff
-        case critical   // very hot — pause non-essential sync
-    }
-    private(set) var thermalLevel: ThermalLevel = .nominal
-    private var thermalObserver: NSObjectProtocol?
-
-    /// Low Power Mode. When enabled, we further throttle sync to save battery.
-    private(set) var isLowPowerMode: Bool = false
-    private var lowPowerObserver: NSObjectProtocol?
 
     /// Effective chained-send delay seconds for the current context.
     /// Base 5s when the user is staring at the sync sheet. Foreground
     /// (default) ×3. Background ×4 (overrides foreground). Cellular ×2
-    /// stacks on top. Thermal adds 1.5× / 3× / pause at fair / serious / critical.
-    /// Low Power Mode adds another 1.5× on top.
+    /// stacks on top.
     var currentSendDelay: TimeInterval {
         let base: TimeInterval = 5
         let foregroundMultiplier: TimeInterval
@@ -109,15 +114,7 @@ final class SyncCore {
         else if userOnSyncSheet { foregroundMultiplier = 1.0 }
         else { foregroundMultiplier = 3.0 }
         let networkMultiplier: TimeInterval = networkClass == .cellular ? 2.0 : 1.0
-        let thermalMultiplier: TimeInterval
-        switch thermalLevel {
-        case .nominal:  thermalMultiplier = 1.0
-        case .fair:     thermalMultiplier = 1.5
-        case .serious:  thermalMultiplier = 3.0
-        case .critical: thermalMultiplier = 10.0  // effectively pauses chained send
-        }
-        let lpmMultiplier: TimeInterval = isLowPowerMode ? 1.5 : 1.0
-        return base * foregroundMultiplier * networkMultiplier * thermalMultiplier * lpmMultiplier
+        return base * foregroundMultiplier * networkMultiplier
     }
     /// Human-readable label for the current throttle multiplier.
     var throttleLabel: String {
@@ -126,57 +123,7 @@ final class SyncCore {
         else if userOnSyncSheet { f = "1×" }
         else { f = "1/3×" }
         let n = networkClass == .cellular ? " · cellular ½" : ""
-        let t: String
-        switch thermalLevel {
-        case .nominal:  t = ""
-        case .fair:     t = " · warm ⅔"
-        case .serious:  t = " · hot ⅓"
-        case .critical: t = " · critical 1/10"
-        }
-        let l = isLowPowerMode ? " · LPM ⅔" : ""
-        return f + n + t + l
-    }
-
-    /// Returns true if background / historical sync work should be
-    /// completely paused right now (thermal critical or extreme conditions).
-    var shouldPauseBackgroundSync: Bool {
-        thermalLevel == .critical
-    }
-
-    /// Send batch size — number of dirty records to pull per sendNow()
-    /// cycle. Smaller when hot to spread work across more cycles and
-    /// keep each individual burst shorter.
-    var currentSendBatchSize: Int {
-        switch thermalLevel {
-        case .nominal:  return 100
-        case .fair:     return 60
-        case .serious:  return 30
-        case .critical: return 15
-        }
-    }
-
-    /// Snapshot of throttling-relevant state, safe to read from any
-    /// actor. Used by ChatStore (a plain actor) to decide how
-    /// aggressively to run the historical backlog scan without having
-    /// to hop to MainActor on every loop iteration.
-    struct ThrottleSnapshot: Sendable {
-        var thermalLevel: ThermalLevel
-        var isAppInBackground: Bool
-        var userOnSyncSheet: Bool
-        var isLowPowerMode: Bool
-    }
-
-    /// Async getter for throttle state — hops to MainActor to read the
-    /// values and returns a Sendable snapshot. Callable from any actor.
-    nonisolated func throttleSnapshot() async -> ThrottleSnapshot {
-        await MainActor.run {
-            ThrottleSnapshot(
-                thermalLevel: self.thermalLevel,
-                isAppInBackground: self.isAppInBackground,
-                userOnSyncSheet: self.userOnSyncSheet,
-                isLowPowerMode: self.isLowPowerMode
-            )
-        }
+        return f + n
     }
 
     /// Sliding window of (timestamp, recordCount) successful save events
@@ -239,6 +186,13 @@ final class SyncCore {
     // MARK: - State
 
     private var pendingSendTask: Task<Void, Never>?
+    /// [T-icloud-device-heartbeat] 30-min SyncDeviceV2 re-announce loop.
+    private var heartbeatTask: Task<Void, Never>?
+    /// [T-icloud-inbound-serial-apply] The most recently started inbound
+    /// apply task. Every `processInbound` call awaits this before touching a
+    /// record, so batches apply strictly in hand-off order. See
+    /// `processInbound` for why.
+    private var inboundTail: Task<Void, Never>?
     private var inboundHandlers: [(SyncInboundBatch) -> Void] = []
     private var isSending = false
 
@@ -291,6 +245,18 @@ final class SyncCore {
             }
         }
         logger.info("[SyncCore] start STEP=observersHooked")
+        // [T-icloud-device-heartbeat] Periodic re-announce while the app is
+        // running. 30 min is far above the poll/push cadence and far below
+        // "days"; the record is ~200 bytes. Cancelled on stop().
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                guard !Task.isCancelled, self != nil, !DeviceIdentity.isProvisional else { continue }
+                await ChatStore.shared.markDirty(recordType: "SyncDeviceV2", recordId: DeviceIdentity.deviceId)
+                logger.info("[SyncCore] device heartbeat re-marked SyncDeviceV2 (30 min)")
+            }
+        }
         for t in transports {
             logger.info("[SyncCore] start STEP=startTransport begin name=\(t.name)")
             do {
@@ -303,8 +269,6 @@ final class SyncCore {
         isRunning = true
         logger.info("[SyncCore] start STEP=exit isRunning=true")
         startPathMonitor()
-        startThermalMonitor()
-        startLowPowerMonitor()
         // Drain any dirty rows left over from a previous session (e.g. a
         // markDirty that happened before the last shutdown). Without this
         // kick, leftover priority=0 rows just sit forever until the user
@@ -321,8 +285,13 @@ final class SyncCore {
             // Treat anything that isn't explicitly cellular as wifi-class
             // so the throttle multiplier is sane on those platforms.
             let cls: NetworkClass = path.usesInterfaceType(.cellular) ? .cellular : .wifi
+            let satisfied = path.status == .satisfied
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                if self.isNetworkSatisfied != satisfied {
+                    self.isNetworkSatisfied = satisfied
+                    logger.info("[SyncCore] network \(satisfied ? "available" : "unavailable")")
+                }
                 if self.networkClass != cls {
                     self.networkClass = cls
                     logger.info("[SyncCore] network class changed → \(cls)")
@@ -333,98 +302,39 @@ final class SyncCore {
         pathMonitor = m
     }
 
-    // MARK: - Thermal & Low Power monitoring
-
-    private func startThermalMonitor() {
-        guard thermalObserver == nil else { return }
-        // Read initial state
-        updateThermalLevel(from: ProcessInfo.processInfo.thermalState)
-        // Observe changes
-        let center = NotificationCenter.default
-        thermalObserver = center.addObserver(
-            forName: ProcessInfo.thermalStateDidChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.updateThermalLevel(from: ProcessInfo.processInfo.thermalState)
-            }
-        }
-    }
-
-    private func stopThermalMonitor() {
-        if let observer = thermalObserver {
-            NotificationCenter.default.removeObserver(observer)
-            thermalObserver = nil
-        }
-    }
-
-    private func updateThermalLevel(from state: ProcessInfo.ThermalState) {
-        let newLevel: ThermalLevel
-        switch state {
-        case .nominal:   newLevel = .nominal
-        case .fair:      newLevel = .fair
-        case .serious:   newLevel = .serious
-        case .critical:  newLevel = .critical
-        @unknown default: newLevel = .nominal
-        }
-        if newLevel != thermalLevel {
-            thermalLevel = newLevel
-            logger.info("[SyncCore] thermal state changed → \(String(describing: newLevel)) (throttle=\(throttleLabel))")
-            // When cooling down from critical/fair, kick a send so the
-            // queue resumes draining promptly instead of waiting for the
-            // next markDirty.
-            if newLevel == .nominal || newLevel == .fair {
-                scheduleSend(delay: 2)
-            }
-        }
-    }
-
-    private func startLowPowerMonitor() {
-        guard lowPowerObserver == nil else { return }
-        // Read initial state
-        isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
-        // Observe changes
-        let center = NotificationCenter.default
-        lowPowerObserver = center.addObserver(
-            forName: NSNotification.Name.NSProcessInfoPowerStateDidChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let newVal = ProcessInfo.processInfo.isLowPowerModeEnabled
-                if newVal != self.isLowPowerMode {
-                    self.isLowPowerMode = newVal
-                    logger.info("[SyncCore] low power mode → \(newVal) (throttle=\(self.throttleLabel))")
-                    if !newVal {
-                        self.scheduleSend(delay: 2)
-                    }
-                }
-            }
-        }
-    }
-
-    private func stopLowPowerMonitor() {
-        if let observer = lowPowerObserver {
-            NotificationCenter.default.removeObserver(observer)
-            lowPowerObserver = nil
-        }
-    }
-
     func stop() async {
+        heartbeatTask?.cancel(); heartbeatTask = nil
         pendingSendTask?.cancel()
         pendingSendTask = nil
         for t in transports {
             await t.stop()
         }
-        stopThermalMonitor()
-        stopLowPowerMonitor()
-        pathMonitor?.cancel()
-        pathMonitor = nil
         isRunning = false
         logger.info("[SyncCore] stopped")
+    }
+
+    // MARK: - Zone purge bracket
+
+    /// [T-icloud-zone-delete-resurrect] Hold the engine still while the user
+    /// deletes one of the `minis-*` zones from the Zones inventory. The
+    /// transport keeps `saveZone` changes pending for all three, so a delete
+    /// that is not bracketed like this lands and is then immediately undone by
+    /// the engine re-creating the zone.
+    ///
+    /// Reuses `stop()` rather than adding a second teardown path, so the
+    /// transports' own stop semantics stay in one place.
+    func suspendForZonePurge() async {
+        guard isRunning else { return }
+        logger.info("[SyncCore] suspending for zone purge")
+        await stop()
+    }
+
+    /// Restart after a zone purge. `start()` self-guards on `isRunning`, and
+    /// re-creates any zone still genuinely in use.
+    func resumeAfterZonePurge() async {
+        guard SyncV2Bootstrap.isEnabled else { return }
+        logger.info("[SyncCore] resuming after zone purge")
+        await start()
     }
 
     // MARK: - Deferred mode
@@ -521,17 +431,8 @@ final class SyncCore {
         // up in this push cycle. Cheap when nothing pending.
         await drainSessionFileChangesIntoDirty()
 
-        // Check if any syncable UserDefaults settings changed since the
-        // last push. If so, mark the AppSettingsV2 record dirty so it's
-        // picked up in this push cycle. Avoids hooking every individual
-        // UserDefaults write path in the UI.
-        await MainActor.run { AppSettingsSync.checkAndMarkDirty() }
-
         // Snapshot dirty rows.
-        let dirty = await ChatStore.shared.loadDirtyRecords(
-            v2Only: true,
-            limit: currentSendBatchSize
-        )
+        let dirty = await ChatStore.shared.loadDirtyRecords(v2Only: true)
         guard !dirty.isEmpty else {
             // DIAG: was debug-level, but "nothing dirty when user expects
             // a write to have just happened" is the single most useful
@@ -549,16 +450,7 @@ final class SyncCore {
         var batchRecords: [PortableRecord] = []
         var batchDeletes: [SyncRecordID] = []
 
-        // [T-icloud-thermal-batch-build] Group dirty rows by recordType so
-        // we can use batch builders (single SQL query per type) instead of
-        // N separate per-record queries. This is the primary CPU optimization
-        // for iCloud sync — 100 messages × 2 queries each = 200 DB round-trips
-        // collapses to 2 batch queries. Types without a batch builder fall
-        // back to per-record buildPortable() transparently.
-        // Step 1: partition dirty rows by recordType (non-delete only).
-        var groupedIds: [String: [String]] = [:]  // recordType → [recordId]
-        var groupedRowIndices: [String: [(rowIdx: Int, recordId: String)]] = [:]
-        for (idx, row) in dirty.enumerated() {
+        for row in dirty {
             guard let metadata = registry.metadata(for: row.recordType) else {
                 continue
             }
@@ -571,35 +463,36 @@ final class SyncCore {
                 }
                 continue
             }
-            groupedIds[row.recordType, default: []].append(row.recordId)
-            groupedRowIndices[row.recordType, default: []].append((rowIdx: idx, recordId: row.recordId))
-        }
-
-        // Step 2: for each recordType, batch-build all PortableRecords in
-        // one call. Falls back to per-record build for types without a
-        // batch builder.
-        for (recordType, ids) in groupedIds {
-            let builtMap = await SyncCoreHydrators.shared.buildPortableBatch(
-                recordType: recordType, ids: ids
-            )
-            // Append in the original dirty-row order so the batch
-            // preserves parent-before-child ordering.
-            for (_, recordId) in groupedRowIndices[recordType] ?? [] {
-                if let portable = builtMap[recordId] {
-                    batchRecords.append(portable)
-                } else {
-                    // buildPortable returned nil — same logic as before:
-                    //   (a) no builder registered → KEEP dirty
-                    //   (b) builder registered but nil → local row gone, clear
-                    if !SyncCoreHydrators.shared.hasBuilder(recordType: recordType) {
-                        logger.warning("[SyncSchema] noBuilderForType: \(recordType):\(recordId.prefix(8)) — keeping dirty for future builder")
-                    } else {
-                        logger.info("[SyncCore] dropping stale dirty: \(recordType):\(recordId.prefix(8)) (no local row)")
-                        await ChatStore.shared.clearDirtyRecord(recordName: "\(recordType):\(recordId)")
-                    }
-                }
+            // Build via the type's owner — SyncCore doesn't know how to
+            // hydrate a SyncedX from local SQLite (that's per-type
+            // ChatStore work). We delegate to a hydrator registered per
+            // recordType (see `SyncCoreHydrators`).
+            if let portable = await SyncCoreHydrators.shared.buildPortable(
+                recordType: row.recordType, id: row.recordId
+            ) {
+                batchRecords.append(portable)
+            }
+            // If buildPortable returned nil there are two distinct cases:
+            //   (a) no builder is registered for this recordType — KEEP
+            //       the dirty row so a future patch with a registered
+            //       builder can pick it up. Clearing it here would lose
+            //       data silently (audit C3).
+            //   (b) builder is registered but returned nil — local row
+            //       is gone, clear the dirty so we don't loop trying to
+            //       rebuild a missing record.
+            else if !SyncCoreHydrators.shared.hasBuilder(recordType: row.recordType) {
+                logger.warning("[SyncSchema] noBuilderForType: \(row.recordType):\(row.recordId.prefix(8)) — keeping dirty for future builder")
+            } else {
+                logger.info("[SyncCore] dropping stale dirty: \(row.recordType):\(row.recordId.prefix(8)) (no local row)")
+                await ChatStore.shared.clearDirtyRecord(recordName: "\(row.recordType):\(row.recordId)")
             }
         }
+
+        // [T-sync-message-resurrection] Remember which operation each
+        // record was sent with, so an ack only clears the dirty row if it
+        // still carries that operation (a delete marked mid-flight survives).
+        var sentOps: [String: String] = [:]
+        for row in dirty { sentOps["\(row.recordType):\(row.recordId)"] = row.operation }
 
         let batch = SyncOutboundBatch(records: batchRecords, deletes: batchDeletes)
         guard !batch.records.isEmpty || !batch.deletes.isEmpty else {
@@ -657,7 +550,7 @@ final class SyncCore {
         for t in transports {
             do {
                 let outcomes = try await t.send(batch, trigger: trigger)
-                await applyOutcomes(outcomes, transport: t.name)
+                await applyOutcomes(outcomes, transport: t.name, sentOps: sentOps)
                 // Pull any throttle gate the transport learned about
                 // server-side (e.g. CloudKit returned 429 with a partial
                 // batch — we got outcomes back rather than a throw, but
@@ -706,9 +599,8 @@ final class SyncCore {
             scheduleSend(delay: delay)
         } else {
             // Even on full success, the dirty queue may still have rows
-            // we couldn't fit in this batch (loadDirtyRecords has a LIMIT
-            // — dynamic based on thermal state, ~100 at nominal — so
-            // 100k+ rows pending takes many cycles, e.g. migration).
+            // we couldn't fit in this batch (loadDirtyRecords LIMIT 395
+            // when 100k+ rows pending — the migration initial-push case).
             // Schedule another debounced send so the queue actually
             // drains. Skip when queue is empty.
             let after = await ChatStore.shared.countDirtyRecords()
@@ -716,9 +608,6 @@ final class SyncCore {
                 logger.info("[SyncCore] sendNow done, dirty.total=\(after.total) remaining — chaining another send (delay=\(currentSendDelay)s, throttle=\(throttleLabel))")
                 scheduleSend(delay: currentSendDelay)
             }
-            // [T-icloud-thermal-modtime-cache] Clear the file stat cache
-            // after each send cycle. The next cycle will re-stat as needed.
-            ChatStoreSyncHydrators.clearFileStatCache()
         }
     }
 
@@ -727,7 +616,8 @@ final class SyncCore {
     /// → clear dirty (we'd loop forever otherwise). Conflicts are
     /// handled by re-merging the server record locally; the transport
     /// is expected to also re-queue the record if it wants a retry.
-    private func applyOutcomes(_ outcomes: [SyncOutcome], transport: String) async {
+    private func applyOutcomes(_ outcomes: [SyncOutcome], transport: String,
+                               sentOps: [String: String] = [:]) async {
         var ok = 0, transient = 0, permanent = 0, conflict = 0
         for outcome in outcomes {
             switch outcome {
@@ -738,7 +628,8 @@ final class SyncCore {
                 // — avoids re-triggering reloadMessagesFromDB for every
                 // freshly-typed message.
                 recentlyPushedIds[id.description] = Date()
-                await ChatStore.shared.clearDirtyRecord(recordName: id.description)
+                await ChatStore.shared.clearDirtyRecord(recordName: id.description,
+                                                        ifOperation: sentOps[id.description])
             case .conflict(_, let serverRecord):
                 conflict += 1
                 processInbound(SyncInboundBatch(records: [serverRecord], deletes: [], sourceDeviceId: nil), from: transport, countAsReceived: false)
@@ -751,7 +642,8 @@ final class SyncCore {
             case .permanentFailure(let id, let reason):
                 permanent += 1
                 logger.error("[SyncCore] permanent failure \(id) via \(transport): \(reason)")
-                await ChatStore.shared.clearDirtyRecord(recordName: id.description)
+                await ChatStore.shared.clearDirtyRecord(recordName: id.description,
+                                                        ifOperation: sentOps[id.description])
             }
         }
         logger.info("[SyncCore] \(transport) outcomes: ok=\(ok) conflict=\(conflict) transient=\(transient) permanent=\(permanent)")
@@ -774,8 +666,59 @@ final class SyncCore {
     /// Apply a remote batch to local SQLite via per-type appliers
     /// registered through `SyncCoreHydrators`. Skips records whose
     /// recordType is not registered (per §3.6.3).
+    /// Stable sort: containers (folders, sessions) first, then their
+    /// children, then everything else in arrival order.
+    private static let applyRank: [String: Int] = [
+        "FolderV2": 0, "SessionV2": 1,
+        "MessageV2": 2, "CompactMarkerV2": 2, "SessionFileV2": 2,
+    ]
+    static func parentsFirst(_ records: [PortableRecord]) -> [PortableRecord] {
+        // Fast path: nothing to reorder when no ranked type is present or
+        // the batch is a single type.
+        guard records.count > 1,
+              records.contains(where: { applyRank[$0.id.type] != nil }) else { return records }
+        return records.enumerated().sorted { a, b in
+            let ra = applyRank[a.element.id.type] ?? 3, rb = applyRank[b.element.id.type] ?? 3
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }.map(\.element)
+    }
+
     func processInbound(_ batch: SyncInboundBatch, from transport: String, countAsReceived: Bool = true) {
-        guard !batch.records.isEmpty || !batch.deletes.isEmpty else { return }
+        // [T-icloud-inbound-serial-apply] Batches apply strictly in the order
+        // processInbound is called. Transports hand a fetch over in 50-record
+        // slices (fetchRecentV2; CKSyncEngine's fetched-changes path, which
+        // also sends its deletes as a separate trailing batch), and each call
+        // used to start an independent MainActor task. Those tasks interleave
+        // at every await (the ChatStore actor hop per record, the 50 ms yield
+        // per 25 records), so parentsFirst — which only sorts WITHIN a batch —
+        // did not hold across slices: slice 2's MessageV2 records ran while
+        // slice 1 was still writing their SessionV2 rows, hit
+        // mergeRemoteMessage's `guard sessionExists` and were dropped. Worse,
+        // the small last slice finished first and its onApplied committed the
+        // poll cursor past those dropped rows, so they were never re-fetched.
+        //
+        // Fix: each apply task awaits the previous one (`inboundTail`) before
+        // it starts. processInbound is synchronous on the main actor, so the
+        // tail swap below is atomic and the chain order is the call order.
+        // A task only ever awaits a task created before it, never itself, so
+        // the chain cannot deadlock; the apply body does not throw (every
+        // await is `try?` or non-throwing), so a slice always completes and
+        // releases the next one. Hydrators never call back into
+        // processInbound and wait on it, which is the only way a cycle could
+        // form. "Last slice applied" therefore really implies "every earlier
+        // slice applied", which is what the cursor commit relies on.
+        let previous = inboundTail
+        guard !batch.records.isEmpty || !batch.deletes.isEmpty else {
+            // An empty batch has nothing to apply, but its completion must
+            // still wait for every batch handed over before it.
+            guard let onApplied = batch.onApplied else { return }
+            guard let previous else { onApplied(); return }
+            inboundTail = Task { @MainActor in
+                await previous.value
+                onApplied()
+            }
+            return
+        }
         // Don't inflate Sync Activity counters when this batch is just the
         // server-side echo from a conflict (our own send racing another
         // device). Real remote fetches and observe-driven inbound do
@@ -785,40 +728,30 @@ final class SyncCore {
             totalReceived += batch.records.count + batch.deletes.count
         }
         let registry = SyncableTypeRegistry.shared
-        // Hydrate inbound in chunks with a yield between chunks. Without
-        // this, a 600-record fetch holds the full PortableRecord array
-        // (each carrying message content + maybe inline attachments) in
-        // main-actor scope while the merger thrashes ChatStore + UI for
-        // tens of seconds, and ARC has no chance to release intermediate
-        // Codable structs. Observed: 3+GB resident before OOM crash on
-        // a 1196-session migration.
-        //
-        // [T-ios-icloud-inbound-thermal] Chunk size and sleep are dynamic
-        // based on thermal state. When the device is hot, we use smaller
-        // chunks and longer sleeps so the main thread stays responsive
-        // for typing, scrolling, and other user interactions.
-        Task { @MainActor [weak self] in
+        // Hydrate inbound in 25-record chunks with a 50ms yield between
+        // chunks. Without this, a 600-record fetch holds the full
+        // PortableRecord array (each carrying message content + maybe
+        // inline attachments) in main-actor scope while the merger
+        // thrashes ChatStore + UI for tens of seconds, and ARC has no
+        // chance to release intermediate Codable structs. Observed:
+        // 3+GB resident before OOM crash on a 1196-session migration.
+        inboundTail = Task { @MainActor [weak self] in
+            // [T-icloud-inbound-serial-apply] Wait for every earlier batch.
+            await previous?.value
             var applied = 0, skipped = 0, blocked = 0, ownEcho = 0
-            let allRecords = batch.records
+            // [T-icloud-sync-tier1-parents-first] Apply parents before
+            // children. A batch arrives in server order, and a session's
+            // MessageV2 records routinely precede its SessionV2 in the same
+            // fetch. mergeRemoteMessage refuses a message whose session row
+            // does not exist yet (`guard sessionExists`), so those messages
+            // were dropped and only re-pulled on the next 120 s poll —
+            // measured on 2026-09-19: the peer showed an empty session for
+            // 73 s. Ordering by type inside the batch is one sort and makes
+            // the guard a true no-op for the in-order case. Types not listed
+            // keep their relative order after the listed ones.
+            let allRecords = Self.parentsFirst(batch.records)
             let allDeletes = batch.deletes
-            // Dynamic chunk sizing based on thermal state
-            let thermal = self?.thermalLevel ?? .nominal
-            let chunkSize: Int
-            let chunkSleepNs: UInt64
-            switch thermal {
-            case .nominal:
-                chunkSize = 25
-                chunkSleepNs = 50_000_000       // 50ms
-            case .fair:
-                chunkSize = 15
-                chunkSleepNs = 100_000_000      // 100ms
-            case .serious:
-                chunkSize = 8
-                chunkSleepNs = 200_000_000      // 200ms
-            case .critical:
-                chunkSize = 5
-                chunkSleepNs = 500_000_000      // 500ms
-            }
+            let chunkSize = 25
             var i = 0
             // Prune stale echo-suppress entries once per batch so the map
             // doesn't grow unbounded over an idle session.
@@ -827,7 +760,16 @@ final class SyncCore {
                 let ttl = strongSelf.echoTTL
                 strongSelf.recentlyPushedIds = strongSelf.recentlyPushedIds.filter { now.timeIntervalSince($0.value) < ttl }
             }
+            // [T-scroll-sync-pause] Each chunk is applied on the main thread
+            // (~20-60 ms for 25 records); one landing mid-fling dropped 4
+            // frames on device (60 ms, 2026-10-03). Hold the batch while the
+            // chat list is being dragged or decelerating and resume once it
+            // has been still for ChatScrollActivity.quietInterval. Order,
+            // thread and cursor-after-apply are unchanged; the batch only
+            // starts later. Capped so a very long scroll cannot starve sync.
+            var scrollWaitBudget = Self.scrollPauseBudget
             while i < allRecords.count {
+                scrollWaitBudget = await Self.waitWhileChatScrolls(budget: scrollWaitBudget)
                 let end = min(i + chunkSize, allRecords.count)
                 for j in i..<end {
                     let record = allRecords[j]
@@ -875,8 +817,10 @@ final class SyncCore {
                 // diff for whatever the user is doing in the foreground,
                 // and so ARC has a chance to release the chunk's Codable
                 // intermediaries before the next chunk allocates more.
-                // Sleep duration is thermal-aware — longer when hot.
-                try? await Task.sleep(nanoseconds: chunkSleepNs)
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if !allDeletes.isEmpty {
+                scrollWaitBudget = await Self.waitWhileChatScrolls(budget: scrollWaitBudget)
             }
             for deleteId in allDeletes {
                 guard registry.metadata(for: deleteId.type) != nil else {
@@ -909,6 +853,11 @@ final class SyncCore {
             if applied > 0 {
                 NotificationCenter.default.post(name: .cloudSyncDidFetchChanges, object: nil)
             }
+            // [T-icloud-sync-tier1-cursor-after-apply] Every record above is
+            // now written (or deliberately skipped). Tell the transport so it
+            // can commit its cursor. Runs after the notification on purpose:
+            // the cursor is bookkeeping, the data is what matters.
+            batch.onApplied?()
             _ = self
         }
     }

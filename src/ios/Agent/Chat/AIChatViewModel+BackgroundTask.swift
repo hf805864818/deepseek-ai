@@ -92,6 +92,18 @@ extension AIChatViewModel {
         startBackgroundStatusTimer()
     }
 
+    /// Index of the current turn's first message (the row after the last
+    /// user-sent message that isn't a bare tool result), or 0.
+    static func currentTurnStartIndex(in history: [AgentMessage]) -> Int {
+        guard let userIdx = history.lastIndex(where: { msg in
+            msg.role == .user && msg.parts.contains { part in
+                if case .toolResult = part { return false }
+                return true
+            }
+        }) else { return 0 }
+        return userIdx + 1
+    }
+
     /// The current turn's last assistant message, or nil. Rows before the last
     /// user-sent message belong to earlier turns and never count.
     func currentTurnAssistantMessage() -> ChatMessage? {
@@ -277,7 +289,7 @@ extension AIChatViewModel {
                 }
                 if !suppressGenericNotification {
                     BackgroundKeepAliveManager.shared.postBackgroundTaskNotification(
-                        sessionTitle: sessionTitle, responseSummary: responseSummary, sessionId: sid, isError: hasError, wasBackground: wasBackground
+                        sessionTitle: sessionTitle, responseSummary: responseSummary, sessionId: sid, outcome: hasError ? .failed : .completed, wasBackground: wasBackground
                     )
                 }
                 await MainActor.run {

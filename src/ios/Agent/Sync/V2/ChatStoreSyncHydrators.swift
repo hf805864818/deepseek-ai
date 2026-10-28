@@ -32,17 +32,6 @@ enum ChatStoreSyncHydrators {
             merger: { record in await mergeMessage(record: record) },
             deletionApplier: { id in await deleteMessage(id: id) }
         )
-        // [T-icloud-thermal-batch-build] Register a batch builder for
-        // MessageV2 — the most numerous record type in iCloud sync. Each
-        // historical session can have hundreds of messages, so a 100-row
-        // dirty batch typically contains 80-95 messages. The old path did
-        // 2 SQL queries per message (loadSingleMessage + messageUpdatedAt);
-        // the batch path does 1 query total. This is the single biggest
-        // CPU reduction in the iCloud thermal optimization.
-        h.registerBatchBuilder(recordType: "MessageV2") { ids in
-            await buildMessagesBatch(ids: ids)
-        }
-
         h.register(
             recordType: "CompactMarkerV2",
             builder: { id in await buildCompactMarker(id: id) },
@@ -71,19 +60,7 @@ enum ChatStoreSyncHydrators {
             builder: { _ in await buildProviderConfig() },
             merger: { record in await mergeProviderConfig(record: record) }
         )
-        // [T-mcp-per-server-sync] Legacy whole-file servers.json record.
-        // New devices NEVER emit it (builder returns nil — leftover upsert
-        // dirty rows drain as no-ops; the one-time op=delete row still
-        // pushes). The merger is kept so a peer on an old build can seed
-        // our list — applied per-server (union) instead of a file
-        // overwrite, so a stale whole-file snapshot can't clobber
-        // per-item state. MCPStore.scheduleLegacyRecordCleanupIfNeeded
-        // removes the cloud record once items have been pushed.
-        h.register(
-            recordType: "MCPServersV2",
-            builder: { _ -> PortableRecord? in nil },
-            merger: { record in await mergeMCPServers(record: record) }
-        )
+
         h.register(
             recordType: "MCPServerItem",
             builder: { id in await buildMCPServerItem(id: id) },
@@ -119,6 +96,12 @@ enum ChatStoreSyncHydrators {
             merger: { record in await mergeProviderThinkingRuleV3(record: record) },
             deletionApplier: { id in await deleteProviderThinkingRuleV3(id: id) }
         )
+        h.register(
+            recordType: "SubAgentV3",
+            builder: { id in await buildSubAgentV3(id: id) },
+            merger: { record in await mergeSubAgentV3(record: record) },
+            deletionApplier: { id in await deleteSubAgentV3(id: id) }
+        )
         // Legacy whole-file env-vars record. New devices NEVER emit it
         // (builder returns nil — caller treats nil as "this builder
         // chose not to push" and drops the dirty row). The merger is
@@ -137,17 +120,12 @@ enum ChatStoreSyncHydrators {
             merger: { record in await mergeEnvVarItem(record: record) },
             deletionApplier: { id in await applyEnvVarItemDeletion(id: id) }
         )
+        // [T-envvar-disable] Enabled / disabled state, its own record type.
         h.register(
-            recordType: "EnvProfile",
-            builder: { id in await buildEnvProfile(id: id) },
-            merger: { record in await mergeEnvProfile(record: record) },
-            deletionApplier: { id in await applyEnvProfileDeletion(id: id) }
-        )
-        h.register(
-            recordType: "EnvProfileVar",
-            builder: { id in await buildEnvProfileVar(id: id) },
-            merger: { record in await mergeEnvProfileVar(record: record) },
-            deletionApplier: { id in await applyEnvProfileVarDeletion(id: id) }
+            recordType: "EnvVarStateItem",
+            builder: { id in await buildEnvVarState(id: id) },
+            merger: { record in await mergeEnvVarState(record: record) },
+            deletionApplier: { id in await applyEnvVarStateDeletion(id: id) }
         )
         h.register(
             recordType: "SyncDeviceV2",
@@ -176,11 +154,6 @@ enum ChatStoreSyncHydrators {
             recordType: "MemoryDailyV2",
             builder: { id in await buildMemoryDaily(dateKey: id) },
             merger: { record in await mergeMemoryDaily(record: record) }
-        )
-        h.register(
-            recordType: "AppSettingsV2",
-            builder: { _ in await buildAppSettings() },
-            merger: { record in await mergeAppSettings(record: record) }
         )
 
         logger.info("[SyncCore] ChatStoreSyncHydrators registered: \(SyncCoreHydrators.shared.registeredRecordTypes.count) types")
@@ -215,15 +188,17 @@ enum ChatStoreSyncHydrators {
         // doesn't know the field exists — only the former may clear local.
         let folderFieldPresent = record.fields["folderId"] != nil
         let folderId = optionalStringField(record, "folderId")
-        let envProfileFieldPresent = record.fields["envProfileId"] != nil
-        let envProfileId = optionalStringField(record, "envProfileId")
+        // [T-p1-delegate-task] Same presence idiom for the child linkage.
+        let parentFieldPresent = record.fields["parentSessionId"] != nil
+        let parentSessionId = optionalStringField(record, "parentSessionId")
+        let parentToolUseId = optionalStringField(record, "parentToolUseId")
 
         var session = ChatSession(
             id: id, title: title, category: category, modelId: modelId,
             createdAt: createdAt, updatedAt: updatedAt
         )
         session.pinnedAt = pinnedAt
-        session.envProfileId = envProfileId
+        session.envProfileId = optionalStringField(record, "envProfileId")
         // v2 doesn't currently track per-device origin in PortableRecord;
         // pass an empty string as a sentinel ("unknown remote device").
         await ChatStore.shared.mergeRemoteSession(
@@ -233,8 +208,9 @@ enum ChatStoreSyncHydrators {
             remotePinnedAtRaw: pinnedAt,
             remoteFolderId: folderId,
             remoteHasFolderField: folderFieldPresent,
-            remoteEnvProfileId: envProfileId,
-            remoteHasEnvProfileField: envProfileFieldPresent
+            remoteParentSessionId: parentSessionId,
+            remoteParentToolUseId: parentToolUseId,
+            remoteHasParentField: parentFieldPresent
         )
     }
 
@@ -299,27 +275,6 @@ enum ChatStoreSyncHydrators {
             .buildPortable(synced)
     }
 
-    /// [T-icloud-thermal-batch-build] Batch-build MessageV2 PortableRecords
-    /// using a single SQL query. Loads all messages + their updatedAt values
-    /// in one pass, then constructs SyncedMessage → PortableRecord for each.
-    /// Equivalent to calling buildMessage(id:) N times but with 1 DB query
-    /// instead of 2N. Messages not found in SQLite are simply omitted from
-    /// the result (same semantics as buildMessage returning nil).
-    private static func buildMessagesBatch(ids: [String]) async -> [String: PortableRecord] {
-        guard !ids.isEmpty else { return [:] }
-        let loaded = await ChatStore.shared.loadMessagesBatch(ids: ids)
-        let metadata = SyncableTypeRegistry.shared.metadata(for: "MessageV2")
-        guard let metadata else { return [:] }
-        var result: [String: PortableRecord] = [:]
-        for (msgId, (msg, updatedAt)) in loaded {
-            let synced = SyncedMessage.from(msg, updatedAt: updatedAt)
-            if let portable = metadata.buildPortable(synced) {
-                result[msgId] = portable
-            }
-        }
-        return result
-    }
-
     private static func mergeMessage(record: PortableRecord) async {
         guard let id = stringField(record, "messageId"),
               let sessionId = stringField(record, "sessionId"),
@@ -332,13 +287,20 @@ enum ChatStoreSyncHydrators {
         let sortOrder = intField(record, "sortOrder") ?? 0
         let updatedAt = dateField(record, "updatedAt") ?? record.updatedAt
 
+        // [T-token-attribution-snapshot] Absent from a sender on an older
+        // build; nil flows through to the COALESCE guards in
+        // mergeRemoteMessage, which keep whatever this device already has.
         await ChatStore.shared.mergeRemoteMessage(
             id: id, sessionId: sessionId, role: role,
             partsJson: partsJson, createdAt: createdAt,
             tokenUsageJson: tokenUsageJson, sortOrder: sortOrder,
             reasoningContent: reasoningContent,
             streamInterruptCount: streamInterruptCount,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            modelId: optionalStringField(record, "modelId"),
+            modelDisplayName: optionalStringField(record, "modelDisplayName"),
+            providerType: optionalStringField(record, "providerType"),
+            providerInstanceId: optionalStringField(record, "providerInstanceId")
         )
     }
 
@@ -429,51 +391,6 @@ enum ChatStoreSyncHydrators {
 
     // MARK: - SessionFile
 
-    /// [T-icloud-thermal-modtime-cache] TTL-cached file stat results to avoid
-    /// repeated `FileManager.attributesOfItem` calls during sync. Each stat
-    /// is a kernel-level filesystem operation that wakes the flash controller
-    /// and prevents the device from entering low-power states. In a sync
-    /// cycle, the same files may be stat'd multiple times (retry, conflict
-    /// resolution, batch rebuild). This cache serves the result from memory
-    /// after the first stat, with a 30-second TTL.
-    /// Keyed by file path. Invalidated on local file writes (see invalidateFileStatCache).
-    private static var fileStatCache: [String: (size: Int, modDate: Date)] = [:]
-    private static var fileStatCacheTimestamp: CFAbsoluteTime = 0
-    private static let fileStatCacheTTL: CFAbsoluteTime = 30  // seconds
-
-    /// Invalidate a single entry (call after writing/modifying a file locally).
-    static func invalidateFileStatCache(path: String) {
-        fileStatCache.removeValue(forKey: path)
-    }
-
-    /// Clear the entire cache (call after a sync cycle completes).
-    static func clearFileStatCache() {
-        fileStatCache.removeAll()
-        fileStatCacheTimestamp = CFAbsoluteTimeGetCurrent()
-    }
-
-    /// Cached file stat: returns (size, modDate) for a path, hitting the
-    /// cache when possible. Returns nil if the file doesn't exist.
-    private static func cachedFileStat(path: String) -> (size: Int, modDate: Date)? {
-        let now = CFAbsoluteTimeGetCurrent()
-        // TTL expired → clear and start fresh
-        if now - fileStatCacheTimestamp > fileStatCacheTTL {
-            fileStatCache.removeAll()
-            fileStatCacheTimestamp = now
-        }
-        if let cached = fileStatCache[path] {
-            return cached
-        }
-        guard FileManager.default.fileExists(atPath: path) else {
-            return nil
-        }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-        let size = (attrs?[.size] as? Int) ?? 0
-        let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
-        fileStatCache[path] = (size: size, modDate: modDate)
-        return (size: size, modDate: modDate)
-    }
-
     /// SessionFile recordId is "sessionId:relativePath" (compositeKey).
     private static func buildSessionFile(id: String) async -> PortableRecord? {
         let parts = id.split(separator: ":", maxSplits: 1)
@@ -482,14 +399,10 @@ enum ChatStoreSyncHydrators {
         let relativePath = String(parts[1])
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
         let fileURL = library.appendingPathComponent("MinisChat/minis/\(sessionId)/\(relativePath)")
-        // [T-icloud-thermal-modtime-cache] Use cached stat instead of
-        // calling FileManager.attributesOfItem on every buildSessionFile
-        // invocation. During a sync cycle the same file may be built
-        // multiple times (retry, conflict resolution); the cache avoids
-        // repeated kernel-level stat calls that prevent low-power state.
-        guard let stat = cachedFileStat(path: fileURL.path) else { return nil }
-        let fileSize = stat.size
-        let modDate = stat.modDate
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (attrs?[.size] as? Int) ?? 0
+        let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
         // Skip oversized files (single source of truth: UploadPolicy.maxFileSizeBytes).
         let maxSize = UploadPolicy.maxFileSizeBytes
         if fileSize > maxSize {
@@ -565,10 +478,6 @@ enum ChatStoreSyncHydrators {
             try fm.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if fm.fileExists(atPath: destURL.path) { try? fm.removeItem(at: destURL) }
             try fm.copyItem(at: asset.fileURL, to: destURL)
-            // [T-icloud-thermal-modtime-cache] Invalidate the stat cache
-            // for this file — we just wrote it, so the cached size/mtime
-            // is now stale.
-            invalidateFileStatCache(path: destURL.path)
             // [T-ios-log-noise-reduction] INFO→DEBUG: per-file apply trace,
             // high-volume during batch sync; not actionable in production.
             logger.debug("[SyncCore] applied SessionFileV2: \(sessionId.prefix(8))/\(relativePath) size=\(asset.size)")
@@ -580,32 +489,31 @@ enum ChatStoreSyncHydrators {
     // MARK: - Skill
 
     private static func buildSkill(id: String) async -> PortableRecord? {
+        // [T-skill-zip-off-main] The main actor hands over only what lives
+        // there: the skill's row and where its files are. Reading SKILL.md
+        // and packing the ZIP used to happen inside this closure too, which
+        // froze the UI for seconds whenever a batch carried a large skill.
         let snapshot = await MainActor.run { () -> SkillSnapshot? in
             guard let s = SkillStore.shared.skills.first(where: { $0.id == id }) else { return nil }
-            let zipData = SkillStore.shared.buildSkillZipData(id)
-            let body = SkillStore.shared.readSkillContent(id) ?? ""
             return SkillSnapshot(
                 id: s.id, name: s.name, description: s.description,
                 version: s.version, importSource: s.importSource.dbValue,
                 isEnabled: s.isEnabled, installedAt: s.installedAt,
-                updatedAt: s.updatedAt, bodyText: body, zipData: zipData
+                updatedAt: s.updatedAt,
+                skillDir: SkillStore.shared.skillDirectoryURL(for: s.id)
             )
         }
         guard let snap = snapshot else { return nil }
-        // Persist zip to a temp URL so we can reference it as a PortableAsset.
-        var bundleAssetURL: URL? = nil
-        if let zip = snap.zipData {
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("skill-v2-\(id).zip")
-            try? zip.write(to: url)
-            bundleAssetURL = url
-        }
+        let bodyText = SkillStore.readSkillContent(in: snap.skillDir) ?? ""
+        // The ZIP as a file we can reference as a PortableAsset: built off
+        // the main thread, and reused while the skill's files are unchanged.
+        let bundleAssetURL = await SkillStore.skillZipFile(skillId: id, skillDir: snap.skillDir)
         let synced = SyncedSkill(
             id: snap.id, name: snap.name, description: snap.description,
             version: snap.version, importSource: snap.importSource,
             isEnabled: snap.isEnabled ? 1 : 0,
             installedAt: snap.installedAt, updatedAt: snap.updatedAt,
-            bodyText: snap.bodyText, bundleZipURL: bundleAssetURL
+            bodyText: bodyText, bundleZipURL: bundleAssetURL
         )
         var portable = SyncableTypeRegistry.shared.metadata(for: "SkillV2")?.buildPortable(synced)
         if var p = portable, let zipURL = bundleAssetURL,
@@ -759,35 +667,6 @@ enum ChatStoreSyncHydrators {
     }
 
     // MARK: - MCPServers (legacy whole-file, inbound-only)
-
-    /// [T-mcp-per-server-sync] Apply an inbound legacy whole-file snapshot
-    /// from a peer still on the pre-per-item build. Decomposed into
-    /// per-server applies (union + per-entry LWW) instead of the old
-    /// whole-file overwrite, so a stale snapshot cannot clobber servers
-    /// added locally or received as MCPServerItem records. Deletes are not
-    /// expressible through this legacy path (acceptable: old-build peers
-    /// couldn't sync at all — their whitelist never included the type).
-    private static func mergeMCPServers(record: PortableRecord) async {
-        guard let json = stringField(record, "serversJson"),
-              let data = json.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rawServers = root["mcpServers"] as? [String: Any] else { return }
-        let remoteUpdatedAt = dateField(record, "updatedAt") ?? record.updatedAt
-        for (name, rawEntry) in rawServers {
-            guard let obj = rawEntry as? [String: Any],
-                  let entryData = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
-                  let entryJson = String(data: entryData, encoding: .utf8) else { continue }
-            let entryUpdated = (obj["updatedAt"] as? Double).map { Date(timeIntervalSince1970: $0) } ?? remoteUpdatedAt
-            let entryCreated = (obj["createdAt"] as? Double).map { Date(timeIntervalSince1970: $0) } ?? remoteUpdatedAt
-            await MainActor.run {
-                MCPStore.shared.applyRemoteServerItem(
-                    name: name, entryJson: entryJson,
-                    remoteCreatedAt: entryCreated, remoteUpdatedAt: entryUpdated
-                )
-            }
-        }
-        logger.info("[SyncCore] applied legacy MCPServersV2 as \(rawServers.count) per-server merges")
-    }
 
     // MARK: - MCPServerItem (per-server)
 
@@ -985,144 +864,43 @@ enum ChatStoreSyncHydrators {
         logger.info("[SyncCore] applied EnvVarItem deletion id=\(id.prefix(8))")
     }
 
-    // MARK: - EnvProfile
+    // MARK: - EnvVarStateItem [T-envvar-disable]
 
-    /// Build a per-profile record. The `id` is the EnvProfile UUID,
-    /// also used as the CK recordName.
-    private static func buildEnvProfile(id: String) async -> PortableRecord? {
-        let profile = await MainActor.run { EnvProfileStore.shared.profile(id: id) }
-        guard let profile else {
-            // Local profile gone — drop the stale upsert dirty row.
-            // The op=delete path is separate (deletionApplier on the
-            // receiver side, op=delete on the dirty row on the sender side).
+    private static func buildEnvVarState(id: String) async -> PortableRecord? {
+        guard let rec = await MainActor.run(body: { EnvVarStore.shared.stateRecord(id: id) }) else {
             return nil
         }
-        let synced = SyncedEnvProfile.from(profile)
-        return SyncableTypeRegistry.shared.metadata(for: "EnvProfile")?.buildPortable(synced)
+        let synced = SyncedEnvVarState(id: id, key: rec.key, enabled: rec.enabled ? 1 : 0,
+                                       updatedAt: rec.updatedAt)
+        return SyncableTypeRegistry.shared.metadata(for: "EnvVarStateItem")?.buildPortable(synced)
     }
 
-    /// Apply an inbound EnvProfile record. Adds-or-replaces the profile
-    /// via EnvProfileStore.applyRemoteProfile. LWW resolution by updatedAt
-    /// ordering from the cloud stream.
-    private static func mergeEnvProfile(record: PortableRecord) async {
-        guard let id = stringField(record, "profileId") else {
-            logger.warning("[SyncCore] mergeEnvProfile: missing profileId field")
+    /// LWW on the state's own clock (EnvVarStateBook.applyRemote): a record
+    /// missing `enabled` or its clock changes nothing, an older or equal one
+    /// is ignored. The variable may not have arrived yet; the state is kept
+    /// for its id.
+    private static func mergeEnvVarState(record: PortableRecord) async {
+        guard let id = stringField(record, "entryId") else {
+            logger.warning("[SyncCore] mergeEnvVarState: missing entryId field")
             return
         }
-        guard let name = stringField(record, "name") else {
-            logger.warning("[SyncCore] mergeEnvProfile: missing name for id=\(id.prefix(8))")
+        let key = stringField(record, "key") ?? ""
+        let enabled = intField(record, "enabled").map { $0 != 0 }
+        let updatedAt = dateField(record, "updatedAt")
+        // A variable deleted here moments ago must not get a state back.
+        if await ChatStore.shared.isRecentlyDeletedRecord(type: "EnvVarItem", id: id,
+                                                          remoteUpdatedAt: updatedAt ?? record.updatedAt) {
+            logger.info("[SyncCore] mergeEnvVarState SKIP (variable recently deleted locally): id=\(id.prefix(8))")
             return
         }
-        let icon = stringField(record, "icon")
-        let color = stringField(record, "color")
-        let isDefault = intField(record, "isDefault") ?? 0
-        let createdAt = dateField(record, "createdAt") ?? Date()
-        let updatedAt = dateField(record, "updatedAt") ?? record.updatedAt
-        // Recently-deleted guard: same pattern as mergeEnvVarItem —
-        // applyRemoteProfile unconditionally re-inserts an unknown id,
-        // so a just-deleted profile re-fetched before the cloud delete
-        // lands would resurrect without this check.
-        if await ChatStore.shared.isRecentlyDeletedRecord(type: "EnvProfile", id: id, remoteUpdatedAt: updatedAt) {
-            logger.info("[SyncCore] mergeEnvProfile SKIP (recently deleted locally): id=\(id.prefix(8))")
-            return
+        let applied = await MainActor.run {
+            EnvVarStore.shared.applyRemoteState(id: id, key: key, enabled: enabled, updatedAt: updatedAt)
         }
-        // In-flight local edit guard: while this id has a pending local
-        // upsert, skip the inbound apply; the post-push fetch reconciles
-        // normally. Same rationale as mergeEnvVarItem.
-        let pendingDirty = await ChatStore.shared.loadDirtyRecords()
-        if pendingDirty.contains(where: { $0.recordType == "EnvProfile" && $0.recordId == id && $0.operation != "delete" }) {
-            logger.info("[SyncCore] mergeEnvProfile SKIP (local upsert pending): id=\(id.prefix(8))")
-            return
-        }
-        await MainActor.run {
-            EnvProfileStore.shared.applyRemoteProfile(
-                id: id, name: name, icon: icon, color: color,
-                isDefault: isDefault != 0, createdAt: createdAt, updatedAt: updatedAt
-            )
-        }
-        logger.info("[SyncCore] applied EnvProfile id=\(id.prefix(8)) name=\(name)")
+        logger.info("[SyncCore] EnvVarStateItem id=\(id.prefix(8)) key=\(key) applied=\(applied)")
     }
 
-    /// Apply an inbound op=delete tombstone for an EnvProfile.
-    /// Removes the profile and all its vars by id.
-    private static func applyEnvProfileDeletion(id: String) async {
-        await MainActor.run {
-            EnvProfileStore.shared.applyRemoteProfileDeletion(id: id)
-        }
-        logger.info("[SyncCore] applied EnvProfile deletion id=\(id.prefix(8))")
-    }
-
-    // MARK: - EnvProfileVar (per-profile-variable)
-
-    /// Build a per-profile-variable record. The `id` is the EnvProfileVar
-    /// UUID, also used as the CK recordName. Values are pulled from
-    /// Keychain at build time and base64-encoded into the record so a
-    /// peer that hasn't yet received the matching iCloud Keychain sync
-    /// entry still gets the value.
-    private static func buildEnvProfileVar(id: String) async -> PortableRecord? {
-        let v = await MainActor.run { EnvProfileStore.shared.varItem(id: id) }
-        guard let v else {
-            // Local var gone — drop the stale upsert dirty row.
-            // The op=delete path is separate.
-            return nil
-        }
-        let synced = SyncedEnvProfileVar.from(v)
-        return SyncableTypeRegistry.shared.metadata(for: "EnvProfileVar")?.buildPortable(synced)
-    }
-
-    /// Apply an inbound per-profile-variable record. Adds-or-replaces
-    /// the var via EnvProfileStore.applyRemoteProfileVar. LWW resolution
-    /// by updatedAt ordering from the cloud stream.
-    private static func mergeEnvProfileVar(record: PortableRecord) async {
-        guard let id = stringField(record, "varId") else {
-            logger.warning("[SyncCore] mergeEnvProfileVar: missing varId field")
-            return
-        }
-        guard let profileId = stringField(record, "profileId") else {
-            logger.warning("[SyncCore] mergeEnvProfileVar: missing profileId for id=\(id.prefix(8))")
-            return
-        }
-        guard let key = stringField(record, "key") else {
-            logger.warning("[SyncCore] mergeEnvProfileVar: missing key for id=\(id.prefix(8))")
-            return
-        }
-        let valueB64 = stringField(record, "valueB64") ?? ""
-        let note = stringField(record, "note") ?? ""
-        let createdAt = dateField(record, "createdAt") ?? Date()
-        let updatedAt = dateField(record, "updatedAt") ?? record.updatedAt
-        // Recently-deleted guard — same pattern as EnvVarItem.
-        if await ChatStore.shared.isRecentlyDeletedRecord(type: "EnvProfileVar", id: id, remoteUpdatedAt: updatedAt) {
-            logger.info("[SyncCore] mergeEnvProfileVar SKIP (recently deleted locally): id=\(id.prefix(8))")
-            return
-        }
-        // In-flight local edit guard — same pattern as EnvVarItem.
-        let pendingDirty = await ChatStore.shared.loadDirtyRecords()
-        if pendingDirty.contains(where: { $0.recordType == "EnvProfileVar" && $0.recordId == id && $0.operation != "delete" }) {
-            logger.info("[SyncCore] mergeEnvProfileVar SKIP (local upsert pending): id=\(id.prefix(8))")
-            return
-        }
-        let value: String = {
-            guard !valueB64.isEmpty,
-                  let data = Data(base64Encoded: valueB64),
-                  let s = String(data: data, encoding: .utf8) else { return "" }
-            return s
-        }()
-        await MainActor.run {
-            EnvProfileStore.shared.applyRemoteProfileVar(
-                id: id, profileId: profileId, key: key, value: value,
-                note: note, createdAt: createdAt, updatedAt: updatedAt
-            )
-        }
-        logger.info("[SyncCore] applied EnvProfileVar id=\(id.prefix(8)) key=\(key)")
-    }
-
-    /// Apply an inbound op=delete tombstone for an EnvProfileVar.
-    /// Removes the var by id and deletes its Keychain entry.
-    private static func applyEnvProfileVarDeletion(id: String) async {
-        await MainActor.run {
-            EnvProfileStore.shared.applyRemoteProfileVarDeletion(id: id)
-        }
-        logger.info("[SyncCore] applied EnvProfileVar deletion id=\(id.prefix(8))")
+    private static func applyEnvVarStateDeletion(id: String) async {
+        await MainActor.run { EnvVarStore.shared.applyRemoteStateDeletion(id: id) }
     }
 
     // MARK: - SyncDevice
@@ -1139,6 +917,9 @@ enum ChatStoreSyncHydrators {
                 .components(separatedBy: ",").filter { !$0.isEmpty }
         )
         await ChatStore.shared.upsertSyncDevice(device)
+        // [T-icloud-device-heartbeat] Discovery is reported long after the
+        // fact; one line per peer record makes it diagnosable from a log.
+        logger.info("[Discovery] peer=\(id.prefix(8)) name=\(device.deviceName) lastSeen=\(device.lastSeen) via=engine")
     }
 
     // MARK: - Helper
@@ -1152,8 +933,7 @@ enum ChatStoreSyncHydrators {
         let isEnabled: Bool
         let installedAt: Date
         let updatedAt: Date
-        let bodyText: String
-        let zipData: Data?
+        let skillDir: URL
     }
 
     /// Minimal MIME helper for SessionFile builds. Keep tiny — full helper
@@ -1180,18 +960,42 @@ enum ChatStoreSyncHydrators {
     private static func buildSoul() async -> PortableRecord? {
         let url = await MainActor.run { SoulStore.fileURL }
         let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else {
+        guard fm.fileExists(atPath: url.path) else {
             logger.info("[SyncCore] buildSoul: SOUL.md missing on disk, skipping push")
             return nil
         }
+        // [T-soul-icon-sidecar] The icon's bytes now live in SOUL.icon.png and
+        // the frontmatter holds only the filename — but the wire format is
+        // deliberately UNCHANGED, still one self-contained `contentMarkdown`
+        // blob with the icon inlined as base64. Two reasons: no CloudKit
+        // schema change, and a peer running a build that predates the sidecar
+        // still receives a working icon instead of a dangling filename that
+        // means nothing in its own container.
+        //
+        // So read through SoulStore (which folds the sidecar back in) rather
+        // than shipping the raw file, whose `icon: "SOUL.icon.png"` would
+        // arrive as an unresolvable reference.
+        guard let file = await MainActor.run(body: { SoulStore.load() }) else {
+            logger.info("[SyncCore] buildSoul: SOUL.md unreadable, skipping push")
+            return nil
+        }
+        let text = await MainActor.run { SoulStore.serializedForWire(file) }
         // Use the file's mtime as updatedAt so a peer's older snapshot
         // can't clobber a locally newer edit just because clocks drift.
+        //
+        // [T-soul-icon-sidecar] Take the LATER of SOUL.md and the icon
+        // sidecar. `SoulStore.save` rewrites SOUL.md on every change so its
+        // mtime normally already moves, but the record's payload now depends
+        // on two files: if the sidecar is ever the only one to change, an
+        // mtime read from SOUL.md alone would date the push to before the edit
+        // it carries and let a peer's older copy win LWW.
+        let iconURL = await MainActor.run { SoulStore.iconFileURL }
         let mtime: Date = {
-            if let attrs = try? fm.attributesOfItem(atPath: url.path),
-               let d = attrs[.modificationDate] as? Date { return d }
-            return Date()
+            func modified(_ u: URL) -> Date? {
+                (try? fm.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
+            }
+            let dates = [modified(url), modified(iconURL)].compactMap { $0 }
+            return dates.max() ?? Date()
         }()
         let synced = SyncedSoul(contentMarkdown: text, updatedAt: mtime)
         return SyncableTypeRegistry.shared.metadata(for: "SoulV2")?.buildPortable(synced)
@@ -1638,7 +1442,24 @@ enum ChatStoreSyncHydrators {
                 type: "ProviderModelEntryV3", id: rawId, remoteUpdatedAt: entryUpdatedAt)
         }
         if recentlyDeleted {
-            logger.info("[v3] mergeProviderModelEntryV3 SKIP (recently deleted locally): id=\(id.prefix(16))")
+            // [T-sync-trace-log-volume] DEBUG, not INFO — unlike its eight
+            // sibling SKIP lines in this file.
+            //
+            // The guard itself is load-bearing (it blocks the iCloud-echo
+            // resurrection fixed in 244afc1ec) and is NOT changed. What changes
+            // is only how loudly the non-event is announced: model entries are
+            // by far the most numerous record type — a single sampled pass
+            // carried 200 of them — so once a device accumulates tombstones this
+            // one line repeats per entry per cycle forever. Measured: 114 lines
+            // in a two-minute sample, 78 of them the SAME id, 62% of all
+            // SyncCore output.
+            //
+            // The eight siblings stay at INFO: instances, groups, folders,
+            // skills, MCP servers, env vars, thinking rules and sub agents are
+            // few, so one line each is proportionate. The batch summary
+            // ("inbound from iCloud: applied=… skipped=… blocked=…") still
+            // reports the aggregate at INFO either way.
+            logger.debug("[v3] mergeProviderModelEntryV3 SKIP (recently deleted locally): id=\(id.prefix(16))")
             return
         }
         let applied = await db.upsertEntryFromInbound(
@@ -1830,7 +1651,11 @@ enum ChatStoreSyncHydrators {
             updatedAt: (dateField(record, "updatedAt") ?? Date()).timeIntervalSince1970,
             extrasJson: optionalStringField(record, "extrasJson"),
             inboundAddedMembers: inboundAdded,
-            inboundRemovedMembers: inboundRemoved
+            inboundRemovedMembers: inboundRemoved,
+            // [T-group-order-log] All the record says about itself. A synced
+            // group record carries no "which device wrote me" field, so the
+            // source device cannot be named here.
+            inboundMeta: "record=ProviderModelGroupV3 schema=\(record.schemaVersion) inboundTombstones=added:\(inboundAdded.count)/removed:\(inboundRemoved.count)"
         )
         if applied {
             // [T-icloud-modelgroup-orphan-members] Orphan diagnostic
@@ -1944,6 +1769,94 @@ enum ChatStoreSyncHydrators {
         await ProviderConfigStore.shared.reloadThinkingRuleCache()
     }
 
+    // MARK: - SubAgentV3 (T-subagent-own-store)
+
+    /// Outbound. nil when the definition no longer exists locally (deleted
+    /// between the markDirty and the push) — the caller drops the dirty row.
+    private static func buildSubAgentV3(id: String) async -> PortableRecord? {
+        guard let def = SubAgentStore.shared.subAgent(id: id) else { return nil }
+        let synced = SyncedSubAgentV3(
+            id: def.id,
+            name: def.name,
+            subAgentDescription: def.description,
+            instructions: def.instructions,
+            modelGroupId: def.modelGroupId,
+            thinkingLevelOverride: def.thinkingLevelOverride?.rawValue,
+            isBuiltIn: def.isBuiltIn ? 1 : 0,
+            sortOrder: def.sortOrder,
+            updatedAt: def.updatedAt
+        )
+        return SyncableTypeRegistry.shared
+            .metadata(for: "SubAgentV3")?
+            .buildPortable(synced)
+    }
+
+    /// Inbound upsert.
+    ///
+    /// [T-subagent-sync-dedupe] This is where the name-dedupe from 07351c6d1
+    /// now runs. Moving to per-record sync changed WHERE it belongs but not
+    /// whether it is needed: ids are per-device UUIDs while the model addresses
+    /// agents by NAME, so two devices that each add "coding-agent" still
+    /// produce two records that are distinct by id and indistinguishable to the
+    /// model. Feeding the incoming definition through
+    /// `SubAgentRoster.merge(local:remote:)` collapses that pair with the same
+    /// deterministic rule as before — newer updatedAt wins, ties break on the
+    /// lexicographically smaller id, so both devices independently reach the
+    /// same winner and stop re-uploading rival rosters.
+    private static func mergeSubAgentV3(record: PortableRecord) async {
+        let id = record.id.id
+        // [T-icloud-record-delete-resurrection] Same guard the provider mergers
+        // use: an agent just deleted here must not be re-inserted by a
+        // fetchRecentV2 that raced ahead of the op=delete reaching the cloud.
+        if await ChatStore.shared.isRecentlyDeletedRecord(
+            type: "SubAgentV3", id: id,
+            remoteUpdatedAt: dateField(record, "updatedAt") ?? Date()) {
+            logger.info("[v3] mergeSubAgentV3 SKIP (recently deleted locally): id=\(id.prefix(8))")
+            return
+        }
+        guard let name = stringField(record, "name"), !name.isEmpty else {
+            logger.warning("[v3] mergeSubAgentV3 SKIP (no name) id=\(id.prefix(8))")
+            return
+        }
+        let incoming = SubAgentDefinition(
+            id: id,
+            name: name,
+            description: stringField(record, "description") ?? "",
+            instructions: stringField(record, "instructions") ?? "",
+            modelGroupId: optionalStringField(record, "modelGroupId"),
+            // [T-subagent-thinking-override] Absent from an older peer's record
+            // → nil → "not set", which is the pre-feature behaviour.
+            thinkingLevelOverride: optionalStringField(record, "thinkingLevelOverride")
+                .flatMap { ThinkingLevel.parse($0) },
+            isBuiltIn: (intField(record, "isBuiltIn") ?? 0) != 0,
+            sortOrder: intField(record, "sortOrder") ?? 0,
+            updatedAt: dateField(record, "updatedAt") ?? Date()
+        )
+        let store = SubAgentStore.shared
+        let before = store.subAgents
+        let merged = SubAgentRoster.merge(local: before, remote: [incoming]) {
+            logger.info("[v3] mergeSubAgentV3: \($0)")
+        }
+        guard merged != before else {
+            logger.info("[v3] mergeSubAgentV3 SKIPPED (local newer or identical) id=\(id.prefix(8))")
+            return
+        }
+        store.applyMergedFromSync(merged)
+        logger.info("[v3] mergeSubAgentV3 APPLIED id=\(id.prefix(8)) roster=\(merged.count)")
+    }
+
+    /// Inbound delete. The local record really is removed — the tombstone
+    /// written by the ORIGINATING device is what stops the resurrection race.
+    private static func deleteSubAgentV3(id: String) async {
+        let store = SubAgentStore.shared
+        guard store.subAgent(id: id) != nil else { return }
+        // Route through the roster directly rather than removeSubAgent(id:),
+        // which would emit a fresh op=delete markDirty and echo our peer's
+        // delete back at the cloud.
+        store.applyMergedFromSync(store.subAgents.filter { $0.id != id })
+        logger.info("[v3] deleted SubAgentV3 \(id.prefix(8))")
+    }
+
     private static func deleteProviderModelGroupV3(id: String) async {
         guard let db = ProviderConfigStore.shared.db else {
             logger.warning("[v3] deleteProviderModelGroupV3 DROPPED (DB not open yet) id=\(id.prefix(8))")
@@ -2012,37 +1925,6 @@ enum ChatStoreSyncHydrators {
         let fresh = await db.dumpProviderConfig()
         await MainActor.run {
             ProviderConfigStore.shared.applyMergedConfigFromSync(fresh)
-        }
-    }
-
-    // MARK: - AppSettings
-
-    /// Outbound builder: reads syncable UserDefaults settings, packs them
-    /// into a JSON blob, and returns a PortableRecord for AppSettingsV2.
-    private static func buildAppSettings() async -> PortableRecord? {
-        let json = AppSettingsSync.collectSettings()
-        let updatedAt = AppSettingsSync.localUpdatedAt()
-        // Don't push if settings have never been changed locally
-        guard updatedAt > .distantPast else {
-            logger.info("[SyncCore] buildAppSettings: no local settings change — skipping push")
-            return nil
-        }
-        let synced = SyncedAppSettings(settingsJson: json, updatedAt: updatedAt)
-        return SyncableTypeRegistry.shared
-            .metadata(for: "AppSettingsV2")?
-            .buildPortable(synced)
-    }
-
-    /// Inbound merger: unpacks the JSON settings blob from a PortableRecord
-    /// and applies it to local UserDefaults with LWW by updatedAt.
-    private static func mergeAppSettings(record: PortableRecord) async {
-        guard let jsonStr = stringField(record, "settingsJson") else {
-            logger.warning("[SyncCore] mergeAppSettings: missing settingsJson field")
-            return
-        }
-        let remoteUpdatedAt = dateField(record, "updatedAt") ?? record.updatedAt
-        await MainActor.run {
-            AppSettingsSync.applySettings(jsonStr, remoteUpdatedAt: remoteUpdatedAt)
         }
     }
 }
