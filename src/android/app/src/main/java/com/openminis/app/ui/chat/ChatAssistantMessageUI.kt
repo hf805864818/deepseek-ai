@@ -122,6 +122,7 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.CloseFullscreen
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lightbulb
@@ -1135,4 +1136,86 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * [UI-261025-11] The time under a reply: 24-hour HH:mm today, with the date in
+ * front on any other day. Both in the device's time zone.
+ */
+internal fun formatReplyClock(
+    epochMs: Long,
+    nowMs: Long,
+    locale: java.util.Locale,
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+): String {
+    val at = java.time.Instant.ofEpochMilli(epochMs).atZone(zone)
+    val now = java.time.Instant.ofEpochMilli(nowMs).atZone(zone)
+    val time = java.time.format.DateTimeFormatter.ofPattern("HH:mm", java.util.Locale.US).format(at)
+    if (at.toLocalDate() == now.toLocalDate()) return time
+    val skeleton = if (at.year == now.year) "MMMd" else "yMMMd"
+    val pattern = android.text.format.DateFormat.getBestDateTimePattern(locale, skeleton)
+    return java.time.format.DateTimeFormatter.ofPattern(pattern, locale).format(at) + " " + time
+}
+
+@Composable
+internal fun UsageCapsule(usage: ChatTokenUsage?, completedAt: Long?) {
+    if (usage == null) return
+    val summary = remember(usage) {
+        buildString {
+            if (usage.latestContextTokens > 0) append("ctx:${formatTokenCount(usage.latestContextTokens)} ")
+            append("in:${formatTokenCount(usage.inputTokens)}")
+            append(" out:${formatTokenCount(usage.outputTokens)}")
+            if (usage.cacheReadTokens > 0) append(" cache:${formatTokenCount(usage.cacheReadTokens)}")
+            if (usage.cacheCreationTokens > 0) append(" +cache:${formatTokenCount(usage.cacheCreationTokens)}")
+        }
+    }
+    val today = java.time.LocalDate.now()
+    val clock = remember(completedAt, today) {
+        completedAt?.let { formatReplyClock(it, System.currentTimeMillis(), java.util.Locale.getDefault()) }
+    }
+    val ink = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier
+            .padding(top = 2.dp, bottom = 2.dp)
+            .clip(RoundedCornerShape(50))
+            .background(ChatColors.userBubble.copy(alpha = 0.10f))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+    ) {
+        Icon(
+            Icons.Default.Speed,
+            contentDescription = null,
+            tint = ink,
+            modifier = Modifier.size(11.dp),
+        )
+        Text(
+            text = summary,
+            fontSize = 10.sp,
+            lineHeight = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            color = ink,
+            maxLines = 1,
+        )
+        clock?.let {
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = it,
+                fontSize = 10.sp,
+                lineHeight = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                color = ink,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+/**
+ * 1234 -> "1.2k", 57000 -> "57k". Mirrors iOS `formatTokenCount`.
+ */
+private fun formatTokenCount(count: Int): String {
+    if (count < 1000) return count.toString()
+    val k = count / 1000.0
+    return if (k % 1.0 == 0.0) "${k.toInt()}k" else String.format(java.util.Locale.US, "%.1fk", k)
 }

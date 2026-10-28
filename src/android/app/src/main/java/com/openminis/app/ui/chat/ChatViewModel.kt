@@ -79,6 +79,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import com.openminis.app.scheduled.ScheduledRepeatMode
 import com.openminis.app.scheduled.ScheduledTargetMode
@@ -855,6 +856,10 @@ class ChatViewModel(
      *  default model name for one frame before the persisted binding settles. */
     private val sessionLoaded = MutableStateFlow(false)
 
+    /** Suspend until the session's first load completes, or return false on timeout. */
+    internal suspend fun awaitSessionLoaded(timeoutMs: Long = 5_000L): Boolean =
+        sessionLoaded.value || withTimeoutOrNull(timeoutMs) { sessionLoaded.first { it } } != null
+
     private val _sessionTitle = MutableStateFlow("New Chat")
     val sessionTitle: StateFlow<String> = _sessionTitle.asStateFlow()
 
@@ -1072,6 +1077,16 @@ class ChatViewModel(
      */
     @Volatile
     private var _browserTabPoolRef: BrowserTabPool? = null
+
+    // [T-p1-delegate-task] Set by the parent's executeDelegateTask on a CHILD
+    // vm before its first turn. Its presence is what every helper-specific
+    // branch keys off: tool set, identity preamble, turn cap, and the
+    // SessionConcurrencyManager bypass.
+    internal var helperConfig: com.openminis.app.agent.jobs.HelperConfig? = null
+    internal val isHelper: Boolean get() = helperConfig != null
+
+    /** Re-point this vm at a pool owned elsewhere (a child adopting its parent's). */
+    internal fun adoptBrowserTabPool(pool: BrowserTabPool) { _browserTabPoolRef = pool }
 
     /** Browser tab pool for browser_use tool. Lazily created on first access. */
     val browserTabPool: BrowserTabPool by lazy {
@@ -2634,6 +2649,19 @@ class ChatViewModel(
      * overlap with an in-flight streaming turn (`_isStreaming`) or another
      * compact. Runs on [Dispatchers.IO].
      */
+    /** Progress of the running compaction, for the UI's compact indicator. */
+    data class CompactProgress(
+        val startedAtMs: Long,
+        val depth: Int = 0,
+        val callsIssued: Int = 0,
+        val callBudget: Int = MAX_COMPACT_LLM_CALLS,
+        val timeoutSeconds: Int = 0,
+        val modelName: String? = null,
+    )
+
+    private val _compactProgress = MutableStateFlow<CompactProgress?>(null)
+    val compactProgress: StateFlow<CompactProgress?> = _compactProgress.asStateFlow()
+
     /**
      * Public entrypoint used by the debug RPC (`chat.session.compact`) to
      * trigger compaction without going through the ChatScreen slash-command
@@ -4141,6 +4169,31 @@ class ChatViewModel(
     /** The real session ID (same as sessionId for existing sessions, generated on first message for drafts). */
     internal var realSessionId: String = if (isDraft) "" else sessionId
 
+    /** Whether this draft still holds an unsent prompt the New Chat flow should reopen. */
+    val hasUnsentDraft: Boolean
+        get() = ChatViewModelStore.isUnsentDraft(
+            isDraft = isDraft,
+            realSessionId = realSessionId,
+            text = _inputText.value,
+            hasAttachments = _attachments.value.isNotEmpty(),
+            busy = hasWorkInFlight(),
+        )
+
+    /** True while a stream, a queued prompt or an agent job keeps this session busy. */
+    fun hasWorkInFlight(): Boolean {
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val agentWork = setOf(activeSessionId, sessionId, realSessionId)
+            .filter { it.isNotEmpty() }
+            .any { registry.hasAgentWork(it) } ||
+            helperConfig?.jobId?.let { registry.job(it)?.isActive } == true
+        return EvictionGuard.hasWorkInFlight(
+            isStreaming = _isStreaming.value,
+            streamJobActive = streamJob?.isActive == true,
+            hasAgentWork = agentWork,
+            hasQueuedPrompts = _promptQueue.value.isNotEmpty(),
+        )
+    }
+
     init {
         loadSession()
         // [T-session-paused-badge-active-false-positive] Drive the session-list
@@ -5463,7 +5516,7 @@ class ChatViewModel(
         // iOS calls BrowserTabPool.deletePersistedData(for:) +
         // BrowserUseOffloadBridge.releasePool(forSession:); on Android the
         // pool is per-VM (lazy), so releasing tabs here is sufficient.
-        _browserTabPoolRef?.releaseAllTabs()
+        _browserTabPoolRef?.destroyAllTabs()
         runCatching {
             java.io.File(context.filesDir, "browser_tabs/$sid.json").delete()
         }
