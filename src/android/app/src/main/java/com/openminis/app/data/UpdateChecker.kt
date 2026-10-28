@@ -99,6 +99,30 @@ object UpdateChecker {
 
     val isChecking: Boolean get() = inFlight.get()
 
+    // Legacy prefs name kept so SettingsScreen's SharedPreferences listener
+    // compiles unchanged; the badge itself now lives in UpdateStateStore.
+    internal const val PREFS_NAME = "update_checker"
+
+    /**
+     * Whether a not-yet-skipped/dismissed update is known. Drives the red dot
+     * badge on Settings → About. Delegates to [UpdateStateStore.hasUpdateBadge]
+     * so the dot stays correct across channels and auto-check off.
+     */
+    fun hasUnreadUpdate(context: Context): Boolean {
+        UpdateStateStore.init(context)
+        return UpdateStateStore.hasUpdateBadge.value
+    }
+
+    /**
+     * Perform a silent background check if the throttle allows it. Automatic
+     * checks are normally driven by [UpdateAutoChecker] on foreground, but
+     * callers may still invoke this directly; it routes through the same
+     * throttle decision so a request is only made when one is actually due.
+     */
+    fun checkSilentlyIfNeeded(context: Context) {
+        UpdateAutoChecker.maybeCheck(context, "silent")
+    }
+
     private fun UpdateStateStore.Available.toResult() = CheckResult.UpdateAvailable(
         tagName = tag, versionName = versionName, versionCode = versionCode, releaseName = releaseName,
         changelog = changelog, apkUrl = apkUrl, apkSizeBytes = apkSize, sha256 = sha256, releaseUrl = releaseUrl,

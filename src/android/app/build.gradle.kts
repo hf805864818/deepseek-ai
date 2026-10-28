@@ -338,6 +338,9 @@ dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
 
+    // [T-android-jankdiag] ProfileVerifier (ART compile state in the jank log).
+    implementation("androidx.profileinstaller:profileinstaller:1.4.0")
+
     // Testing — JVM unit tests
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")

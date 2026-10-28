@@ -81,7 +81,7 @@ data class ChatSessionEntity(
     /** The parent's `delegate_task` tool_use id that spawned this child, or
      *  null for a child created by `minis-scheduled --target child-of-current`. */
     @ColumnInfo(name = "parent_tool_use_id") val parentToolUseId: String? = null,
-    val envProfileId: String? = null,
+    @ColumnInfo(name = "env_profile_id") val envProfileId: String? = null,
 ) {
     val isChild: Boolean get() = parentSessionId != null
 }

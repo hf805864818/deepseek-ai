@@ -458,7 +458,7 @@ class ChatViewModel(
         /// `ToolInputDelta`. Drained on preflight failure for diagnosis.
         private const val TOOL_INPUT_CHUNK_RING_MAX = 10
         /** Auto-retry backoff schedule (seconds). Mirrors iOS retryDelays, scaled to task spec: 1s → 2s → 4s. */
-        private val AUTO_RETRY_DELAYS_SEC = intArrayOf(1, 2, 4)
+        internal val AUTO_RETRY_DELAYS_SEC = intArrayOf(1, 2, 4)
 
         /**
          * Factory for use with `viewModel(factory = ...)`. Binds the ChatViewModel
@@ -935,6 +935,13 @@ class ChatViewModel(
      */
     private val _lastTurnContextTokens = MutableStateFlow(0)
     val lastTurnContextTokens: StateFlow<Int> = _lastTurnContextTokens.asStateFlow()
+
+    // [T-port-composer-hint-debug] Composer usage line (context / quota
+    // carousel). Kept as a StateFlow so the composer can react to a new
+    // generation; `contextHintGeneration` ensures each publish is distinct.
+    private val _contextUsageHint = MutableStateFlow<ContextUsageHint?>(null)
+    internal val contextUsageHint: StateFlow<ContextUsageHint?> = _contextUsageHint.asStateFlow()
+    private var contextHintGeneration = 0
 
     /**
      * Latest compact summary for the current session, loaded from the DB on
@@ -1433,6 +1440,16 @@ class ChatViewModel(
     internal val _thinkingLevel = MutableStateFlow(ThinkingLevel.OFF)
     val thinkingLevel: StateFlow<ThinkingLevel> = _thinkingLevel.asStateFlow()
 
+    // [T-android-token-usage] Which message usage capsules the user has
+    // expanded. Per-VM memory state, not persisted.
+    internal val _revealedUsageIds = MutableStateFlow<Set<String>>(emptySet())
+    val revealedUsageIds: StateFlow<Set<String>> = _revealedUsageIds.asStateFlow()
+
+    fun toggleUsageCapsule(messageId: String) {
+        val cur = _revealedUsageIds.value
+        _revealedUsageIds.value = if (messageId in cur) cur - messageId else cur + messageId
+    }
+
     // [T-android-perf-system-prompt-cache] Cached system prompt.
     // Invalidated when any dependency changes (deep mode, memory, thinking level, etc.).
     // Reduces CPU work on every send, especially noticeable with deep mode on.
@@ -1753,6 +1770,52 @@ class ChatViewModel(
         return if (groupLimit != null) minOf(window, groupLimit) else window
     }
 
+    /** The quota page for the currently active model entry, or null. */
+    private fun composerQuotaPart(): com.openminis.app.quota.QuotaComposerHintRules.Segment? {
+        val entryId = _activeEntryId.value ?: return null
+        val entry = providerRepository.config.value.modelEntries.find { it.id == entryId } ?: return null
+        val st = com.openminis.app.quota.QuotaStore.state.value
+        val locale = context.resources.configuration.locales[0] ?: java.util.Locale.getDefault()
+        return com.openminis.app.quota.QuotaComposerHintRules.segment(
+            st.modelView(entry.providerInstanceId, entry.model.id), st.pools,
+            locale = locale, strings = com.openminis.app.ui.quota.QuotaResourceStrings(context),
+        )
+    }
+
+    private fun ContextUsageHint.withQuota(seg: com.openminis.app.quota.QuotaComposerHintRules.Segment?): ContextUsageHint {
+        seg ?: return this
+        return copy(
+            quotaText = seg.text,
+            quotaHighlight = seg.highlight,
+            quotaTier = when (seg.level) {
+                com.openminis.app.quota.QuotaLevel.normal -> ContextUsage.Tier.NORMAL
+                com.openminis.app.quota.QuotaLevel.low -> ContextUsage.Tier.WARNING
+                com.openminis.app.quota.QuotaLevel.depleted -> ContextUsage.Tier.CRITICAL
+            },
+        )
+    }
+
+    /**
+     * [T-port-composer-hint-debug] DEV_TOOLS builds only (the
+     * `debug.chat.usageHint` RPC): publish a composer usage line with chosen
+     * figures as a new generation, so the context / quota carousel can be
+     * tested without filling 70% of a context window.
+     */
+    internal fun debugShowContextUsageHint(
+        percent: Int,
+        windowTokens: Int,
+        quota: DebugUsageHint.Quota?,
+        useLiveQuota: Boolean,
+    ): ContextUsageHint? {
+        if (!com.openminis.app.BuildConfig.DEV_TOOLS) return null
+        contextHintGeneration += 1
+        val base = DebugUsageHint.build(contextHintGeneration, percent, windowTokens, quota)
+        val hint = if (useLiveQuota) base.withQuota(composerQuotaPart()) else base
+        _contextUsageHint.value = hint
+        AppLogger.info(TAG, "[ContextUsage] DEBUG hint gen=$contextHintGeneration tier=${hint.tier} percent=$percent quota=${hint.quotaText != null}")
+        return hint
+    }
+
     val currentModelMaxOutputTokens: Int?
         get() = currentModel?.maxOutputTokens
 
@@ -1774,7 +1837,39 @@ class ChatViewModel(
         val cacheWrite: Long,
         val context: Int,
         val loopCount: Int,
-    )
+        /**
+         * [T-android-token-usage-output-speed] Wall-clock ms spent streaming,
+         * summed over the turns that recorded it, and the output tokens those
+         * SAME turns produced. Kept as a matched pair so the average is not
+         * skewed by turns written before `streamMs` existed (or by a turn that
+         * produced no output): a turn contributes to both sums or to neither.
+         */
+        val streamMs: Long = 0L,
+        val streamOutput: Long = 0L,
+    ) {
+        /** Output tokens per second across streaming turns, or null if unknown. */
+        val outputTokensPerSecond: Double?
+            get() = if (streamMs > 0 && streamOutput > 0) {
+                streamOutput.toDouble() / (streamMs / 1000.0)
+            } else {
+                null
+            }
+
+        /**
+         * [T-android-token-usage-cache-hit-rate] Share of this session's input
+         * that was served from cache, as a percentage. Denominator matches the
+         * sheet's "Input (incl. cache)" row exactly. Null hides the row.
+         */
+        val cacheHitRate: Double?
+            get() {
+                val totalInput = input + cacheRead + cacheWrite
+                return if (totalInput > 0 && cacheRead > 0) {
+                    cacheRead.toDouble() / totalInput.toDouble() * 100.0
+                } else {
+                    null
+                }
+            }
+    }
 
     data class ThinkingInfo(
         val supported: Boolean,
@@ -1807,6 +1902,8 @@ class ChatViewModel(
         var cacheRead = 0L
         var cacheWrite = 0L
         var context = 0
+        var streamMs = 0L
+        var streamOutput = 0L
         for (json in usages) {
             try {
                 val obj = org.json.JSONObject(json)
@@ -1816,6 +1913,14 @@ class ChatViewModel(
                 cacheWrite += obj.optLong("cacheCreationTokens", 0L)
                 val ctx = obj.optInt("latestContextTokens", 0)
                 if (ctx > 0) context = ctx
+                val ms = obj.optLong("streamMs", 0L)
+                val out = obj.optLong("streamOutputTokens", 0L)
+                // A turn contributes to both sums or to neither, so the
+                // average is not skewed by turns that predate `streamMs`.
+                if (ms > 0 && out > 0) {
+                    streamMs += ms
+                    streamOutput += out
+                }
             } catch (_: Exception) { /* skip malformed row */ }
         }
         val snapshot = _messages.value
@@ -1823,7 +1928,7 @@ class ChatViewModel(
         val toolCalls = snapshot.filter { it.role == "assistant" }
             .sumOf { msg -> msg.toolBlocks.count { it.kind != "text" && it.kind != "info" } }
         val loops = maxOf(toolCalls, assistantCount)
-        return SessionTokenStats(input, output, cacheRead, cacheWrite, context, loops)
+        return SessionTokenStats(input, output, cacheRead, cacheWrite, context, loops, streamMs, streamOutput)
     }
 
     // [T-android-split-chat] toggleMemorySheet / dismissMemorySheet moved to ChatViewModelUiStateExt.kt.
