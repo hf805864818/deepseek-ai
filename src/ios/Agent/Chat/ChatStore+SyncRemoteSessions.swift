@@ -52,7 +52,8 @@ extension ChatStore {
     ///   sending an explicit nil means "ungrouped on that device" and, when
     ///   remote is newer, that wins (folder_id rides the session's LWW).
     func mergeRemoteSession(_ session: ChatSession, fromDeviceId: String, memoryEnabled: Bool = true, modelBinding: String? = nil, remotePinnedAtRaw: Date? = nil, remoteFolderId: String? = nil, remoteHasFolderField: Bool = false,
-                            remoteParentSessionId: String? = nil, remoteParentToolUseId: String? = nil, remoteHasParentField: Bool = false) {
+                            remoteParentSessionId: String? = nil, remoteParentToolUseId: String? = nil, remoteHasParentField: Bool = false,
+                            remoteEnvProfileId: String? = nil, remoteHasEnvProfileField: Bool = false) {
         // FULL: a remote session may be one this device has never seen, so it
         // can ADD a row to the set — the incremental patch cannot express that.
         invalidateSessionListCache()
@@ -77,7 +78,8 @@ extension ChatStore {
         var localUpdatedAt: Double?
         var localPinnedAt: Double?
         var localFolderId: String?
-        let checkSql = "SELECT updated_at, pinned_at, folder_id FROM sessions WHERE id = ?"
+        var localEnvProfileId: String?
+        let checkSql = "SELECT updated_at, pinned_at, folder_id, env_profile_id FROM sessions WHERE id = ?"
         var checkStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, checkSql, -1, &checkStmt, nil) == SQLITE_OK {
             sqlite3_bind_text(checkStmt, 1, (session.id as NSString).utf8String, -1, nil)
@@ -87,6 +89,7 @@ extension ChatStore {
                     localPinnedAt = sqlite3_column_double(checkStmt, 1)
                 }
                 localFolderId = sqlite3_column_text(checkStmt, 2).map { String(cString: $0) }
+                localEnvProfileId = sqlite3_column_text(checkStmt, 3).map { String(cString: $0) }
             }
         }
         sqlite3_finalize(checkStmt)
@@ -163,6 +166,20 @@ extension ChatStore {
                 // backgrounded the app or pulled-to-refresh
                 // (T-inbound-session-no-refresh).
                 NotificationCenter.default.post(name: .sessionDidUpdate, object: session.id)
+                // env_profile_id rides the session's LWW the same way folder_id
+                // does: write it only when the peer's record actually carried
+                // the field, so an old-build peer omitting it can't clear a
+                // local pin.
+                if remoteHasEnvProfileField {
+                    let eSql = "UPDATE sessions SET env_profile_id = ? WHERE id = ?"
+                    var eStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, eSql, -1, &eStmt, nil) == SQLITE_OK {
+                        bindOptionalText(eStmt, index: 1, value: remoteEnvProfileId)
+                        sqlite3_bind_text(eStmt, 2, (session.id as NSString).utf8String, -1, nil)
+                        sqlite3_step(eStmt)
+                    }
+                    sqlite3_finalize(eStmt)
+                }
             } else {
                 let delta = localTs - remoteUpdated
                 iCloudLogger.info("[iCloud] mergeRemoteSession SKIP (local newer): id=\(session.id) localTs=\(localTs) remoteTs=\(remoteUpdated) delta=\(String(format: "%+.3f", delta))s from=\(fromDeviceId)")
@@ -197,6 +214,19 @@ extension ChatStore {
                     iCloudLogger.info("[iCloud] mergeRemoteSession folder sub-merge: id=\(session.id.prefix(8)) -> folder \(remoteFid.prefix(8))")
                     NotificationCenter.default.post(name: .sessionDidUpdate, object: session.id)
                 }
+                // Same conservative rule as folder: adopt the remote env
+                // profile only when we have no local opinion (local NULL).
+                if remoteHasEnvProfileField, localEnvProfileId == nil, let remoteEid = remoteEnvProfileId {
+                    let eSql = "UPDATE sessions SET env_profile_id = ? WHERE id = ? AND env_profile_id IS NULL"
+                    var eStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, eSql, -1, &eStmt, nil) == SQLITE_OK {
+                        sqlite3_bind_text(eStmt, 1, (remoteEid as NSString).utf8String, -1, nil)
+                        sqlite3_bind_text(eStmt, 2, (session.id as NSString).utf8String, -1, nil)
+                        sqlite3_step(eStmt)
+                    }
+                    sqlite3_finalize(eStmt)
+                    iCloudLogger.info("[iCloud] mergeRemoteSession env-profile sub-merge: id=\(session.id.prefix(8)) -> env \(remoteEid.prefix(8))")
+                }
                 // Even if we skip the main update, still merge pin state if remote has pin info
                 // and the resolved pin differs from local
                 if remotePinnedAtRaw != nil, resolvedPinnedAt != localPinnedAt {
@@ -227,7 +257,7 @@ extension ChatStore {
             }
             // Local doesn't have this session — insert
             iCloudLogger.info("[iCloud] mergeRemoteSession INSERT: id=\(session.id) title=\(session.title ?? "nil") from=\(fromDeviceId)")
-            let sql = "INSERT INTO sessions (id, title, category, model_id, created_at, updated_at, remote_origin_device_id, memory_enabled, model_binding, pinned_at, folder_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            let sql = "INSERT INTO sessions (id, title, category, model_id, created_at, updated_at, remote_origin_device_id, memory_enabled, model_binding, pinned_at, folder_id, env_profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(stmt, 1, (session.id as NSString).utf8String, -1, nil)
@@ -248,6 +278,7 @@ extension ChatStore {
                 // the list renders it as ungrouped until FolderV2 arrives
                 // (fetchRecentV2 ordering gives no cross-type guarantees).
                 bindOptionalText(stmt, index: 11, value: remoteHasFolderField ? remoteFolderId : nil)
+                bindOptionalText(stmt, index: 12, value: remoteHasEnvProfileField ? remoteEnvProfileId : nil)
                 sqlite3_step(stmt)
             }
             sqlite3_finalize(stmt)

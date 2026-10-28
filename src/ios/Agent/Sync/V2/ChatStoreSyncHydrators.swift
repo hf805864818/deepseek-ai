@@ -199,6 +199,7 @@ enum ChatStoreSyncHydrators {
         )
         session.pinnedAt = pinnedAt
         session.envProfileId = optionalStringField(record, "envProfileId")
+        let envProfileFieldPresent = record.fields["envProfileId"] != nil
         // v2 doesn't currently track per-device origin in PortableRecord;
         // pass an empty string as a sentinel ("unknown remote device").
         await ChatStore.shared.mergeRemoteSession(
@@ -210,7 +211,9 @@ enum ChatStoreSyncHydrators {
             remoteHasFolderField: folderFieldPresent,
             remoteParentSessionId: parentSessionId,
             remoteParentToolUseId: parentToolUseId,
-            remoteHasParentField: parentFieldPresent
+            remoteHasParentField: parentFieldPresent,
+            remoteEnvProfileId: session.envProfileId,
+            remoteHasEnvProfileField: envProfileFieldPresent
         )
     }
 
