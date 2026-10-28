@@ -151,7 +151,7 @@ final class GoogleDriveSyncManager: ObservableObject {
         logger.info("Step 2: building ZIP archive (\(files.count) files, \(totalRawSize) bytes raw)...")
 
         // 2. Create ZIP archive (CPU + memory heavy — runs on background)
-        let zipData = SkillStore.buildZipArchive(files: files)
+        let zipData = SkillZipPackager.buildZipArchive(files: files)
         let fileSize = zipData.count
         logger.info("Step 2: ZIP built: \(fileSize) bytes")
 

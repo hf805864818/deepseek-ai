@@ -95,6 +95,10 @@ struct AssistantBlockView: View {
                 // summary instead of the generic capsule's raw content.
                 HelperBlockView(block: block, detailBlock: $detailBlock)
             }
+        case .visualization:
+            ToolCapsuleView(block: block, icon: "chart.bar.fill", accentColor: .purple,
+                            commandStartTime: commandStartTime, onStop: onStop,
+                            toolSnapshots: toolSnapshots, detailBlock: $detailBlock)
         case .info:
             // Reason lines (⚠️, the middle elided past nine) then the final
             // switched line. [T-in-chat-search] Shared with the search, which
@@ -311,6 +315,7 @@ struct ToolCapsuleView: View {
         case .memoryTool:    toolName = "memory"
         case .delegateTool:  toolName = SubAgentDefinition.toolName
         case .userAskTool:   toolName = UserAskTool.name
+        case .visualization: toolName = "render_widget"
         case .text, .thinking, .info: toolName = "unknown"
         }
 

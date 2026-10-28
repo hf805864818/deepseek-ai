@@ -1908,9 +1908,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         messages.append(msg)
     }
 
-}
 
-extension AIChatViewModel {
     /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
     /// UserDefaults (the Settings toggle) so it applies across all sessions
     /// without per-session state. When on, an extra deep-mode behavior

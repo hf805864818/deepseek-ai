@@ -351,6 +351,8 @@ extension AIChatViewModel {
         case .readImageTool: toolName = "read_image"
         case .memoryTool: toolName = "memory"
         case .visualization: toolName = "render_widget"
+        case .delegateTool: toolName = SubAgentDefinition.toolName
+        case .userAskTool: toolName = UserAskTool.name
         case .info: toolName = "info"
         }
 

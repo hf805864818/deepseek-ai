@@ -305,6 +305,8 @@ struct ChatMessageRow: View {
             case .userAskTool:
                 // [T-user-ask] Copy the questions and the result, not the UI.
                 parts.append("Asked: \(UserAskCardModel.questionsSummary(block))\n\(block.content)")
+            case .visualization:
+                parts.append("Visualization\n\(block.content)")
             case .thinking:
                 if !block.content.isEmpty { parts.append("[Thinking]\n\(block.content)") }
             case .info:

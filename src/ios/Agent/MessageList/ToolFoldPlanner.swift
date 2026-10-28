@@ -253,7 +253,7 @@ extension ToolFoldPlanner {
         case .info, .delegateTool, .userAskTool:  // [T-user-ask] never folded
             return .barrier
         case .shellTool, .fileReadTool, .fileWriteTool, .fileEditTool,
-             .browserTool, .readImageTool, .memoryTool:
+             .browserTool, .readImageTool, .memoryTool, .visualization:
             switch block.toolStatus {
             case .success: return .tool(.succeeded)
             case .failed: return .tool(.failed)
