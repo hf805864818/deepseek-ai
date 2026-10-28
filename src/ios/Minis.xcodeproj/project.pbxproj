@@ -650,7 +650,6 @@
 		MERGE00029 /* DeepModeRule.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5RULE101 /* DeepModeRule.swift */; };
 		MERGE00030 /* SequentialThinkingTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SEQ9101 /* SequentialThinkingTool.swift */; };
 		MERGE00031 /* StructuredMemoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5SMEM101 /* StructuredMemoryStore.swift */; };
-		MERGE00032 /* CollectionViewMessageListV3.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5V300011 /* CollectionViewMessageListV3.swift */; };
 		MERGE00033 /* AppSettingsSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5W00001E /* AppSettingsSync.swift */; };
 		MERGE00034 /* CrossSessionContextStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5XSES101 /* CrossSessionContextStore.swift */; };
 		MERGE00035 /* GoogleDriveOAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = GD00000001 /* GoogleDriveOAuthManager.swift */; };
@@ -3201,7 +3200,6 @@
 				MERGE00029 /* DeepModeRule.swift in Sources */,
 				MERGE00030 /* SequentialThinkingTool.swift in Sources */,
 				MERGE00031 /* StructuredMemoryStore.swift in Sources */,
-				MERGE00032 /* CollectionViewMessageListV3.swift in Sources */,
 				MERGE00033 /* AppSettingsSync.swift in Sources */,
 				MERGE00034 /* CrossSessionContextStore.swift in Sources */,
 				MERGE00035 /* GoogleDriveOAuthManager.swift in Sources */,
