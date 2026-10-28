@@ -65,7 +65,7 @@
 // effectiveRange:] — captures the last 10 queries into a tiny ring so
 // the HangDetector dump can show what the typesetter was asking about
 // at stall time.
-#import "AttributeQueryRecorder.h"
+#import "Debug/AttributeQueryRecorder.h"
 
 #endif /* MinisApp_Bridging_Header_h */
 
