@@ -170,7 +170,6 @@ object ExecutionCoordinator {
     }
 
     private lateinit var appContext: Context
-    var envVarRepository: EnvVarRepository? = null
 
     /** Thread-safe per-session shell registry. */
     private val shells = ConcurrentHashMap<String, PersistentShell>()

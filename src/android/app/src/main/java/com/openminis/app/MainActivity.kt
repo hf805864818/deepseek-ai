@@ -375,13 +375,13 @@ class MainActivity : ComponentActivity() {
                                 // Fall through — the polling loop will time out.
                             }
                             OffloadPermissionManager.respondToSettingsGate(
-                                OffloadPermissionManager.SettingsGateDecision.OPEN
+                                gate, OffloadPermissionManager.SettingsGateDecision.OPEN
                             )
                         }
                         .setNegativeButton(gate.negativeLabel) { d, _ ->
                             d.dismiss()
                             OffloadPermissionManager.respondToSettingsGate(
-                                OffloadPermissionManager.SettingsGateDecision.CANCEL
+                                gate, OffloadPermissionManager.SettingsGateDecision.CANCEL
                             )
                         }
                         .show()

@@ -50,6 +50,10 @@ object AgentTools {
         // not a sub agent, an interactive run). Not in the list = does not
         // exist: no schema, no prompt line, no retries on it. Last, as on iOS.
         userAskExposed: Boolean = false,
+        // [T-deep-mode-phase-d/e] Deep mode adds two tools: inline SVG/HTML
+        // visualization (render_widget) and scheduled automation (schedule_task).
+        // Only registered while the master deep-mode switch is on.
+        deepModeEnabled: Boolean = false,
     ): List<AgentToolDefinition> = buildList {
         add(shellExecuteDefinition())
         add(FileReadTool.definition())
@@ -66,8 +70,42 @@ object AgentTools {
         if (!isHelper && delegateEnabled) {
             add(subAgentTaskDefinition(rosterNames))
         }
+        if (deepModeEnabled && !isHelper) {
+            add(renderWidgetDefinition())
+            add(scheduleTaskDefinition())
+        }
         if (userAskExposed && !isHelper) add(com.openminis.app.agent.userask.UserAskPromptText.definition())
     }
+
+    /** [T-deep-mode-phase-d] Inline SVG/HTML visualization. */
+    private fun renderWidgetDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "render_widget",
+        description = "Render an inline visual in the chat: a diagram/chart/comparison as SVG, or an isolated interactive demo as self-contained HTML (inline script allowed, no external network assets). Use it when a visual communicates better than prose; fall back to markdown when prose or a table is clearer.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this visual shows."),
+            "content" to AgentToolParam("string", "The SVG (for diagram/chart/comparison) or self-contained HTML (for interactive) markup, kept compact and readable."),
+        ),
+        required = listOf("tool_title", "content"),
+        propertyOrdering = listOf("tool_title", "content"),
+    )
+
+    /** [T-deep-mode-phase-e] Create a one-off or repeating scheduled automation. */
+    private fun scheduleTaskDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "schedule_task",
+        description = "Schedule a self-contained agent task to run later or on a repeating schedule. Parse natural-language timing into a 24-hour `time` (HH:MM) and a `repeat` mode; confirm the created task back in one line.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of the scheduled task."),
+            "label" to AgentToolParam("string", "Short label shown in the Scheduled Tasks list."),
+            "prompt" to AgentToolParam("string", "The complete self-contained instruction for the agent to run each time."),
+            "time" to AgentToolParam("string", "24-hour time in HH:MM, e.g. 09:00."),
+            "repeat" to AgentToolParam("string", "once | daily | weekdays | custom", enumValues = listOf("once", "daily", "weekdays", "custom")),
+            "days" to AgentToolParam("string", "repeat=custom only: comma-separated weekdays, e.g. Mon,Wed,Fri."),
+            "target" to AgentToolParam("string", "new (default) | follow-up | rerun", enumValues = listOf("new", "follow-up", "rerun")),
+            "session_id" to AgentToolParam("string", "target=follow-up/rerun only: the session to append to or rerun."),
+        ),
+        required = listOf("tool_title", "label", "prompt", "time"),
+        propertyOrdering = listOf("tool_title", "label", "prompt", "time", "repeat", "days", "target", "session_id"),
+    )
 
     /**
      * [T-sub-agents-v1] The one sub agent tool: delegate, and inspect or stop

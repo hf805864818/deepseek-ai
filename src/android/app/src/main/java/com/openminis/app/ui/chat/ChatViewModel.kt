@@ -10022,8 +10022,10 @@ class ChatViewModel(
             it.inputModalities?.map { m -> m.lowercase() }?.contains("image") == true
         } == true
         if (nativeVision) return null
-        if (!com.openminis.app.tools.VisionGroupResolver.isConfigured(providerRepository, context)) return null
-        return com.openminis.app.tools.VisionGroupResolver.noVisionImagePlaceholder(path)
+        val configured = com.openminis.app.tools.VisionGroupResolver
+            .isConfigured(providerRepository, context)
+        return com.openminis.app.tools.VisionGroupResolver
+            .noVisionImagePlaceholder(path, visionGroupConfigured = configured)
     }
 
     /**
