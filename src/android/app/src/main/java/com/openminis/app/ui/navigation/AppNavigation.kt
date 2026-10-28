@@ -864,8 +864,13 @@ fun AppNavigation(
         }
 
         composable(Routes.STORAGE) {
+            val storageContext = androidx.compose.ui.platform.LocalContext.current
+            val storageVm: com.openminis.app.ui.settings.StorageUsageViewModel =
+                androidx.lifecycle.viewmodel.compose.viewModel(
+                    factory = com.openminis.app.ui.settings.StorageUsageViewModel.factory(storageContext, chatRepository),
+                )
             StorageManagementScreen(
-                chatDao = chatRepository.dao,
+                vm = storageVm,
                 onBack = { navController.safePopBackStack() },
                 onRootfsClick = { navController.safeNavigate(Routes.ROOTFS_MANAGEMENT) },
                 onSessionClick = { sessionId ->
@@ -879,10 +884,21 @@ fun AppNavigation(
             arguments = listOf(navArgument("sessionId") { type = NavType.StringType }),
         ) { backStackEntry ->
             val sessionId = backStackEntry.arguments?.getString("sessionId") ?: return@composable
+            val storageVm = remember(backStackEntry) {
+                runCatching { navController.getBackStackEntry(Routes.STORAGE) }.getOrNull()
+            }?.let { parent ->
+                androidx.lifecycle.viewmodel.compose.viewModel<com.openminis.app.ui.settings.StorageUsageViewModel>(
+                    viewModelStoreOwner = parent,
+                    factory = com.openminis.app.ui.settings.StorageUsageViewModel.factory(
+                        androidx.compose.ui.platform.LocalContext.current, chatRepository,
+                    ),
+                )
+            }
             SessionStorageDetailScreen(
                 sessionId = sessionId,
                 chatDao = chatRepository.dao,
                 onBack = { navController.safePopBackStack() },
+                onMeasured = { id, minis, media -> storageVm?.onSessionMeasured(id, minis, media) },
                 onBrowseFiles = { rootPath ->
                     // [T-android-copy-abs-path-fullpath] This browser is rooted at
                     // the per-session host dir (filesDir/minis-sessions/<sid>),
