@@ -129,6 +129,9 @@ object Routes {
     const val NETWORK_TAILSCALE = "network_tailscale"
     const val NETWORK_PROXIES = "network_proxies"
     const val CONTAINER_DNS = "container_dns"
+    const val BACKUP_INITIAL_TAB_KEY = "backup_initial_tab"
+    const val AGENTS = "agents"
+    fun agentTranscript(sessionId: String) = "agent_transcript/$sessionId"
 
     fun skillDetail(skillId: String) = "skill/$skillId"
     fun skillFile(skillId: String, relativePath: String = "SKILL.md"): String {

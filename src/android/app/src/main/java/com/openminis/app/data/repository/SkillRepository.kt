@@ -6,6 +6,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
 import android.util.Log
 import com.openminis.app.data.GitHubMirrorManager
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,6 +20,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -1929,7 +1931,10 @@ Scan code for security vulnerabilities, not just bugs.
         }
     }
 
-    fun requestReload(reason: String, force: Boolean = false) {
+        private val forceReloadPending = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val reloadRequests = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.CONFLATED)
+
+fun requestReload(reason: String, force: Boolean = false) {
             if (force) forceReloadPending.set(true)
             reloadRequests.trySend(reason)
         }

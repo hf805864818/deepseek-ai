@@ -619,7 +619,6 @@ interface ChatDao {
         startMs: Long?,
         endMs: Long?,
     ): Int
-}
 
     @Query("""
         SELECT DISTINCT s.* FROM sessions s
@@ -631,6 +630,7 @@ interface ChatDao {
 
     @Query("UPDATE sessions SET env_profile_id = :envProfileId WHERE id = :id")
     suspend fun updateSessionEnvProfileId(id: String, envProfileId: String?)
+}
 
 
 /** [T-android-search-visible-only] A search hit: the session, and its newest matching message. */
