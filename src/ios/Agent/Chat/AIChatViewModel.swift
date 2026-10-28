@@ -1909,3 +1909,1351 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     }
 
 }
+
+extension AIChatViewModel {
+    /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
+    /// UserDefaults (the Settings toggle) so it applies across all sessions
+    /// without per-session state. When on, an extra deep-mode behavior
+    /// fragment is injected and the bundled deep skills are enabled.
+    var deepModeEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "deepMode.enabled")
+    }
+
+    /// [T-deep-mode-level] Three-tier intensity for deep mode, controlling
+    /// which cognitive abilities are active and which sentinels are forced.
+    /// Stored in UserDefaults so it persists across sessions and is readable
+    /// from both ContentView (settings) and AIChatView (slash menu picker).
+    /// - low: base workflow + C1-C5 (prompt only) + C9 background monitoring
+    /// - medium: low + C10/C12/C14 forced sentinels + C9 sentinel
+    /// - high: medium + C11 tool registration + C13 root cause
+    var deepModeLevel: DeepModeLevel {
+        DeepModeLevel(rawValue: UserDefaults.standard.string(forKey: "deepMode.level") ?? "medium") ?? .medium
+    }
+
+    /// Setter for deep mode level — persists to UserDefaults and broadcasts
+    /// so live VMs re-read the level on the next turn.
+    func setDeepModeLevel(_ level: DeepModeLevel) {
+        UserDefaults.standard.set(level.rawValue, forKey: "deepMode.level")
+        NotificationCenter.default.post(name: .deepModeLevelDidChange, object: nil)
+    }
+
+    /// [T-deep-mode-plan-gate] Gate state for Layer B: `.awaitingApproval`
+    /// when the agent's last turn was a plan-only reply awaiting the user's
+    /// confirm/edit. Only ever set while deep mode is on.
+    @Published var planGateState: PlanGate.State = .idle
+
+    /// [T-deep-mode-floating-panel] Multi-path selection state for the
+    /// Trae-style floating confirm panel. Holds the user's chosen path indexes
+    /// (1-based, matching CandidatePath.index) while a multi-path plan is
+    /// awaiting approval. Empty means "use the recommended path". Reset to
+    /// empty in resetWorkflow() so it never lingers across workflows.
+    @Published var selectedPathIndexes: Set<Int> = []
+
+    /// [T-deep-mode-workflow] Phase 1 explicit workflow state machine. The
+    /// client owns the phase — `.planning` (plan raised), `.executing` (user
+    /// confirmed) — instead of relying on the model's fuzzy plan output. Always
+    /// gated on `deepModeEnabled` and reset to `.idle` whenever the toggle is
+    /// off, so disabling deep mode leaves no residue.
+    @Published var workflowPhase: WorkflowPhase = .idle
+
+
+    /// [T-deep-mode-resume-opt] Saved state for fast resume after pause.
+    /// When user pauses during workflow, we save the current state here.
+    /// On resume, we skip re-evaluation and directly restore the saved state.
+    private var savedWorkflowState: (phase: WorkflowPhase, steps: [WorkflowStep], verifyRoundsLeft: Int, goalRunnerRoundsLeft: Int)? = nil
+    /// [T-deep-mode-workflow] Parsed plan steps for the current workflow, shown
+    /// as a live progress list. Empty unless a plan is active. In-memory only.
+    @Published var workflowSteps: [WorkflowStep] = []
+
+    /// [T-deep-mode-session-workflow] P2: Rollback switch for session-scoped
+    /// workflow. Default ON.
+    ///
+    /// When ON, an in-flight workflow (.executing/.verifying) survives
+    /// interjections and pause/resume — the P0/P1 session behavior and its
+    /// progress capsule. When OFF, the client falls back to the LEGACY
+    /// "per-request workflow" behavior: every user send resets phase/steps, no
+    /// snapshot is saved on pause, and nothing is restored on resume (the
+    /// pre-refactor semantics). This is a configuration-layer kill-switch /
+    /// grayscale lever, per refactor plan item 5. The default is read
+    /// true-when-absent so a fresh install keeps the new behavior; the toggle
+    /// is persisted in UserDefaults.
+    @Published var keepSessionWorkflow: Bool = {
+        let d = UserDefaults.standard
+        // Absent key == never set == default to session-scoped behavior (ON).
+        return d.object(forKey: "deepMode.keepSessionWorkflow") == nil
+            ? true
+            : d.bool(forKey: "deepMode.keepSessionWorkflow")
+    }() {
+        didSet {
+            UserDefaults.standard.set(keepSessionWorkflow, forKey: "deepMode.keepSessionWorkflow")
+            // [T-deep-mode-session-workflow] Audit H1: turning the rollback
+            // switch OFF mid-workflow must destroy the pending session state,
+            // otherwise phase/steps/snapshot/busy linger and the capsule keeps
+            // rendering (the master switch is still on). resetWorkflow() also
+            // clears savedWorkflowState and the round/verify budgets, so this
+            // becomes a graceful, residue-free exit to the LEGACY behavior.
+            if !keepSessionWorkflow {
+                resetWorkflow()
+                workflowBusy = false
+            }
+        }
+    }
+
+    /// [T-deep-mode-session-workflow] P2: Active workflow gating = total deep
+    /// switch AND the session-workflow rollback switch.
+    ///
+    /// `deepModeEnabled` is the master switch; `keepSessionWorkflow` lets the
+    /// operator disable the session behavior independently (Fallback mode).
+    /// Both must hold for the session-scoped path (interjection preservation,
+    /// pause snapshot / resume restore, and the activity indicator) to apply.
+    /// Total-switch safe: when the master switch is off this is always false,
+    /// so every affected path degrades to the pre-refactor behavior.
+    /// Internal (not private) so the progress-capsule view can gate on it.
+    var sessionWorkflowEnabled: Bool {
+        deepModeEnabled && keepSessionWorkflow
+    }
+
+    /// [T-deep-mode-session-workflow] P2: Activity indicator for the progress
+    /// capsule. True while the agent loop (a "round") is actively executing —
+    /// model reasoning or tool calls such as shell/file — and false when the
+    /// turn settles into an idle/awaiting state. The UI can render a
+    /// pulse/small-spin on the capsule while this is true so a long-running
+    /// shell call does not look like a frozen "0/x". Set to false immediately
+    /// on round exit via `defer`. Gated so it never flickers outside an active
+    /// session workflow.
+    @Published var workflowBusy: Bool = false
+
+    /// [T-deep-mode-workflow] Pending one-shot task that fades the completed
+    /// tracker out after a short all-green "完成过渡". Cancelled on master-switch
+    /// teardown so a disabled deep mode never lets a stray delay mutate state.
+    var workflowFinishTask: Task<Void, Never>?
+
+    /// [T-deep-mode-goal-runner] Remaining auto-continuation budget for Layer C.
+    /// Decremented once per auto-round, reset to `GoalRunner.maxAutoRounds` on a
+    /// fresh user send, on a `done` sentinel, on reaching the cap, and on
+    /// session load. Not @Published: nothing renders it directly today; it is
+    /// only consulted at the turn's end and logged for diagnostics.
+    var goalRunnerRoundsLeft: Int = GoalRunner.maxAutoRounds
+
+    /// [T-deep-mode-strip-sentinel] Sentinel resolved at text-capture time (in
+    /// the agent loop, right before the final assistant text is flushed/persisted).
+    /// The visible text is stripped of the `<<GOAL_STATE>>` line at that same
+    /// point, so the auto-continue step at turn end reads this stash instead of
+    /// re-parsing `block.content` (which no longer carries the marker).
+    var pendingGoalSentinel: GoalRunner.ParseResult? = nil
+
+    // MARK: - Phase 2: VerifyGate
+
+    /// [T-deep-mode-verify-gate] Remaining self-verification rounds for Phase 2.
+    /// Decremented each time we re-enter `.executing` from a failed verify,
+    /// reset on fresh user send / session load / workflow reset. Not @Published:
+    /// nothing renders it directly; it is only consulted at verify-turn end.
+    var verifyRoundsLeft: Int = VerifyGate.maxVerifyRounds
+
+    /// [T-deep-mode-verify-gate] Verify sentinel resolved at text-capture time,
+    /// same pattern as `pendingGoalSentinel`. The `<<VERIFY_STATE>>` line is
+    /// stripped from the visible text; the parsed result is stashed here for
+    /// the verify-result handler at turn end.
+    var pendingVerifySentinel: VerifyGate.ParseResult? = nil
+
+    // MARK: - Phase F: SpecGate
+
+    /// [T-deep-mode-phase-f] Spec-gate public state. `.awaitingReview(files:)`
+    /// drives the spec-review panel; `.approved`+ is reached when the user
+    /// approves and the workflow finishes. Always gated on
+    /// `deepModeEnabled && specModeEnabled`; memory-only, never persisted —
+    /// toggling either switch off leaves zero residue.
+    @Published var specGateState = SpecGate.State.idle
+
+    /// [T-deep-mode-phase-f] The spec artifacts produced on the latest
+    /// spec-writing turn, surfaced in the review panel. Only consulted while
+    /// Spec mode is active; cleared on reset / disable.
+    @Published var pendingSpecFiles: [SpecGate.SpecFile] = []
+
+    /// [T-deep-mode-phase-f] Whether the last spec-writing turn emitted the
+    /// SPEC_STATE sentinel. Resolved at text-capture time alongside the other
+    /// sentinels; consumed by `maybeProcessSpecResult` at turn end.
+    var pendingSpecSentinel = false
+
+    /// [T-deep-mode-phase-f] Remaining reject→regenerate edit rounds for the
+    /// current workflow. Bounded so a reject/edit loop can't run forever.
+    var specEditRoundsLeft = SpecGate.maxEditRounds
+
+    /// [T-deep-mode-phase-f] Convenience: is the Spec gate live right now?
+    /// True only when BOTH the master switch and the Spec-mode toggle are on.
+    private var specActive: Bool { SpecGate.isActive(deepModeEnabled: deepModeEnabled) }
+
+    // MARK: - Phase 2: ClarifyGate
+
+    /// [T-deep-mode-clarify-gate] Clarification gate state for Phase 2.
+    /// `.awaitingClarification` when the gate detected ambiguity in the user's
+    /// request and raised a question before planning begins. Always gated on
+    /// `deepModeEnabled`; memory-only, never persisted.
+    @Published var clarifyState: ClarifyGate.State = .idle
+
+    // MARK: - P2 Cognitive: C9 Cognitive Load Monitor
+
+    /// [T-deep-mode-cognitive-p2-c9] Real-time cognitive load state. Updated
+    /// during `runAgentLoop` by merging the model's self-assessed sentinel
+    /// with client-computed metrics (context saturation, tool count, etc.).
+    /// The UI renders a warning banner when level >= .high.
+    /// Total-switch safe: reset to `.empty` in `deepModeDidDisableCleanup()`.
+    @Published var cognitiveLoadState: CognitiveLoadState = .empty
+
+    /// [T-deep-mode-cognitive-p2-c9] The model's self-assessed load signal
+    /// from the last turn's sentinel. Kept separately so the UI can show
+    /// both the model's and the client's assessment.
+    var lastModelLoadSignal: CognitiveLoadSignal?
+
+    // MARK: - P2 Cognitive: C10 Dynamic Autonomy Exit
+
+    /// [T-deep-mode-cognitive-p2-c10] When the model emits
+    /// `<<GOAL_STATE>> need_more_context: <reason>`, the auto-continuation
+    /// loop stops and this state is set. The UI renders a "needs input" prompt.
+    /// Reset to nil in `deepModeDidDisableCleanup()` and on fresh send.
+    @Published var needMoreContextState: String? = nil
+
+    /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
+    /// execution prompt through the normal `send()` path so it inherits every
+    /// existing guard (context check, persistence, session tracking, run loop).
+    /// After `send()` (which resets the workflow as part of its fresh-send
+    /// path) re-enters the executing phase with the captured steps, so the
+    /// progress tracker survives the confirm round-trip.
+    ///
+    /// [T-deep-mode-floating-panel] `selection` carries the user's multi-path
+    /// choice from the floating confirm panel (empty = use the recommended
+    /// path, so unchecking all is still safe). When the user picked specific
+    /// paths, the execution prompt is rebuilt to mention only those paths and
+    /// the step tracker is re-parsed from the merged selected path bodies, so
+    /// the user's choice actually drives what gets executed. Passing a value
+    /// overrides `selectedPathIndexes`; when nil, the stored property is read
+    /// (the host just calls `confirmPlan()`).
+    func confirmPlan(selection: Set<Int>? = nil) {
+        guard case .awaitingApproval(let pendingPlanText, let paths, _) = planGateState else { return }
+        let chosen = selection ?? selectedPathIndexes
+        let capturedSteps: [WorkflowStep]
+        let executionPrompt: String
+
+        if !paths.isEmpty, !chosen.isEmpty {
+            // Multi-path plan with explicit user selection: merge the bodies
+            // of the chosen paths into one execution instruction.
+            let selectedPaths = paths.filter { chosen.contains($0.index) }
+            let mergedPlan = selectedPaths.map(\.body).joined(separator: "\n\n")
+            capturedSteps = mergedPlan.isEmpty
+                ? workflowSteps
+                : WorkflowPlanParser.parseSteps(from: mergedPlan)
+            let labels = selectedPaths.map { "路径 \($0.index)（\($0.title)）" }.joined(separator: "、")
+            executionPrompt = AppLocalized("计划已确认。请严格按所选路径（\(labels)）执行，不要再输出计划，直接开始。")
+        } else {
+            capturedSteps = workflowSteps
+            executionPrompt = AppLocalized("计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
+        }
+        // [T-deep-mode-cognitive-p2-c14] C14: Save the active project context
+        // when a plan is confirmed, so future sessions know what the user
+        // was last working on. Total-switch safe: this code path is only
+        // reachable when deepModeEnabled (PlanGate is gated on it).
+        if deepModeEnabled {
+            // Extract the first meaningful line of the plan as the project context.
+            let firstLine = pendingPlanText.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty && !$0.hasPrefix("```") } ?? String(pendingPlanText.prefix(100))
+            try? CrossSessionContextStore.setActiveProject(firstLine, sessionId: sessionId)
+            logger.info("[CrossSession] C14: active project context saved")
+        }
+        planGateState = .idle
+        selectedPathIndexes = []
+        inputText = executionPrompt
+        send()
+        // [T-deep-mode-workflow] `send()` can early-return before committing
+        // (context near/exhausted shows a dialog, read-only mode, still
+        // processing). Only enter `.executing` when the message actually went
+        // through — otherwise an "执行中" bar would linger with no real run.
+        guard !showCompactBeforeSendPrompt && !showContextExhaustedPrompt else { return }
+        beginExecution(restoring: capturedSteps)
+    }
+
+    /// [T-deep-mode-plan-gate] User wants to adjust the plan: park the plan
+    /// text in the composer and close the gate. The user edits and sends it as
+    /// a normal message. The workflow is reset — editing a plan is a return to
+    /// the idle pre-task state, not an execution instruction.
+    func editPlan() {
+        guard case .awaitingApproval(let planText, _, _) = planGateState else { return }
+        planGateState = .idle
+        selectedPathIndexes = []
+        resetWorkflow()
+        inputText = planText
+    }
+
+    /// [T-deep-mode-plan-gate] Dismiss the pending plan without acting.
+    func cancelPlan() {
+        planGateState = .idle
+        resetWorkflow()
+    }
+
+    // MARK: - Phase 2: ClarifyGate actions
+
+    /// [T-deep-mode-clarify-gate] Skip the clarification step and proceed
+    /// directly with the original request. Used when the user clicks "直接执行"
+    /// on the clarification banner — they don't need to clarify, they just want
+    /// the agent to make a reasonable guess and get on with it.
+    func skipClarification() {
+        guard case .awaitingClarification(_, let original) = clarifyState else { return }
+        clarifyState = .idle
+        inputText = original
+        // Set a flag so send() knows to skip the ambiguity check this time.
+        skipClarifyCheck = true
+        send()
+    }
+
+    /// [T-deep-mode-clarify-gate] Cancel the pending clarification — close the
+    /// banner, restore the original text to the composer, and do NOT send.
+    func cancelClarification() {
+        guard case .awaitingClarification(_, let original) = clarifyState else { return }
+        clarifyState = .idle
+        inputText = original
+    }
+
+    /// [T-deep-mode-clarify-gate] When true, send() skips the ambiguity check
+    /// for the current message. Set by `skipClarification()` so the user can
+    /// bypass the gate on demand. Reset to false after each send.
+    /// Internal access (same as goalRunnerRoundsLeft / pendingGoalSentinel) so
+    /// cross-file extensions (Persistence) can reset it on session load.
+    var skipClarifyCheck = false
+
+    /// [T-deep-mode-workflow] Reset the Phase 1 workflow state machine to its
+    /// "off" shape: idle phase, no steps. Idempotent and safe to call even when
+    /// deep mode is off — it is the single place that guarantees the toggle-off
+    /// contract leaves zero residue.
+    func resetWorkflow() {
+        // [T-deep-mode-workflow] Cancel any pending fade-out so a delayed reset
+        // from a previously completed workflow can't wipe a new run's state.
+        // (Was previously only done in beginExecution(); resetWorkflow is the
+        // canonical "return to idle" entry point so it should own this cleanup.)
+        workflowFinishTask?.cancel()
+        // [T-deep-mode-workflow] Audit M2: defensively clear the activity
+        // indicator here too — this is the canonical "return to idle" entry
+        // point, so it must not leave a stale busy pulse behind.
+        workflowBusy = false
+        // [T-deep-mode-resume-opt] Clear saved state on reset
+        savedWorkflowState = nil
+        workflowPhase = .idle
+        workflowSteps = []
+        // [T-deep-mode-floating-panel] Multi-path selection is per-workflow:
+        // clear it on reset so a choice can never bleed into the next run.
+        selectedPathIndexes = []
+        // [T-deep-mode-verify-gate] Phase 2: verify budget and sentinel are
+        // also per-workflow; resets alongside the workflow state machine.
+        verifyRoundsLeft = VerifyGate.maxVerifyRounds
+        pendingVerifySentinel = nil
+        // [T-deep-mode-phase-f] Phase F spec state is per-workflow; clear it on
+        // reset so a prior run's review / sentinel can't bleed into the next.
+        specGateState = .idle
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        specEditRoundsLeft = SpecGate.maxEditRounds
+        // [fix] Also clear the goal sentinel for consistency. While callers
+        // already re-check deepModeEnabled / message errors before reading it,
+        // leaving a stale sentinel across a reset is a latent hazard if a
+        // future caller forgets the guard.
+        pendingGoalSentinel = nil
+    }
+
+    /// [T-deep-mode-workflow] Enter the executing phase and light up the first
+    /// pending step. Gated on the master switch: if deep mode is somehow off,
+    /// fall back to a hard reset so the state machine can never run unbounded.
+    /// Also falls back when the plan parsed zero recognizable steps — there is
+    /// nothing to track, so we stay idle rather than render an empty "0/0" bar.
+    private func beginExecution(restoring steps: [WorkflowStep]) {
+        guard deepModeEnabled, !steps.isEmpty else {
+            resetWorkflow()
+            return
+        }
+        // [T-deep-mode-workflow] A fresh execution invalidates any pending fade
+        // from a previous completed task, so a stale delayed reset can never
+        // wipe the new run's tracker.
+        workflowFinishTask?.cancel()
+        // [T-deep-mode-cognitive-p1] C7: Reset the retrospective flag for the
+        // new workflow — each workflow gets one retrospective at completion.
+        retrospectiveHasRun = false
+        // [T-deep-mode-cognitive-p1] C7 fix: Also clear isRetrospectiveRunning
+        // in case a previous retrospective was interrupted mid-execution.
+        isRetrospectiveRunning = false
+        workflowPhase = .executing
+        var s = steps
+        if let i = s.firstIndex(where: { $0.status == .pending }) {
+            s[i].status = .active
+        }
+        workflowSteps = s
+    }
+
+    /// [T-deep-mode-workflow] Advance the step tracker by one: mark the current
+    /// active step done and promote the next pending step to active. Coarse but
+    /// deterministic heuristic — each goal-runner auto-continue round is treated
+    /// as roughly one plan step. Never advances outside the executing phase and
+    /// never beyond the parsed step list.
+    private func advanceWorkflowStep() {
+        guard workflowPhase == .executing, !workflowSteps.isEmpty else { return }
+        var steps = workflowSteps
+        if let activeIdx = steps.firstIndex(where: { $0.status == .active }) {
+            steps[activeIdx].status = .done
+        }
+        if let nextIdx = steps.firstIndex(where: { $0.status == .pending }) {
+            steps[nextIdx].status = .active
+        }
+        workflowSteps = steps
+    }
+
+    /// [T-deep-mode-session-workflow] Advanced event-level progress refresh.
+    /// Called once per completed tool result (in the batch stitch loop) so a
+    /// long multi-tool step advances the capsule in near-real time instead of
+    /// reading as a frozen "0/x".
+    ///
+    /// Guard guarantees we NEVER flip the last remaining step to `.done` via a
+    /// tool event:
+    ///   * `workflowPhase == .executing` (same guard as `advanceWorkflowStep`),
+    ///   * `sessionWorkflowEnabled` (master switch AND rollback switch, so this
+    ///     refinement is also a graceful lever that can be turned off),
+    ///   * more than one non-done step remains (if only one is left, this is a
+    ///     no-op).
+    /// Final completion of the last step stays owned by the `.done` sentinel →
+    /// `completeWorkflow`, so the `.verifying` entry is never triggered by tool
+    /// events alone and GoalCompletionEvaluator cannot see a spurious all-done.
+    private func advanceStepOnToolEvent() {
+        guard sessionWorkflowEnabled,
+              workflowPhase == .executing,
+              workflowSteps.filter({ $0.status != .done }).count > 1 else { return }
+        advanceWorkflowStep()
+    }
+
+    /// [T-deep-mode-workflow] Clear the tracker when an execution turn stops on
+    /// its own (no continuation signal, or the auto-continue cap is reached).
+    /// No-op unless a workflow is actually executing, so it can't disturb the
+    /// planning gate or a trivial `.idle` turn.
+    private func finishWorkflow() {
+        guard workflowPhase == .executing else { return }
+        workflowFinishTask?.cancel()
+        resetWorkflow()
+    }
+
+    /// [T-deep-mode-workflow] Task fully done (`done` sentinel): flip every step
+    /// to `.done` and enter the `.verifying` phase. In Phase 1 this was a brief
+    /// fade-out; in Phase 2 it is a real self-check phase — the client injects
+    /// a mandatory verify prompt and the model must confirm with
+    /// `<<VERIFY_STATE>> passed` before the workflow actually finishes.
+    private func completeWorkflow() async {
+        guard workflowPhase == .executing else {
+            resetWorkflow()
+            return
+        }
+        var steps = workflowSteps
+        for i in steps.indices { steps[i].status = .done }
+        workflowSteps = steps
+        workflowPhase = .verifying
+        // [T-deep-mode-verify-gate] Phase 2: kick off the self-verification
+        // round. If verify budget is already exhausted, fall back to the
+        // Phase 1 behavior (instant finish) — zero blockage, zero risk.
+        guard verifyRoundsLeft > 0 else {
+            // [T-deep-mode-s2-1] Log warning when verification budget is exhausted
+            logger.warning("[VerifyGate] verify budget exhausted — finishing without verification (S2-1)")
+            logger.info("[VerifyGate] verify budget exhausted — finishing without verification")
+            scheduleWorkflowFinish()
+            return
+        }
+        await beginVerification()
+    }
+
+    /// [T-deep-mode-verify-gate] Phase 2: inject a self-verification prompt
+    /// and recurse into `runAgentLoop()`. The model is asked to re-read its
+    /// results, run/preview/compare, and report `passed` or `failed`.
+    /// Gated on `deepModeEnabled` at the call-site; this method assumes the
+    /// caller already checked.
+    private func beginVerification() async {
+        guard deepModeEnabled else { return }
+        guard workflowPhase == .verifying else { return }
+        verifyRoundsLeft -= 1
+        let used = VerifyGate.maxVerifyRounds - verifyRoundsLeft
+        logger.info("[VerifyGate] beginning self-verification \(used)/\(VerifyGate.maxVerifyRounds)")
+
+        let cont = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>深度模式自检阶段：执行已完成，请现在严格复查你的工作。请重新阅读所有改动的文件、运行或预览结果、对照原始需求检查是否完全正确。如果一切正常，回复 <<VERIFY_STATE>> passed；如果发现问题，说明问题在哪里、为什么错、以及如何修复，并回复 <<VERIFY_STATE>> failed: <问题简述>。不要输出新的计划块，直接开始复查。</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(cont)
+        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+
+        do {
+            try await runAgentLoop()
+        } catch is CancellationError {
+            logger.info("[VerifyGate] verification cancelled")
+            handleUserCancelledCleanup()
+        } catch {
+            logger.error("[VerifyGate] verification error: \(String(describing: error))")
+        }
+    }
+
+    /// [T-deep-mode-verify-gate] Phase 2: process the result of a verification
+    /// turn. Called at turn end when `workflowPhase == .verifying`.
+    ///   • `passed` → schedule the finish fade-out (workflow truly done).
+    ///   • `failed` → re-enter `.executing` so the model can fix the issues.
+    ///   • no sentinel / unknown → treat as passed (fail-safe: don't block).
+    private func maybeProcessVerifyResult(afterMsgIdx msgIdx: Int) async {
+        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? String(describing: pendingVerifySentinel!) : \"nil\")")
+        guard deepModeEnabled else { return }
+        guard workflowPhase == .verifying else { return }
+        guard messages.indices.contains(msgIdx) else { return }
+        guard messages[msgIdx].error == nil else {
+            logger.info("[VerifyGate] skipped — turn has error")
+            scheduleWorkflowFinish()
+            return
+        }
+        guard !canResume else {
+            logger.info("[VerifyGate] skipped — turn resumable")
+            scheduleWorkflowFinish()
+            return
+        }
+
+        guard let result = pendingVerifySentinel else {
+            // [T-deep-mode-verify-gate] Fail-safe: no sentinel or unrecognized
+            // token → treat as passed and finish. This degrades gracefully to
+            // Phase 1 behavior instead of blocking the user.
+            // [T-deep-mode-s1-2] Log warning when sentinel is missing
+            logger.warning("[VerifyGate] no verify sentinel — treating as passed (fail-safe) — possible missed verification round")
+            logger.info("[VerifyGate] no verify sentinel — treating as passed (fail-safe)")
+            scheduleWorkflowFinish()
+            return
+        }
+
+        switch result {
+        case .passed:
+            logger.info("[VerifyGate] verification passed")
+            // [T-deep-mode-phase-f] If Spec mode is live, verification passing
+            // no longer finishes immediately — enter the spec-writing phase so
+            // the model formalizes the work into spec docs for user review.
+            // Otherwise keep the original behavior (finish now).
+            if specActive {
+                await beginSpecWriting()
+            } else {
+                scheduleWorkflowFinish()
+            }
+        case .failed(let reason):
+            if verifyRoundsLeft > 0 {
+                // [T-deep-mode-s2-2] Log coupling state between VerifyGate and GoalRunner
+                logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft), goalRoundsLeft: \(goalRunnerRoundsLeft))")
+                logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft))")
+                // Flip the last step back to active so the progress tracker
+                // shows "still working" instead of "all done".
+                workflowPhase = .executing
+                var steps = workflowSteps
+                if let lastDoneIdx = steps.lastIndex(where: { $0.status == .done }) {
+                    steps[lastDoneIdx].status = .active
+                }
+                workflowSteps = steps
+                // [T-deep-mode-verify-gate] Top up the GoalRunner budget by 1
+                // if it's exhausted, so the fix round has at least one continue
+                // available. Without this, a task that used all 3 goal rounds
+                // before "falsely reporting done" would be stuck after verify
+                // failure — the model would output pending but couldn't continue.
+                if goalRunnerRoundsLeft <= 0 {
+                    goalRunnerRoundsLeft = 1
+                    logger.info("[VerifyGate] topped up goalRunner budget to 1 for fix round")
+                }
+                // Inject a "fix it" continue prompt and recurse.
+                // [T-deep-mode-cognitive-p2-c13] Instead of a plain "fix it"
+                // prompt, inject a root-cause analysis prompt that asks the
+                // model to: (1) analyze the fundamental reason for failure,
+                // (2) fix it, (3) generate a reusable avoidance rule wrapped
+                // in <<ROOT_CAUSE_RULE>> sentinels. After the fix turn
+                // completes, the rule is extracted and appended to
+                // deep-rules.md. Total-switch safe: only reachable when
+                // deepModeEnabled (guard at maybeProcessVerifyResult entry).
+                let fixReason = reason ?? "发现问题需要修复"
+                let cont = AgentMessage(role: .user, parts: [
+                    .text(ErrorRootCauseAnalyzer.rootCausePrompt(failureReason: fixReason))
+                ])
+                let ci = agentHistory.count
+                agentHistory.append(cont)
+                if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+                    agentHistory[ci].dbMessageId = pid
+                }
+                do {
+                    try await runAgentLoop()
+                    // [T-deep-mode-cognitive-p2-c13] After the fix turn
+                    // completes, extract the root-cause rule from the
+                    // model's last assistant response and append it to
+                    // deep-rules.md. The rule is wrapped in
+                    // <<ROOT_CAUSE_RULE>> sentinels. Total-switch safe:
+                    // only reachable when deepModeEnabled.
+                    if let lastMsg = messages.last,
+                       case .text = lastMsg.blocks.last?.kind,
+                       let lastText = lastMsg.blocks.last?.content,
+                       let rule = ErrorRootCauseAnalyzer.extractRule(from: lastText) {
+                        ErrorRootCauseAnalyzer.appendAutoRule(rule)
+                        logger.info("[RootCauseAnalyzer] C13: extracted and appended auto-rule: \(rule.prefix(80))")
+                    }
+                } catch is CancellationError {
+                    logger.info("[VerifyGate] fix-round cancelled")
+                    handleUserCancelledCleanup()
+                } catch {
+                    logger.error("[VerifyGate] fix-round error: \(String(describing: error))")
+                }
+            } else {
+                logger.info("[VerifyGate] verification failed but out of rounds — finishing anyway")
+                scheduleWorkflowFinish()
+            }
+        }
+    }
+
+    /// [T-deep-mode-workflow] Schedule the fade-out of a completed tracker after
+    /// a short delay. Cancels any prior pending fade first so repeated completion
+    /// can't schedule duplicate mutations. The `deepModeEnabled` re-check at fire
+    /// time guarantees the toggle-off contract isn't violated by a stray delay.
+    private func scheduleWorkflowFinish() {
+        workflowFinishTask?.cancel()
+        workflowFinishTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self, self.deepModeEnabled else { return }
+            self.resetWorkflow()
+            // [T-deep-mode-cognitive-p1] C7 fix: Wait for the main agent loop
+            // to fully finish before running the retrospective. The 900ms delay
+            // above usually suffices, but if the loop is still cleaning up
+            // (error handling, DB writes, queued prompts), isProcessing would
+            // still be true — calling runAgentLoop() again would cause
+            // reentrancy. Wait up to 5 seconds for the loop to release, then
+            // proceed. If it doesn't release (stuck), skip the retrospective
+            // for this workflow — the retrospectiveHasRun flag ensures we
+            // don't double-run on the next finish.
+            var waitCount = 0
+            while self.isProcessing && waitCount < 50 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled else { return }
+                waitCount += 1
+            }
+            if self.isProcessing {
+                logger.warning("[Retrospective] C7 skipped — isProcessing still true after 5s wait")
+                return
+            }
+            await self.maybeRunRetrospective()
+        }
+    }
+
+    // MARK: - Phase F: Spec Writing & Review flow
+
+    /// [T-deep-mode-phase-f] Enter the spec-writing phase after verification
+    /// passes (only when Spec mode is live). Injects a spec-generation prompt
+    /// and recurses into `runAgentLoop()` so the model can write spec.md /
+    /// checklist.md / tasks.md and append `<<SPEC_STATE>>`. Fail-safe: if the
+    /// gate guard fails, fall back to a normal workflow finish (zero blockage).
+    private func beginSpecWriting() async {
+        guard specActive else { scheduleWorkflowFinish(); return }
+        guard workflowPhase == .verifying else { scheduleWorkflowFinish(); return }
+        workflowPhase = .specWriting
+        pendingSpecSentinel = false
+        pendingSpecFiles = []
+        specEditRoundsLeft = SpecGate.maxEditRounds
+        logger.info("[SpecGate] Phase F — entered spec-writing")
+        let cont = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>深度模式规格化阶段：你刚刚完成执行并通过自检。现在请把已完成的成果正式化为一套规格文档。用 file_write（create_dirs=true）写出三个文件：spec.md（目标 / 范围内外 / 功能清单 / 验收标准）、checklist.md（对照验收标准的检查清单）、tasks.md（任务拆分，独立的可并行任务用 [PARALLEL] 标注）。直接基于你实际完成的工作来写，不要发明新的需求。三个文件都写完、且只用这一个回复序完成后，在回复最末尾另起一行补上：\n<<SPEC_STATE>>\n本阶段只写这三份规格文档，不要开始任何新的执行工作。</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(cont)
+        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+        do {
+            try await runAgentLoop()
+        } catch is CancellationError {
+            logger.info("[SpecGate] spec-writing cancelled")
+            handleUserCancelledCleanup()
+        } catch {
+            logger.error("[SpecGate] spec-writing error: \(String(describing: error))")
+        }
+    }
+
+    /// [T-deep-mode-phase-f] Process the end of a spec-writing turn. Called at
+    /// turn end when `workflowPhase == .specWriting`. Harvests the produced
+    /// spec files and, on the sentinel or with detected docs, pauses in
+    /// `.specReviewing` for the user's approve / edit / reject.
+    ///   • sentinel present / docs detected → enter `.specReviewing`.
+    ///   • no sentinel and no docs (or a failed / resumable turn) → fail-safe
+    ///     finish so the capsule never hangs.
+    private func maybeProcessSpecResult(afterMsgIdx msgIdx: Int) async {
+        logger.info("[WorkflowLog] maybeProcessSpecResult() - workflowPhase=\(workflowPhase)")
+        guard specActive else { return }
+        guard workflowPhase == .specWriting else { return }
+        guard messages.indices.contains(msgIdx),
+              messages[msgIdx].error == nil,
+              !canResume else {
+            scheduleSpecFinishFallback()
+            return
+        }
+
+        let detected = SpecGate.detectFiles(in: messages[msgIdx].blocks)
+        if !detected.isEmpty {
+            pendingSpecFiles = detected
+            specGateState = .awaitingReview(files: detected)
+            workflowPhase = .specReviewing
+            logger.info("[SpecGate] spec docs produced (\(detected.count)) — awaiting review")
+        } else if pendingSpecSentinel {
+            // Sentinelled but no product files captured; still let the user
+            // review the (possibly persisted) docs rather than block silently.
+            specGateState = .awaitingReview(files: [])
+            workflowPhase = .specReviewing
+            logger.info("[SpecGate] spec sentinel present but no docs detected — awaiting review")
+        } else {
+            // No sentinel and no files: the spec turn produced nothing useful.
+            logger.warning("[SpecGate] no spec docs and no sentinel — finishing (fail-safe)")
+            scheduleSpecFinishFallback()
+        }
+    }
+
+    /// [T-deep-mode-phase-f] Fail-safe finish when a spec-writing turn cannot
+    /// proceed (error, resumable, or produced nothing). Clears spec state and
+    /// finishes the workflow instead of hanging the capsule.
+    private func scheduleSpecFinishFallback() {
+        specGateState = .idle
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        scheduleWorkflowFinish()
+    }
+
+    /// [T-deep-mode-phase-f] User approved the generated spec docs. Transition
+    /// through `.specApproved` and finish the workflow.
+    func specApprove() {
+        guard specActive else { return }
+        guard workflowPhase == .specReviewing else { return }
+        specGateState = .approved
+        workflowPhase = .specApproved
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        logger.info("[SpecGate] user approved spec — finishing workflow")
+        scheduleWorkflowFinish()
+    }
+
+    /// [T-deep-mode-phase-f] User wants to edit / regenerate the spec docs.
+    /// Bounded by `specEditRoundsLeft`. Re-injects the spec prompt and
+    /// re-enters writing. When the budget is exhausted, treat as approved.
+    func specEdit() {
+        guard specActive else { return }
+        guard workflowPhase == .specReviewing else { return }
+        guard specEditRoundsLeft > 0 else { specApprove(); return }
+        specEditRoundsLeft -= 1
+        specGateState = .idle
+        pendingSpecSentinel = false
+        workflowPhase = .specWriting
+        logger.info("[SpecGate] user requested spec edit (rounds left: \(specEditRoundsLeft))")
+        Task { await injectSpecEditPromptAndRun() }
+    }
+
+    /// [T-deep-mode-phase-f] User rejected the spec / wants to abandon Spec
+    /// mode for this workflow. Finish without further execution (docs stay on
+    /// disk if they were written, but the workflow closes).
+    func specReject() {
+        guard specActive else { return }
+        guard workflowPhase == .specReviewing else { return }
+        specGateState = .idle
+        pendingSpecFiles = []
+        pendingSpecSentinel = false
+        logger.info("[SpecGate] user rejected spec — finishing workflow")
+        resetWorkflow()
+    }
+
+    /// [T-deep-mode-phase-f] Inject an edit prompt for the spec docs and recurse
+    /// into `runAgentLoop()`. Reuses the same sentinel contract.
+    private func injectSpecEditPromptAndRun() async {
+        guard specActive, workflowPhase == .specWriting else {
+            scheduleWorkflowFinish()
+            return
+        }
+        let cont = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>规格文档需要修改。请根据用户刚才的修改意见，用 file_write 重新写入需要调整的 spec.md / checklist.md / tasks.md，然后在这个回复最末尾另起一行补上：\n<<SPEC_STATE>>\n（本阶段只写规格文档，不要开始新的执行工作。）</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(cont)
+        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+        do {
+            try await runAgentLoop()
+        } catch is CancellationError {
+            logger.info("[SpecGate] spec edit cancelled")
+            handleUserCancelledCleanup()
+        } catch {
+            logger.error("[SpecGate] spec edit error: \(String(describing: error))")
+        }
+    }
+
+    /// [T-deep-mode-workflow] Invoked on a master-switch change. When deep mode
+    /// is now OFF, tear down every Phase 1 / deep-mode UI state so the UI and
+    /// behavior return byte-for-byte to the pre-deep-mode shape. Non-destructive
+    /// no-op when deep mode is ON.
+    func deepModeDidDisableCleanup() {
+        guard !deepModeEnabled else { return }
+        workflowFinishTask?.cancel()
+        planGateState = .idle
+        resetWorkflow()
+        goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+        pendingGoalSentinel = nil
+        // [T-deep-mode-clarify-gate] Phase 2: clarification gate also resets
+        // immediately when the master switch goes off — no residual banner.
+        clarifyState = .idle
+        skipClarifyCheck = false
+        // [T-deep-mode-cognitive-p1] C7: Clear the retrospective flag so it
+        // doesn't carry over to a future deep-mode re-enable. Also clears the
+        // C8 uncertainty flag for the same reason. Total-switch safe: both are
+        // in-memory only and never persisted.
+        retrospectiveHasRun = false
+        isRetrospectiveRunning = false
+        didInjectUncertaintyCheckThisRun = false
+        // [T-deep-mode-perf-fragment-cache] Clear the cached deep-mode fragment
+        // so nothing survives a toggle-off (cache re-keyed anyway, but explicit
+        // for the total-switch contract).
+        _cachedDeepModeFragment = nil
+        _cachedDeepModeFragmentKey = nil
+        _cachedRulesModTime = -1  // [T-perf-deepmode-modtime-ttl]
+        _cachedRulesModTimeTS = 0
+        // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load state to
+        // empty so no warning banner survives the off switch.
+        cognitiveLoadState = .empty
+        lastModelLoadSignal = nil
+        // [T-deep-mode-cognitive-p2-c10] C10: Reset the need-more-context
+        // state so no "needs input" prompt survives the off switch.
+        needMoreContextState = nil
+        // [T-deep-mode-cognitive-p2-c14] C14: Clear the active project pointer
+        // in the cross-session store. Historical summaries are preserved
+        // (passive data, no behavioral impact when deep mode is off).
+        try? CrossSessionContextStore.clearActiveProject()
+    }
+
+    /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
+    /// runAgentLoop turn (right after the per-block markdown cache). Reads the
+    /// goal sentinel from the just-finished turn and, when deep mode is on and
+    /// the sentinel says `pending`, injects a synthetic continue message and
+    /// recurses into a fresh `runAgentLoop()` — bounded by `goalRunnerRoundsLeft`.
+    ///
+    /// Fail-safe and non-blocking by construction:
+    ///   • no sentinel / unrecognized token → no-op (parse returns nil).
+    ///   • plan gate still waiting → no-op (a plan is not an execution turn).
+    ///   • errored or resumable turn → no-op (never auto-continue a broken turn).
+    ///   • cap reached → reset budget and stop.
+    private func maybeAutoContinueGoal(afterMsgIdx msgIdx: Int) async {
+        guard deepModeEnabled else {
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            // [T-deep-mode-diagnose] Deep mode off is the #1 silent-skip cause.
+            // One info line per turn makes it impossible to confuse "toggle off"
+            // with a code deficiency again.
+            logger.info("[GoalRunner] skipped — deep mode off")
+            return
+        }
+        // [T-deep-mode-cognitive-p1] C7 fix: If the retrospective's runAgentLoop
+        // is running, do NOT auto-continue — the review text might coincidentally
+        // contain a <<GOAL_STATE>> sentinel, which would trigger an unintended
+        // auto-continue chain inside the retrospective. The retrospective is a
+        // single-turn reflection, not a new task execution. Clear any sentinel
+        // that was parsed from the review text so it can't linger.
+        if isRetrospectiveRunning {
+            logger.info("[GoalRunner] skipped — retrospective in progress (C7 guard)")
+            pendingGoalSentinel = nil
+            return
+        }
+        // A pending plan is awaiting user confirmation — don't auto-continue.
+        guard case .idle = planGateState else {
+            logger.info("[GoalRunner] skipped — plan gate not idle (\(planGateState))")
+            return
+        }
+        // [T-deep-mode-verify-gate] Phase 2: don't auto-continue during the
+        // verification phase — that phase is driven by VerifyGate's own sentinel,
+        // not GoalRunner's. A verify turn may incidentally mention goal state
+        // (e.g. "still pending because I need to fix X") and we don't want that
+        // to trigger a GoalRunner continue inside a verify round.
+        guard workflowPhase != .verifying else {
+            logger.info("[GoalRunner] skipped — in verifying phase (VerifyGate owns this turn)")
+            return
+        }
+        guard messages.indices.contains(msgIdx) else {
+            logger.warning("[GoalRunner] skipped — msgIdx \(msgIdx) out of range")
+            return
+        }
+        if messages[msgIdx].error != nil {
+            logger.info("[GoalRunner] skipped — turn has error")
+            return
+        }
+        if canResume {
+            logger.info("[GoalRunner] skipped — turn resumable (truncated at tool limit)")
+            return
+        }
+        if userDidCancel {
+            logger.info("[GoalRunner] skipped — user cancelled")
+            return
+        }
+        if Task.isCancelled {
+            logger.info("[GoalRunner] skipped — task cancelled")
+            return
+        }
+
+        // [T-deep-mode-strip-sentinel] Read the result resolved at text-capture
+        // time. The visible text was already stripped of the `<<GOAL_STATE>>`
+        // line before flush/persist, so re-parsing `block.content` here would
+        // always miss it.
+        guard let result = pendingGoalSentinel else {
+            logger.info("[GoalRunner] skipped — no sentinel parsed")
+            // [T-deep-mode-workflow] No continuation signal: the execution turn
+            // ended on its own. Clear the tracker so it can't linger as "执行中".
+            // [T-deep-mode-verify-gate] Phase 2: but don't clear during verifying —
+            // that phase has its own lifecycle and shouldn't be wiped by the
+            // absence of a goal sentinel (verify turns use the VERIFY sentinel).
+            // [T-deep-mode-session-workflow] P1: before wiping, run the client
+            // completion evaluator. If every parsed plan step is already done but
+            // the model simply forgot to emit `<<GOAL_STATE>> done`, treat the
+            // turn as complete (all-green + verifying) instead of hard-resetting
+            // to idle — this is the fix for the "capsule disappears after the
+            // last shell command" observation. Only when steps genuinely remain
+            // (or there is no plan to complete) do we reset.
+            if workflowPhase != .verifying {
+                let verdict = GoalCompletionEvaluator.evaluate(
+                    steps: workflowSteps,
+                    broad: false,
+                    roundsLeft: goalRunnerRoundsLeft
+                )
+                if workflowPhase == .executing, verdict == .passed {
+                    await completeWorkflow()
+                } else {
+                    finishWorkflow()
+                }
+            }
+            return
+        }
+
+        switch result {
+        case .done:
+            logger.info("[GoalRunner] done sentinel — resetting auto-continue budget")
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            // [T-deep-mode-session-workflow] P1: cross-check that a `done`
+            // claim is credible. If a plan is being tracked and the client-side
+            // evaluator says NOT all steps are done, don't trust a premature
+            // `done` — nudge the model to finish the remaining steps instead of
+            // wrapping early. (Deterministic stop-when-achieved; still bounded
+            // by goalRunnerRoundsLeft so it can never loop forever.)
+            let verdict = GoalCompletionEvaluator.evaluate(
+                steps: workflowSteps,
+                broad: false,
+                roundsLeft: goalRunnerRoundsLeft
+            )
+            if workflowSteps.isEmpty {
+                // No parsed plan → trust the model's `done` and wrap up.
+                await completeWorkflow()
+            } else if verdict == .passed {
+                // [T-deep-mode-workflow] Task complete: show an all-green completion
+                // for a beat, then fade the tracker out (no lingering residue).
+                await completeWorkflow()
+            } else {
+                // Steps remain but model claims done — ask it to keep going once
+                // more rather than accepting an incomplete task. Bounded: after
+                // decrementing, if budget hit 0 we stop and finish anyway.
+                goalRunnerRoundsLeft -= 1
+                advanceWorkflowStep()
+                let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
+                logger.info("[GoalRunner] done claimed but steps remain — continue \(used)/\(GoalRunner.maxAutoRounds)")
+                let next = "你在上一条回复中标记任务已完成，但仍有计划步骤尚未执行。请继续完成剩余步骤，全部完成后以 <<GOAL_STATE>> done 结束本回合。"
+                let cont = AgentMessage(role: .user, parts: [
+                    .text("<system-reminder>深度模式自动续跑：\(next)</system-reminder>")
+                ])
+                let ci = agentHistory.count
+                agentHistory.append(cont)
+                do {
+                    try await runAgentLoop()
+                } catch is CancellationError {
+                    logger.info("[GoalRunner] auto-continue (post-done) cancelled")
+                    handleUserCancelledCleanup()
+                } catch {
+                    logger.error("[GoalRunner] auto-continue (post-done) error: \(String(describing: error))")
+                }
+            }
+        // [T-deep-mode-cognitive-p2-c10] Dynamic autonomy exit: the model
+        // proactively asks for user input instead of guessing. Stop the
+        // auto-continuation loop, surface the reason, and wait for the user.
+        case .needMoreContext(let reason):
+            logger.info("[GoalRunner] need_more_context sentinel — stopping auto-continue, surfacing to user")
+            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+            needMoreContextState = reason
+            // The model's visible text already explains what it needs.
+            // We just stop the loop — the user sees the message and can reply.
+            finishWorkflow()
+        case .pending(let reason):
+            guard goalRunnerRoundsLeft > 0 else {
+                logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
+                goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
+                // [T-deep-mode-cognitive-p0] C5: Fail-switch — when the auto-continue
+                // budget is exhausted (3 rounds used without reaching `done`), the
+                // model has effectively "failed the same approach 3 times". Instead
+                // of silently stopping, inject a fail-switch directive that tells the
+                // model to try a fundamentally different strategy on the next user
+                // interaction. This is a one-shot injected user message — it does
+                // NOT auto-continue (we're out of budget); it only surfaces the
+                // recommendation in the conversation so the user sees it and the
+                // model's next turn is primed to switch approach.
+                // Total-switch safe: this code path is already inside
+                // `guard deepModeEnabled` at maybeAutoContinueGoal entry, and the
+                // injected message is a normal AgentMessage — no new state, no
+                // persistence, no UI.
+                let failSwitchMsg = AgentMessage(role: .user, parts: [
+                    .text("<system-reminder>深度模式认知提示（C5 失败切换）：已连续尝试 \(GoalRunner.maxAutoRounds) 轮未完成任务。请勿重复同一方法。下次执行时必须切换到完全不同的策略路径，并说明切换理由。如果当前路径是唯一可行路径，请说明为何前 \(GoalRunner.maxAutoRounds) 次未能成功，以及需要用户提供什么才能突破。</system-reminder>")
+                ])
+                let fci = agentHistory.count
+                agentHistory.append(failSwitchMsg)
+                // [T-perf-goalrunner-transient] Do NOT persist synthetic
+                // fail-switch messages to the DB. They are only needed during
+                // the active run; persisting them bloats agentHistory on
+                // session reload, causing estimateContextTokens O(n) stalls
+                // and loadSession delays. The continuation state
+                // (goalRunnerRoundsLeft) is reset on reload, so these messages
+                // are useless after reload and only add to context bloat.
+                // [T-deep-mode-workflow] Stopping without a `done` sentinel:
+                // clear the tracker so it can't linger as "执行中".
+                finishWorkflow()
+                return
+            }
+            goalRunnerRoundsLeft -= 1
+            // [T-deep-mode-workflow] Each auto-continue round advances the step
+            // tracker one position so the user sees live progress.
+            advanceWorkflowStep()
+            let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
+            logger.info("[GoalRunner] pending sentinel — auto-continue \(used)/\(GoalRunner.maxAutoRounds)")
+
+            // Synthetic continue turn: lives only in agentHistory, produces no
+            // user bubble (the `<system-reminder>` prefix makes isUserBubbleEntry
+            // treat it as non-visible). Mirrors resume()'s stop-continue message.
+            let next = reason ?? "继续完成剩余步骤"
+            let cont = AgentMessage(role: .user, parts: [
+                .text("<system-reminder>深度模式自动续跑：目标尚未完成。\(next)。请继续执行剩余步骤，不要重复已完成的工作；全部完成后以 <<GOAL_STATE>> done 结束本回合。</system-reminder>")
+            ])
+            let ci = agentHistory.count
+            agentHistory.append(cont)
+            // [T-perf-goalrunner-transient] Do NOT persist synthetic
+            // auto-continuation messages to the DB. They are only needed
+            // during the active run for the agent loop; persisting them bloats
+            // agentHistory on session reload, compounding estimateContextTokens
+            // O(n) traversal cost and loadSession DB-query overhead. The
+            // continuation state (goalRunnerRoundsLeft) is reset to
+            // maxAutoRounds on reload, so a persisted continuation message
+            // without the matching round state would be an orphan that the
+            // model can't act on — it just inflates the context window.
+
+            // Recurse: the next runAgentLoop() reuses every existing backstop —
+            // maxAgentTurns per round, ToolLoopDetector, in-loop compaction.
+            // Bounded by goalRunnerRoundsLeft, so this cannot loop forever.
+            do {
+                try await runAgentLoop()
+            } catch is CancellationError {
+                logger.info("[GoalRunner] auto-continue cancelled")
+                handleUserCancelledCleanup()
+            } catch {
+                logger.error("[GoalRunner] auto-continue error: \(String(describing: error))")
+                // Never wedge the turn: swallow and stop continuing.
+            }
+        }
+    }
+    /// only the rules that are relevant to the current turn.
+    // [T-perf-scope-cache] Cache for buildDeepModeScopeContext() result.
+    // The scope context depends on the last user message + recent 10 messages'
+    // file path mentions. Between send() and runAgentLoop entry, messages don't
+    // change, so the cache hits and skips the regex traversal.
+    var _cachedScopeContext: DeepModeScopeContext?
+    var _cachedScopeLastUserMessage: String = ""
+
+    /// [T-deep-mode-perf-fragment-cache] Cache for the computed
+    /// `deepModeFragment` string (the large multi-KB deep-agent behavior
+    /// fragment). It is recomputed on every send/resume/fallback/auto-continue
+    /// turn today (AIChatViewModel.swift deepModeFragment), hitting expensive
+    /// paths (scope-context regex traversal + rule glob NSPredicate builds +
+    /// multi-KB string concat) each time. Caching it keyed on its true inputs
+    /// (level + memory flag + scope signature + rules file mod-time) makes all
+    /// the within-turn recomputations O(1) cache hits.
+    ///
+    /// Total-switch safe: this cache is only ever READ inside `deepModeFragment`,
+    /// which is only invoked under `if deepModeEnabled`. When the switch is off
+    /// the fragment is never read and the cache is never touched; we additionally
+    /// clear it in `deepModeDidDisableCleanup()` so no state survives a toggle-off.
+    var _cachedDeepModeFragment: String?
+    var _cachedDeepModeFragmentKey: String?
+    /// [T-perf-deepmode-modtime-ttl] TTL-cached rules file mod time. The old code
+    /// called DeepModeStore.rulesFileModTime() (a file system stat) on every
+    /// single deepModeFragment access — including cache hits — adding I/O latency
+    /// to the main thread. We now cache the result for 2 seconds, so the 3–8
+    /// inference calls within a turn only stat the file once.
+    var _cachedRulesModTime: Double = -1
+    var _cachedRulesModTimeTS: CFAbsoluteTime = 0
+
+    private func buildDeepModeScopeContext() -> DeepModeScopeContext {
+        // [T-perf-scope-cache] Return cached result when the last user message
+        // hasn't changed (same send flow → same scope context → no recomputation).
+        let lastUserMessage = messages
+            .last(where: { $0.role == .user })?.content ?? ""
+
+        if let cached = _cachedScopeContext,
+           lastUserMessage == _cachedScopeLastUserMessage {
+            return cached
+        }
+
+        // Extract file paths from recent messages (last 10 messages)
+        let recentMessages = messages.suffix(10)
+        var mentionedPaths: Set<String> = []
+        for msg in recentMessages {
+            let paths = Self.extractFilePaths(from: msg.content)
+            mentionedPaths.formUnion(paths)
+            // Also extract from assistant blocks (tool_use descriptions, etc.)
+            for block in msg.blocks {
+                let blockPaths = Self.extractFilePaths(from: block.content)
+                mentionedPaths.formUnion(blockPaths)
+            }
+        }
+
+        let ctx = DeepModeScopeContext(
+            mentionedFilePaths: Array(mentionedPaths),
+            userInputLowercased: lastUserMessage.lowercased()
+        )
+        _cachedScopeContext = ctx
+        _cachedScopeLastUserMessage = lastUserMessage
+        return ctx
+    }
+
+    // [T-deep-mode-scope-perf] Precompiled regexes — compiled ONCE per process.
+    //
+    // Before: the bare-filename scan looped over 41 extensions and called
+    // `NSRegularExpression(pattern:)` INSIDE the loop on every invocation, then
+    // ran each of those 42 regexes over the full text. Because
+    // `buildDeepModeScopeContext()` runs this over the last 10 messages and
+    // every block inside them, one scope build performed thousands of ICU regex
+    // compilations plus thousands of full-text scans — measured as 1.2-4.5s of
+    // main-thread hang in long DeepMode sessions (HangDetector stack:
+    // extractFilePaths <- buildDeepModeScopeContext <- deepModeFragment).
+    //
+    // Now: one alternation covers all extensions, so a scan costs 2 regexes
+    // (0 compilations) instead of 42 compilations + 42 scans.
+    private static let slashPathRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"[^\s]*/[^\s]*"#, options: [])
+
+    private static let bareFilenameRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"[\w\-.]+\.(?:markdown|storyboard|swiftpm|podspec|bash|zsh|swift|tsx|jsx|scss|html|yaml|toml|json|plist|php|css|xml|yml|ini|cfg|txt|env|java|cpp|hpp|sql|xib|rb|go|rs|sh|ts|js|py|kt|mm|md|m|c|h)\b"#,
+        options: [.caseInsensitive])
+
+    /// Upper bound on how much of a single text is scanned for file paths.
+    /// DeepMode tool results routinely reach hundreds of KB; paths buried deep
+    /// in a giant log dump are useless for rule scoping, and scanning them made
+    /// the cost scale with accumulated output size — so it got worse the longer
+    /// a session ran.
+    private static let maxPathScanCharacters = 8_192
+
+    /// Extract potential file paths / filenames from text using heuristics.
+    /// Matches:
+    ///   - Paths containing slashes: /foo/bar.swift, src/main.py
+    ///   - Bare filenames with known extensions: file.swift, script.py
+    private static func extractFilePaths(from text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+
+        var paths: Set<String> = []
+
+        // [T-deep-mode-scope-perf] Only scan a bounded prefix. DeepMode tool
+        // results can be hundreds of KB; without this cap the cost of a scope
+        // build scaled with accumulated output size, so it degraded the longer
+        // a session ran.
+        let scanned: String
+        if text.count > Self.maxPathScanCharacters {
+            scanned = String(text.prefix(Self.maxPathScanCharacters))
+        } else {
+            scanned = text
+        }
+        guard !scanned.isEmpty else { return [] }
+
+        let nsRange = NSRange(scanned.startIndex..., in: scanned)
+
+        // Pattern 1: paths with slashes (e.g. /a/b/c.swift, src/foo/bar.py)
+        // Match sequences of non-whitespace that contain at least one /
+        // and end with a known extension or a filename-like component.
+        Self.slashPathRegex?.enumerateMatches(in: scanned, options: [], range: nsRange) { match, _, _ in
+            guard let match = match,
+                  let range = Range(match.range, in: scanned) else { return }
+            var path = String(scanned[range])
+            // Trim trailing punctuation that's unlikely to be part of a path
+            while path.last?.isPunctuation == true && path.last != "/" && path.last != "." {
+                path.removeLast()
+            }
+            if !path.isEmpty {
+                paths.insert(path)
+            }
+        }
+
+        // Pattern 2: bare filenames with common code extensions.
+        // One combined regex (see bareFilenameRegex) replaces the previous
+        // per-extension loop that recompiled 41 regexes on every call.
+        Self.bareFilenameRegex?.enumerateMatches(in: scanned, options: [], range: nsRange) { match, _, _ in
+            guard let match = match,
+                  let range = Range(match.range, in: scanned) else { return }
+            paths.insert(String(scanned[range]))
+        }
+
+        return Array(paths)
+    }
+
+    /// [T-deep-mode] Extra "deep agent" behavior fragment injected just before
+    /// the memory footer when the global 深度龙虾Ai toggle is on. It upgrades
+    /// the agent from the default "act immediately" posture to a
+    /// plan → execute → verify loop modelled on TRAE's autonomous workflow,
+    /// WITHOUT touching `baseSystemPrompt` (which sits on a type-check
+    /// boundary and must not be edited).
+    ///
+    /// Phase 3 evolution: rules are scoped to the current conversation context
+    /// (file paths mentioned + user input keywords) rather than always injecting
+    /// the full rule set. This reduces token waste and keeps the prompt focused.
+    ///
+    /// [T-ios-orphan-scan-perf] Incremental orphan scan cursor. Tracks how far
+    /// into agentHistory we have already verified tool-use/result pairing.
+    /// On each runAgentLoop entry we only scan from this cursor forward,
+    /// reducing O(n*m) to O(d*m) where d is the number of new messages
+    /// since the last scan. Reset to 0 on resume (partial re-scan needed).
+    var orphanScanCursor = 0
+
+    /// [T-perf-orphan-incremental] Cumulative set of toolResult IDs from the
+    /// clean prefix (0..<orphanScanCursor). The old code re-scanned the entire
+    /// clean prefix for toolResult IDs on every send — twice (Phase 1 + Phase 2).
+    /// This set lets us skip both prefix scans: we just merge it into the
+    /// working set in O(1). Reset alongside orphanScanCursor.
+    var orphanScanPrefixToolResultIds = Set<String>()
+
+    private var deepModeFragment: String {
+        // [T-deep-mode-perf-fragment-cache] Cache hit fast-path. The fragment
+        // is a pure function of: deep-mode level, memory flag, the scope context
+        // (itself cached/derived from the last user message), and the rules
+        // file mod-time. When none of those changed since the last build, reuse
+        // the cached string instead of re-running the scope regex traversal +
+        // rule glob NSPredicate builds + multi-KB concat.
+        let scopeCtx = buildDeepModeScopeContext()
+        let level = deepModeLevel
+        // [T-perf-deepmode-modtime-ttl] Only stat the rules file once every 2s.
+        // The old code called rulesFileModTime() on every access — a file system
+        // stat that blocked the main thread even on cache hits. Within a turn
+        // (3–8 inference calls) the file can't change, so this is safe.
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - _cachedRulesModTimeTS > 2.0 {
+            _cachedRulesModTime = DeepModeStore.rulesFileModTime() ?? -1
+            _cachedRulesModTimeTS = now
+        }
+        // [T-perf-deepmode-cachekey-hash] Use a hash of the user input instead
+        // of the full text. The old key embedded the entire user message, which
+        // made key comparison O(n) on every access. A hash is O(1) and captures
+        // the same validity signal: different messages → different hash → miss.
+        let inputHash = scopeCtx.userInputLowercased.hashValue
+        let cacheKey = "\(level.rawValue)|\(memoryEnabled)|\(inputHash)|\(scopeCtx.mentionedFilePaths.joined())|\(_cachedRulesModTime)"
+        if let cached = _cachedDeepModeFragment, _cachedDeepModeFragmentKey == cacheKey {
+            return cached
+        }
+        var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED (intensity: \(level.rawValue)). Adopt a deliberate, senior-engineer working style for this turn:\n"
+        // [T-deep-mode-rules-phase3] Behavior rules are scoped to current context.
+        // Phase 3: only rules matching the current scope (file globs + keywords
+        // + alwaysApply) are injected, replacing the old flat full-list injection.
+        s += DeepModeStore.rulesFragment(for: scopeCtx) + "\n"
+        // [T-deep-mode-plan-gate] Layer B: deterministic plan-gate instruction.
+        // For multi-step tasks the model must first emit ONLY a plan inside a
+        // fenced ```plan``` code block and issue no tool calls; the client then
+        // raises a confirm/edit bar and pauses execution until the user acts.
+        // Trivial single-command tasks skip the plan and act immediately.
+        s += "PLAN GATE — if a request needs more than one step, your FIRST reply must be ONLY a plan: a fenced ```plan``` code block listing numbered steps, with no tool calls. Stop there and wait for the user to confirm before executing anything. For a trivial single-command task, skip the plan and act immediately.\n"
+        // [T-deep-mode-goal-runner] Layer C: deterministic goal sentinel. After
+        // executing (a turn that used tools), the model appends exactly one
+        // status line; the client auto-continues on `pending` until `done` or
+        // the cap. Emitting nothing is always safe (no auto-continuation).
+        s += "GOAL AUTO-CONTINUE — at the very END of a turn where you used tools, append exactly one line (and do NOT put other text after it):\n  • <<GOAL_STATE>> done   (the task is fully complete)\n  • <<GOAL_STATE>> pending: <one-line next step>   (still incomplete; the client will auto-continue)\n"
+        // [T-deep-mode-verify-gate] Phase 2: deterministic self-verification.
+        // When in the verification phase (client injected a verify prompt), the
+        // model MUST re-read its own results, run / preview / compare them, and
+        // append exactly one VERIFY_STATE line at the very end. The client uses
+        // this to decide whether to finish the workflow or loop back to fix.
+        s += "SELF-VERIFY — when the client asks you to verify your work, re-read all changed files, run/preview/test the results, and check against the original goal. At the very END of your reply append exactly one line:\n  • <<VERIFY_STATE>> passed   (everything works correctly, matches the requirements)\n  • <<VERIFY_STATE>> failed: <one-line summary of what's wrong + how to fix>   (issues found; the client will let you fix them)\n"
+        // [T-deep-mode-memory-proactive-phase3] Phase 3: proactive memory with
+        // categories. The agent should classify memories by type (preference /
+        // convention / fact / taboo / project) when writing them.
+        if memoryEnabled {
+            s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, project fact, or taboo worth keeping, persist it via memory_write with an appropriate category (preference/convention/fact/taboo/project) and mention it in a single line, rather than waiting to be asked."
+        }
+        // [T-deep-mode-cognitive-p0] Phase 4.5 P0: cognitive thinking abilities.
+        // Five prompt-injected directives that make the agent "think more like a
+        // human". All are pure prompt additions inside deepModeFragment, so the
+        // master switch controls them implicitly — when deepModeEnabled is off,
+        // deepModeFragment is never appended to the system prompt, and none of
+        // these directives appear. Zero runtime state, zero UI, zero persistence.
+        // These C1-C5 directives are included at ALL levels (low/medium/high).
+        s += "\n"
+        s += "COGNITIVE ABILITIES (think like a senior engineer, not just execute):\n"
+        // C1: Three-layer intent decoding
+        s += "1. THREE-LAYER INTENT — Before acting on a request, silently decode three layers: (a) What is the user literally asking? (b) What is the real underlying need behind this request? (c) After this is solved, what will the user likely ask next? Design your solution for layer (b), not just (a). If layers (a) and (b) conflict, address (b) and briefly explain why.\n"
+        // C2: Reverse verification
+        s += "2. ADVERSARIAL SELF-CHECK — After reaching a conclusion or producing output, actively search for evidence that could DISPROVE your solution. Try to break your own work: what edge case fails? What assumption might be wrong? Only if you cannot find a disproof is the conclusion reliable. State what you tried to break and why it held.\n"
+        // C3: First-principles reasoning
+        s += "3. FIRST PRINCIPLES — Do not rely on \"this worked last time\". For each non-trivial decision, reason from fundamental constraints (what the platform/language/runtime actually guarantees), not from pattern-matching prior solutions. Past success does not justify current reuse if the fundamentals have changed.\n"
+        // C4: Proactive risk anticipation
+        s += "4. PROACTIVE RISK FORESIGHT — Before the user asks, identify risks they haven't mentioned. If your plan has potential side effects, breaking changes, performance implications, or security concerns, surface them proactively in one line. Don't wait to be asked \"what could go wrong\" — tell the user first.\n"
+        // C5: Fail-three-times-switch-method
+        s += "5. FAIL-SWITCH — If the same approach fails 3 consecutive times (same error pattern or same dead-end), STOP and switch to a fundamentally different strategy. Do not attempt a 4th iteration of the same method. State: \"Approach X failed 3 times — switching to Y because Z.\" The auto-continue budget (3 rounds) exists for this: if you've used all 3 rounds without success, the next step must be a different approach, not a retry.\n"
+        // [T-deep-mode-level] Medium/High only: C12 multi-path, C9 sentinel,
+        // C10 need_more_context, C14 cross-session. Low level skips these
+        // for a more natural, less sentinel-heavy conversation experience.
+        if level.forcesMultiPath {
+            // [T-deep-mode-cognitive-p2-c12] C12: Multi-path parallel thinking.
+            s += "6. MULTI-PATH THINKING — When you produce a plan (fenced ```plan``` block), if the task is complex (more than 3 steps, or involves architecture/design decisions), generate AT LEAST 3 candidate paths. Format each path as:\n  ## PATH 1: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 2: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 3: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  RECOMMENDED: PATH <N>\n  Briefly explain why you recommend this path over the others (1-2 sentences). For trivial tasks (≤3 steps, no design decisions), use a standard single-path plan as before.\n"
+        }
+        if level.enablesRootCause {
+            // [T-deep-mode-cognitive-p2-c13] C13: Error → root cause → strategy
+            s += "7. ROOT CAUSE LEARNING — When verification fails and you receive a root-cause analysis prompt, do NOT just fix the surface symptom. Analyze the FUNDAMENTAL reason it went wrong (wrong assumption? missing step? platform constraint?), fix it, then produce a single reusable rule that would prevent this class of error. Wrap the rule in <<ROOT_CAUSE_RULE>> ... <<ROOT_CAUSE_RULE>> tags. The rule will be auto-saved to your behavior rules for future sessions.\n"
+        }
+        if level.forcesCognitiveLoadSentinel {
+            // [T-deep-mode-cognitive-p2-c9] C9: Cognitive load real-time monitoring.
+            s += "8. COGNITIVE LOAD MONITORING — At the END of each turn where you used tools, assess your cognitive load and append exactly one line:\n  • <<COGNITIVE_LOAD>> low    (on track, confident, context is clear)\n  • <<COGNITIVE_LOAD>> medium  (some complexity, but manageable)\n  • <<COGNITIVE_LOAD>> high: <one-line note>   (losing track, context getting long, multiple failures)\n  • <<COGNITIVE_LOAD>> critical: <one-line note>   (context near limit, severe confusion, need to step back)\n  Be honest — under-reporting load leads to degraded output quality. If the client also detects high load from its own metrics, it will warn the user.\n"
+        }
+        if level.enablesNeedMoreContext {
+            // [T-deep-mode-cognitive-p2-c10] C10: Dynamic autonomy exit.
+            s += "9. DYNAMIC AUTONOMY EXIT — If you are in an auto-continue loop and discover you need information you don't have (ambiguous requirements, missing file access, need a design decision only the user can make), do NOT guess. Instead emit:\n  • <<GOAL_STATE>> need_more_context: <one-line description of what you need>\n  The client will STOP the auto-continuation loop and surface your question to the user. This is preferable to 3 rounds of increasingly-wrong assumptions.\n"
+        }
+        if level.enablesCrossSession {
+            // [T-deep-mode-cognitive-p2-c14] C14: Unified cross-mode context.
+            s += "10. CROSS-SESSION CONTEXT — When you complete a meaningful workflow (not a trivial single-step task), append a one-line summary of what was accomplished. The client will persist this as cross-session context so future sessions can pick up where you left off. Also, when you start a new workflow, briefly state the current project context so the client can persist it as the active project.\n"
+        }
+        if level.registersSequentialThinking {
+            // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
+            s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
+        }
+        // [T-deep-mode-skill-accumulate] Phase B B2: Skill accumulation hint.
+        // Teaches the model to notice a RECURRING task pattern and propose a
+        // reusable skill, instead of only acting on explicit skill requests.
+        // Pure prompt addition inside deepModeFragment — fully governed by
+        // the master switch (never injected when deep mode is off).
+        s += "13. SKILL ACCUMULATION — If about the 3rd time in this session you're handling the SAME type of task (a recurring workflow: producing a docx report, generating a slide deck, the same class of code fix), that workflow is a candidate for a reusable skill. Mention it to the user in one line and offer to create one using the skill format. Do NOT propose a skill on the first or second occurrence — only when a reliable pattern has clearly emerged.\n"
+        // [T-deep-mode-phase-d] Phase D: Inline-visualization guidance. Teaches
+        // the model when and how to use the render_widget tool. Pure prompt
+        // addition inside deepModeFragment — governed by the master switch.
+        s += "14. VISUALIZATION — You have a `render_widget` tool that renders an SVG diagram/chart or an isolated HTML widget INLINE in the chat (not saved as a file). Use it when a visual communicates better than prose: for flowcharts and architecture/sequence diagrams, comparison tables, small data charts, or interactive demos. Provide well-formed inline SVG for 'diagram'/'chart'/'comparison' and self-contained HTML (inline <script> allowed, NO external network assets) for 'interactive'. Keep it compact and readable; width auto-fits the container. Fall back to normal markdown text when prose or a table is clearer. Do NOT use render_widget for content that is better as a real saved file the user can open elsewhere.\n"
+        // [T-deep-mode-phase-e] Phase E: Scheduled-automation guidance. Teaches
+        // the model when and how to use the schedule_task tool. Pure prompt
+        // addition inside deepModeFragment — governed by the master switch.
+        // The tool is only registered in deep mode; created tasks stay
+        // manageable in Settings regardless of the switch.
+        s += "15. SCHEDULED AUTOMATION — You have a `schedule_task` tool that creates a repeating AI action (run daily / weekdays / on specific days at a set time). Use it when the user asks to set up anything recurring: '每天 9 点生成日报', '每个工作日早上整理邮件', '每周一运行安全检查'. Parse the natural-language request into the structured arguments: a short `label`, a fully self-contained `prompt` (the task starts in a FRESH chat, so include all necessary context), a 24-hour `time` (HH:MM), and a `repeat` mode (daily / weekdays / custom + days). After creating, tell the user the next-fire time and that they can manage the task in [Settings → Agent Runtime → Scheduled Tasks](minis://settings/scheduled-tasks). The task runs on a best-effort schedule via a local notification + open-time catch-up; a missed fire is caught the next time the app is opened, never silently dropped.\n"
+        // [T-deep-mode-phase-f] Phase F: Spec-mode guidance. Injected ONLY when
+        // the Spec toggle is on (deep-mode fragment is already gated on the
+        // master switch, so `SpecGate.modeEnabled && deepModeEnabled` together
+        // gate this). Pure prompt addition — zero runtime state.
+        if SpecGate.modeEnabled {
+            s += "16. SPECIFICATION (SPEC) MODE — an OPTIONAL phase AFTER verification passes. Only activate when BOTH deep mode is on AND Spec mode is enabled (the client will already have entered the spec-writing phase and told you to start). Formalize the completed work into THREE documents with file_write (create_dirs=true): spec.md (goal / scope-in / scope-out / feature list / acceptance criteria), checklist.md (a verification checklist derived from the acceptance criteria), tasks.md (task breakdown, marking independent tasks with [PARALLEL]). Keep each document precise, structured markdown; reuse the actual work you just did — do NOT invent new requirements. At the END of your turn, after all three files are written, append exactly one line:\n  <<SPEC_STATE>>\nDo NOT start new execution work during the spec-writing phase — only write the three specification documents.\n"
+        }
+        _cachedDeepModeFragment = s
+        _cachedDeepModeFragmentKey = cacheKey
+        return s
+    }
+
+    // MARK: - P1 Cognitive Abilities (C6/C7/C8)
+
+    /// [T-deep-mode-cognitive-p1] C7: Guard flag ensuring the retrospective runs
+    /// at most once per workflow completion. Set when the retrospective begins,
+    /// cleared when a new workflow starts (beginExecution). Total-switch safe:
+}

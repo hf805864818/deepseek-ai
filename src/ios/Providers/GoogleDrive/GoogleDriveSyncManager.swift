@@ -151,7 +151,7 @@ final class GoogleDriveSyncManager: ObservableObject {
         logger.info("Step 2: building ZIP archive (\(files.count) files, \(totalRawSize) bytes raw)...")
 
         // 2. Create ZIP archive (CPU + memory heavy — runs on background)
-        let zipData = await SkillStore.buildZipArchive(files: files)
+        let zipData = SkillStore.buildZipArchive(files: files)
         let fileSize = zipData.count
         logger.info("Step 2: ZIP built: \(fileSize) bytes")
 
@@ -481,7 +481,7 @@ final class GoogleDriveSyncManager: ObservableObject {
     func mergeBackup(_ zipData: Data) async throws {
         let entries: [SkillStore.ZipEntry]
         do {
-            entries = try await SkillStore.readZipEntries(data: zipData)
+            entries = try SkillStore.readZipEntries(data: zipData)
         } catch {
             logger.error("Failed to read ZIP entries: \(error.localizedDescription)")
             throw LLMError.providerError(message: "Failed to read backup archive: \(error.localizedDescription)")

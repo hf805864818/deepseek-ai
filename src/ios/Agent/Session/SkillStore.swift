@@ -2474,7 +2474,7 @@ final class SkillZipPackager: @unchecked Sendable {
 
     /// Build a ZIP archive in memory from a list of (relativePath, data) pairs.
     /// Uses Store method (no compression) for simplicity and speed.
-    static func buildZipArchive(files: [(relativePath: String, data: Data)]) -> Data {
+    nonisolated static func buildZipArchive(files: [(relativePath: String, data: Data)]) -> Data {
         var archive = Data()
         // Headers are 30 + 46 bytes per file plus the name twice; reserving
         // up front saves regrowing a multi-megabyte buffer file by file.
@@ -2557,7 +2557,7 @@ final class SkillZipPackager: @unchecked Sendable {
     /// steps for a 5 MB skill, and most of the 2.5 s the main thread lost.
     /// zlib's is the same polynomial and the same value. Qualified as
     /// `zlib.crc32` because this type's own `crc32(_:)` would otherwise win.
-    static func crc32(_ data: Data) -> UInt32 {
+    nonisolated static func crc32(_ data: Data) -> UInt32 {
         guard !data.isEmpty else { return 0 }
         return data.withUnsafeBytes { buf -> UInt32 in
             guard let base = buf.bindMemory(to: Bytef.self).baseAddress else { return 0 }
@@ -2587,7 +2587,7 @@ extension SkillStore {
         let data: Data
     }
 
-    static func readZipEntries(data: Data) throws -> [ZipEntry] {
+    nonisolated static func readZipEntries(data: Data) throws -> [ZipEntry] {
         guard data.count >= 22 else { throw SkillError.invalidArchive }
 
         var eocdOffset = -1

@@ -272,7 +272,7 @@ final class LocalSyncManager: ObservableObject {
 
         // 2. Create ZIP archive.
         await MainActor.run { backupPhase = .packaging }
-        let zipData = await SkillStore.buildZipArchive(files: files)
+        let zipData = SkillStore.buildZipArchive(files: files)
         logger.info("Step 2: ZIP built: \(zipData.count) bytes")
 
         let timestamp = Self.backupDateFormatter.string(from: Date())
