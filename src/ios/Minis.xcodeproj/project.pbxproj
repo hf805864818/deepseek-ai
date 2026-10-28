@@ -1491,8 +1491,8 @@
 		E5EP0011 /* EnvProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/EnvProfileStore.swift; sourceTree = "<group>"; };
 		E5EP0012 /* EnvProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/Settings/EnvProfileView.swift; sourceTree = "<group>"; };
 		E5FTP101 /* FloatingToolPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/Chat/FloatingToolPreviewView.swift; sourceTree = "<group>"; };
-		E5J000041 /* AttributeQueryRecorder.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AttributeQueryRecorder.m; sourceTree = "<group>"; };
-		E5J000042 /* AttributeQueryRecorder.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AttributeQueryRecorder.h; sourceTree = "<group>"; };
+		E5J000041 /* AttributeQueryRecorder.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Debug/AttributeQueryRecorder.m; sourceTree = "<group>"; };
+		E5J000042 /* AttributeQueryRecorder.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Debug/AttributeQueryRecorder.h; sourceTree = "<group>"; };
 		E5MPATH101 /* MultiPathPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Agent/Chat/MultiPathPlanner.swift; sourceTree = "<group>"; };
 		E5OVL101 /* ChatOverlays.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/Chat/ChatOverlays.swift; sourceTree = "<group>"; };
 		E5PHD0101 /* RenderWidgetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/Chat/RenderWidgetView.swift; sourceTree = "<group>"; };
