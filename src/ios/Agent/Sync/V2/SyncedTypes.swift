@@ -22,6 +22,11 @@ struct SyncedSession: Syncable {
     var modelBinding: String?
     var pinnedAt: Date?
     var folderId: String?
+    // [T-p1-delegate-task] Child-session linkage; optional, no version bump
+    // (same shape as folderId). Old builds ignore it and show the child as a
+    // normal session titled "Agent · …" — accepted build-skew.
+    var parentSessionId: String?
+    var parentToolUseId: String?
     var envProfileId: String?
 
     static let syncMetadata: SyncTypeMetadata<SyncedSession> = {
@@ -44,6 +49,8 @@ struct SyncedSession: Syncable {
                 // bump): old devices ignore the unknown CKRecord field on read
                 // and omit it on write, both of which decode as nil here.
                 F.optionalString("folderId", \SyncedSession.folderId),
+                F.optionalString("parentSessionId", \SyncedSession.parentSessionId),
+                F.optionalString("parentToolUseId", \SyncedSession.parentToolUseId),
                 F.optionalString("envProfileId", \SyncedSession.envProfileId),
             ],
             conflictPolicy: .lastWriteWinsByField(\SyncedSession.updatedAt),
@@ -63,6 +70,8 @@ struct SyncedSession: Syncable {
             modelBinding: modelBinding,
             pinnedAt: s.pinnedAt,
             folderId: s.folderId,
+            parentSessionId: s.parentSessionId,
+            parentToolUseId: s.parentToolUseId,
             envProfileId: s.envProfileId
         )
     }
@@ -85,6 +94,19 @@ struct SyncedMessage: Syncable {
     var sortOrder: Int
     var createdAt: Date
     var updatedAt: Date
+    /// [T-token-attribution-snapshot] Which model actually produced this
+    /// message. Optional so a device on an older build — which sends none of
+    /// these — still decodes: `optionalString` returns nil for a missing key
+    /// rather than throwing, so no protocol version bump is needed.
+    ///
+    /// A receiver must treat nil as "no information", never as "empty": see the
+    /// COALESCE guards in `ChatStore.mergeRemoteMessage`, without which an
+    /// older device echoing a message back would wipe a newer device's
+    /// correctly-recorded attribution.
+    var modelId: String?
+    var modelDisplayName: String?
+    var providerType: String?
+    var providerInstanceId: String?
 
     static let syncMetadata: SyncTypeMetadata<SyncedMessage> = {
         typealias F = FieldDescriptor<SyncedMessage>
@@ -103,6 +125,10 @@ struct SyncedMessage: Syncable {
                 F.int("sortOrder",                    \SyncedMessage.sortOrder),
                 F.date("createdAt",                   \SyncedMessage.createdAt),
                 F.date("updatedAt",                   \SyncedMessage.updatedAt),
+                F.optionalString("modelId",           \SyncedMessage.modelId),
+                F.optionalString("modelDisplayName",  \SyncedMessage.modelDisplayName),
+                F.optionalString("providerType",      \SyncedMessage.providerType),
+                F.optionalString("providerInstanceId", \SyncedMessage.providerInstanceId),
             ],
             conflictPolicy: .lastWriteWinsByField(\SyncedMessage.updatedAt),
             version: 1
@@ -127,7 +153,11 @@ struct SyncedMessage: Syncable {
             streamInterruptCount: m.streamInterruptCount,
             sortOrder: m.sortOrder,
             createdAt: m.createdAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            modelId: m.modelId,
+            modelDisplayName: m.modelDisplayName,
+            providerType: m.providerType,
+            providerInstanceId: m.providerInstanceId
         )
     }
 }
@@ -285,33 +315,6 @@ struct SyncedProviderConfig: Syncable {
                 F.date("updatedAt",      \SyncedProviderConfig.updatedAt),
             ],
             conflictPolicy: .lastWriteWinsByField(\SyncedProviderConfig.updatedAt),
-            version: 1
-        )
-    }()
-}
-
-// MARK: - SyncedMCPServers
-
-/// [T-mcp-integration-ios] Whole-file sync of /var/minis/mcp-servers/servers.json
-/// (the MCP server list). One record per app; last-write-wins by updatedAt
-/// (the file mtime), aligned with how the other config files sync.
-struct SyncedMCPServers: Syncable {
-    /// Constant id — only one MCP server list per app.
-    var id: String = "mcp-servers"
-    var serversJson: String
-    var updatedAt: Date
-
-    static let syncMetadata: SyncTypeMetadata<SyncedMCPServers> = {
-        typealias F = FieldDescriptor<SyncedMCPServers>
-        return SyncTypeMetadata<SyncedMCPServers>(
-            recordType: "MCPServersV2",
-            idKeyPath: \SyncedMCPServers.id,
-            scope: .global,
-            fields: [
-                F.string("serversJson", \SyncedMCPServers.serversJson),
-                F.date("updatedAt",     \SyncedMCPServers.updatedAt),
-            ],
-            conflictPolicy: .lastWriteWinsByField(\SyncedMCPServers.updatedAt),
             version: 1
         )
     }()
@@ -582,6 +585,59 @@ struct SyncedProviderThinkingRuleV3: Syncable {
     }()
 }
 
+/// [T-subagent-own-store] One CK record per sub agent definition.
+///
+/// Per-record rather than whole-roster so two devices editing different agents
+/// merge as a natural union instead of one overwriting the other — the same
+/// reason EnvVarItem replaced the whole-file EnvVarV2.
+///
+/// `sortOrder` rides on each record because it is disclosure order in the
+/// roster the model reads, i.e. real content, and a single record cannot
+/// express "the list moved" — a reorder therefore pushes one upsert per id.
+///
+/// `modelGroupId` is the one field pointing into provider-land. It is a plain
+/// foreign key and is synced verbatim; a group that does not exist on the
+/// receiving device resolves to "model chooses", which is the same fallback a
+/// locally-deleted group produces.
+struct SyncedSubAgentV3: Syncable {
+    var id: String                  // definition UUID (or SubAgentDefinition.builtInId)
+    var name: String
+    var subAgentDescription: String // `description` is taken on Syncable conformers
+    var instructions: String
+    var modelGroupId: String?
+    /// [T-subagent-thinking-override] ThinkingLevel raw value, nil = not set.
+    /// `optionalString`, so a peer on an older build that sends no such key
+    /// decodes as nil rather than throwing — no protocol version bump needed.
+    var thinkingLevelOverride: String?
+    /// 0/1 rather than Bool: the sync framework's FieldDescriptor offers
+    /// string / int / date only, and adding a bool descriptor for one field
+    /// would change shared infrastructure for no behavioural gain.
+    var isBuiltIn: Int
+    var sortOrder: Int
+    var updatedAt: Date
+
+    static let syncMetadata: SyncTypeMetadata<SyncedSubAgentV3> = {
+        typealias F = FieldDescriptor<SyncedSubAgentV3>
+        return SyncTypeMetadata<SyncedSubAgentV3>(
+            recordType: "SubAgentV3",
+            idKeyPath: \SyncedSubAgentV3.id,
+            scope: .global,
+            fields: [
+                F.string("name",                 \SyncedSubAgentV3.name),
+                F.string("description",          \SyncedSubAgentV3.subAgentDescription),
+                F.string("instructions",         \SyncedSubAgentV3.instructions),
+                F.optionalString("modelGroupId", \SyncedSubAgentV3.modelGroupId),
+                F.optionalString("thinkingLevelOverride", \SyncedSubAgentV3.thinkingLevelOverride),
+                F.int("isBuiltIn",               \SyncedSubAgentV3.isBuiltIn),
+                F.int("sortOrder",               \SyncedSubAgentV3.sortOrder),
+                F.date("updatedAt",              \SyncedSubAgentV3.updatedAt),
+            ],
+            conflictPolicy: .lastWriteWinsByField(\SyncedSubAgentV3.updatedAt),
+            version: 1
+        )
+    }()
+}
+
 // MARK: - SyncedEnvVars (legacy whole-file record)
 //
 // Kept for inbound compatibility ONLY. New devices push per-variable
@@ -660,104 +716,40 @@ struct SyncedEnvVar: Syncable {
     }()
 }
 
-// MARK: - SyncedEnvProfile
+// MARK: - SyncedEnvVarState [T-envvar-disable]
 //
-// One CK record per environment variable profile. Profiles are
-// per-account global scope; last-write-wins by updatedAt. Profile
-// variables (SyncedEnvProfileVar) are child records scoped by profileId.
-struct SyncedEnvProfile: Syncable {
-    var id: String          // EnvProfile.id (UUID) — also CK recordName
-    var name: String
-    var icon: String?
-    var color: String?
-    var isDefault: Int      // 0/1
-    var createdAt: Date
-    var updatedAt: Date
+// A variable's enabled / disabled state, one record per variable
+// (recordName = EnvVarEntry.id). Its own record type rather than a field on
+// EnvVarItem, so that builds predating the feature can never write or delete
+// it: they do not register the type (SyncCore ignores unknown types on
+// inbound) and never emit it. A field on EnvVarItem would be exposed to an
+// older build's delete-and-recreate of that record and to a fresh zone
+// re-upload by an older build; here neither can happen. `updatedAt` is the
+// state's own clock (EnvVarStateBook), independent of EnvVarItem's.
+// Note: like every new record type, it must be deployed to the CloudKit
+// Production schema before a release; until then only state sync is off.
+struct SyncedEnvVarState: Syncable {
+    var id: String         // EnvVarEntry.id - also CK recordName
+    var key: String        // variable name at the time; diagnostics only
+    var enabled: Int       // 1 enabled, 0 disabled
+    var updatedAt: Date    // the state's own LWW clock
 
-    static let syncMetadata: SyncTypeMetadata<SyncedEnvProfile> = {
-        typealias F = FieldDescriptor<SyncedEnvProfile>
-        return SyncTypeMetadata<SyncedEnvProfile>(
-            recordType: "EnvProfile",
-            idKeyPath: \SyncedEnvProfile.id,
+    static let syncMetadata: SyncTypeMetadata<SyncedEnvVarState> = {
+        typealias F = FieldDescriptor<SyncedEnvVarState>
+        return SyncTypeMetadata<SyncedEnvVarState>(
+            recordType: "EnvVarStateItem",
+            idKeyPath: \SyncedEnvVarState.id,
             scope: .global,
             fields: [
-                F.string("profileId",     \SyncedEnvProfile.id),
-                F.string("name",          \SyncedEnvProfile.name),
-                F.optionalString("icon",  \SyncedEnvProfile.icon),
-                F.optionalString("color", \SyncedEnvProfile.color),
-                F.int("isDefault",        \SyncedEnvProfile.isDefault),
-                F.date("createdAt",       \SyncedEnvProfile.createdAt),
-                F.date("updatedAt",       \SyncedEnvProfile.updatedAt),
+                F.string("entryId",  \SyncedEnvVarState.id),
+                F.string("key",      \SyncedEnvVarState.key),
+                F.int("enabled",     \SyncedEnvVarState.enabled),
+                F.date("updatedAt",  \SyncedEnvVarState.updatedAt),
             ],
-            conflictPolicy: .lastWriteWinsByField(\SyncedEnvProfile.updatedAt),
+            conflictPolicy: .lastWriteWinsByField(\SyncedEnvVarState.updatedAt),
             version: 1
         )
     }()
-
-    static func from(_ p: EnvProfile) -> SyncedEnvProfile {
-        SyncedEnvProfile(
-            id: p.id,
-            name: p.name,
-            icon: p.icon,
-            color: p.color,
-            isDefault: p.isDefault ? 1 : 0,
-            createdAt: p.createdAt,
-            updatedAt: p.updatedAt
-        )
-    }
-}
-
-// MARK: - SyncedEnvProfileVar (per-profile-variable record)
-//
-// One CK record per environment variable within a profile. Follows the
-// same per-record LWW pattern as SyncedEnvVar but scoped to a profile.
-//
-// `valueB64`: base64(utf8(value)) — same trust model as SyncedEnvVar.
-// Values travel in the record (not solely via iCloud Keychain) so a
-// brand-new entry shows up on a peer with its value immediately. The
-// receiver decodes and writes the value into Keychain itself.
-struct SyncedEnvProfileVar: Syncable {
-    var id: String          // EnvProfileVar.id (UUID) — also CK recordName
-    var profileId: String   // owning EnvProfile.id
-    var key: String
-    var valueB64: String    // base64(value); empty for "no value yet"
-    var note: String
-    var createdAt: Date
-    var updatedAt: Date
-
-    static let syncMetadata: SyncTypeMetadata<SyncedEnvProfileVar> = {
-        typealias F = FieldDescriptor<SyncedEnvProfileVar>
-        return SyncTypeMetadata<SyncedEnvProfileVar>(
-            recordType: "EnvProfileVar",
-            idKeyPath: \SyncedEnvProfileVar.id,
-            scope: .perParent(parentType: "EnvProfile", \SyncedEnvProfileVar.profileId),
-            fields: [
-                F.string("varId",       \SyncedEnvProfileVar.id),
-                F.string("profileId",   \SyncedEnvProfileVar.profileId),
-                F.string("key",         \SyncedEnvProfileVar.key),
-                F.string("valueB64",    \SyncedEnvProfileVar.valueB64),
-                F.string("note",        \SyncedEnvProfileVar.note),
-                F.date("createdAt",     \SyncedEnvProfileVar.createdAt),
-                F.date("updatedAt",     \SyncedEnvProfileVar.updatedAt),
-            ],
-            conflictPolicy: .lastWriteWinsByField(\SyncedEnvProfileVar.updatedAt),
-            version: 1
-        )
-    }()
-
-    static func from(_ v: EnvProfileVar) -> SyncedEnvProfileVar {
-        let value = EnvProfileStore.loadValueSync(profileId: v.profileId, key: v.key) ?? ""
-        let valueB64 = Data(value.utf8).base64EncodedString()
-        return SyncedEnvProfileVar(
-            id: v.id,
-            profileId: v.profileId,
-            key: v.key,
-            valueB64: valueB64,
-            note: v.note,
-            createdAt: v.createdAt,
-            updatedAt: v.updatedAt
-        )
-    }
 }
 
 // MARK: - SyncedDevice
@@ -933,37 +925,6 @@ struct SyncedFolder: Syncable {
     }
 }
 
-// MARK: - SyncedAppSettings (user preferences singleton)
-//
-// One singleton record per iCloud account holding the user's app preferences
-// (appearance, font sizes, auto-grouping, memory toggle, etc.) as a JSON
-// blob. LWW by updatedAt — settings change infrequently and having the
-// entire blob sync as a unit is acceptable for the first iteration.
-//
-// Device-specific settings (Google Drive auth, iCloud toggle, rootfs state,
-// logging, auth tokens) are intentionally NOT included — each device owns
-// those independently.
-struct SyncedAppSettings: Syncable {
-    var id: String = "app-settings"   // constant — one record per account
-    var settingsJson: String          // JSON-encoded [String: AnyCodableValue]
-    var updatedAt: Date
-
-    static let syncMetadata: SyncTypeMetadata<SyncedAppSettings> = {
-        typealias F = FieldDescriptor<SyncedAppSettings>
-        return SyncTypeMetadata<SyncedAppSettings>(
-            recordType: "AppSettingsV2",
-            idKeyPath: \SyncedAppSettings.id,
-            scope: .global,
-            fields: [
-                F.string("settingsJson", \SyncedAppSettings.settingsJson),
-                F.date("updatedAt",       \SyncedAppSettings.updatedAt),
-            ],
-            conflictPolicy: .lastWriteWinsByField(\SyncedAppSettings.updatedAt),
-            version: 1
-        )
-    }()
-}
-
 enum SyncedTypesBootstrap {
     static func registerAll() {
         let r = SyncableTypeRegistry.shared
@@ -974,7 +935,6 @@ enum SyncedTypesBootstrap {
         r.register(SyncedSessionFile.self)
         r.register(SyncedSkill.self)
         r.register(SyncedProviderConfig.self)
-        r.register(SyncedMCPServers.self)   // legacy whole-file, inbound only
         r.register(SyncedMCPServer.self)    // per-server, current schema
         // v3 per-record provider sync. These coexist with the legacy
         // SyncedProviderConfig dual-write outbound until all peer
@@ -984,14 +944,16 @@ enum SyncedTypesBootstrap {
         r.register(SyncedProviderModelEntryV3.self)
         r.register(SyncedProviderModelGroupV3.self)
         r.register(SyncedProviderThinkingRuleV3.self)
+        // [T-subagent-own-store] Missing this line is a SILENT failure:
+        // metadata(for: "SubAgentV3") returns nil, buildPortable is never
+        // reached, and the builder pushes nothing while dirty rows drain.
+        r.register(SyncedSubAgentV3.self)
         r.register(SyncedEnvVars.self)   // legacy whole-file, inbound only
         r.register(SyncedEnvVar.self)    // per-variable, current schema
-        r.register(SyncedEnvProfile.self)
-        r.register(SyncedEnvProfileVar.self)
+        r.register(SyncedEnvVarState.self) // [T-envvar-disable] enabled state
         r.register(SyncedDevice.self)
         r.register(SyncedSoul.self)
         r.register(SyncedMemoryGlobal.self)
         r.register(SyncedMemoryDaily.self)
-        r.register(SyncedAppSettings.self)
     }
 }
