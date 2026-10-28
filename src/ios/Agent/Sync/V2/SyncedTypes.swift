@@ -925,6 +925,31 @@ struct SyncedFolder: Syncable {
     }
 }
 
+// MARK: - SyncedAppSettings (user preferences singleton)
+//
+// One singleton record per iCloud account holding the user's app preferences
+// as a JSON blob. LWW by updatedAt.
+struct SyncedAppSettings: Syncable {
+    var id: String = "app-settings"   // constant — one record per account
+    var settingsJson: String          // JSON-encoded preferences
+    var updatedAt: Date
+
+    static let syncMetadata: SyncTypeMetadata<SyncedAppSettings> = {
+        typealias F = FieldDescriptor<SyncedAppSettings>
+        return SyncTypeMetadata<SyncedAppSettings>(
+            recordType: "AppSettingsV2",
+            idKeyPath: \SyncedAppSettings.id,
+            scope: .global,
+            fields: [
+                F.string("settingsJson", \SyncedAppSettings.settingsJson),
+                F.date("updatedAt",       \SyncedAppSettings.updatedAt),
+            ],
+            conflictPolicy: .lastWriteWinsByField(\SyncedAppSettings.updatedAt),
+            version: 1
+        )
+    }()
+}
+
 enum SyncedTypesBootstrap {
     static func registerAll() {
         let r = SyncableTypeRegistry.shared
@@ -955,5 +980,6 @@ enum SyncedTypesBootstrap {
         r.register(SyncedSoul.self)
         r.register(SyncedMemoryGlobal.self)
         r.register(SyncedMemoryDaily.self)
+        r.register(SyncedAppSettings.self)
     }
 }
