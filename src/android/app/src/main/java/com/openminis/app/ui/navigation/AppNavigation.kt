@@ -153,8 +153,9 @@ object Routes {
         return if (params.isEmpty()) "terminal" else "terminal?${params.joinToString("&")}"
     }
     /** Chat-files browser: opens FileBrowser rooted at /var/minis for the session. */
-    const val CHAT_FILES = "chat_files/{sessionId}"
-    fun chatFiles(sessionId: String) = "chat_files/$sessionId"
+    const val CHAT_FILES = "chat_files/{sessionId}?path={path}"
+    fun chatFiles(sessionId: String, path: String? = null) =
+        if (path == null) "chat_files/$sessionId" else "chat_files/$sessionId?path=${android.net.Uri.encode(path)}"
     const val MEMORY = "memory"
     /** [T-mcp-integration-android] MCP Integrations management screen. */
     const val MCP = "mcp"

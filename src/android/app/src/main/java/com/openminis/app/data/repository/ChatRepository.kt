@@ -349,6 +349,10 @@ class ChatRepository(internal val dao: ChatDao) {
         return out
     }
 
+    /** Sessions matching [query] by title or message content (legacy shape). */
+    suspend fun searchSessions(query: String): List<com.openminis.app.data.db.ChatSessionEntity> =
+        searchSessionsWithHits(query).map { it.session }
+
     /** The newest match was already tried; look through the next few. */
     private suspend fun olderSearchSnippet(sessionId: String, terms: List<String>, visibleOnly: Boolean): String? {
         val older = try {

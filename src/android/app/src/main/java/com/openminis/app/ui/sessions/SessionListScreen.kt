@@ -464,6 +464,10 @@ fun SessionListScreen(
     onRootfsClick: () -> Unit = {},
     // [T-android-scheduled-tasks-design] Entry to the scheduled-tasks list.
     onScheduledTasksClick: () -> Unit = {},
+    /** Navigate to the Backup screen with the "Restore" tab pre-selected. */
+    onRestoreBackupClick: () -> Unit = {},
+    /** Navigate to one of the network screens (Tailscale / proxies / DNS). */
+    onNetworkPageClick: (String) -> Unit = {},
     /**
      * [T-android-tablet-split] The session currently shown in the detail pane,
      * highlighted in the list. Non-null only in two-pane (tablet) mode — in

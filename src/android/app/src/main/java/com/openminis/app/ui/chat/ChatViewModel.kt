@@ -1577,7 +1577,10 @@ class ChatViewModel(
     val fastModeEnabled: StateFlow<Boolean> = _fastModeEnabled.asStateFlow()
 
     fun setFastModeEnabled(enabled: Boolean) {
-        com.openminis.app.data.FastModePrefs.setEnabled(context, enabled)
+        com.openminis.app.data.FastModePrefs.setTier(
+            context,
+            if (enabled) com.openminis.app.data.SpeedTier.FAST else com.openminis.app.data.SpeedTier.STANDARD,
+        )
         _fastModeEnabled.value = enabled
     }
 
@@ -4645,7 +4648,7 @@ class ChatViewModel(
                     if (instance != null) {
                         val apiKey = providerRepository.usableApiKey(instance)
                         if (apiKey != null) {
-                            currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+                            currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
                             _providerName.value = instance.label.ifEmpty { entry.model.provider }
                             resolved = true
                             // No binding row (e.g. a synced session that only
@@ -5200,7 +5203,7 @@ class ChatViewModel(
                     _selectedGroupId.value = null
                     _selectedGroupName.value = ""
                     _activeEntryId.value = entry.id
-                    currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+                    currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
                     true
                 }
                 else -> false
@@ -5238,7 +5241,7 @@ class ChatViewModel(
         _providerName.value = instance.label.ifEmpty { targetEntry.model.provider }
         _selectedGroupName.value = group.name
         _activeEntryId.value = targetEntry.id
-        currentProvider = ProviderFactory.create(instance, apiKey, targetEntry.model, context)
+        currentProvider = ProviderFactory.create(instance, apiKey, targetEntry.model, context, sessionId = activeSessionId, overrides = targetEntry.overrides)
         return true
     }
 
@@ -5319,7 +5322,7 @@ class ChatViewModel(
         _providerName.value = instance.label.ifEmpty { entry.model.provider }
         val apiKey = providerRepository.usableApiKey(instance)
         if (apiKey != null) {
-            currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+            currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
         }
         return true
     }
@@ -5337,7 +5340,7 @@ class ChatViewModel(
         _selectedGroupId.value = null
         _selectedGroupName.value = ""
         _activeEntryId.value = entry.id
-        currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+        currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
         persistBinding("""{"type":"entry","entryId":"$entryId"}""")
         // [T-newchat-default-model-fallback-android] Remember this as the
         // global last-used model so the NEXT new chat (when no default group
@@ -5404,7 +5407,7 @@ class ChatViewModel(
             if (!instance.isEnabled) continue
             val apiKey = providerRepository.usableApiKey(instance) ?: continue
             val p = try {
-                ProviderFactory.create(instance, apiKey, entry.model, context)
+                ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
             } catch (_: Exception) { continue }
             result.add(FallbackCandidate(provider = p, entryId = entry.id))
         }
@@ -5464,7 +5467,7 @@ class ChatViewModel(
             currentModel = entry.model
             _modelName.value = entry.model.displayName
             _activeEntryId.value = entry.id
-            val provider = ProviderFactory.create(instance, apiKey, entry.model, context)
+            val provider = ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
             currentProvider = provider
             return provider
         }
@@ -5987,7 +5990,8 @@ class ChatViewModel(
                         if (freshToken != storedKey) {
                             providerRepository.saveApiKey(instance.id, freshToken)
                             provider = com.openminis.app.provider.ProviderFactory.create(
-                                instance, freshToken, currentModel ?: provider.model, context
+                                instance, freshToken, currentModel ?: provider.model, context,
+                                sessionId = activeSessionId,
                             )
                             currentProvider = provider
                         }
@@ -6780,7 +6784,8 @@ class ChatViewModel(
                                 providerRepository.saveApiKey(instance.id, freshToken)
                                 // Recreate provider with fresh token
                                 provider = com.openminis.app.provider.ProviderFactory.create(
-                                    instance, freshToken, currentModel ?: provider.model, context
+                                    instance, freshToken, currentModel ?: provider.model, context,
+                                    sessionId = activeSessionId,
                                 )
                                 currentProvider = provider
                                 android.util.Log.i(TAG, "OAuth token refreshed before send")
@@ -7128,7 +7133,7 @@ class ChatViewModel(
                             val storedKey = providerRepository.loadApiKey(instance.id)
                             if (freshToken != storedKey) {
                                 providerRepository.saveApiKey(instance.id, freshToken)
-                                provider = ProviderFactory.create(instance, freshToken, currentModel ?: provider.model, context)
+                                provider = ProviderFactory.create(instance, freshToken, currentModel ?: provider.model, context, sessionId = activeSessionId)
                                 currentProvider = provider
                             }
                         }
@@ -10222,6 +10227,7 @@ class ChatViewModel(
             mimeType = mime,
             seed = kotlin.math.abs(argsJson.hashCode()),
             customPrompt = customPrompt,
+            sessionId = activeSessionId,
             // [T-vision-group-attribution / GH#182] iOS rewrites the tool block's
             // live content here so the card names the model as it works. Android
             // has no equivalent channel — no tool streams partial output to its
@@ -12562,7 +12568,7 @@ C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use i
                 Log.w(TAG, "TitleGen OAuth refresh failed: ${e.message}")
             }
         }
-        return ProviderFactory.create(instance, apiKey, entry.model, context)
+        return ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = activeSessionId, overrides = entry.overrides)
     }
 
     /** Parse LLM response for title/category JSON. Multiple fallback strategies. */
@@ -12744,7 +12750,8 @@ C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use i
                             if (freshToken != storedKey) {
                                 providerRepository.saveApiKey(instance.id, freshToken)
                                 provider = com.openminis.app.provider.ProviderFactory.create(
-                                    instance, freshToken, currentModel ?: provider.model, context
+                                    instance, freshToken, currentModel ?: provider.model, context,
+                                    sessionId = activeSessionId,
                                 )
                                 currentProvider = provider
                             }

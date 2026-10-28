@@ -427,18 +427,24 @@ fun ChatScreen(
      *  (no trailing newline — the user reviews and presses Enter manually).
      *  Wired to the top-right Terminal button on a shell_execute ToolDetailSheet. */
     onOpenTerminalWithCommand: (command: String) -> Unit = {},
+    /** [T-p2-agent-series] Open the full-screen read-only transcript of an agent's child session. */
+    onOpenAgentTranscript: (childSessionId: String) -> Unit = {},
     /** "Move to…" capsule (T51): called when the user picks a target session
      *  from MoveToSessionSheet after a share-injected turn. The caller is
      *  responsible for navigating; this screen has already stashed the
      *  pending transfer in [ChatViewModelStore.stashPendingTransfer]. */
     onMoveToSession: (sessionId: String) -> Unit = {},
     onBrowseChatFiles: () -> Unit = {},
+    /** [T-minis-folder-link] Open the chat file browser at a Linux folder path. */
+    onBrowseChatFolder: (String) -> Unit = {},
     /** T150: open FilePreviewScreen for a non-image attachment in a user bubble. */
     onPreviewAttachment: (com.openminis.app.ui.sandbox.FileItem) -> Unit = {},
     /** [T-android-modelpicker-group-edit] Navigate to the Model Groups
      *  management screen — wired to the "Edit" button on the model picker's
      *  Model Groups section header. */
     onModelGroupsClick: () -> Unit = {},
+    /** [T-android-picker-provider-edit] Open one provider instance's settings. */
+    onEditProviderClick: (instanceId: String) -> Unit = {},
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -532,6 +538,10 @@ fun ChatScreen(
     // pop back) doesn't wipe what the user has typed. Mirrors iOS
     // `AIChatView` which binds the composer against `vm.inputText`.
     val inputText by viewModel.inputText.collectAsState()
+    val revealedUsageIds by viewModel.revealedUsageIds.collectAsState()
+    // Synthetic delegate block behind a tapped callback card; hosted at
+    // ChatScreen scope so it survives LazyColumn item disposal.
+    var callbackDetailBlock by remember { mutableStateOf<AssistantBlock?>(null) }
 
     // ─── T51: Share Injection + Move-to capsule ───────────────────────
     // Drain any pending share buffered by ShareCoordinator (cold start =
@@ -541,7 +551,7 @@ fun ChatScreen(
     val shareBufferVersion by com.openminis.app.share.ShareCoordinator.bufferVersion.collectAsState()
     androidx.compose.runtime.LaunchedEffect(shareBufferVersion) {
         if (shareBufferVersion == 0) return@LaunchedEffect
-        val pending = com.openminis.app.share.ShareCoordinator.consumeBuffer(context)
+        val pending = com.openminis.app.share.ShareCoordinator.consumeBuffer(context, sessionId)
             ?: return@LaunchedEffect
         com.openminis.app.logging.AppLogger.info(
             "ChatScreen",
@@ -2227,6 +2237,7 @@ fun ChatScreen(
                         else -> onPreviewAttachment(action.item)
                     }
                 }
+                is ChatLinkAction.SandboxFolder -> onBrowseChatFolder(action.linuxPath)
                 is ChatLinkAction.ExternalApp ->
                     com.openminis.app.ui.browser.BrowserExternalSchemeHandler
                         .handle(context, action.url)
@@ -3421,6 +3432,10 @@ fun ChatScreen(
                     is FlatChatItem.AssistantTyping -> false
                     is FlatChatItem.AssistantError -> grayedMap[originalMessageId(messageId)] == true
                     is FlatChatItem.AssistantLegacyContent -> grayedMap[originalMessageId(messageId)] == true
+                    is FlatChatItem.AgentCallbackCard -> false
+                    is FlatChatItem.AssistantToolGroup -> grayedMap[originalMessageId(messageId)] == true
+                    is FlatChatItem.AssistantUsage -> false
+                    is FlatChatItem.ScheduledTaskCardItem -> false
                 }
                 // SelectionContainer must wrap the WHOLE LazyColumn — placing
                 // it per-item breaks long-press because items get disposed
@@ -3994,6 +4009,34 @@ fun ChatScreen(
                                             shardId = "legacy",
                                         ),
                                     )
+                                }
+                            }
+                            is FlatChatItem.ScheduledTaskCardItem -> ScheduledTaskCard(
+                                marker = item.marker,
+                                hostSessionId = viewModel.currentSessionId,
+                            )
+                            is FlatChatItem.AgentCallbackCard -> AgentCallbackCard(
+                                callback = item.callback,
+                                onTap = { callbackDetailBlock = item.callback.syntheticBlock() },
+                            )
+                            is FlatChatItem.AssistantToolGroup -> ToolGroupRow(item) {}
+                            is FlatChatItem.AssistantUsage -> {
+                                val msgId = item.messageId.substringBefore('#')
+                                val shown = msgId in revealedUsageIds
+                                UsageCapsuleRow(
+                                    shown = shown,
+                                    onToggle = { viewModel.toggleUsageCapsule(msgId) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 12.dp),
+                                ) {
+                                    androidx.compose.animation.AnimatedVisibility(
+                                        visible = shown,
+                                        enter = androidx.compose.animation.fadeIn(),
+                                        exit = androidx.compose.animation.fadeOut(),
+                                    ) {
+                                        UsageCapsule(item.usage, item.completedAt)
+                                    }
                                 }
                             }
                         }

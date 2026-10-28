@@ -597,7 +597,10 @@ class SessionListViewModel(
                 }
             }
             val provider = try {
-                ProviderFactory.create(instance, apiKey, entry.model, context)
+                ProviderFactory.create(
+                    instance, apiKey, entry.model, context,
+                    sessionId = ProviderFactory.oneOffSessionId(), overrides = entry.overrides,
+                )
             } catch (e: Exception) {
                 Log.w(TAG, "GroupSuggest provider creation failed for ${entry.model.displayName}: ${e.message}")
                 continue
@@ -897,7 +900,10 @@ class SessionListViewModel(
                     }
 
                     val provider = try {
-                        ProviderFactory.create(instance, apiKey, entry.model, context)
+                        ProviderFactory.create(
+                            instance, apiKey, entry.model, context,
+                            sessionId = ProviderFactory.oneOffSessionId(), overrides = entry.overrides,
+                        )
                     } catch (e: Exception) {
                         Log.w(TAG, "Provider creation failed for ${entry.model.displayName}: ${e.message}")
                         continue
