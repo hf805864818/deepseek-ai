@@ -1,3 +1,70 @@
+//
+//  AIChatViewModel.swift
+//  Minis - chat view model (Agent/Chat)
+//
+//  AIChatViewModel - one chat session's view model: messages, the agent loop
+//  that talks to the model and runs tools, and the state the chat UI binds to.
+//
+//  Map of the AIChatViewModel files (all in Agent/Chat/)
+//  ====================================================
+//
+//    AIChatViewModel.swift      this file: every stored property (@Published
+//        state, loop / queue / speech / sync state, signals), init / deinit,
+//        and a few small computed properties that read like state
+//    Turn flow
+//        +Send            send(), retry(), resume(), unanswered user turn
+//        +AgentLoop       runAgentLoop / runAgentLoopCore (request, stream,
+//                         tools, repeat)
+//        +Rerun           retry from a message / tool block, delete from here
+//        +EditMessage     edit a sent message, cut at a user bubble
+//        +Cancel          Stop, cancel work bound to a previous model
+//        +PromptQueue     queued prompts: drain, inject as a new turn
+//        +TurnCompletion  haptic, failure banner, stop / cancel cleanup
+//        +SSEStream, +ConcurrentTools, +ToolDefinitions, +ToolPreflight,
+//        +RequestBudget, +Fallback, +ProviderFactory, +ProgrammaticPrompt,
+//        +UserAsk, +Offloading, +Compaction   (older extension files)
+//    Prompt and context
+//        +SystemPrompt    base system prompt, fixed token cost
+//        +ContextUsage    usage glow / hint, model capability queries
+//        +ThinkingLevel   session thinking level
+//    UI plumbing
+//        +StreamingUI     streaming / transition gates, streamed text writes
+//        +Speech          TTS output;  +AutoPlayAudio  audio auto-play, MIME
+//        +Attachments, +MentionMenu, +SlashCommands   (older extension files)
+//    Session and lifecycle
+//        +Lifecycle       cache eviction teardown, font cache invalidation
+//        +Persistence, +TitleGeneration, +BackgroundTask, +Misc   (older)
+//    Tools
+//        +FileTools, +MemoryTools, +ISHCommand   (older extension files)
+//    Diagnostics
+//        +DebugDumps      agentHistory / queue log dumps
+//    LLMProviderError.swift  the provider error enum that ended this file
+//
+//  Rules that keep this split working
+//  ==================================
+//
+//  - Stored properties stay in this class body (extensions cannot hold them);
+//    their order is the order they had before the split.
+//  - Each extension file declares its own file-private `logger` (category
+//    "AIChatVM"), like the older extension files.
+//  - Members used from another file are internal; treat them as private to
+//    the view model.
+//  - New behaviour goes into the extension file of its concern (or a new one).
+//  - Source-scanning tests (MinisTests/Standalone) read this file together with
+//    the files split out of it (chatViewModelSource() lists them), so code may
+//    move between those files; a new file split out of this one belongs on
+//    that list too.
+//
+//  History: +Lifecycle, +ContextUsage, +StreamingUI, +Speech, +AutoPlayAudio,
+//  +SystemPrompt, +Send, +Rerun, +EditMessage, +Cancel, +PromptQueue,
+//  +DebugDumps, +TurnCompletion, +AgentLoop, +ThinkingLevel and
+//  LLMProviderError.swift were split out of this file (~8.5k lines before).
+//  The code was moved verbatim; the differences are the repeated import list,
+//  per-file logger copies, dropped `private` / `fileprivate`, the extension
+//  wrappers and one doc comment put back on its function (see
+//  AIChatViewModel+TurnCompletion.swift).
+//
+
 import AVFoundation
 import Combine
 import CryptoKit
@@ -23,14 +90,32 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// they can be re-viewed via the `read_image` tool.
     static let kImageContextKeepCount = 20
 
-    // MARK: - Image byte budgets (T-imgsize-13b7d81c)
+    // MARK: - Image byte budgets (T-imgsize-13b7d81c, T-image-budget-base64)
     //
-    // Anthropic rejects requests whose total inline image payload exceeds
-    // 30 MB ("Downloaded image content cannot exceed 30MB" — the 30 MB
-    // applies to decoded image bytes, NOT the base64-inflated wire form,
-    // so we budget in raw bytes too). Other providers have similar but
-    // undocumented caps. We enforce a tighter, pre-encoding budget so the
-    // request never reaches the wire too big:
+    // [T-image-budget-base64] These budgets are measured in BASE64 bytes —
+    // the size the image actually occupies in the request body — not in raw
+    // decoded bytes.
+    //
+    // The original comment here reasoned that Anthropic's 30 MB limit applies
+    // to decoded image bytes, so budgeting in raw bytes was equivalent. That
+    // is true of Anthropic's own per-image content rule, but it is NOT the
+    // constraint that was actually breaking requests: gateways in front of
+    // several providers (OpenAI and Anthropic both observed) enforce a 32 MB
+    // limit on the HTTP REQUEST BODY, and images travel that body base64
+    // encoded, which inflates them by 4/3. A 25 MB raw budget therefore put
+    // ~33.3 MB on the wire before a single byte of text history or tool
+    // schema — over the cap on its own, which is exactly the
+    // "request too large (~32 MB, limit 32 MB)" failure users hit.
+    //
+    // Budgeting in base64 bytes makes the number mean what it says: the
+    // ceiling is what we are about to send. Raw-byte sizes are converted
+    // with `estimatedBase64Length` at every comparison instead of the
+    // constants being scaled down, so there is no rounding drift and the
+    // headroom below stays exact rather than approximate.
+    //
+    // Other providers have similar but undocumented caps. We enforce a
+    // tighter, pre-encoding budget so the request never reaches the wire
+    // too big:
     //
     //   - Per image: 5 MB after JPEG re-encode. The Anthropic SDK's own
     //     per-image soft hint; well under the 30 MB request cap and
@@ -45,8 +130,46 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     //   - Above the message cap, additional images are dropped to a text
     //     placeholder (same fallback the count cap already uses).
 
-    /// Hard ceiling per single image after compression. Matches the
-    /// Anthropic SDK's per-image hint; well below the 30 MB request cap.
+    /// [T-image-budget-base64] Bytes `rawBytes` will occupy once base64
+    /// encoded into the request body: 4 output bytes per 3 input bytes,
+    /// rounded up to the next 4-byte group (which is what padding produces).
+    ///
+    /// Exact for the encoding itself, so no fudge factor is needed. It
+    /// deliberately does NOT model the JSON string overhead around the
+    /// payload (quotes, the `data:` prefix, escaping) — those are tens of
+    /// bytes against megabytes, and the budgets already reserve headroom for
+    /// the rest of the body.
+    ///
+    /// Computed rather than measured: base64-encoding every candidate image
+    /// just to learn its length would cost a full copy of each image's bytes
+    /// on every request-budget pass, for a number this returns exactly.
+    ///
+    /// Mirrors Android's `ImageBudget.estimatedBase64Length`.
+    static func estimatedBase64Length(_ rawBytes: Int) -> Int {
+        guard rawBytes > 0 else { return 0 }
+        return ((rawBytes + 2) / 3) * 4
+    }
+
+    /// [T-image-budget-base64] Inverse of `estimatedBase64Length`: the largest
+    /// raw byte count that still encodes within `base64Budget`.
+    ///
+    /// Needed because the compressor ladder (`compressedImageDataUnderBudget`)
+    /// measures its output in RAW bytes — it is comparing `data.count` against
+    /// the target it was handed. Feeding it a base64 budget directly would
+    /// silently let it stop compressing at 5 MB raw, i.e. ~6.7 MB on the wire,
+    /// which is the very overshoot this change removes. So budgets cross that
+    /// boundary through here.
+    ///
+    /// Mirrors Android's `ImageBudget.rawBytesForBase64Budget`.
+    static func rawBytesForBase64Budget(_ base64Budget: Int) -> Int {
+        guard base64Budget > 0 else { return 0 }
+        return (base64Budget / 4) * 3
+    }
+
+    /// Hard ceiling per single image after compression, measured in BASE64
+    /// bytes (see `estimatedBase64Length`). 5 MB of wire payload is ~3.75 MB
+    /// of decoded image, still comfortably above what the compressor ladder
+    /// targets for a readable photo.
     static let kPerImageMaxBytes = 5 * 1024 * 1024
 
     /// Hard ceiling across all inlined images in one user message.
@@ -118,19 +241,42 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         return until > Date()
     }
 
-    /// Enter the post-stop hold: pause SyncCore (blocks push) for the grace
-    /// window and arm a timer that releases at the deadline. Called when the
-    /// agent loop transitions to idle.
+    /// Enter the post-stop hold for the PULL side only, and release the push
+    /// immediately. Called when the agent loop transitions to idle.
+    ///
+    /// [T-icloud-sync-tier1-push-on-idle] This used to also call
+    /// `SyncCore.pause(for: 60)`, holding every outbound record for a full
+    /// minute after the loop ended. That pause never protected anything:
+    /// the on-screen overwrite it was added for (c74a3a313, 2026-06-01) is
+    /// caused by a PULL-driven reload replacing in-memory content, which the
+    /// `isSyncHeld` guard in `reloadMessagesFromDB` and the cancel guard from
+    /// ebe9cb844 already prevent — and our own pushed records come back as
+    /// `ownEcho` and never trigger a reload. Measured cost of the pause on
+    /// two devices: 60 of the 96–160 s it took a finished turn to appear on
+    /// the peer. `persistAgentMessage` is awaited before `isProcessing`
+    /// flips, so on every normal completion the records are already durable
+    /// here; on cancel the kept partial is memory-only and is never marked
+    /// dirty until it persists, so nothing unpersisted can be pushed either.
+    ///
+    /// So: end this vm's send deferral and flush NOW (the store still holds
+    /// the send back if another loop is running), and keep only the pull
+    /// hold — `postStopSyncHoldUntil` + the timer — so a peer change that
+    /// arrived mid-turn is merged at the hold's release, not the instant the
+    /// candidate lands.
     @MainActor
     private func beginPostStopSyncHold() {
         let until = Date().addingTimeInterval(Self.postStopSyncHoldSeconds)
         postStopSyncHoldUntil = until
-        SyncCore.shared.pause(for: Self.postStopSyncHoldSeconds)
         postStopSyncHoldTimer?.invalidate()
         postStopSyncHoldTimer = Timer.scheduledTimer(withTimeInterval: Self.postStopSyncHoldSeconds, repeats: false) { [weak self] _ in
             Task { @MainActor in self?.releasePostStopSyncHold(reason: "timer-60s") }
         }
-        logger.info("[SyncHold] BEGIN hold until \(until) (\(Int(Self.postStopSyncHoldSeconds))s) sid=\(self.sessionId?.prefix(8) ?? "nil")")
+        let owner = String(vmInstanceId)
+        Task {
+            await ChatStore.shared.endSyncSendDeferral(owner: owner)
+            await ChatStore.shared.flushPendingSyncDirty()
+        }
+        logger.info("[SyncHold] BEGIN pull-hold until \(until) (\(Int(Self.postStopSyncHoldSeconds))s), push released now sid=\(self.sessionId?.prefix(8) ?? "nil")")
     }
 
     /// Release the hold early/at-deadline and run one catch-up sync: resume
@@ -142,10 +288,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         postStopSyncHoldUntil = nil
         postStopSyncHoldTimer?.invalidate()
         postStopSyncHoldTimer = nil
-        logger.info("[SyncHold] RELEASE reason=\(reason) sid=\(self.sessionId?.prefix(8) ?? "nil") — resuming sync + catch-up")
-        SyncCore.shared.resume()
-        // Push: flush whatever the agent turn marked dirty.
-        Task { await ChatStore.shared.flushPendingSyncDirty() }
+        // [T-p0-sync-defer-refcount] Another session's loop may still be
+        // streaming. Its own hold/release will resume + flush when IT finishes
+        // (SyncCore.pause is deadline-bounded, so skipping resume here can't
+        // strand it). Only release this vm's deferral and let the store decide
+        // whether anything is still holding the send back.
+        let owner = String(vmInstanceId)
+        let othersActive = SessionActivityTracker.shared.activeSessions.contains { $0 != self.sessionId }
+        logger.info("[SyncHold] RELEASE reason=\(reason) sid=\(self.sessionId?.prefix(8) ?? "nil") othersActive=\(othersActive) — \(othersActive ? "deferring catch-up to the running session" : "resuming sync + catch-up")")
+        // [T-icloud-sync-tier1-push-on-idle] Push was already released and
+        // flushed in beginPostStopSyncHold; SyncCore was never paused, so
+        // there is nothing to resume. `endSyncSendDeferral` is set-based and
+        // idempotent — call it again only as a belt-and-braces for the
+        // paths that reach here without having gone through begin (deinit,
+        // background). It does not re-flush.
+        _ = othersActive
+        Task { await ChatStore.shared.endSyncSendDeferral(owner: owner) }
         // Pull: replay a deferred reload now that it's safe.
         if pendingSyncReloadOnIdle, !isProcessing, sessionId != nil {
             pendingSyncReloadOnIdle = false
@@ -172,15 +330,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     private var bgHintForegroundObserver: Any?
     private var snapshotForegroundObserver: Any?
     private var detachedLoopEndObserver: Any?
-    /// [T-deep-mode-workflow] Observer that hard-resets Phase 1 workflow state
-    /// the moment the 深度龙虾Ai master switch is toggled off.
-    private var deepModeObserver: Any?
+    /// [T-ios-switch-model-ghost-retry] Observes `.sessionModelBindingChanged`
+    /// so a mid-conversation model switch tears down work aimed at the model
+    /// being switched away from. The notification was already being posted by
+    /// `SessionModelPicker`; until this, nothing listened to it.
+    private var modelBindingChangeObserver: Any?
+    /// [T-ios-switch-model-next-request] Set when the user picks a different
+    /// model while a HEALTHY turn is in flight. The running agent loop checks
+    /// it at the top of each iteration — i.e. before its next LLM request —
+    /// and swaps to the newly bound model there, so the switch takes effect
+    /// without interrupting the stream or tool call already under way.
+    var pendingModelSwitch = false
     /// Timestamp of the most recent background-entry, used to detect that a
     /// long-running browser task actually spanned a background period.
-    private var bgHintBackgroundEntryDate: Date?
+    var bgHintBackgroundEntryDate: Date?
     /// A browser tool running longer than this when the app returns to the
     /// foreground (after having been backgrounded) gets the suspension hint.
-    private static let bgHintBrowserThreshold: TimeInterval = 5 * 60
+    static let bgHintBrowserThreshold: TimeInterval = 5 * 60
 
     init() {
         logger.info("🔄SESSION [vm=\(self.vmInstanceId)] init — new AIChatViewModel created")
@@ -285,6 +451,25 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
             }
         }
 
+        // [T-ios-switch-model-ghost-retry] A model switch must stop whatever is
+        // still aimed at the model being switched away from. `SessionModelPicker`
+        // has always posted this; nothing observed it, so the old model's agent
+        // loop kept retrying and its errors kept surfacing over the new model's
+        // working replies.
+        modelBindingChangeObserver = NotificationCenter.default.addObserver(
+            forName: .sessionModelBindingChanged, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self, let sid = self.sessionId else { return }
+            // Only THIS conversation's switch. The notification is global and
+            // carries its session id, so a switch in another chat (or from a
+            // background/scheduled binding write) must not cancel this one.
+            guard let notifSid = notification.userInfo?["sessionId"] as? String,
+                  notifSid == sid else { return }
+            Task { @MainActor in
+                self.cancelWorkBoundToPreviousModel(reason: "user switched model")
+            }
+        }
+
         syncChangeObserver = NotificationCenter.default.addObserver(
             forName: .cloudSyncDidFetchChanges, object: nil, queue: .main
         ) { [weak self] _ in
@@ -311,19 +496,21 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 logger.info("[ReloadTrace] DEFER reason=cloudSyncDidFetchChanges sid=\(sid.prefix(8)) isProcessing=true — will reload on idle")
                 return
             }
-            Task { @MainActor in
-                await self.reloadMessagesFromDB(reason: "cloudSyncDidFetchChanges")
+            // [T-scroll-sync-defer] A reload mid-fling either costs frames (hash
+            // check) or re-snapshots the list under the user's finger; run it
+            // once the list is still.
+            // Re-check the gates above when it finally runs: a send may have
+            // started, or the user may have left, in the meantime.
+            ChatScrollActivity.runWhenStill("chat.syncReload.\(sid)") { [weak self] in
+                guard let self, self.sessionId == sid, Self.activeSessionId == sid else { return }
+                if self.isProcessing {
+                    self.pendingSyncReloadOnIdle = true
+                    return
+                }
+                Task { @MainActor in
+                    await self.reloadMessagesFromDB(reason: "cloudSyncDidFetchChanges")
+                }
             }
-        }
-
-        // [T-deep-mode-workflow] Master-switch contract: when the 深度龙虾Ai
-        // toggle is turned off, tear down every Phase 1 / deep-mode UI state so
-        // no banner, phase, or step list survives the off switch.
-        deepModeObserver = NotificationCenter.default.addObserver(
-            forName: .deepModeDidChange, object: nil, queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in self.deepModeDidDisableCleanup() }
         }
 
         activityTrackingCancellable = $isProcessing
@@ -476,6 +663,11 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         // and deinit is nonisolated; `_deinitSnapshot` is updated on the
         // main actor during normal flow so we can read it here safely.
         logger.info("🔄SESSION [vm=\(vmId)] deinit lastKnown: \(self._deinitSnapshot)")
+        // [T-p0-sync-defer-refcount] A vm evicted mid-hold never reaches
+        // releasePostStopSyncHold (the timer holds self weakly); drop its
+        // deferral so it cannot pin iCloud sends off forever.
+        let owner = String(vmId)
+        Task { await ChatStore.shared.endSyncSendDeferral(owner: owner) }
         if let observer = fontChangeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -494,50 +686,22 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         if let observer = detachedLoopEndObserver {
             NotificationCenter.default.removeObserver(observer)
         }
-        if let observer = deepModeObserver {
+        if let observer = modelBindingChangeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
-    }
-
-    /// [T-tool-bg-suspended-hint] On foreground return, mark still-running
-    /// browser tool blocks that spanned the just-ended background period and
-    /// have now run longer than `bgHintBrowserThreshold`. Skips entirely when
-    /// enhanced background is already effective (nothing to suggest) — same
-    /// gate as the BackgroundInterruptionTracker banner. In-memory only.
-    @MainActor
-    func markLongBackgroundBrowserTasks() {
-        defer { bgHintBackgroundEntryDate = nil }
-        guard let _ = bgHintBackgroundEntryDate else { return }
-        guard !BackgroundKeepAliveManager.shared.enhancedBackgroundEffective else { return }
-        let now = Date()
-        for msg in messages where msg.role == .assistant {
-            for block in msg.blocks {
-                guard case .browserTool = block.kind else { continue }
-                guard case .running = block.toolStatus else { continue }
-                guard let start = block.toolStartTime,
-                      now.timeIntervalSince(start) > Self.bgHintBrowserThreshold else { continue }
-                block.wasBackgroundSuspended = true
-            }
-        }
-    }
-
-    /// Clear all cached attributed strings so they re-render with the new font size.
-    /// Called by the coordinator before reconfiguring cells to guarantee ordering.
-    @MainActor
-    func invalidateAttributedStringCaches() {
-        for msg in messages {
-            for block in msg.blocks {
-                if block.cachedAttributedString != nil {
-                    block.cachedAttributedString = nil
-                }
-            }
-        }
-        if !transitionSuspended { objectWillChange.send() }
     }
 
     // MARK: - Published State
 
     @Published var messages: [ChatMessage] = []
+    /// [T-in-chat-search] "Search in Chat" for this conversation. Not
+    /// @Published: the search bar and the highlighted rows observe it
+    /// directly, so typing a query never re-renders the whole chat page.
+    lazy var chatSearch: ChatSearchController = {
+        let search = ChatSearchController()
+        search.viewModel = self
+        return search
+    }()
     /// [T-voice-input-mode-preference-ios] True when a voice session
     /// contributed to the CURRENT composition (set on recording start by any
     /// path: mic tap, quick action, preference auto-entry). Cleared whenever
@@ -579,12 +743,117 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Updated on every isProcessing flip and on send entry.
     nonisolated(unsafe) var _deinitSnapshot: String = "isProcessing=false session=nil draft=nil"
 
+    // [T-ios-context-usage-hint] Context-window occupancy, published so the
+    // composer can render the ambient glow live and the placeholder line
+    // once per finished turn. Recomputed by publishContextUsage() whenever
+    // a message's usage lands or a session loads; nil when no assistant turn
+    // has reported usage yet (some providers never do — the feature then
+    // stays hidden instead of showing 0%).
+    @Published var contextUsage: ContextUsage?
+    /// One request per finished user-visible turn; the composer's Coordinator
+    /// acts on each generation exactly once (debounced there).
+    @Published var contextUsageHint: ContextUsageHint?
+    var contextUsageHintGeneration = 0
+    /// [T-ctx-usage-after-compact] The message whose stamped usage was taken
+    /// BEFORE the latest compaction in this session. Its `latestContextTokens`
+    /// is the size of the context the compaction replaced, so while it is
+    /// still the newest usage-bearing message, `publishContextUsage()` shows
+    /// the measured post-compaction size instead. Cleared implicitly: the next
+    /// turn stamps usage on a newer message, which no longer matches.
+    var usageReportSupersededByCompaction: UUID?
+    /// [T-ios-context-usage-realtime-crossing] Shared by the mid-loop crossing
+    /// path and the loop-end path so the two never announce the same tier
+    /// twice within seconds. Internal (not private) so the session-load
+    /// extension can reset it.
+    var contextTierTracker = ContextTierCrossingTracker()
+
+    /// [T-ctx-measure-outbound] Calibration state for `ContextSizeMeter`.
+    ///
+    /// Replaces `liveContextTokensForCapacity`, a mirror of the newest API
+    /// report that the capacity guard folded in with `max()`. That number
+    /// described the previous request and nothing but another successful call
+    /// could replace it, so after a compaction it kept the guard above the line
+    /// and the loop re-compacted until it gave up (see ContextSizeMeter).
+    ///
+    /// `contextCalibrationRatios` — provider count / our estimate, taken from the
+    ///   same request, PER MODEL: a ratio mostly reflects the provider's
+    ///   tokenizer, so one learned on model A does not describe model B after a
+    ///   switch. `lastLearnedCalibration` is the newest ratio of any model; a
+    ///   model with none of its own borrows it with a margin (see
+    ///   ContextSizeMeter.ratio(for:)).
+    /// `contextFixedTokens` — estimated system prompt + tool schemas, refreshed
+    ///   every loop iteration; seeded from the last stamped turn on load so the
+    ///   send-time check has it before any loop has run.
+    /// `lastDispatchEstimate` — estimate of the request currently in flight,
+    ///   paired with its report when usage arrives.
+    var contextCalibrationRatios: [String: Double] = [:]
+    var lastLearnedCalibration: Double? = nil
+    /// The session the in-memory ratios were learned for (see seedContextCalibration).
+    var calibrationSessionId: String? = nil
+    /// [T-ctx-warmup-fit] Per compaction marker: how many leading warm-up
+    /// messages were dropped to fit. Decided once, then reused, so the request
+    /// prefix stays stable across turns (see trimWarmUpToFit).
+    var warmUpDropByMarker: [String: Int] = [:]
+    var contextFixedTokens = 0
+    /// [T-ctx-count-reasoning] Whether the provider serving this session sends
+    /// past `reasoningContent` back (AgentProvider.echoesReasoningContent). Set
+    /// by the agent loop from the live provider; the send-time check, which
+    /// runs before a provider exists, reads the value of the previous request.
+    var contextEchoesReasoning = false
+    /// [T-ctx-trim-ladder] The live provider's default output cap, for the
+    /// output reserve of the watermarks. Set by the agent loop like the flag
+    /// above; 16K until a provider has been seen.
+    var contextProviderMaxOutput = 16_384
+    /// [T-ctx-trim-ladder] The frozen trim plan: cut-off keys re-applied to
+    /// every measurement and request until the next re-plan, so the request
+    /// prefix (and the provider's prompt cache) stays stable. In memory only.
+    /// It belongs to one session and one compaction marker; a change of either
+    /// drops it (see applyFrozenTrim).
+    var trimState: ContextTrimPlanner.State?
+    var trimStateSessionId: String?
+    var trimStateMarkerId: String?
+    /// [T-ctx-trim-plan-window] The window the plan was sized for.
+    var trimStateWindow: Int?
+    /// Set when the next check must re-plan even below the trigger (after a
+    /// compaction, or when the frozen plan stopped matching the history).
+    var trimReplanPending = false
+    /// [T-ctx-trim-collapse-first] Set once a re-plan was allowed to collapse;
+    /// later re-plans for the same session and marker keep allowing it (see
+    /// ContextTrimPlanner.CollapseUnlock).
+    var trimCollapseUnlock: ContextTrimPlanner.CollapseUnlock?
+    /// [T-ctx-trim-escalate] True when the re-plan just made could not
+    /// collapse and recovered too little (ContextTrimPlanner.shouldEscalate).
+    var lastTrimPlanEscalates = false
+    /// Disk paths of what the ladder already offloaded, so re-applying a plan
+    /// writes nothing.
+    var trimOffloadPaths: [String: String] = [:]
+    var lastDispatchEstimate = 0
+    /// [T-ctx-overflow-attribute-dispatch] Model id and window of the request
+    /// in flight, so a rejection is attributed to the model that received it.
+    var lastDispatchModelId: String?
+    var lastDispatchWindow = 0
+    /// The ratio and calibrated size used for the request in flight, so its
+    /// response can be scored against the prediction ([CtxMeter] actual).
+    var lastDispatchRatio: Double = 1.0
+    var lastDispatchPredicted = 0
+    /// Whether an uncalibrated send past an extrapolated "over the window"
+    /// verdict has already been spent (see the in-loop guard). One per piece
+    /// of provider evidence: an accepted response re-arms it, a rejection
+    /// spends it, and it survives Retry.
+    var sentPastExtrapolatedLimitThisLoop = false
+
     @Published var isProcessing = false {
         didSet {
             _deinitSnapshot = "isProcessing=\(isProcessing) session=\(sessionId ?? "nil") draft=\(draftId ?? "nil")"
             if isProcessing && !oldValue {
-                // Agent loop starting — defer iCloud sync sends until completion
-                Task { await ChatStore.shared.setSyncSendDeferred(true) }
+                // Agent loop starting — defer iCloud sync sends until completion.
+                // [T-p0-sync-defer-refcount] Owner-keyed: two sessions can run
+                // loops concurrently (ViewModelCache + SessionConcurrencyManager),
+                // and a plain bool let the first loop to finish un-defer sync
+                // under the one still streaming. The deferral for this vm is
+                // released in releasePostStopSyncHold (or deinit).
+                let owner = String(vmInstanceId)
+                Task { await ChatStore.shared.beginSyncSendDeferral(owner: owner) }
                 // [T-ios-defer-icloud-sync-after-stop] A new turn supersedes any
                 // pending post-stop hold; clear it WITHOUT a catch-up sync (the
                 // new turn re-pauses sync via setSyncSendDeferred anyway).
@@ -610,6 +879,58 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
                 // runs on release (60s timer / leave session / background).
                 beginPostStopSyncHold()
                 StreamingHangLogger.shared.release(reason: "isProcessing=false session=\(sessionId ?? "nil")")
+                // [T-p0-programmatic-prompt] A silent (programmatic) turn ends
+                // here whether it completed or was cancelled; never let the
+                // flag leak into the user's next manual send.
+                // [T-subagent-callback-no-keyboard] Hand the fact forward first:
+                // this didSet runs before SwiftUI's onChange, so the auto-focus
+                // observer would otherwise see an already-cleared flag and pop
+                // the keyboard on a sub agent's callback.
+                turnWasSilentProgrammatic = programmaticSilentTurn
+                programmaticSilentTurn = false
+                programmaticTurnOrigin = nil  // [T-user-ask]
+                // [T-ios-context-usage-hint] Offer the usage line for this
+                // turn. Only for a turn the user started and let finish:
+                // a cancelled turn's usage is whatever call happened to be
+                // in flight, and a silent sub-agent callback is not the
+                // user's turn at all. The composer must also be empty —
+                // the label is hidden behind typed text anyway, so the
+                // request would just expire unseen. The Coordinator adds
+                // its own debounce on top so a burst of quick turns shows
+                // the line once, for the last of them.
+                publishContextUsage()
+                // [T-ios-context-usage-realtime-crossing] Keep the shared tier
+                // record in step with the final usage (a cancelled or
+                // queued-turn path may have landed usage the mid-loop observer
+                // never saw), and skip the line when the mid-loop path already
+                // announced this very tier moments ago — the label would just
+                // repaint the same text and the voice panel would re-show it.
+                let loopEndNow = Date()
+                if let tier = contextUsage?.tier { _ = contextTierTracker.observe(tier, now: loopEndNow) }
+                if !userDidCancel, !turnWasSilentProgrammatic, inputText.isEmpty,
+                   let usage = contextUsage {
+                    if contextTierTracker.recentlyFired(for: usage.tier, now: loopEndNow) {
+                        logger.info("[ContextUsageHint] loop-end → dedup: mid-loop crossing hint for \(usage.tier) fired <\(Int(ContextTierCrossingTracker.minInterval))s ago (\(usage.usedTokens)/\(usage.windowTokens))")
+                    } else {
+                        contextUsageHintGeneration += 1
+                        contextUsageHint = ContextUsageHint.make(usage: usage, generation: contextUsageHintGeneration,
+                                                              quota: composerQuotaPart())
+                        contextTierTracker.markFired(usage.tier, now: loopEndNow)
+                        logger.info("[ContextUsageHint] loop-end → hint gen\(contextUsageHintGeneration) '\(contextUsageHint?.text ?? "")' (\(usage.usedTokens)/\(usage.windowTokens))")
+                    }
+                } else {
+                    logger.info("[ContextUsageHint] loop-end → NO hint: cancel=\(userDidCancel) silent=\(turnWasSilentProgrammatic) inputEmpty=\(inputText.isEmpty) usage=\(contextUsage.map { "\($0.usedTokens)/\($0.windowTokens)" } ?? "nil")")
+                }
+                // [T-p0-programmatic-prompt] Rescue drain. Every drain runs in
+                // some loop's epilogue BEFORE that loop flips isProcessing to
+                // false, so a prompt enqueued in the await-gap between the
+                // epilogue's drain and this flip has no consumer — it would sit
+                // in promptQueue until the user's next turn. Start one now.
+                // cancel() owns its own resume (resumeQueueAfterCancel) and
+                // sets userDidCancel first, so it is excluded here.
+                if !promptQueue.isEmpty && !userDidCancel {
+                    startDrainIfIdle(reason: "loop-ended-with-queued-prompts")
+                }
                 // [T-ios-ui-frozen-on-tool-while-loop-runs] Force one snapshot
                 // re-apply from the CURRENT in-memory messages at loop end.
                 //
@@ -763,6 +1084,14 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         }
     }
     @Published var isSuspended = false
+    /// [T-ios-streamdiag-phantom-model] LEGACY FALLBACK DEFAULT — never
+    /// written anywhere; permanently holds `.claudeHaiku45`. The real model
+    /// selection flows through `activeEntryId` → `ProviderConfigStore`
+    /// (see runAgentLoop). The only legitimate reads are `?? selectedModel`
+    /// last-resort fallbacks when entry resolution fails (documented in
+    /// +ToolDefinitions). NEVER log or display this as "the current model":
+    /// the SSE stall diagnostics did exactly that, and a stall investigation
+    /// was nearly pinned on claude-haiku-4-5 — a model the session never used.
     @Published var selectedModel: LLMModel = .claudeHaiku45
     @Published var isLoadingSession = false
     /// False until the FIRST loadSession() for this vm completes. Lets the view
@@ -774,11 +1103,63 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// re-evaluates the view.
     var hasCompletedInitialLoad = false
     @Published var errorMessage: String?
-    /// Transient banner / toast message for in-loop notices (e.g. "older
-    /// N image(s) elided from request to fit 25MB budget"). Set by the
-    /// request-level image budget pass when it had to drop history images;
-    /// UI clears it after a short display window.
+
+    /// [T-ios-retry-keyboard] Marks the in-flight turn as one the user started
+    /// by tapping Retry / Resume on an EXISTING failed message, rather than by
+    /// sending something new.
+    ///
+    /// The auto-focus-after-reply observer keys off the `isProcessing` true→false
+    /// edge, and a retry produces exactly that edge — so re-running an old
+    /// failure looked identical to "a reply just finished" and popped the
+    /// keyboard. That is wrong for a retry specifically: the user's gesture was
+    /// "send this again", not "let me type", and the composer rising covers the
+    /// error they are trying to read.
+    ///
+    /// Deliberately NOT "suppress focus whenever a turn fails": auto-focus at
+    /// the moment a fresh send fails is existing, wanted behaviour. The
+    /// distinction being drawn is the ORIGIN of the turn, not its outcome.
+    ///
+    /// Not @Published — the observer reads it synchronously inside the
+    /// isProcessing handler, and publishing it would re-render the whole chat
+    /// on every retry for no visual reason.
+    var turnStartedByRetry = false
+
+    /// [T-longctx-persona-reminder-cachebreak] Context size at which the
+    /// long-context persona reminder was last appended to `agentHistory`, or
+    /// nil when this session has not been reminded yet.
+    ///
+    /// Drives the re-arm interval in `personaReminderIsDue(contextTokens:)`.
+    /// Intentionally NOT persisted: on a fresh launch it starts nil and
+    /// `personaReminderAlreadyInHistory()` recovers the state from history
+    /// itself, which is self-healing and survives reload / iCloud restore
+    /// without adding a schema column.
+    var lastPersonaReminderContextTokens: Int?
+
+    /// [T-subagent-callback-no-keyboard] True when the turn that just ended was
+    /// started programmatically and silently — a sub agent's progress report or
+    /// completion callback arriving via `submitProgrammaticPrompt(silent:)`.
+    ///
+    /// `programmaticSilentTurn` cannot serve here: it is cleared inside
+    /// `isProcessing`'s own `didSet`, which runs BEFORE SwiftUI delivers the
+    /// `onChange`, so the view would always read false. This flag is set from
+    /// the same place and read (and consumed) by the auto-focus observer.
+    ///
+    /// Why it matters: the observer treats every `isProcessing → false` edge as
+    /// "a reply arrived, ready the composer". A background sub agent reporting
+    /// in drives a full parent turn, so each progress callback raised the
+    /// keyboard while the user was reading — a focus change they never asked
+    /// for. Same reasoning as `turnStartedByRetry`: the ORIGIN of the turn
+    /// decides, not its outcome.
+    ///
+    /// Not @Published — read synchronously in the isProcessing handler.
+    var turnWasSilentProgrammatic = false
+    /// Transient banner for one-off notices the user should see (e.g. a
+    /// resumed sub agent whose definition is gone, HelperRunner). UI clears it
+    /// after a short display window. Not for automatic per-request handling:
+    /// the request-level image budget notice that used to be set here was
+    /// silenced to a log line ([T-silence-auto-notices]).
     @Published var transientNotice: String?
+
     @Published var autoRetryAttempt: Int = 0
     @Published var autoRetryCountdown: Int = 0
     /// [T-ios-empty-after-toolresult-reminder] Guards the one-shot
@@ -788,14 +1169,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// error instead of injecting again — so it can never loop. Reset at the
     /// start of each agent loop (a fresh user turn).
     var didInjectEmptyToolReminderThisRun = false
-    /// [T-deep-mode-cognitive-p1] C8: Uncertainty detection flag — ensures the
-    /// uncertainty check is injected at most once per runAgentLoop invocation.
-    /// When the model's output contains uncertainty markers ("不确定", "可能",
-    /// "大概", "I'm not sure", "maybe", "probably"), a one-shot verification
-    /// prompt is appended to the tool result message (or injected as a new user
-    /// message if the turn had no tool calls). Capped at 1 per run to prevent
-    /// loops. Reset at the start of each agent loop. Guarded by deepModeEnabled.
-    var didInjectUncertaintyCheckThisRun = false
     /// Incremented when a model fallback occurs so the UI can animate the model name change.
     @Published var fallbackTrigger: Int = 0
     /// Signal to trigger scroll-to-bottom in views (not @Published to avoid full view diff).
@@ -816,6 +1189,23 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// re-measures its height (UIKit doesn't always trigger preferredLayoutAttributesFitting
     /// reliably when the SwiftUI body changes inside a UIHostingConfiguration).
     let blockContentFilledSignal = PassthroughSubject<(messageId: UUID, blockId: UUID), Never>()
+    /// [T-fold-at-request-end] The assistant message the running agent loop
+    /// is writing into; nil between loops. The message list folds only this
+    /// message up to its fold horizon and plans every other message whole —
+    /// `isProcessing` alone is too broad (a manual compaction sets it with no
+    /// loop running, and the previous reply would then be cut back).
+    var toolFoldRunningMessageId: UUID?
+    /// [T-fold-at-request-end] For the running message: the last block of
+    /// every request (one LLM call) whose reply was long enough to fold the
+    /// tool runs before it (`ToolFoldPlanner.isFoldSeparator`), plus the last
+    /// block it already held when this loop started writing into it (a resumed
+    /// or retried turn: that content is finished, and was planned whole). The
+    /// list folds the message up to the latest of these
+    /// (`ToolFoldPlanner.foldHorizon`). Kept here rather than in the list so a
+    /// re-created chat view still knows them. Cleared when a loop starts/ends.
+    var toolFoldSeparators: [UUID: Set<UUID>] = [:]
+    /// Fires with the message id after a request added to `toolFoldSeparators`.
+    let toolFoldSeparatorSignal = PassthroughSubject<UUID, Never>()
     /// Content offset Y published on each scroll event (for debug jitter monitoring).
     let contentOffsetYSignal = PassthroughSubject<CGFloat, Never>()
     /// Content size height delta signal (for debug jitter monitoring).
@@ -908,1091 +1298,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     var pendingSendText: String?
     /// Attachments held back while the compact-before-send prompt is shown.
     var pendingSendAttachments: [InputAttachment] = []
+    /// [T-programmatic-prompt-no-composer] True when `pendingSendText` came
+    /// from the composer, i.e. the user typed it. A programmatic prompt can
+    /// reach the same holding area (send()'s .needsCompact / .exhausted
+    /// branches run for every caller), and `cancelCompactBeforeSend` must not
+    /// pour a job's prompt into the user's draft — it restores only their own
+    /// text.
+    var pendingSendIsFromComposer = false
     /// When true, skip the needsCompactBeforeSend check (used after compactAndSend to avoid loop).
     var skipCompactCheck = false
     /// When false, memory_write tool calls are skipped (returns "Memory disabled") in this session.
     @Published var memoryEnabled = true
-
-    // [T-perf-estimate-cache] Cache for estimateContextTokens() to avoid
-    // repeated full-history traversal + JSON serialization on the main thread.
-    // Invalidated by history count change (send/resume adds entries → count
-    // differs → cache miss). Between checkContextBeforeSend and runAgentLoop
-    // entry, agentHistory doesn't change, so the cache hits and skips the
-    // expensive recomputation. Also used by defer-block logging (which used
-    // to call estimateContextTokens() twice more at round end).
-    // [fix] Changed from `private` to `internal` so the estimate cache
-    // is accessible from AIChatViewModel+Offloading.swift (same module,
-    // different file — `private` only permits same-file access in Swift).
-    var _cachedEstimateTokens: Int? = nil
-    var _cachedEstimateHistoryCount: Int = -1
-    /// [T-perf-estimate-incremental] Track the effective slice count and
-    /// compaction marker from the last computation. When agentHistory grows
-    /// but the marker is unchanged, the effective slice only grew at the tail,
-    /// so we compute only the new messages' tokens and add to the cached total.
-    var _cachedEstimateSliceCount: Int = 0
-    var _cachedEstimateMarkerId: String? = nil
-    /// [T-perf-trim-images-skip] Cached image count + history count to avoid
-    /// the O(n*m) first-pass traversal on every runAgentLoop entry when no
-    /// new images have been added since the last check.
-    var _cachedImageCount: Int = -1
-    var _cachedImageCountHistorySize: Int = -1
-
-    /// Invalidate the estimate cache. Called at send()/resume() entry points
-    /// and whenever agentHistory is mutated by compaction/offload.
-    func invalidateEstimateCache() {
-        _cachedEstimateTokens = nil
-        _cachedEstimateHistoryCount = -1
-        _cachedEstimateSliceCount = 0
-        _cachedEstimateMarkerId = nil
-        // [T-perf-trim-images-skip] Also invalidate the image count cache when
-        // compaction/offload mutates agentHistory (images may have been evicted).
-        _cachedImageCount = -1
-        _cachedImageCountHistorySize = -1
-    }
-    /// [T-deep-mode] Global "深度龙虾Ai" agent-mode switch, read live from
-    /// UserDefaults (the Settings toggle) so it applies across all sessions
-    /// without per-session state. When on, an extra deep-mode behavior
-    /// fragment is injected and the bundled deep skills are enabled.
-    var deepModeEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "deepMode.enabled")
-    }
-
-    /// [T-deep-mode-level] Three-tier intensity for deep mode, controlling
-    /// which cognitive abilities are active and which sentinels are forced.
-    /// Stored in UserDefaults so it persists across sessions and is readable
-    /// from both ContentView (settings) and AIChatView (slash menu picker).
-    /// - low: base workflow + C1-C5 (prompt only) + C9 background monitoring
-    /// - medium: low + C10/C12/C14 forced sentinels + C9 sentinel
-    /// - high: medium + C11 tool registration + C13 root cause
-    var deepModeLevel: DeepModeLevel {
-        DeepModeLevel(rawValue: UserDefaults.standard.string(forKey: "deepMode.level") ?? "medium") ?? .medium
-    }
-
-    /// Setter for deep mode level — persists to UserDefaults and broadcasts
-    /// so live VMs re-read the level on the next turn.
-    func setDeepModeLevel(_ level: DeepModeLevel) {
-        UserDefaults.standard.set(level.rawValue, forKey: "deepMode.level")
-        NotificationCenter.default.post(name: .deepModeLevelDidChange, object: nil)
-    }
-
-    /// [T-deep-mode-plan-gate] Gate state for Layer B: `.awaitingApproval`
-    /// when the agent's last turn was a plan-only reply awaiting the user's
-    /// confirm/edit. Only ever set while deep mode is on.
-    @Published var planGateState: PlanGate.State = .idle
-
-    /// [T-deep-mode-floating-panel] Multi-path selection state for the
-    /// Trae-style floating confirm panel. Holds the user's chosen path indexes
-    /// (1-based, matching CandidatePath.index) while a multi-path plan is
-    /// awaiting approval. Empty means "use the recommended path". Reset to
-    /// empty in resetWorkflow() so it never lingers across workflows.
-    @Published var selectedPathIndexes: Set<Int> = []
-
-    /// [T-deep-mode-workflow] Phase 1 explicit workflow state machine. The
-    /// client owns the phase — `.planning` (plan raised), `.executing` (user
-    /// confirmed) — instead of relying on the model's fuzzy plan output. Always
-    /// gated on `deepModeEnabled` and reset to `.idle` whenever the toggle is
-    /// off, so disabling deep mode leaves no residue.
-    @Published var workflowPhase: WorkflowPhase = .idle
-
-
-    /// [T-deep-mode-resume-opt] Saved state for fast resume after pause.
-    /// When user pauses during workflow, we save the current state here.
-    /// On resume, we skip re-evaluation and directly restore the saved state.
-    private var savedWorkflowState: (phase: WorkflowPhase, steps: [WorkflowStep], verifyRoundsLeft: Int, goalRunnerRoundsLeft: Int)? = nil
-    /// [T-deep-mode-workflow] Parsed plan steps for the current workflow, shown
-    /// as a live progress list. Empty unless a plan is active. In-memory only.
-    @Published var workflowSteps: [WorkflowStep] = []
-
-    /// [T-deep-mode-session-workflow] P2: Rollback switch for session-scoped
-    /// workflow. Default ON.
-    ///
-    /// When ON, an in-flight workflow (.executing/.verifying) survives
-    /// interjections and pause/resume — the P0/P1 session behavior and its
-    /// progress capsule. When OFF, the client falls back to the LEGACY
-    /// "per-request workflow" behavior: every user send resets phase/steps, no
-    /// snapshot is saved on pause, and nothing is restored on resume (the
-    /// pre-refactor semantics). This is a configuration-layer kill-switch /
-    /// grayscale lever, per refactor plan item 5. The default is read
-    /// true-when-absent so a fresh install keeps the new behavior; the toggle
-    /// is persisted in UserDefaults.
-    @Published var keepSessionWorkflow: Bool = {
-        let d = UserDefaults.standard
-        // Absent key == never set == default to session-scoped behavior (ON).
-        return d.object(forKey: "deepMode.keepSessionWorkflow") == nil
-            ? true
-            : d.bool(forKey: "deepMode.keepSessionWorkflow")
-    }() {
-        didSet {
-            UserDefaults.standard.set(keepSessionWorkflow, forKey: "deepMode.keepSessionWorkflow")
-            // [T-deep-mode-session-workflow] Audit H1: turning the rollback
-            // switch OFF mid-workflow must destroy the pending session state,
-            // otherwise phase/steps/snapshot/busy linger and the capsule keeps
-            // rendering (the master switch is still on). resetWorkflow() also
-            // clears savedWorkflowState and the round/verify budgets, so this
-            // becomes a graceful, residue-free exit to the LEGACY behavior.
-            if !keepSessionWorkflow {
-                resetWorkflow()
-                workflowBusy = false
-            }
-        }
-    }
-
-    /// [T-deep-mode-session-workflow] P2: Active workflow gating = total deep
-    /// switch AND the session-workflow rollback switch.
-    ///
-    /// `deepModeEnabled` is the master switch; `keepSessionWorkflow` lets the
-    /// operator disable the session behavior independently (Fallback mode).
-    /// Both must hold for the session-scoped path (interjection preservation,
-    /// pause snapshot / resume restore, and the activity indicator) to apply.
-    /// Total-switch safe: when the master switch is off this is always false,
-    /// so every affected path degrades to the pre-refactor behavior.
-    /// Internal (not private) so the progress-capsule view can gate on it.
-    var sessionWorkflowEnabled: Bool {
-        deepModeEnabled && keepSessionWorkflow
-    }
-
-    /// [T-deep-mode-session-workflow] P2: Activity indicator for the progress
-    /// capsule. True while the agent loop (a "round") is actively executing —
-    /// model reasoning or tool calls such as shell/file — and false when the
-    /// turn settles into an idle/awaiting state. The UI can render a
-    /// pulse/small-spin on the capsule while this is true so a long-running
-    /// shell call does not look like a frozen "0/x". Set to false immediately
-    /// on round exit via `defer`. Gated so it never flickers outside an active
-    /// session workflow.
-    @Published var workflowBusy: Bool = false
-
-    /// [T-deep-mode-workflow] Pending one-shot task that fades the completed
-    /// tracker out after a short all-green "完成过渡". Cancelled on master-switch
-    /// teardown so a disabled deep mode never lets a stray delay mutate state.
-    var workflowFinishTask: Task<Void, Never>?
-
-    /// [T-deep-mode-goal-runner] Remaining auto-continuation budget for Layer C.
-    /// Decremented once per auto-round, reset to `GoalRunner.maxAutoRounds` on a
-    /// fresh user send, on a `done` sentinel, on reaching the cap, and on
-    /// session load. Not @Published: nothing renders it directly today; it is
-    /// only consulted at the turn's end and logged for diagnostics.
-    var goalRunnerRoundsLeft: Int = GoalRunner.maxAutoRounds
-
-    /// [T-deep-mode-strip-sentinel] Sentinel resolved at text-capture time (in
-    /// the agent loop, right before the final assistant text is flushed/persisted).
-    /// The visible text is stripped of the `<<GOAL_STATE>>` line at that same
-    /// point, so the auto-continue step at turn end reads this stash instead of
-    /// re-parsing `block.content` (which no longer carries the marker).
-    var pendingGoalSentinel: GoalRunner.ParseResult? = nil
-
-    // MARK: - Phase 2: VerifyGate
-
-    /// [T-deep-mode-verify-gate] Remaining self-verification rounds for Phase 2.
-    /// Decremented each time we re-enter `.executing` from a failed verify,
-    /// reset on fresh user send / session load / workflow reset. Not @Published:
-    /// nothing renders it directly; it is only consulted at verify-turn end.
-    var verifyRoundsLeft: Int = VerifyGate.maxVerifyRounds
-
-    /// [T-deep-mode-verify-gate] Verify sentinel resolved at text-capture time,
-    /// same pattern as `pendingGoalSentinel`. The `<<VERIFY_STATE>>` line is
-    /// stripped from the visible text; the parsed result is stashed here for
-    /// the verify-result handler at turn end.
-    var pendingVerifySentinel: VerifyGate.ParseResult? = nil
-
-    // MARK: - Phase F: SpecGate
-
-    /// [T-deep-mode-phase-f] Spec-gate public state. `.awaitingReview(files:)`
-    /// drives the spec-review panel; `.approved`+ is reached when the user
-    /// approves and the workflow finishes. Always gated on
-    /// `deepModeEnabled && specModeEnabled`; memory-only, never persisted —
-    /// toggling either switch off leaves zero residue.
-    @Published var specGateState = SpecGate.State.idle
-
-    /// [T-deep-mode-phase-f] The spec artifacts produced on the latest
-    /// spec-writing turn, surfaced in the review panel. Only consulted while
-    /// Spec mode is active; cleared on reset / disable.
-    @Published var pendingSpecFiles: [SpecGate.SpecFile] = []
-
-    /// [T-deep-mode-phase-f] Whether the last spec-writing turn emitted the
-    /// SPEC_STATE sentinel. Resolved at text-capture time alongside the other
-    /// sentinels; consumed by `maybeProcessSpecResult` at turn end.
-    var pendingSpecSentinel = false
-
-    /// [T-deep-mode-phase-f] Remaining reject→regenerate edit rounds for the
-    /// current workflow. Bounded so a reject/edit loop can't run forever.
-    var specEditRoundsLeft = SpecGate.maxEditRounds
-
-    /// [T-deep-mode-phase-f] Convenience: is the Spec gate live right now?
-    /// True only when BOTH the master switch and the Spec-mode toggle are on.
-    private var specActive: Bool { SpecGate.isActive(deepModeEnabled: deepModeEnabled) }
-
-    // MARK: - Phase 2: ClarifyGate
-
-    /// [T-deep-mode-clarify-gate] Clarification gate state for Phase 2.
-    /// `.awaitingClarification` when the gate detected ambiguity in the user's
-    /// request and raised a question before planning begins. Always gated on
-    /// `deepModeEnabled`; memory-only, never persisted.
-    @Published var clarifyState: ClarifyGate.State = .idle
-
-    // MARK: - P2 Cognitive: C9 Cognitive Load Monitor
-
-    /// [T-deep-mode-cognitive-p2-c9] Real-time cognitive load state. Updated
-    /// during `runAgentLoop` by merging the model's self-assessed sentinel
-    /// with client-computed metrics (context saturation, tool count, etc.).
-    /// The UI renders a warning banner when level >= .high.
-    /// Total-switch safe: reset to `.empty` in `deepModeDidDisableCleanup()`.
-    @Published var cognitiveLoadState: CognitiveLoadState = .empty
-
-    /// [T-deep-mode-cognitive-p2-c9] The model's self-assessed load signal
-    /// from the last turn's sentinel. Kept separately so the UI can show
-    /// both the model's and the client's assessment.
-    var lastModelLoadSignal: CognitiveLoadSignal?
-
-    // MARK: - P2 Cognitive: C10 Dynamic Autonomy Exit
-
-    /// [T-deep-mode-cognitive-p2-c10] When the model emits
-    /// `<<GOAL_STATE>> need_more_context: <reason>`, the auto-continuation
-    /// loop stops and this state is set. The UI renders a "needs input" prompt.
-    /// Reset to nil in `deepModeDidDisableCleanup()` and on fresh send.
-    @Published var needMoreContextState: String? = nil
-
-    /// [T-deep-mode-plan-gate] User approved the pending plan. Re-send an
-    /// execution prompt through the normal `send()` path so it inherits every
-    /// existing guard (context check, persistence, session tracking, run loop).
-    /// After `send()` (which resets the workflow as part of its fresh-send
-    /// path) re-enters the executing phase with the captured steps, so the
-    /// progress tracker survives the confirm round-trip.
-    ///
-    /// [T-deep-mode-floating-panel] `selection` carries the user's multi-path
-    /// choice from the floating confirm panel (empty = use the recommended
-    /// path, so unchecking all is still safe). When the user picked specific
-    /// paths, the execution prompt is rebuilt to mention only those paths and
-    /// the step tracker is re-parsed from the merged selected path bodies, so
-    /// the user's choice actually drives what gets executed. Passing a value
-    /// overrides `selectedPathIndexes`; when nil, the stored property is read
-    /// (the host just calls `confirmPlan()`).
-    func confirmPlan(selection: Set<Int>? = nil) {
-        guard case .awaitingApproval(let pendingPlanText, let paths, _) = planGateState else { return }
-        let chosen = selection ?? selectedPathIndexes
-        let capturedSteps: [WorkflowStep]
-        let executionPrompt: String
-
-        if !paths.isEmpty, !chosen.isEmpty {
-            // Multi-path plan with explicit user selection: merge the bodies
-            // of the chosen paths into one execution instruction.
-            let selectedPaths = paths.filter { chosen.contains($0.index) }
-            let mergedPlan = selectedPaths.map(\.body).joined(separator: "\n\n")
-            capturedSteps = mergedPlan.isEmpty
-                ? workflowSteps
-                : WorkflowPlanParser.parseSteps(from: mergedPlan)
-            let labels = selectedPaths.map { "路径 \($0.index)（\($0.title)）" }.joined(separator: "、")
-            executionPrompt = AppLocalized("计划已确认。请严格按所选路径（\(labels)）执行，不要再输出计划，直接开始。")
-        } else {
-            capturedSteps = workflowSteps
-            executionPrompt = AppLocalized("计划已确认。请严格按上述计划执行，不要再输出计划，直接开始。")
-        }
-        // [T-deep-mode-cognitive-p2-c14] C14: Save the active project context
-        // when a plan is confirmed, so future sessions know what the user
-        // was last working on. Total-switch safe: this code path is only
-        // reachable when deepModeEnabled (PlanGate is gated on it).
-        if deepModeEnabled {
-            // Extract the first meaningful line of the plan as the project context.
-            let firstLine = pendingPlanText.components(separatedBy: "\n")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { !$0.isEmpty && !$0.hasPrefix("```") } ?? String(pendingPlanText.prefix(100))
-            try? CrossSessionContextStore.setActiveProject(firstLine, sessionId: sessionId)
-            logger.info("[CrossSession] C14: active project context saved")
-        }
-        planGateState = .idle
-        selectedPathIndexes = []
-        inputText = executionPrompt
-        send()
-        // [T-deep-mode-workflow] `send()` can early-return before committing
-        // (context near/exhausted shows a dialog, read-only mode, still
-        // processing). Only enter `.executing` when the message actually went
-        // through — otherwise an "执行中" bar would linger with no real run.
-        guard !showCompactBeforeSendPrompt && !showContextExhaustedPrompt else { return }
-        beginExecution(restoring: capturedSteps)
-    }
-
-    /// [T-deep-mode-plan-gate] User wants to adjust the plan: park the plan
-    /// text in the composer and close the gate. The user edits and sends it as
-    /// a normal message. The workflow is reset — editing a plan is a return to
-    /// the idle pre-task state, not an execution instruction.
-    func editPlan() {
-        guard case .awaitingApproval(let planText, _, _) = planGateState else { return }
-        planGateState = .idle
-        selectedPathIndexes = []
-        resetWorkflow()
-        inputText = planText
-    }
-
-    /// [T-deep-mode-plan-gate] Dismiss the pending plan without acting.
-    func cancelPlan() {
-        planGateState = .idle
-        resetWorkflow()
-    }
-
-    // MARK: - Phase 2: ClarifyGate actions
-
-    /// [T-deep-mode-clarify-gate] Skip the clarification step and proceed
-    /// directly with the original request. Used when the user clicks "直接执行"
-    /// on the clarification banner — they don't need to clarify, they just want
-    /// the agent to make a reasonable guess and get on with it.
-    func skipClarification() {
-        guard case .awaitingClarification(_, let original) = clarifyState else { return }
-        clarifyState = .idle
-        inputText = original
-        // Set a flag so send() knows to skip the ambiguity check this time.
-        skipClarifyCheck = true
-        send()
-    }
-
-    /// [T-deep-mode-clarify-gate] Cancel the pending clarification — close the
-    /// banner, restore the original text to the composer, and do NOT send.
-    func cancelClarification() {
-        guard case .awaitingClarification(_, let original) = clarifyState else { return }
-        clarifyState = .idle
-        inputText = original
-    }
-
-    /// [T-deep-mode-clarify-gate] When true, send() skips the ambiguity check
-    /// for the current message. Set by `skipClarification()` so the user can
-    /// bypass the gate on demand. Reset to false after each send.
-    /// Internal access (same as goalRunnerRoundsLeft / pendingGoalSentinel) so
-    /// cross-file extensions (Persistence) can reset it on session load.
-    var skipClarifyCheck = false
-
-    /// [T-deep-mode-workflow] Reset the Phase 1 workflow state machine to its
-    /// "off" shape: idle phase, no steps. Idempotent and safe to call even when
-    /// deep mode is off — it is the single place that guarantees the toggle-off
-    /// contract leaves zero residue.
-    func resetWorkflow() {
-        // [T-deep-mode-workflow] Cancel any pending fade-out so a delayed reset
-        // from a previously completed workflow can't wipe a new run's state.
-        // (Was previously only done in beginExecution(); resetWorkflow is the
-        // canonical "return to idle" entry point so it should own this cleanup.)
-        workflowFinishTask?.cancel()
-        // [T-deep-mode-workflow] Audit M2: defensively clear the activity
-        // indicator here too — this is the canonical "return to idle" entry
-        // point, so it must not leave a stale busy pulse behind.
-        workflowBusy = false
-        // [T-deep-mode-resume-opt] Clear saved state on reset
-        savedWorkflowState = nil
-        workflowPhase = .idle
-        workflowSteps = []
-        // [T-deep-mode-floating-panel] Multi-path selection is per-workflow:
-        // clear it on reset so a choice can never bleed into the next run.
-        selectedPathIndexes = []
-        // [T-deep-mode-verify-gate] Phase 2: verify budget and sentinel are
-        // also per-workflow; resets alongside the workflow state machine.
-        verifyRoundsLeft = VerifyGate.maxVerifyRounds
-        pendingVerifySentinel = nil
-        // [T-deep-mode-phase-f] Phase F spec state is per-workflow; clear it on
-        // reset so a prior run's review / sentinel can't bleed into the next.
-        specGateState = .idle
-        pendingSpecFiles = []
-        pendingSpecSentinel = false
-        specEditRoundsLeft = SpecGate.maxEditRounds
-        // [fix] Also clear the goal sentinel for consistency. While callers
-        // already re-check deepModeEnabled / message errors before reading it,
-        // leaving a stale sentinel across a reset is a latent hazard if a
-        // future caller forgets the guard.
-        pendingGoalSentinel = nil
-    }
-
-    /// [T-deep-mode-workflow] Enter the executing phase and light up the first
-    /// pending step. Gated on the master switch: if deep mode is somehow off,
-    /// fall back to a hard reset so the state machine can never run unbounded.
-    /// Also falls back when the plan parsed zero recognizable steps — there is
-    /// nothing to track, so we stay idle rather than render an empty "0/0" bar.
-    private func beginExecution(restoring steps: [WorkflowStep]) {
-        guard deepModeEnabled, !steps.isEmpty else {
-            resetWorkflow()
-            return
-        }
-        // [T-deep-mode-workflow] A fresh execution invalidates any pending fade
-        // from a previous completed task, so a stale delayed reset can never
-        // wipe the new run's tracker.
-        workflowFinishTask?.cancel()
-        // [T-deep-mode-cognitive-p1] C7: Reset the retrospective flag for the
-        // new workflow — each workflow gets one retrospective at completion.
-        retrospectiveHasRun = false
-        // [T-deep-mode-cognitive-p1] C7 fix: Also clear isRetrospectiveRunning
-        // in case a previous retrospective was interrupted mid-execution.
-        isRetrospectiveRunning = false
-        workflowPhase = .executing
-        var s = steps
-        if let i = s.firstIndex(where: { $0.status == .pending }) {
-            s[i].status = .active
-        }
-        workflowSteps = s
-    }
-
-    /// [T-deep-mode-workflow] Advance the step tracker by one: mark the current
-    /// active step done and promote the next pending step to active. Coarse but
-    /// deterministic heuristic — each goal-runner auto-continue round is treated
-    /// as roughly one plan step. Never advances outside the executing phase and
-    /// never beyond the parsed step list.
-    private func advanceWorkflowStep() {
-        guard workflowPhase == .executing, !workflowSteps.isEmpty else { return }
-        var steps = workflowSteps
-        if let activeIdx = steps.firstIndex(where: { $0.status == .active }) {
-            steps[activeIdx].status = .done
-        }
-        if let nextIdx = steps.firstIndex(where: { $0.status == .pending }) {
-            steps[nextIdx].status = .active
-        }
-        workflowSteps = steps
-    }
-
-    /// [T-deep-mode-session-workflow] Advanced event-level progress refresh.
-    /// Called once per completed tool result (in the batch stitch loop) so a
-    /// long multi-tool step advances the capsule in near-real time instead of
-    /// reading as a frozen "0/x".
-    ///
-    /// Guard guarantees we NEVER flip the last remaining step to `.done` via a
-    /// tool event:
-    ///   * `workflowPhase == .executing` (same guard as `advanceWorkflowStep`),
-    ///   * `sessionWorkflowEnabled` (master switch AND rollback switch, so this
-    ///     refinement is also a graceful lever that can be turned off),
-    ///   * more than one non-done step remains (if only one is left, this is a
-    ///     no-op).
-    /// Final completion of the last step stays owned by the `.done` sentinel →
-    /// `completeWorkflow`, so the `.verifying` entry is never triggered by tool
-    /// events alone and GoalCompletionEvaluator cannot see a spurious all-done.
-    private func advanceStepOnToolEvent() {
-        guard sessionWorkflowEnabled,
-              workflowPhase == .executing,
-              workflowSteps.filter({ $0.status != .done }).count > 1 else { return }
-        advanceWorkflowStep()
-    }
-
-    /// [T-deep-mode-workflow] Clear the tracker when an execution turn stops on
-    /// its own (no continuation signal, or the auto-continue cap is reached).
-    /// No-op unless a workflow is actually executing, so it can't disturb the
-    /// planning gate or a trivial `.idle` turn.
-    private func finishWorkflow() {
-        guard workflowPhase == .executing else { return }
-        workflowFinishTask?.cancel()
-        resetWorkflow()
-    }
-
-    /// [T-deep-mode-workflow] Task fully done (`done` sentinel): flip every step
-    /// to `.done` and enter the `.verifying` phase. In Phase 1 this was a brief
-    /// fade-out; in Phase 2 it is a real self-check phase — the client injects
-    /// a mandatory verify prompt and the model must confirm with
-    /// `<<VERIFY_STATE>> passed` before the workflow actually finishes.
-    private func completeWorkflow() async {
-        guard workflowPhase == .executing else {
-            resetWorkflow()
-            return
-        }
-        var steps = workflowSteps
-        for i in steps.indices { steps[i].status = .done }
-        workflowSteps = steps
-        workflowPhase = .verifying
-        // [T-deep-mode-verify-gate] Phase 2: kick off the self-verification
-        // round. If verify budget is already exhausted, fall back to the
-        // Phase 1 behavior (instant finish) — zero blockage, zero risk.
-        guard verifyRoundsLeft > 0 else {
-            // [T-deep-mode-s2-1] Log warning when verification budget is exhausted
-            logger.warning("[VerifyGate] verify budget exhausted — finishing without verification (S2-1)")
-            logger.info("[VerifyGate] verify budget exhausted — finishing without verification")
-            scheduleWorkflowFinish()
-            return
-        }
-        await beginVerification()
-    }
-
-    /// [T-deep-mode-verify-gate] Phase 2: inject a self-verification prompt
-    /// and recurse into `runAgentLoop()`. The model is asked to re-read its
-    /// results, run/preview/compare, and report `passed` or `failed`.
-    /// Gated on `deepModeEnabled` at the call-site; this method assumes the
-    /// caller already checked.
-    private func beginVerification() async {
-        guard deepModeEnabled else { return }
-        guard workflowPhase == .verifying else { return }
-        verifyRoundsLeft -= 1
-        let used = VerifyGate.maxVerifyRounds - verifyRoundsLeft
-        logger.info("[VerifyGate] beginning self-verification \(used)/\(VerifyGate.maxVerifyRounds)")
-
-        let cont = AgentMessage(role: .user, parts: [
-            .text("<system-reminder>深度模式自检阶段：执行已完成，请现在严格复查你的工作。请重新阅读所有改动的文件、运行或预览结果、对照原始需求检查是否完全正确。如果一切正常，回复 <<VERIFY_STATE>> passed；如果发现问题，说明问题在哪里、为什么错、以及如何修复，并回复 <<VERIFY_STATE>> failed: <问题简述>。不要输出新的计划块，直接开始复查。</system-reminder>")
-        ])
-        let ci = agentHistory.count
-        agentHistory.append(cont)
-        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
-            agentHistory[ci].dbMessageId = pid
-        }
-
-        do {
-            try await runAgentLoop()
-        } catch is CancellationError {
-            logger.info("[VerifyGate] verification cancelled")
-            handleUserCancelledCleanup()
-        } catch {
-            logger.error("[VerifyGate] verification error: \(String(describing: error))")
-        }
-    }
-
-    /// [T-deep-mode-verify-gate] Phase 2: process the result of a verification
-    /// turn. Called at turn end when `workflowPhase == .verifying`.
-    ///   • `passed` → schedule the finish fade-out (workflow truly done).
-    ///   • `failed` → re-enter `.executing` so the model can fix the issues.
-    ///   • no sentinel / unknown → treat as passed (fail-safe: don't block).
-    private func maybeProcessVerifyResult(afterMsgIdx msgIdx: Int) async {
-        logger.info("[WorkflowLog] maybeProcessVerifyResult() - workflowPhase=verifying pendingSentinel=(pendingVerifySentinel != nil ? String(describing: pendingVerifySentinel!) : \"nil\")")
-        guard deepModeEnabled else { return }
-        guard workflowPhase == .verifying else { return }
-        guard messages.indices.contains(msgIdx) else { return }
-        guard messages[msgIdx].error == nil else {
-            logger.info("[VerifyGate] skipped — turn has error")
-            scheduleWorkflowFinish()
-            return
-        }
-        guard !canResume else {
-            logger.info("[VerifyGate] skipped — turn resumable")
-            scheduleWorkflowFinish()
-            return
-        }
-
-        guard let result = pendingVerifySentinel else {
-            // [T-deep-mode-verify-gate] Fail-safe: no sentinel or unrecognized
-            // token → treat as passed and finish. This degrades gracefully to
-            // Phase 1 behavior instead of blocking the user.
-            // [T-deep-mode-s1-2] Log warning when sentinel is missing
-            logger.warning("[VerifyGate] no verify sentinel — treating as passed (fail-safe) — possible missed verification round")
-            logger.info("[VerifyGate] no verify sentinel — treating as passed (fail-safe)")
-            scheduleWorkflowFinish()
-            return
-        }
-
-        switch result {
-        case .passed:
-            logger.info("[VerifyGate] verification passed")
-            // [T-deep-mode-phase-f] If Spec mode is live, verification passing
-            // no longer finishes immediately — enter the spec-writing phase so
-            // the model formalizes the work into spec docs for user review.
-            // Otherwise keep the original behavior (finish now).
-            if specActive {
-                await beginSpecWriting()
-            } else {
-                scheduleWorkflowFinish()
-            }
-        case .failed(let reason):
-            if verifyRoundsLeft > 0 {
-                // [T-deep-mode-s2-2] Log coupling state between VerifyGate and GoalRunner
-                logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft), goalRoundsLeft: \(goalRunnerRoundsLeft))")
-                logger.info("[VerifyGate] verification failed — re-entering execution to fix (rounds left: \(verifyRoundsLeft))")
-                // Flip the last step back to active so the progress tracker
-                // shows "still working" instead of "all done".
-                workflowPhase = .executing
-                var steps = workflowSteps
-                if let lastDoneIdx = steps.lastIndex(where: { $0.status == .done }) {
-                    steps[lastDoneIdx].status = .active
-                }
-                workflowSteps = steps
-                // [T-deep-mode-verify-gate] Top up the GoalRunner budget by 1
-                // if it's exhausted, so the fix round has at least one continue
-                // available. Without this, a task that used all 3 goal rounds
-                // before "falsely reporting done" would be stuck after verify
-                // failure — the model would output pending but couldn't continue.
-                if goalRunnerRoundsLeft <= 0 {
-                    goalRunnerRoundsLeft = 1
-                    logger.info("[VerifyGate] topped up goalRunner budget to 1 for fix round")
-                }
-                // Inject a "fix it" continue prompt and recurse.
-                // [T-deep-mode-cognitive-p2-c13] Instead of a plain "fix it"
-                // prompt, inject a root-cause analysis prompt that asks the
-                // model to: (1) analyze the fundamental reason for failure,
-                // (2) fix it, (3) generate a reusable avoidance rule wrapped
-                // in <<ROOT_CAUSE_RULE>> sentinels. After the fix turn
-                // completes, the rule is extracted and appended to
-                // deep-rules.md. Total-switch safe: only reachable when
-                // deepModeEnabled (guard at maybeProcessVerifyResult entry).
-                let fixReason = reason ?? "发现问题需要修复"
-                let cont = AgentMessage(role: .user, parts: [
-                    .text(ErrorRootCauseAnalyzer.rootCausePrompt(failureReason: fixReason))
-                ])
-                let ci = agentHistory.count
-                agentHistory.append(cont)
-                if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
-                    agentHistory[ci].dbMessageId = pid
-                }
-                do {
-                    try await runAgentLoop()
-                    // [T-deep-mode-cognitive-p2-c13] After the fix turn
-                    // completes, extract the root-cause rule from the
-                    // model's last assistant response and append it to
-                    // deep-rules.md. The rule is wrapped in
-                    // <<ROOT_CAUSE_RULE>> sentinels. Total-switch safe:
-                    // only reachable when deepModeEnabled.
-                    if let lastMsg = messages.last,
-                       case .text = lastMsg.blocks.last?.kind,
-                       let lastText = lastMsg.blocks.last?.content,
-                       let rule = ErrorRootCauseAnalyzer.extractRule(from: lastText) {
-                        ErrorRootCauseAnalyzer.appendAutoRule(rule)
-                        logger.info("[RootCauseAnalyzer] C13: extracted and appended auto-rule: \(rule.prefix(80))")
-                    }
-                } catch is CancellationError {
-                    logger.info("[VerifyGate] fix-round cancelled")
-                    handleUserCancelledCleanup()
-                } catch {
-                    logger.error("[VerifyGate] fix-round error: \(String(describing: error))")
-                }
-            } else {
-                logger.info("[VerifyGate] verification failed but out of rounds — finishing anyway")
-                scheduleWorkflowFinish()
-            }
-        }
-    }
-
-    /// [T-deep-mode-workflow] Schedule the fade-out of a completed tracker after
-    /// a short delay. Cancels any prior pending fade first so repeated completion
-    /// can't schedule duplicate mutations. The `deepModeEnabled` re-check at fire
-    /// time guarantees the toggle-off contract isn't violated by a stray delay.
-    private func scheduleWorkflowFinish() {
-        workflowFinishTask?.cancel()
-        workflowFinishTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            guard !Task.isCancelled else { return }
-            guard let self, self.deepModeEnabled else { return }
-            self.resetWorkflow()
-            // [T-deep-mode-cognitive-p1] C7 fix: Wait for the main agent loop
-            // to fully finish before running the retrospective. The 900ms delay
-            // above usually suffices, but if the loop is still cleaning up
-            // (error handling, DB writes, queued prompts), isProcessing would
-            // still be true — calling runAgentLoop() again would cause
-            // reentrancy. Wait up to 5 seconds for the loop to release, then
-            // proceed. If it doesn't release (stuck), skip the retrospective
-            // for this workflow — the retrospectiveHasRun flag ensures we
-            // don't double-run on the next finish.
-            var waitCount = 0
-            while self.isProcessing && waitCount < 50 {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                guard !Task.isCancelled else { return }
-                waitCount += 1
-            }
-            if self.isProcessing {
-                logger.warning("[Retrospective] C7 skipped — isProcessing still true after 5s wait")
-                return
-            }
-            await self.maybeRunRetrospective()
-        }
-    }
-
-    // MARK: - Phase F: Spec Writing & Review flow
-
-    /// [T-deep-mode-phase-f] Enter the spec-writing phase after verification
-    /// passes (only when Spec mode is live). Injects a spec-generation prompt
-    /// and recurses into `runAgentLoop()` so the model can write spec.md /
-    /// checklist.md / tasks.md and append `<<SPEC_STATE>>`. Fail-safe: if the
-    /// gate guard fails, fall back to a normal workflow finish (zero blockage).
-    private func beginSpecWriting() async {
-        guard specActive else { scheduleWorkflowFinish(); return }
-        guard workflowPhase == .verifying else { scheduleWorkflowFinish(); return }
-        workflowPhase = .specWriting
-        pendingSpecSentinel = false
-        pendingSpecFiles = []
-        specEditRoundsLeft = SpecGate.maxEditRounds
-        logger.info("[SpecGate] Phase F — entered spec-writing")
-        let cont = AgentMessage(role: .user, parts: [
-            .text("<system-reminder>深度模式规格化阶段：你刚刚完成执行并通过自检。现在请把已完成的成果正式化为一套规格文档。用 file_write（create_dirs=true）写出三个文件：spec.md（目标 / 范围内外 / 功能清单 / 验收标准）、checklist.md（对照验收标准的检查清单）、tasks.md（任务拆分，独立的可并行任务用 [PARALLEL] 标注）。直接基于你实际完成的工作来写，不要发明新的需求。三个文件都写完、且只用这一个回复序完成后，在回复最末尾另起一行补上：\n<<SPEC_STATE>>\n本阶段只写这三份规格文档，不要开始任何新的执行工作。</system-reminder>")
-        ])
-        let ci = agentHistory.count
-        agentHistory.append(cont)
-        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
-            agentHistory[ci].dbMessageId = pid
-        }
-        do {
-            try await runAgentLoop()
-        } catch is CancellationError {
-            logger.info("[SpecGate] spec-writing cancelled")
-            handleUserCancelledCleanup()
-        } catch {
-            logger.error("[SpecGate] spec-writing error: \(String(describing: error))")
-        }
-    }
-
-    /// [T-deep-mode-phase-f] Process the end of a spec-writing turn. Called at
-    /// turn end when `workflowPhase == .specWriting`. Harvests the produced
-    /// spec files and, on the sentinel or with detected docs, pauses in
-    /// `.specReviewing` for the user's approve / edit / reject.
-    ///   • sentinel present / docs detected → enter `.specReviewing`.
-    ///   • no sentinel and no docs (or a failed / resumable turn) → fail-safe
-    ///     finish so the capsule never hangs.
-    private func maybeProcessSpecResult(afterMsgIdx msgIdx: Int) async {
-        logger.info("[WorkflowLog] maybeProcessSpecResult() - workflowPhase=\(workflowPhase)")
-        guard specActive else { return }
-        guard workflowPhase == .specWriting else { return }
-        guard messages.indices.contains(msgIdx),
-              messages[msgIdx].error == nil,
-              !canResume else {
-            scheduleSpecFinishFallback()
-            return
-        }
-
-        let detected = SpecGate.detectFiles(in: messages[msgIdx].blocks)
-        if !detected.isEmpty {
-            pendingSpecFiles = detected
-            specGateState = .awaitingReview(files: detected)
-            workflowPhase = .specReviewing
-            logger.info("[SpecGate] spec docs produced (\(detected.count)) — awaiting review")
-        } else if pendingSpecSentinel {
-            // Sentinelled but no product files captured; still let the user
-            // review the (possibly persisted) docs rather than block silently.
-            specGateState = .awaitingReview(files: [])
-            workflowPhase = .specReviewing
-            logger.info("[SpecGate] spec sentinel present but no docs detected — awaiting review")
-        } else {
-            // No sentinel and no files: the spec turn produced nothing useful.
-            logger.warning("[SpecGate] no spec docs and no sentinel — finishing (fail-safe)")
-            scheduleSpecFinishFallback()
-        }
-    }
-
-    /// [T-deep-mode-phase-f] Fail-safe finish when a spec-writing turn cannot
-    /// proceed (error, resumable, or produced nothing). Clears spec state and
-    /// finishes the workflow instead of hanging the capsule.
-    private func scheduleSpecFinishFallback() {
-        specGateState = .idle
-        pendingSpecFiles = []
-        pendingSpecSentinel = false
-        scheduleWorkflowFinish()
-    }
-
-    /// [T-deep-mode-phase-f] User approved the generated spec docs. Transition
-    /// through `.specApproved` and finish the workflow.
-    func specApprove() {
-        guard specActive else { return }
-        guard workflowPhase == .specReviewing else { return }
-        specGateState = .approved
-        workflowPhase = .specApproved
-        pendingSpecFiles = []
-        pendingSpecSentinel = false
-        logger.info("[SpecGate] user approved spec — finishing workflow")
-        scheduleWorkflowFinish()
-    }
-
-    /// [T-deep-mode-phase-f] User wants to edit / regenerate the spec docs.
-    /// Bounded by `specEditRoundsLeft`. Re-injects the spec prompt and
-    /// re-enters writing. When the budget is exhausted, treat as approved.
-    func specEdit() {
-        guard specActive else { return }
-        guard workflowPhase == .specReviewing else { return }
-        guard specEditRoundsLeft > 0 else { specApprove(); return }
-        specEditRoundsLeft -= 1
-        specGateState = .idle
-        pendingSpecSentinel = false
-        workflowPhase = .specWriting
-        logger.info("[SpecGate] user requested spec edit (rounds left: \(specEditRoundsLeft))")
-        Task { await injectSpecEditPromptAndRun() }
-    }
-
-    /// [T-deep-mode-phase-f] User rejected the spec / wants to abandon Spec
-    /// mode for this workflow. Finish without further execution (docs stay on
-    /// disk if they were written, but the workflow closes).
-    func specReject() {
-        guard specActive else { return }
-        guard workflowPhase == .specReviewing else { return }
-        specGateState = .idle
-        pendingSpecFiles = []
-        pendingSpecSentinel = false
-        logger.info("[SpecGate] user rejected spec — finishing workflow")
-        resetWorkflow()
-    }
-
-    /// [T-deep-mode-phase-f] Inject an edit prompt for the spec docs and recurse
-    /// into `runAgentLoop()`. Reuses the same sentinel contract.
-    private func injectSpecEditPromptAndRun() async {
-        guard specActive, workflowPhase == .specWriting else {
-            scheduleWorkflowFinish()
-            return
-        }
-        let cont = AgentMessage(role: .user, parts: [
-            .text("<system-reminder>规格文档需要修改。请根据用户刚才的修改意见，用 file_write 重新写入需要调整的 spec.md / checklist.md / tasks.md，然后在这个回复最末尾另起一行补上：\n<<SPEC_STATE>>\n（本阶段只写规格文档，不要开始新的执行工作。）</system-reminder>")
-        ])
-        let ci = agentHistory.count
-        agentHistory.append(cont)
-        if let pid = await persistAgentMessage(cont), ci < agentHistory.count {
-            agentHistory[ci].dbMessageId = pid
-        }
-        do {
-            try await runAgentLoop()
-        } catch is CancellationError {
-            logger.info("[SpecGate] spec edit cancelled")
-            handleUserCancelledCleanup()
-        } catch {
-            logger.error("[SpecGate] spec edit error: \(String(describing: error))")
-        }
-    }
-
-    /// [T-deep-mode-workflow] Invoked on a master-switch change. When deep mode
-    /// is now OFF, tear down every Phase 1 / deep-mode UI state so the UI and
-    /// behavior return byte-for-byte to the pre-deep-mode shape. Non-destructive
-    /// no-op when deep mode is ON.
-    func deepModeDidDisableCleanup() {
-        guard !deepModeEnabled else { return }
-        workflowFinishTask?.cancel()
-        planGateState = .idle
-        resetWorkflow()
-        goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-        pendingGoalSentinel = nil
-        // [T-deep-mode-clarify-gate] Phase 2: clarification gate also resets
-        // immediately when the master switch goes off — no residual banner.
-        clarifyState = .idle
-        skipClarifyCheck = false
-        // [T-deep-mode-cognitive-p1] C7: Clear the retrospective flag so it
-        // doesn't carry over to a future deep-mode re-enable. Also clears the
-        // C8 uncertainty flag for the same reason. Total-switch safe: both are
-        // in-memory only and never persisted.
-        retrospectiveHasRun = false
-        isRetrospectiveRunning = false
-        didInjectUncertaintyCheckThisRun = false
-        // [T-deep-mode-perf-fragment-cache] Clear the cached deep-mode fragment
-        // so nothing survives a toggle-off (cache re-keyed anyway, but explicit
-        // for the total-switch contract).
-        _cachedDeepModeFragment = nil
-        _cachedDeepModeFragmentKey = nil
-        _cachedRulesModTime = -1  // [T-perf-deepmode-modtime-ttl]
-        _cachedRulesModTimeTS = 0
-        // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load state to
-        // empty so no warning banner survives the off switch.
-        cognitiveLoadState = .empty
-        lastModelLoadSignal = nil
-        // [T-deep-mode-cognitive-p2-c10] C10: Reset the need-more-context
-        // state so no "needs input" prompt survives the off switch.
-        needMoreContextState = nil
-        // [T-deep-mode-cognitive-p2-c14] C14: Clear the active project pointer
-        // in the cross-session store. Historical summaries are preserved
-        // (passive data, no behavioral impact when deep mode is off).
-        try? CrossSessionContextStore.clearActiveProject()
-    }
-
-    /// [T-deep-mode-goal-runner] Layer C hook, called exactly once per completed
-    /// runAgentLoop turn (right after the per-block markdown cache). Reads the
-    /// goal sentinel from the just-finished turn and, when deep mode is on and
-    /// the sentinel says `pending`, injects a synthetic continue message and
-    /// recurses into a fresh `runAgentLoop()` — bounded by `goalRunnerRoundsLeft`.
-    ///
-    /// Fail-safe and non-blocking by construction:
-    ///   • no sentinel / unrecognized token → no-op (parse returns nil).
-    ///   • plan gate still waiting → no-op (a plan is not an execution turn).
-    ///   • errored or resumable turn → no-op (never auto-continue a broken turn).
-    ///   • cap reached → reset budget and stop.
-    private func maybeAutoContinueGoal(afterMsgIdx msgIdx: Int) async {
-        guard deepModeEnabled else {
-            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-            // [T-deep-mode-diagnose] Deep mode off is the #1 silent-skip cause.
-            // One info line per turn makes it impossible to confuse "toggle off"
-            // with a code deficiency again.
-            logger.info("[GoalRunner] skipped — deep mode off")
-            return
-        }
-        // [T-deep-mode-cognitive-p1] C7 fix: If the retrospective's runAgentLoop
-        // is running, do NOT auto-continue — the review text might coincidentally
-        // contain a <<GOAL_STATE>> sentinel, which would trigger an unintended
-        // auto-continue chain inside the retrospective. The retrospective is a
-        // single-turn reflection, not a new task execution. Clear any sentinel
-        // that was parsed from the review text so it can't linger.
-        if isRetrospectiveRunning {
-            logger.info("[GoalRunner] skipped — retrospective in progress (C7 guard)")
-            pendingGoalSentinel = nil
-            return
-        }
-        // A pending plan is awaiting user confirmation — don't auto-continue.
-        guard case .idle = planGateState else {
-            logger.info("[GoalRunner] skipped — plan gate not idle (\(planGateState))")
-            return
-        }
-        // [T-deep-mode-verify-gate] Phase 2: don't auto-continue during the
-        // verification phase — that phase is driven by VerifyGate's own sentinel,
-        // not GoalRunner's. A verify turn may incidentally mention goal state
-        // (e.g. "still pending because I need to fix X") and we don't want that
-        // to trigger a GoalRunner continue inside a verify round.
-        guard workflowPhase != .verifying else {
-            logger.info("[GoalRunner] skipped — in verifying phase (VerifyGate owns this turn)")
-            return
-        }
-        guard messages.indices.contains(msgIdx) else {
-            logger.warning("[GoalRunner] skipped — msgIdx \(msgIdx) out of range")
-            return
-        }
-        if messages[msgIdx].error != nil {
-            logger.info("[GoalRunner] skipped — turn has error")
-            return
-        }
-        if canResume {
-            logger.info("[GoalRunner] skipped — turn resumable (truncated at tool limit)")
-            return
-        }
-        if userDidCancel {
-            logger.info("[GoalRunner] skipped — user cancelled")
-            return
-        }
-        if Task.isCancelled {
-            logger.info("[GoalRunner] skipped — task cancelled")
-            return
-        }
-
-        // [T-deep-mode-strip-sentinel] Read the result resolved at text-capture
-        // time. The visible text was already stripped of the `<<GOAL_STATE>>`
-        // line before flush/persist, so re-parsing `block.content` here would
-        // always miss it.
-        guard let result = pendingGoalSentinel else {
-            logger.info("[GoalRunner] skipped — no sentinel parsed")
-            // [T-deep-mode-workflow] No continuation signal: the execution turn
-            // ended on its own. Clear the tracker so it can't linger as "执行中".
-            // [T-deep-mode-verify-gate] Phase 2: but don't clear during verifying —
-            // that phase has its own lifecycle and shouldn't be wiped by the
-            // absence of a goal sentinel (verify turns use the VERIFY sentinel).
-            // [T-deep-mode-session-workflow] P1: before wiping, run the client
-            // completion evaluator. If every parsed plan step is already done but
-            // the model simply forgot to emit `<<GOAL_STATE>> done`, treat the
-            // turn as complete (all-green + verifying) instead of hard-resetting
-            // to idle — this is the fix for the "capsule disappears after the
-            // last shell command" observation. Only when steps genuinely remain
-            // (or there is no plan to complete) do we reset.
-            if workflowPhase != .verifying {
-                let verdict = GoalCompletionEvaluator.evaluate(
-                    steps: workflowSteps,
-                    broad: false,
-                    roundsLeft: goalRunnerRoundsLeft
-                )
-                if workflowPhase == .executing, verdict == .passed {
-                    await completeWorkflow()
-                } else {
-                    finishWorkflow()
-                }
-            }
-            return
-        }
-
-        switch result {
-        case .done:
-            logger.info("[GoalRunner] done sentinel — resetting auto-continue budget")
-            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-            // [T-deep-mode-session-workflow] P1: cross-check that a `done`
-            // claim is credible. If a plan is being tracked and the client-side
-            // evaluator says NOT all steps are done, don't trust a premature
-            // `done` — nudge the model to finish the remaining steps instead of
-            // wrapping early. (Deterministic stop-when-achieved; still bounded
-            // by goalRunnerRoundsLeft so it can never loop forever.)
-            let verdict = GoalCompletionEvaluator.evaluate(
-                steps: workflowSteps,
-                broad: false,
-                roundsLeft: goalRunnerRoundsLeft
-            )
-            if workflowSteps.isEmpty {
-                // No parsed plan → trust the model's `done` and wrap up.
-                await completeWorkflow()
-            } else if verdict == .passed {
-                // [T-deep-mode-workflow] Task complete: show an all-green completion
-                // for a beat, then fade the tracker out (no lingering residue).
-                await completeWorkflow()
-            } else {
-                // Steps remain but model claims done — ask it to keep going once
-                // more rather than accepting an incomplete task. Bounded: after
-                // decrementing, if budget hit 0 we stop and finish anyway.
-                goalRunnerRoundsLeft -= 1
-                advanceWorkflowStep()
-                let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
-                logger.info("[GoalRunner] done claimed but steps remain — continue \(used)/\(GoalRunner.maxAutoRounds)")
-                let next = "你在上一条回复中标记任务已完成，但仍有计划步骤尚未执行。请继续完成剩余步骤，全部完成后以 <<GOAL_STATE>> done 结束本回合。"
-                let cont = AgentMessage(role: .user, parts: [
-                    .text("<system-reminder>深度模式自动续跑：\(next)</system-reminder>")
-                ])
-                let ci = agentHistory.count
-                agentHistory.append(cont)
-                do {
-                    try await runAgentLoop()
-                } catch is CancellationError {
-                    logger.info("[GoalRunner] auto-continue (post-done) cancelled")
-                    handleUserCancelledCleanup()
-                } catch {
-                    logger.error("[GoalRunner] auto-continue (post-done) error: \(String(describing: error))")
-                }
-            }
-        // [T-deep-mode-cognitive-p2-c10] Dynamic autonomy exit: the model
-        // proactively asks for user input instead of guessing. Stop the
-        // auto-continuation loop, surface the reason, and wait for the user.
-        case .needMoreContext(let reason):
-            logger.info("[GoalRunner] need_more_context sentinel — stopping auto-continue, surfacing to user")
-            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-            needMoreContextState = reason
-            // The model's visible text already explains what it needs.
-            // We just stop the loop — the user sees the message and can reply.
-            finishWorkflow()
-        case .pending(let reason):
-            guard goalRunnerRoundsLeft > 0 else {
-                logger.info("[GoalRunner] auto-continue cap reached — stopping this chain")
-                goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-                // [T-deep-mode-cognitive-p0] C5: Fail-switch — when the auto-continue
-                // budget is exhausted (3 rounds used without reaching `done`), the
-                // model has effectively "failed the same approach 3 times". Instead
-                // of silently stopping, inject a fail-switch directive that tells the
-                // model to try a fundamentally different strategy on the next user
-                // interaction. This is a one-shot injected user message — it does
-                // NOT auto-continue (we're out of budget); it only surfaces the
-                // recommendation in the conversation so the user sees it and the
-                // model's next turn is primed to switch approach.
-                // Total-switch safe: this code path is already inside
-                // `guard deepModeEnabled` at maybeAutoContinueGoal entry, and the
-                // injected message is a normal AgentMessage — no new state, no
-                // persistence, no UI.
-                let failSwitchMsg = AgentMessage(role: .user, parts: [
-                    .text("<system-reminder>深度模式认知提示（C5 失败切换）：已连续尝试 \(GoalRunner.maxAutoRounds) 轮未完成任务。请勿重复同一方法。下次执行时必须切换到完全不同的策略路径，并说明切换理由。如果当前路径是唯一可行路径，请说明为何前 \(GoalRunner.maxAutoRounds) 次未能成功，以及需要用户提供什么才能突破。</system-reminder>")
-                ])
-                let fci = agentHistory.count
-                agentHistory.append(failSwitchMsg)
-                // [T-perf-goalrunner-transient] Do NOT persist synthetic
-                // fail-switch messages to the DB. They are only needed during
-                // the active run; persisting them bloats agentHistory on
-                // session reload, causing estimateContextTokens O(n) stalls
-                // and loadSession delays. The continuation state
-                // (goalRunnerRoundsLeft) is reset on reload, so these messages
-                // are useless after reload and only add to context bloat.
-                // [T-deep-mode-workflow] Stopping without a `done` sentinel:
-                // clear the tracker so it can't linger as "执行中".
-                finishWorkflow()
-                return
-            }
-            goalRunnerRoundsLeft -= 1
-            // [T-deep-mode-workflow] Each auto-continue round advances the step
-            // tracker one position so the user sees live progress.
-            advanceWorkflowStep()
-            let used = GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
-            logger.info("[GoalRunner] pending sentinel — auto-continue \(used)/\(GoalRunner.maxAutoRounds)")
-
-            // Synthetic continue turn: lives only in agentHistory, produces no
-            // user bubble (the `<system-reminder>` prefix makes isUserBubbleEntry
-            // treat it as non-visible). Mirrors resume()'s stop-continue message.
-            let next = reason ?? "继续完成剩余步骤"
-            let cont = AgentMessage(role: .user, parts: [
-                .text("<system-reminder>深度模式自动续跑：目标尚未完成。\(next)。请继续执行剩余步骤，不要重复已完成的工作；全部完成后以 <<GOAL_STATE>> done 结束本回合。</system-reminder>")
-            ])
-            let ci = agentHistory.count
-            agentHistory.append(cont)
-            // [T-perf-goalrunner-transient] Do NOT persist synthetic
-            // auto-continuation messages to the DB. They are only needed
-            // during the active run for the agent loop; persisting them bloats
-            // agentHistory on session reload, compounding estimateContextTokens
-            // O(n) traversal cost and loadSession DB-query overhead. The
-            // continuation state (goalRunnerRoundsLeft) is reset to
-            // maxAutoRounds on reload, so a persisted continuation message
-            // without the matching round state would be an orphan that the
-            // model can't act on — it just inflates the context window.
-
-            // Recurse: the next runAgentLoop() reuses every existing backstop —
-            // maxAgentTurns per round, ToolLoopDetector, in-loop compaction.
-            // Bounded by goalRunnerRoundsLeft, so this cannot loop forever.
-            do {
-                try await runAgentLoop()
-            } catch is CancellationError {
-                logger.info("[GoalRunner] auto-continue cancelled")
-                handleUserCancelledCleanup()
-            } catch {
-                logger.error("[GoalRunner] auto-continue error: \(String(describing: error))")
-                // Never wedge the turn: swallow and stop continuing.
-            }
-        }
-    }
 
     // MARK: - Session Stats
     /// Accumulated streaming duration (seconds) for output token speed calculation.
@@ -2008,230 +1324,53 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Cumulative output tokens across all API calls in this session.
     var sessionOutputTokens: Int = 0
 
-    /// Session-level token totals.
-    var sessionTokenStats: (input: Int, output: Int, cacheRead: Int, cacheWrite: Int, context: Int, loopCount: Int) {
-        var context = 0
-        var toolCalls = 0
-        for msg in messages where msg.role == .assistant {
-            if let u = msg.usage, u.latestContextTokens > 0 {
-                context = u.latestContextTokens
-            }
-            for block in msg.blocks {
-                switch block.kind {
-                case .text, .info: break
-                default: toolCalls += 1
-                }
-            }
-        }
-        let assistantCount = messages.filter({ $0.role == .assistant }).count
-        return (sessionInputTokens, sessionOutputTokens, sessionCacheReadTokens, sessionCacheWriteTokens, context, max(toolCalls, assistantCount))
-    }
-
-    /// Context window size of the current model (from models.dev or heuristic).
-    /// Resolved via `resolveCurrentEntry()` so the UI shows the same window the
-    /// send path and capacity checks use (availability re-routing included).
-    var currentModelContextWindow: Int? {
-        guard let entry = resolveCurrentEntry() else { return nil }
-        return effectiveContextWindow(for: entry.model)
-    }
-
-    /// Whether the current model (or any model in the group) supports reasoning/thinking.
-    ///
-    /// Tri-state handling of `model.supportsReasoning`:
-    /// - `true`  → supported
-    /// - `false` → not supported
-    /// - `nil`   → unknown (e.g. DeepSeek V4 fetched from `/v1/models`, which
-    ///            returns no capability metadata). Treat as allowed so users
-    ///            can still opt into thinking manually; sending the thinking
-    ///            params to a non-reasoning model is generally a no-op on the
-    ///            server side, whereas hiding the toggle on a reasoning-capable
-    ///            model makes the feature unreachable.
-    var currentModelSupportsReasoning: Bool {
-        let store = ProviderConfigStore.shared
-
-        // Try session binding first
-        if let sid = sessionId, let binding = store.binding(for: sid) {
-            return checkBindingSupportsReasoning(binding, store: store)
-        }
-
-        // No session yet — resolve from default group
-        if let entry = resolveCurrentEntry() {
-            return Self.entryAllowsReasoning(entry, store: store)
-        }
-
-        // Fallback: if user already set pending thinking, honor it
-        return (pendingThinkingLevel ?? .off) != .off
-    }
-
-    var availableThinkingLevels: [ThinkingLevel] {
-        // [T-thinking-levels-data-driven] Offer one option per DISTINCT wire
-        // tier the model declares, instead of every level below a ceiling.
-        // The old ladder let four options collapse onto a single
-        // `reasoning_effort` — verified on-device 2026-08-01: glm-5.2
-        // (declares ["high","max"]) sent "high" for Low/Med/High/XHigh alike,
-        // while "max" was declared yet unreachable. See
-        // `ModelEntry.selectableThinkingLevels` for the fallback rules.
-        guard let entry = resolveCurrentEntry() else {
-            return ThinkingLevel.allCases.filter { $0 != .off && $0 <= .xhigh }
-        }
-        return entry.selectableThinkingLevels
-    }
-
-    /// Whether a model entry should expose the thinking toggle.
-    ///
-    /// Base rule (tri-state, unchanged): `supportsReasoning ?? true` — `true`
-    /// and unknown (`nil`) both allow the toggle, only an explicit `false`
-    /// hides it.
-    ///
-    /// OpenAI-compatible providers additionally OVERRIDE an explicit `false`:
-    /// their backend usually accepts thinking params even when models.dev
-    /// tagged the model non-reasoning, so we let the user opt in. Two groups:
-    ///   - `.openAI` / `.openAIResponses` ONLY when they have a `customBaseURL`
-    ///     (Ollama / LM Studio / DashScope / self-hosted gateways). Official
-    ///     OpenAI (no custom base) keeps the strict `?? true` rule so a model
-    ///     genuinely marked `false` there still hides the toggle.
-    ///   - `.openRouter` / `.xAI` always — these are inherently third-party /
-    ///     aggregator OpenAI-compatible backends (no official-vs-custom split;
-    ///     their `customBaseURL` is nil because they use a fixed built-in base),
-    ///     and their thinking injection (`reasoning.effort` / OpenAIProvider
-    ///     path) is model-id driven, not gated on `supportsReasoning`.
-    /// All other provider types (anthropic, gemini, …) keep the strict rule,
-    /// so a model genuinely marked `false` there still hides the toggle.
-    static func entryAllowsReasoning(_ entry: ModelEntry, store: ProviderConfigStore) -> Bool {
-        if entry.model.supportsReasoning != false {
-            return true  // true or nil → allowed
-        }
-        // Explicit false: allow for OpenAI-compatible providers.
-        guard let instance = store.instance(for: entry.providerInstanceId) else { return false }
-        switch instance.providerType {
-        case .openAI, .openAIResponses:
-            // Custom/local base only — never official OpenAI.
-            return instance.customBaseURL?.isEmpty == false
-        case .openRouter, .xAI, .kimiCode:
-            return true
-        case .anthropic, .gemini, .antigravity, .unsupported:
-            return false
-        }
-    }
-
-    private func checkBindingSupportsReasoning(_ binding: SessionModelBinding, store: ProviderConfigStore) -> Bool {
-        switch binding.primarySource {
-        case .directEntry(let id, _):
-            guard let entry = store.entry(for: id) else { return false }
-            return Self.entryAllowsReasoning(entry, store: store)
-        case .group(let groupId, let resolvedId):
-            // Check resolved model first
-            if let entry = store.entry(for: resolvedId),
-               Self.entryAllowsReasoning(entry, store: store) {
-                return true
-            }
-            // Check any model in the group
-            guard let group = store.group(for: groupId) else { return false }
-            return group.memberEntryIds.contains { memberId in
-                guard let entry = store.entry(for: memberId) else { return false }
-                return Self.entryAllowsReasoning(entry, store: store)
-            }
-        }
-    }
-
-    /// Max output tokens of the current model (from models.dev).
-    var currentModelMaxOutputTokens: Int? {
-        guard let sid = sessionId,
-              let binding = ProviderConfigStore.shared.binding(for: sid) else { return nil }
-        let entryId: String? = switch binding.primarySource {
-        case .directEntry(let id, _): id
-        case .group(_, let resolvedId): resolvedId
-        }
-        guard let entryId, let entry = ProviderConfigStore.shared.entry(for: entryId) else { return nil }
-        return entry.model.maxOutputTokens
-    }
-
-    /// Thinking mode info for the current model.
-    var currentModelThinkingInfo: (supported: Bool, enabled: Bool, level: String)? {
-        guard let sid = sessionId,
-              let binding = ProviderConfigStore.shared.binding(for: sid) else { return nil }
-        // Resolve entry: for groups, try resolved first, fallback to first member
-        let entryId: String? = switch binding.primarySource {
-        case .directEntry(let id, _): id
-        case .group(_, let resolvedId): resolvedId
-        }
-        guard let entryId else { return nil }
-        // If resolved entry is gone (stale UUID), try first group member
-        let entry: ModelEntry?
-        if let e = ProviderConfigStore.shared.entry(for: entryId) {
-            entry = e
-        } else if case .group(let gid, _) = binding.primarySource,
-                  let group = ProviderConfigStore.shared.group(for: gid),
-                  let firstId = group.memberEntryIds.first {
-            entry = ProviderConfigStore.shared.entry(for: firstId)
-        } else {
-            entry = nil
-        }
-        guard let entry,
-              let instance = ProviderConfigStore.shared.instance(for: entry.providerInstanceId) else { return nil }
-        let model = entry.model
-        // Use the same allow-rule as `currentModelSupportsReasoning` so the
-        // thinking info card stays consistent with the slash-menu toggle
-        // availability: `nil` allowed, and custom-base OpenAI-compatible
-        // providers also allowed even when explicitly `false`.
-        let supported = Self.entryAllowsReasoning(entry, store: ProviderConfigStore.shared)
-        let cfg = ProviderConfigStore.shared.inferenceConfig(for: sid) ?? SessionInferenceConfig()
-        let enabled = cfg.thinkingEnabled
-
-        let level: String
-        if !enabled {
-            level = "—"
-        } else {
-            let thinkLvl = cfg.thinkingLevel
-            switch instance.providerType {
-            case .anthropic:
-                level = "budget: \(AnthropicAgentProvider.thinkingBudget(for: model, maxTokens: 64000, level: thinkLvl))"
-            case .gemini:
-                level = thinkLvl.displayName
-            case .openAI, .openAIResponses, .openRouter, .xAI, .kimiCode:
-                level = OpenAIAgentProvider.reasoningEffort(for: model, level: thinkLvl) ?? "—"
-            case .unsupported:
-                level = "—"
-            case .antigravity:
-                let lid = model.id.lowercased()
-                if lid.contains("claude") { level = "budget: \(AnthropicAgentProvider.thinkingBudget(for: model, maxTokens: 64000, level: thinkLvl))" }
-                else { level = thinkLvl.displayName }
-            }
-        }
-        return (supported, enabled, level)
-    }
-
-    /// Average output tokens per second across this session.
-    var sessionOutputTokensPerSecond: Double {
-        guard sessionStreamDuration > 0 else { return 0 }
-        return Double(sessionStreamOutputTokens) / sessionStreamDuration
-    }
-
     // Tool snapshots
     @Published var toolSnapshots: [ToolSnapshotItem] = []
 
     // Attachments
     @Published var attachments: [InputAttachment] = []
+    /// [OpenMinis#433] The composer holds something worth keeping when the
+    /// user leaves: non-blank text (which also covers `[Pasted#N]`
+    /// placeholders, whose buffer lives on this VM) or an attachment.
+    var hasUnsentDraft: Bool {
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+    }
     /// Number of videos currently being imported from the photo picker.
     @Published var loadingVideoCount = 0
+
+    // [T-paste-placeholder] Session-scoped buffer for long pasted texts.
+    //
+    // A long paste no longer becomes a .txt attachment (models treat files
+    // through a different, often worse, path than inline text). Instead the
+    // text is stashed here and a `[pasted#N]` literal is inserted at the
+    // caret; send() expands the literals back to the original text.
+    //
+    // Deliberately memory-only: the composer draft itself (`inputText`) is
+    // never persisted, so buffer and draft share one lifetime by
+    // construction — there is no "draft survived but buffer didn't" state to
+    // degrade from. `nextPasteId` is monotonically increasing per vm
+    // lifetime so ids are never reused while any draft that references them
+    // can still exist.
+    @Published var pastedTexts: [PastedText] = []
+    var nextPasteId = 1
 
     /// Old iOS releases visibly jitter when the actively streaming markdown block
     /// re-self-sizes during user scroll/deceleration. While this flag is set, the
     /// newest streamed text snapshot is buffered and only applied after scrolling settles.
-    private struct DeferredStreamingTextUpdate {
+    struct DeferredStreamingTextUpdate {
         let messageId: UUID
         let blockId: UUID
         let text: String
         let parsedMarkdown: MarkdownContent?
         let cacheAttributedString: Bool
     }
-    private var deferredStreamingTextUpdates: [DeferredStreamingTextUpdate] = []
-    private(set) var streamingUIUpdatesSuspended = false
+    var deferredStreamingTextUpdates: [DeferredStreamingTextUpdate] = []
+    var streamingUIUpdatesSuspended = false
 
     /// Set when `isProcessing` transitions to false but `retrySnapshotReloadSignal`
     /// cannot fire because `streamingUIUpdatesSuspended` is true. Cleared when the
     /// suspend lifts — at that point the snapshot rebuild is safe and is replayed.
-    private var needsSnapshotReloadOnResume = false
+    var needsSnapshotReloadOnResume = false
 
     /// [T-ios-ui-blocks-lost-suspend-resume] Fired on the main thread whenever
     /// `streamingUIUpdatesSuspended` transitions from true → false, from ANY
@@ -2243,67 +1382,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// the trailing assistant blocks never render even though they're in the DB.
     var onStreamingUIUpdatesResumed: (() -> Void)?
 
-    /// Single chokepoint for clearing `streamingUIUpdatesSuspended`. Sets the
-    /// flag false (idempotent) and, if it actually transitioned, fires the
-    /// resume hook so deferred consumers (the Coordinator snapshot) can catch
-    /// up. Callers that need the VM-side deferred-text flush still call it
-    /// themselves; this only owns the flag + hook.
-    private func clearStreamingUIUpdatesSuspended() {
-        guard streamingUIUpdatesSuspended else { return }
-        streamingUIUpdatesSuspended = false
-        onStreamingUIUpdatesResumed?()
-        if needsSnapshotReloadOnResume {
-            needsSnapshotReloadOnResume = false
-            let totalBlocks = messages.reduce(0) { $0 + $1.blocks.count }
-            let lastBlocks = messages.last?.blocks.count ?? 0
-            logger.info("[BlocksLost] REPLAY retrySnapshot — suspend cleared. sid=\(sessionId?.prefix(8) ?? "nil") totalBlocks=\(totalBlocks) lastMsgBlocks=\(lastBlocks) msgCount=\(messages.count)")
-            retrySnapshotReloadSignal.send()
-        }
-    }
-
-    /// Called from AIChatView.onAppear REUSING path. When the agent loop ended
-    /// while the user was away (no CollectionView subscriber), the
-    /// `retrySnapshotReloadSignal` fired into the void and
-    /// `needsSnapshotReloadOnResume` may still be set. The `didBecomeActive`
-    /// observer only covers background→foreground; this covers the in-app
-    /// navigation case (user switches between sessions while the app stays
-    /// active). Sends `retrySnapshotReloadSignal` after a short delay so the
-    /// newly-mounted CollectionView's `bindViewModel` subscription is already
-    /// installed when the signal arrives.
-    @MainActor
-    func consumeDeferredSnapshotIfNeeded() {
-        // [T-blockslost-defensive] Entry state is logged even when there is
-        // nothing to consume — a silent no-op here is indistinguishable from
-        // "flag was consumed into the void earlier" (defect ②'s signature)
-        // when triaging from device logs.
-        logger.info("[BlocksLost] consumeDeferred onAppear-reuse sid=\(sessionId?.prefix(8) ?? "nil") vm=\(vmInstanceId) needsFlag=\(needsSnapshotReloadOnResume)")
-        guard needsSnapshotReloadOnResume else { return }
-        needsSnapshotReloadOnResume = false
-        let totalBlocks = messages.reduce(0) { $0 + $1.blocks.count }
-        let lastBlocks = messages.last?.blocks.count ?? 0
-        logger.info("[BlocksLost] REPLAY retrySnapshot — onAppear reuse consumed deferred. sid=\(sessionId?.prefix(8) ?? "nil") totalBlocks=\(totalBlocks) lastMsgBlocks=\(lastBlocks) msgCount=\(messages.count)")
-        DispatchQueue.main.async { [weak self] in
-            self?.retrySnapshotReloadSignal.send()
-        }
-    }
-
-    /// [T-ios-scroll-suspend-leak] Compress a `Thread.callStackSymbols` frame to
-    /// just the demangled Swift function name (drops the module load address,
-    /// index, and image name that make raw frames unreadable in logs). Used only
-    /// for the [SuspendState] transition trace.
-    private static func shortFrame(_ raw: String) -> String {
-        // Raw frame looks like:
-        // "3   Minis   0x0000000104abcd12 $s5Minis... mangled ... + 40"
-        // Prefer the human name after the mangled symbol if present, else the
-        // whitespace-collapsed tail.
-        let parts = raw.split(separator: " ", omittingEmptySubsequences: true)
-        // The mangled/demangled symbol is typically the 4th token onward.
-        guard parts.count >= 4 else { return raw.trimmingCharacters(in: .whitespaces) }
-        let symbol = parts[3...].joined(separator: " ")
-        // Strip the trailing " + <offset>" and cap length.
-        let trimmed = symbol.split(separator: "+").first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? symbol
-        return String(trimmed.prefix(80))
-    }
+    /// [T-voice-viewport-context] Installed by the message-list Coordinator: the rows
+    /// around what the user is looking at, for voice correction's on-screen context.
+    /// Main thread. nil (or returning nil) when no list is on screen.
+    var captureViewportSnapshot: (() -> ViewportSnapshot?)?
 
     /// True while this vm is the OUTGOING side of a session-switch transition.
     /// During the brief window when the UICollectionView/SwiftUI host views of
@@ -2321,34 +1403,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     ///   * Manual `objectWillChange.send()` callers consult `isTransitionSuspended`
     ///     and elide the publish when true (retry / edit / thinking-level
     ///     paths). The next genuine state change after resume re-publishes.
-    private(set) var transitionSuspended = false
-    /// Public read so the manual `objectWillChange.send()` call sites can gate.
-    var isTransitionSuspended: Bool { transitionSuspended }
-
-    /// [T-ios-stream-publish-transition-gap] Publish unless this vm is the
-    /// outgoing side of a navigation transition.
-    ///
-    /// Every manual `objectWillChange.send()` on a STREAMING path must go
-    /// through this. The audit that added it found the mitigation only half
-    /// wired: `setSuspendedForTransition` was being set correctly by both
-    /// ContentView observers (4300d0a29 iPad, db9fc144f iPhone), and the four
-    /// low-frequency publishers (retry / edit / cache-invalidate /
-    /// thinking-level) consulted `transitionSuspended` — but the four
-    /// HIGHEST-frequency ones, all in `+SSEStream.swift`, published
-    /// unconditionally. Those are precisely the mutations the 2026-08-10 crash
-    /// log shows still running during (and after) the hosting-view teardown:
-    /// `[TOOL:STREAMING]` at 19:23:26.735 / 27.138 / 27.349 is the `:718` site,
-    /// firing across a transition that completed at 27.213.
-    ///
-    /// Eliding is safe because a suspended vm is off-screen by construction:
-    /// SwiftUI re-reads the whole model when the view is next displayed, the
-    /// resume path (`setSuspendedForTransition(false)`) publishes explicitly,
-    /// and the underlying `messages` mutation has already happened — only the
-    /// notification is dropped, never data.
-    func publishUnlessTransitioning() {
-        guard !transitionSuspended else { return }
-        objectWillChange.send()
-    }
+    var transitionSuspended = false
 
     /// True for the synchronous window of `retryFromMessage` /
     /// `retryFromToolBlock`: from the moment we start clearing `canResume` /
@@ -2361,15 +1416,12 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// while this is true, and the canResume didSet does not replay the
     /// deferred reload; the next safe idle drains it. [T-ios-retry-usermsg-vanish]
     var isTruncatingForRetry = false
-    /// [T-ios-retry-keyboard] True when the current / most recent agent turn
-    /// was started by a retry action (retryFromMessage / retryFromToolBlock).
-    /// Used by the UI to skip the "reply arrived → focus composer" behavior
-    /// for retried turns, since the user already knows what they asked.
-    /// Reset to false by the view after the turn completes.
-    var turnStartedByRetry = false
 
     // MARK: - Browser
-    let browserTabPool = BrowserTabPool()
+    /// `var`, not `let`: a helper (child) vm adopts its PARENT's pool so both
+    /// agents browse in one tab set (T-p2-shared-workspace). Per-agent default
+    /// tabs keep them from stepping on each other — see BrowserTabPool.owner.
+    var browserTabPool = BrowserTabPool()
     /// When true, the agent loop pauses at the next checkpoint to let the user operate the browser.
     @Published var browserTakeoverActive = false
 
@@ -2379,13 +1431,18 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
     // MARK: - Speech
 
-    private let speechSynthesizer = AVSpeechSynthesizer()
-    private lazy var speechDelegate = SpeechFinishedDelegate()
+    let speechSynthesizer = AVSpeechSynthesizer()
+    lazy var speechDelegate = SpeechFinishedDelegate()
     /// True when speech is paused (not stopped). Toggled by the floating speech button.
     @Published var speechPaused = false
 
     /// Accumulates reasons for provider fallbacks within a single attempt, consumed by runAgentLoop to insert info blocks.
     var fallbackReasons: [(model: String, instance: String, reason: String)] = []
+
+    /// [T-provider-live-check] Model and provider each agent provider object
+    /// of this conversation was built for, by entry id. Read before every
+    /// request to check that provider is still there and enabled.
+    var providerIdentities: [String: ProviderAvailabilityRules.Identity] = [:]
 
     /// True when the synthesizer is actively speaking or has queued utterances.
     var isSpeaking: Bool {
@@ -2406,343 +1463,8 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// that turns reading on (so a new session / relaunch shows compact).
     @Published var speechPlayerExpanded = false
 
-    /// Explicitly set the playback speed (player control speed chip).
-    func setSpeechSpeed(_ s: Float) {
-        VoiceOutputPreferences.speedMultiplier = s
-        speechSpeed = s
-        // Apply to the currently-playing cloud audio in real time (System TTS
-        // can't re-rate a queued utterance, so it takes effect on the next one).
-        VoiceOutputPlayer.shared.setRate(s)
-        syncSpeechStateToGlobal()
-    }
-
-    /// Cycle to the next speed step (1.0→1.25→1.5→2.0→1.0).
-    func nextSpeechSpeed() {
-        let steps = VoiceOutputPreferences.speedSteps
-        let cur = VoiceOutputPreferences.speedMultiplier
-        let idx = steps.firstIndex(of: cur) ?? 0
-        setSpeechSpeed(steps[(idx + 1) % steps.count])
-    }
-
-    /// Pause or resume speech playback (handles both System + cloud engines).
-    func toggleSpeechPause() {
-        if speechPaused {
-            // Resume
-            if speechSynthesizer.isPaused { speechSynthesizer.continueSpeaking() }
-            VoiceOutputPlayer.shared.resume()
-            speechPaused = false
-        } else {
-            // Pause
-            if speechSynthesizer.isSpeaking { speechSynthesizer.pauseSpeaking(at: .word) }
-            VoiceOutputPlayer.shared.pause()
-            speechPaused = true
-        }
-        syncSpeechStateToGlobal()
-    }
-
-    /// Read an entire assistant reply aloud FROM THE START. Clears any in-progress
-    /// TTS (so it doesn't overlap), enables read-replies, then queues the whole
-    /// reply split into sentences. No-op while that reply is still streaming (the
-    /// caller greys the menu item out, but we guard here too).
-    func readReplyFromStart(_ message: ChatMessage) {
-        // Build the reply's plain text from its text blocks.
-        let fullText = message.blocks
-            .compactMap { block -> String? in
-                if case .text = block.kind { return block.content }
-                return nil
-            }
-            .joined(separator: "\n\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !fullText.isEmpty else { return }
-
-        // Clear whatever THIS session is playing/queuing so the replay starts
-        // clean — other concurrent sessions' queued speech is left alone.
-        stopSpeechForThisSession()
-        // Ensure read-replies is on (and reflected in prefs/voice VM).
-        if !speakEnabled {
-            speakEnabled = true
-            VoiceOutputPreferences.isEnabled = true
-        }
-        // [T-readaloud-menu-force-unmute] Explicit user intent beats the mute
-        // switch. Enabling `speakEnabled` alone was not enough: `canSpeakNow`
-        // resolves to `VoiceOutputState.canPlay` == `isEnabled && !isMuted`, so
-        // while muted every `speakQueued` below returned early and the tap did
-        // nothing at all — silently, with no feedback.
-        unmuteForExplicitReadAloud()
-        isReadingAloud = true
-        // Split into sentences and queue each — reuses the streaming segmenter so
-        // sizing / dynamic window behave the same as live playback.
-        let (sentences, _) = extractNewSentences(from: fullText, spokenOffset: 0)
-        let units = sentences.isEmpty ? [fullText] : sentences
-        for s in units { speakQueued(s) }
-    }
-
-    /// [T-readaloud-menu-force-unmute] Lift a TEMPORARY mute because the user
-    /// explicitly asked for read-aloud from a long-press menu.
-    ///
-    /// The mute switch (capsule speaker) is meant to silence *automatic* reply
-    /// TTS, not to veto a deliberate "read this" tap. Since `canSpeakNow` folds
-    /// `isMuted` into its gate, leaving it set made those menu actions no-ops
-    /// with no user-visible feedback.
-    ///
-    /// Only `isMuted` is touched — deliberately NOT `isEnabled`, so this cannot
-    /// resurrect read-replies for someone who switched the feature fully off;
-    /// callers that want it on (e.g. `readReplyFromStart`) enable it themselves.
-    /// `isMuted`'s `didSet` persists the change, matching what a manual un-mute
-    /// tap on the capsule does. Mirrors `SelectableMarkdownView`'s
-    /// `activateReadAloudState()`, which already did this for the menus that
-    /// bypass this view model.
-    private func unmuteForExplicitReadAloud() {
-        let state = VoiceOutputState.shared
-        guard state.isMuted else { return }
-        VoiceLog.log("[ReadAloud] explicit menu action — clearing temporary mute")
-        state.isMuted = false
-    }
-
-    /// Turn read-replies off entirely, stopping playback.
-    func disableSpeech(resetSpeed: Bool) {
-        stopSpeech()
-        speakEnabled = false
-        VoiceOutputPreferences.isEnabled = false
-        if resetSpeed {
-            VoiceOutputPreferences.speedMultiplier = 1.0
-            speechSpeed = 1.0
-        }
-    }
-
-    /// Push this VM's live read-aloud state up to the global VoiceOutputState so
-    /// the home-screen capsule reflects it. Also registers this VM as the active
-    /// controller so global-capsule actions forward here.
-    func syncSpeechStateToGlobal(registerActive: Bool = false) {
-        if registerActive { VoiceOutputState.shared.registerActive(self) }
-        VoiceOutputState.shared.syncState(reading: isReadingAloud,
-                                          paused: speechPaused,
-                                          speed: speechSpeed)
-    }
-
-    /// Stop all speech and reset paused state.
-    func stopSpeech() {
-        speechSynthesizer.stopSpeaking(at: .immediate)
-        VoiceOutputPlayer.shared.stopAll()
-        speechPaused = false
-        isReadingAloud = false
-        // End the reply-TTS intent (coordinator drops .replyTTS; if nothing else
-        // needs audio it deactivates the session).
-        AudioSessionCoordinator.shared.end(.replyTTS)
-        syncSpeechStateToGlobal()
-    }
-
-    /// Session-scoped stop: clears only THIS session's units from the shared
-    /// cloud TTS queue (other concurrent chats' queued speech keeps playing) and
-    /// stops the System synthesizer (engine-global — it has no queue to scope).
-    /// Used at reply start / read-from-start so one chat starting a new reply
-    /// can't wipe another chat's in-flight speech, which the old global
-    /// `stopSpeech()` did (queue hijack + text loss across concurrent sessions).
-    func stopSpeechForThisSession() {
-        speechSynthesizer.stopSpeaking(at: .immediate)
-        VoiceOutputPlayer.shared.stopSession(sessionId ?? "")
-        speechPaused = false
-        isReadingAloud = false
-        if !useCloudTTS {
-            // System engine path: nothing else shares the intent, release it.
-            // The cloud path releases inside stopSession only when the WHOLE
-            // queue is idle — ending it here would tear the audio session out
-            // from under another session's still-playing audio.
-            AudioSessionCoordinator.shared.end(.replyTTS)
-        }
-        syncSpeechStateToGlobal()
-    }
-
-    /// Speak text aloud if speakEnabled is on. Interrupts any current speech.
-    /// When Background Speak is enabled, configures audio session for .playback
-    /// so TTS continues in the background and keeps the process alive.
-    func speakText(_ rawText: String) {
-        // Strip emoji / non-speakable glyphs before TTS.
-        let text = VoiceTextSanitizer.sanitize(rawText)
-        // [T-readaloud-menu-force-unmute] Sole caller is the "Read Selection"
-        // long-press menu action, i.e. an explicit request to hear THIS text —
-        // so lift a temporary mute rather than dropping the request on the
-        // floor. Ordered before the `canSpeakNow` guard, which folds in
-        // `isMuted` and would otherwise return early.
-        unmuteForExplicitReadAloud()
-        guard canSpeakNow, !text.isEmpty else { return }
-        isReadingAloud = true
-        syncSpeechStateToGlobal(registerActive: true)
-        // Reply TTS (System + cloud are the SAME source/intent) — declare it once
-        // up front; the resolved provider then picks the engine.
-        AudioSessionCoordinator.shared.begin(.replyTTS)
-        if useCloudTTS {
-            VoiceOutputPlayer.shared.enqueue(text, sessionId: sessionId ?? "")
-            return
-        }
-        if BackgroundKeepAliveManager.shared.backgroundSpeakEnabled {
-            BackgroundKeepAliveManager.shared.stopSilentAudio()
-            speechSynthesizer.delegate = speechDelegate
-        }
-        if speechSynthesizer.isSpeaking {
-            speechSynthesizer.stopSpeaking(at: .word)
-        }
-        let utterance = makeUtterance(text)
-        speechSynthesizer.speak(utterance)
-    }
-
-    /// Dynamic TTS window: decide how much of the accumulated `buffer` to send to
-    /// cloud TTS now, returning the LEFTOVER text the caller should keep buffering.
-    /// Rules:
-    ///  • Idle (no buffered/playing audio) → send the FIRST batch ASAP (low latency).
-    ///  • Otherwise wait until the buffer reaches the player's recommended minimum
-    ///    (grows with buffered audio → longer, more coherent batches mid/late reply).
-    ///  • PARAGRAPH-COHERENT: once eligible, prefer cutting at a PARAGRAPH boundary
-    ///    (blank line / newline) so a whole paragraph is synthesized in ONE request
-    ///    and doesn't get split across batches (which made Gemini render the two
-    ///    halves in slightly different timbres). Only fall back to a sentence cut
-    ///    if the paragraph would exceed `maxBatchChars` (synth-timeout guard).
-    ///  • `force` (stream end / tool) → send everything left.
-    /// System TTS has no synth metrics → it just sends immediately, whole buffer.
-    /// Returns the unsent leftover (caller stores it back into the buffer).
-    func feedDynamicTTS(_ buffer: String, force: Bool) -> String {
-        let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        // REAL-TIME global gate: if read-replies was turned off mid-stream (e.g.
-        // the user muted from the global capsule), drop any remaining buffered /
-        // force-flushed text instead of speaking it. `speakEnabled` is a live proxy
-        // for VoiceOutputState.shared, so this reflects the latest global state —
-        // not a stream-start snapshot.
-        guard canSpeakNow else {
-            VoiceLog.log("feedDynamicTTS DROP — read-replies off (speakEnabled=\(speakEnabled) capturing=\(VoiceModePreference.shared.isCapturing))")
-            return ""
-        }
-
-        // System path: no dynamic window, speak each batch as it arrives.
-        guard useCloudTTS else {
-            speakQueued(trimmed)
-            return ""
-        }
-
-        let player = VoiceOutputPlayer.shared
-        let minChars = player.recommendedMinChars
-        let maxChars = VoiceOutputPlayer.maxBatchChars
-        let idle = !player.hasPendingAudio
-        let len = trimmed.count
-
-        if force {
-            VoiceLog.log("dyn-window FLUSH(force) len=\(len)")
-            speakQueued(trimmed)
-            return ""
-        }
-
-        // Not yet eligible → keep accumulating (unless idle: send ASAP for latency).
-        guard idle || len >= minChars else {
-            VoiceLog.log("dyn-window HOLD len=\(len) < minChars=\(minChars)")
-            return trimmed
-        }
-
-        // Eligible. Send the largest whole-PARAGRAPH prefix that fits maxChars; if a
-        // single paragraph already exceeds maxChars, fall back to a sentence cut.
-        let cut = Self.coherentCutIndex(in: trimmed, minChars: idle ? 1 : minChars, maxChars: maxChars)
-        let head = String(trimmed[trimmed.startIndex..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let tail = String(trimmed[cut...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if head.isEmpty {
-            // No boundary found within maxChars and below min → keep waiting.
-            VoiceLog.log("dyn-window HOLD(no-boundary) len=\(len)")
-            return trimmed
-        }
-        VoiceLog.log("dyn-window FLUSH len=\(head.count) (of \(len)) minChars=\(minChars) idle=\(idle) leftover=\(tail.count)")
-        speakQueued(head)
-        return tail
-    }
-
-    /// Find the index to cut `text` at: the LAST paragraph boundary (newline) at or
-    /// before `maxChars` and at/after `minChars`; else the last sentence-ender in
-    /// that window; else `maxChars` (hard cap) if the text already exceeds it; else
-    /// `endIndex` (send all — it's a complete short unit).
-    nonisolated private static func coherentCutIndex(in text: String, minChars: Int, maxChars: Int) -> String.Index {
-        let chars = Array(text)
-        let n = chars.count
-        if n <= maxChars {
-            // Whole buffer fits a batch — prefer ending on a paragraph break if the
-            // buffer doesn't already end at one; otherwise send it all as one unit.
-            // (Sending all keeps a multi-sentence paragraph intact.)
-            return text.endIndex
-        }
-        // Buffer exceeds maxChars: must cut. Search [minChars, maxChars] for the
-        // best boundary — paragraph (newline) first, then sentence-ender.
-        let lo = max(1, min(minChars, maxChars))
-        var paragraphCut = -1, sentenceCut = -1
-        let enders = AIChatViewModel.speechEndersForCut
-        var i = lo - 1
-        while i < min(maxChars, n) {
-            let c = chars[i]
-            if c == "\n" { paragraphCut = i + 1 }
-            else if enders.contains(c) { sentenceCut = i + 1 }
-            i += 1
-        }
-        let idx = paragraphCut > 0 ? paragraphCut : (sentenceCut > 0 ? sentenceCut : maxChars)
-        return text.index(text.startIndex, offsetBy: idx)
-    }
-
-    /// Sentence-ender set used by the coherent-cut fallback (mirrors the SSE
-    /// segmenter's tier-1 enders).
-    nonisolated static let speechEndersForCut: Set<Character> = ["。", "！", "？", ".", "!", "?", "；", ";"]
-
-    /// Enqueue text for speech without interrupting current utterance.
-    /// Used for streaming text playback — sentences are queued in order.
-    /// AVSpeechSynthesizer automatically queues multiple speak() calls; the cloud
-    /// player keeps its own ordered queue + synthesize pipeline.
-    func speakQueued(_ rawText: String) {
-        // Strip emoji / non-speakable glyphs before TTS.
-        let text = VoiceTextSanitizer.sanitize(rawText)
-        guard canSpeakNow, !text.isEmpty else {
-            VoiceLog.log("speakQueued SKIP — speakEnabled=\(speakEnabled) isCapturing=\(AudioSessionCoordinator.shared.isCapturing) empty=\(text.isEmpty)")
-            return
-        }
-        isReadingAloud = true
-        syncSpeechStateToGlobal(registerActive: true)
-        AudioSessionCoordinator.shared.begin(.replyTTS)
-        if useCloudTTS {
-            VoiceOutputPlayer.shared.enqueue(text, sessionId: sessionId ?? "")
-            return
-        }
-        if BackgroundKeepAliveManager.shared.backgroundSpeakEnabled {
-            BackgroundKeepAliveManager.shared.stopSilentAudio()
-            speechSynthesizer.delegate = speechDelegate
-        }
-        let utterance = makeUtterance(text)
-        speechSynthesizer.speak(utterance)  // queues automatically, does NOT interrupt
-    }
-
-    /// Declare the reply-TTS audio intent before System TTS speaks. The
-    /// coordinator applies the `.playback/.spokenAudio/.duckOthers` profile (audible
-    /// even on silent switch) with a FULL category+mode+options reconfigure — fixing
-    /// the bug where a stale `.playback/.mixWithOthers` profile (from the keep-alive
-    /// track) was inherited and left System TTS silent / un-ducked.
-    @MainActor
-    static func ensureSpeechPlaybackSession() {
-        AudioSessionCoordinator.shared.begin(.replyTTS)
-    }
-
-    /// Whether reply TTS may speak right now: enabled AND the mic isn't capturing
-    /// (capture and playback are mutually exclusive — no echo / session fight).
-    private var canSpeakNow: Bool {
-        // Enabled AND not muted AND not capturing. `canPlay` folds in the temporary
-        // mute (capsule speaker) on top of the full on/off `isEnabled`.
-        VoiceOutputState.shared.canPlay && !VoiceModePreference.shared.isCapturing
-    }
-
-    /// True when a configured cloud TTS model is selected (not the offline System
-    /// provider). Snapshotted once per reply (`replyUsesCloudTTS`) so a mid-reply
-    /// provider change can't split one reply across two engines playing at once.
-    private var useCloudTTS: Bool {
-        if let snap = replyUsesCloudTTS { return snap }
-        let v = !(VoiceProviderResolver.outputProvider() is SystemVoiceProvider)
-        replyUsesCloudTTS = v
-        return v
-    }
     /// Per-reply snapshot of the TTS engine choice; cleared at each reply start.
-    private var replyUsesCloudTTS: Bool?
-
-    /// Reset the per-reply TTS engine snapshot (call at the start of each reply).
-    func resetReplyTTSEngine() { replyUsesCloudTTS = nil }
+    var replyUsesCloudTTS: Bool?
 
     /// True once THIS turn (one user send, spanning ALL agent-loop iterations)
     /// has cleared the previous turn's TTS leftovers. Lives on the vm — NOT on
@@ -2752,842 +1474,37 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// read-aloud context; iterations append and play back-to-back.
     var hasClearedTTSForCurrentTurn = false
 
-    /// Create an AVSpeechUtterance with the user's speech settings applied.
-    private func makeUtterance(_ text: String) -> AVSpeechUtterance {
-        let mgr = BackgroundKeepAliveManager.shared
-        let utterance = AVSpeechUtterance(string: text)
-        let lang = text.range(of: "\\p{Han}", options: .regularExpression) != nil ? "zh-CN" : "en-US"
-        // Stage 1: if the user picked a SPECIFIC System voice model in the Voice
-        // Output selection, honor it directly (one voice for all languages). Only
-        // fall back to the legacy per-language auto-selection when no specific
-        // voice is chosen — so existing users see no behavior change.
-        if let vid = VoiceProviderResolver.resolvedSystemOutputVoiceId(),
-           let picked = AVSpeechSynthesisVoice(identifier: vid) {
-            utterance.voice = picked
-        } else {
-            utterance.voice = mgr.voiceForLanguage(lang)
-        }
-        // Apply the read-replies speed multiplier on top of the user's base rate,
-        // clamped to AVSpeechUtterance's valid range.
-        let mult = VoiceOutputPreferences.speedMultiplier
-        utterance.rate = min(AVSpeechUtteranceMaximumSpeechRate,
-                             max(AVSpeechUtteranceMinimumSpeechRate, mgr.speechRate * mult))
-        utterance.pitchMultiplier = SystemVoicePreferences.pitch
-        utterance.volume = SystemVoicePreferences.volume
-        return utterance
-    }
-
-    // MARK: - Auto-Play Audio
-
-    /// Regex to find Markdown image syntax with audio extensions and ?auto_play=true query.
-    /// Matches: ![...](minis://attachments/file.mp3?auto_play=true)
-    private static let autoPlayAudioPattern: NSRegularExpression? = {
-        // Match ![alt](url) where url ends with audio extension and has auto_play=true/1
-        try? NSRegularExpression(
-            pattern: #"!\[[^\]]*\]\(([^)]+\.(?:mp3|m4a|wav|aac|ogg|flac)\?[^)]*auto_play=(?:true|1)[^)]*)\)"#,
-            options: .caseInsensitive
-        )
-    }()
-
-    /// Scan assistant text for audio URLs with ?auto_play=true and trigger playback
-    /// directly via GlobalAudioPlayer. Works even in background (Shortcuts intents).
-    static func triggerAutoPlayAudio(in text: String) {
-        guard !text.isEmpty, let regex = autoPlayAudioPattern else { return }
-        let range = NSRange(text.startIndex..., in: text)
-        let matches = regex.matches(in: text, range: range)
-        guard let firstMatch = matches.first, firstMatch.numberOfRanges >= 2,
-              let urlRange = Range(firstMatch.range(at: 1), in: text) else { return }
-        let rawURL = String(text[urlRange])
-
-        // Strip query parameters to get clean file URL
-        guard let url = URL(string: rawURL),
-              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
-        components.queryItems = nil
-        guard let cleanURL = components.url else { return }
-
-        // Resolve minis:// to file URL
-        let fileURL: URL?
-        if cleanURL.scheme == "minis" {
-            fileURL = resolveMinisFileURLForAutoPlay(url: cleanURL)
-        } else {
-            fileURL = cleanURL
-        }
-
-        guard let resolved = fileURL else {
-            logger.warning("⏵ auto_play: could not resolve URL \(rawURL)")
-            return
-        }
-
-        logger.info("⏵ auto_play: triggering playback for \(resolved.lastPathComponent)")
-        // GlobalAudioPlayer.play() configures the audio session itself (without
-        // .mixWithOthers) so that it appears in Control Center / lock screen.
-        GlobalAudioPlayer.shared.play(url: resolved)
-    }
-
-    /// Resolve minis:// URL to local file URL (standalone, no UI dependency).
-    private static func resolveMinisFileURLForAutoPlay(url: URL) -> URL? {
-        guard url.scheme == "minis", let host = url.host else { return nil }
-        // Tolerate double-encoded links alongside single-encoded.
-        // [T-fix-double-encoding]
-        let subPaths = MinisURLPathDecoding.subPathCandidates(for: url)
-        let fm = FileManager.default
-
-        // Global directories resolve without session ID
-        let globalDirs = ["memory", "skills", "shared"]
-        if globalDirs.contains(host) {
-            let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first!
-            for subPath in subPaths {
-                let globalURL = library.appendingPathComponent("MinisChat/\(host)", isDirectory: true)
-                    .appendingPathComponent(subPath)
-                if fm.fileExists(atPath: globalURL.path) { return globalURL }
-            }
-        }
-
-        if let sid = activeSessionId {
-            for subPath in subPaths {
-                let persistURL = minisPersistentBase
-                    .appendingPathComponent(sid, isDirectory: true)
-                    .appendingPathComponent(host, isDirectory: true)
-                    .appendingPathComponent(subPath)
-                if fm.fileExists(atPath: persistURL.path) { return persistURL }
-            }
-        }
-
-        // [T-ios-minisurl-cross-session-isolation] Fallback to the iSH-visible
-        // /var/minis data dir ONLY for the global, non-session-scoped
-        // namespaces (memory/skills/shared). For a session-scoped host like
-        // `attachments`, /var/minis/<host> binds to whichever session is
-        // currently MOUNTED — which may not be the session whose message is
-        // being rendered — so reaching it here would be a cross-session leak.
-        // Session-scoped resolution already happened above against
-        // activeSessionId; not-found is correct beyond that.
-        if globalDirs.contains(host) {
-            let dataPath = RootfsManager.shared.dataPath
-            for subPath in subPaths {
-                let linuxPath = "/var/minis/\(host)/\(subPath)"
-                let hostPath = dataPath.appendingPathComponent(linuxPath.hasPrefix("/") ? String(linuxPath.dropFirst()) : linuxPath)
-                if fm.fileExists(atPath: hostPath.path) { return hostPath }
-            }
-        }
-
-        return nil
-    }
-
-    /// Detect image MIME type from magic bytes; defaults to image/jpeg.
-    /// Internal-access so concurrent tool extensions can call it. [T-concurrent-tools]
-    static func detectImageMime(_ data: Data) -> String {
-        guard data.count >= 4 else { return "image/jpeg" }
-        let b = [UInt8](data.prefix(4))
-        if b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47 { return "image/png" }
-        if b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x38 { return "image/gif" }
-        if b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 { return "image/webp" }
-        return "image/jpeg"
-    }
-
     // MARK: - Private
 
     /// Approximate current time string, rounded to the hour for cache stability.
-    private var _cachedTimeString: String = ""
-    private var _cachedTimeDate: Date = .distantPast
-    private var approximateTimeString: String {
-        let now = Date()
-        if now.timeIntervalSince(_cachedTimeDate) > 3600 {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyy-MM-dd HH:00"
-            fmt.timeZone = .current
-            _cachedTimeString = fmt.string(from: now)
-            _cachedTimeDate = now
-        }
-        return _cachedTimeString
-    }
-
-    // internal so the (future) subagent_task runner in Agent/Jobs can reuse it.
-    var baseSystemPrompt: String {
-        // [T-soul-md] Layer 1 is rendered by SystemPromptBuilder, which
-        // owns the "You are <name>, a capable AI assistant running on an
-        // iOS device ..." identity sentence (parametric on SOUL.md's
-        // `name` field) and optionally appends a clearly-labeled
-        // Personality section from SOUL.md's body. The original wording
-        // is preserved inside SystemPromptBuilder.identityTemplate so we
-        // don't regress model behavior that depended on it.
-        SystemPromptBuilder.identitySection()
-            + "You should proactively use shell commands to accomplish the user's tasks — installing packages (apk add), "
-            + "writing and running scripts, managing files, networking, and any other operations a Linux terminal can perform.\n\n"
-            + "Available tools:\n"
-            + "- shell_execute: Run any shell command. Each invocation is an isolated process with stdout/stderr captured. "
-            + "Prefer this for most tasks — it is a real Linux environment with persistent filesystem. "
-            + "Common tools (python3, pip, curl, wget, git, ssh, etc.) can be installed via apk add; Python packages via pip install. "
-            + "Use `which <cmd>` to check if a tool is already installed before running apk add — many packages persist across sessions. "
-            + "When you need to wait before checking results (e.g. polling, waiting for a process), use the `delay` parameter instead of `sleep` in the command — "
-            + "delay blocks the agent flow without occupying the iSH shell, so other concurrent tasks can use it during the wait. This avoids resource contention. "
-            // [T-agent-prompt-no-phantom-checkins] Device log 2026-07-17: the agent
-            // promised "I'll check every 1-2 minutes" after dispatching a long task,
-            // then went silent — it assumed some scheduler would wake it. Recurred
-            // 2026-07-20 in a variant the old wording didn't name: one status check,
-            // then "let's keep waiting" and the turn ended. Rewritten borrowing
-            // Hermes Agent's execution-discipline phrasing (act immediately instead
-            // of describing intentions / keep working until complete / never end a
-            // turn with a promise of future action), plus an HONEST off-ramp —
-            // Minis has no in-app scheduler (see 'Scheduled tasks'), so the only
-            // truthful alternatives are poll-now or tell-the-user-nothing-runs.
-            + "Execution discipline for long-running or dispatched work: make tool calls immediately instead of describing intentions, and keep working until the task is complete. "
-            + "Without a scheduler or timed-callback tool, `delay` is your ONLY wait mechanism within a turn — to follow up on something still running, chain delay-then-check calls at a task-appropriate interval until you have the result or hit a sensible retry cap. "
-            + "NEVER end a turn with a promise of future action: 'I'll keep monitoring', 'will sync the result later', and ending right after a single still-running status check with 'let's keep waiting' are all the same violation — once your turn ends, NOTHING runs until the user's next message. "
-            + "If polling to completion is genuinely not worth blocking the turn, close honestly instead: state that the task keeps running in the background, that you will only learn its outcome when the user next messages (or they ask you to check), and — if it must fire on a schedule beyond this conversation — point them to an Apple Shortcuts automation per 'Scheduled tasks' later in this prompt.\n"
-            + "- file_read: Read file contents (faster than cat).\n"
-            + "- file_write: Create new files or overwrite existing files (faster than echo/tee).\n"
-            + "- file_edit: Edit existing files with exact string replacement (old_string → new_string). Preferred over file_write for modifications — always file_read first.\n"
-            + "- browser_use: Web browsing (navigate, screenshot, click, type, get_text, scroll, scroll_and_collect, get_readable, get_backbone, fetch, etc.). "
-            + "Starts with a desktop Safari user agent. Use screenshot to see the page.\n"
-            + "- memory_write: Save a memory entry to today's daily log (YYYY-MM-DD.md). Use proactively to note user preferences, project patterns, and important context.\n"
-            + "- memory_get: Recall memories with keyword search. Check memory at the start of new topics to leverage past knowledge.\n\n"
-            + "Current time (approximate): \(approximateTimeString) (\(TimeZone.current.identifier)). "
-            + "Device languages: \((UserDefaults.standard.object(forKey: "AppleLanguages") as? [String] ?? Locale.preferredLanguages).joined(separator: ", ")).\n\n"
-            + "Shared directory /var/minis/ (bidirectional read/write between shell and app):\n"
-            + "  /var/minis/attachments/ — Media files (images, audio, video). Display inline with ![desc](minis://attachments/filename).\n"
-            + "  /var/minis/workspace/   — Working files (scripts, data, configs). Link with [name](minis://workspace/filename).\n"
-            + "  /var/minis/offloads/    — Auto-saved large outputs. Read with file_read.\n"
-            + "  /var/minis/browser/     — Browser screenshots and extracts.\n"
-            + "  /var/minis/shared/      — Cross-session shared storage for artifacts and documents. Organize by project or topic (e.g. shared/myproject/, shared/datasets/). Do NOT store temporary files here.\n"
-            + "  /var/minis/memory/GLOBAL.md    — Persistent global memory (read-only, user-maintained via Settings).\n"
-            + "  /var/minis/memory/YYYY-MM-DD.md — Daily memory log.\n"
-            + "  /var/minis/mounts/<name>/ — User-mounted external folders from iOS Files (e.g. an Obsidian vault, Downloads, another app's iCloud container). Presence and names vary per user. Check this directory first when the task references external/user files. Some mounts may be read-only; write tools will reject writes with a clear error.\n\n"
-            + "The minis:// URL scheme:\n"
-            + "  minis://attachments/file.png  →  /var/minis/attachments/file.png\n"
-            + "  minis://workspace/data.csv    →  /var/minis/workspace/data.csv\n"
-            + "  minis://shared/project/f.txt  →  /var/minis/shared/project/f.txt\n\n"
-            + "IMPORTANT: minis:// URLs are app-internal — they are NOT web URLs. Do NOT pass minis:// action URLs (open_terminal, views, settings) to browser_use — those are app deep links, use Markdown links in chat instead. "
-            + "However, minis:// resource URLs CAN be opened in browser_use with navigate. All directories under /var/minis/ are accessible: workspace, attachments, offloads, shared, etc. "
-            + "The built-in browser fully supports minis:// — HTML pages and all sub-resources (JS, CSS, images, fonts, etc.) referenced via minis:// absolute URLs or relative paths resolve correctly within the current session. "
-            + "When building multi-file web projects, use file_write to create files in the same directory (e.g. /var/minis/workspace/myapp/), "
-            + "then reference sub-resources with relative paths in HTML (e.g. <link href=\"style.css\">, <script src=\"app.js\">, <img src=\"logo.png\">). "
-            + "The browser resolves relative paths against the minis:// base URL automatically. "
-            + "Cross-directory references also work with absolute minis:// URLs (e.g. <img src=\"minis://attachments/photo.png\"> from a workspace HTML page). "
-            + "Navigate to the entry HTML to preview, e.g. minis://workspace/myapp/index.html.\n"
-            + "To display a minis:// URL in chat, write it as a Markdown link or image (e.g. [name](minis://...)) — the app handles it when the user taps it.\n"
-            + "IMPORTANT: minis:// URLs MUST be percent-encoded. Non-ASCII characters (Chinese, emoji, spaces, etc.) in filenames will break Markdown rendering if not encoded. "
-            + "Use the minis_url from tool results directly — it is already encoded. "
-            + "If you construct a minis:// URL manually, percent-encode the filename (e.g. %E4%B8%AD%E6%96%87 for non-ASCII characters).\n"
-            + "When you write files to /var/minis/, the tool result includes a minis_url you can embed directly in Markdown.\n"
-            + "Supported inline types: images (.png/.jpg/.gif/.webp), audio (.mp3/.m4a/.wav), video (.mp4/.mov/.m4v).\n"
-            + "Audio auto-play: append ?auto_play=true to an audio minis:// URL to auto-play when rendered (e.g. ![audio](minis://attachments/song.mp3?auto_play=true)). Use sparingly — only when the user explicitly asks to hear audio immediately.\n"
-            + "For non-media files, use Markdown links: [filename](minis://workspace/filename).\n"
-            + "Tappable link previews: text/code (.py/.json/.md/etc), images, audio, video, HTML, and PDF files open native previews when the user taps a [name](minis://...) link.\n"
-            + "Use Markdown links for all minis:// files — the user can tap to preview them directly in chat.\n\n"
-            + "File creation guidelines:\n"
-            + "- Use file_write to CREATE new files. Use file_edit to MODIFY existing files. "
-            + "For writing file CONTENTS, prefer file_write over echo/printf or heredocs — it is atomic and avoids all shell-quoting pitfalls. "
-            + "Heredocs (cat << EOF, python3 << 'EOF') work reliably, including when the command ends right at the terminator. "
-            + "When you hit escaping or parsing errors with long inline content, write the content to a file first (file_write), then pass or execute the file (e.g. `python3 /tmp/script.py`).\n"
-            + "- file_write and file_edit are atomic, preserve formatting, and make it easy to fix errors or update content later.\n"
-            + "- shell_execute is for RUNNING commands, not for writing files.\n"
-            + "- shell_execute supports multi-line commands directly — quoting and special characters are handled automatically. "
-            + "However, commands MUST NOT exceed 1000 characters. If longer, write a script file with file_write first, then run it.\n"
-            + "- The default shell is BusyBox ash. `**` recursive glob (globstar) is not supported — use `find <dir> -name '*.ext'` for recursive search, piped to `xargs` for tools like `wc`. "
-            + "You do NOT need to hand-rewrite bash-specific syntax to POSIX: when a command uses bashisms (arrays arr=(...)/${arr[@]}, [[ ]], (( )), brace ranges {1..9}, process substitution, etc.), Minis automatically installs and runs it under bash. Write the script naturally in whichever shell dialect is clearest; only globstar has no automatic fallback.\n"
-            + "- Python packages: many PyPI packages (numpy, pandas, scipy, pillow, etc.) lack musllinux_aarch64 wheels and will fail to build from source. "
-            + "Use Alpine's native packages instead: `apk search py3-<name>` then `apk add py3-numpy py3-pandas py3-matplotlib py3-pillow py3-scipy py3-requests`. "
-            + "Only fall back to `pip install` for pure-Python packages not available via apk. "
-            + "For matplotlib, always set `matplotlib.use('Agg')` before importing pyplot — there is no display server in iSH.\n"
-            + "- Background services: each shell_execute runs in an isolated process. "
-            + "When starting a background server (e.g. `python3 -m http.server &`), you MUST redirect stdout/stderr to avoid SIGPIPE when the shell exits: "
-            + "`python3 -m http.server 8765 > /dev/null 2>&1 &`. "
-            + "Without redirection the server dies silently after the command finishes.\n"
-            + "- File search: when looking for user files, do NOT scan the whole filesystem. Search under /var/minis/ first (workspace/attachments/shared for the current session, mounts/* for user-provided external folders). Only widen the scope if the file is clearly not under /var/minis/.\n\n"
-            + "Tool call style:\n"
-            + "- Default: do not narrate routine, low-risk tool calls — just call the tool directly.\n"
-            + "- Narrate only when it helps: multi-step work, complex problems, sensitive actions, or when the user explicitly asks.\n"
-            + "- Keep narration brief and value-dense; avoid repeating obvious steps.\n"
-            + "- When a tool exists for an action, use it directly instead of explaining what you plan to do or asking the user to confirm.\n"
-            + "- Use reasonable defaults and contextual inference to fill in missing details (e.g. 'tonight' means today, 'remind me' implies creating a reminder immediately). Only ask for clarification when genuinely ambiguous.\n\n"
-            + "Tone and style:\n"
-            + "- Reply in the language that best matches the user's input. Only switch languages when the user explicitly asks.\n"
-            + "- Be concise. Prefer action over explanation — when the user asks for something that can be done via shell, do it directly.\n\n"
-            + "Native Apple framework tools:\n"
-            + "CLI tools at /usr/local/bin with the apple- prefix give you access to iOS frameworks (alarm, bluetooth, calendar, clipboard, device, healthkit, homekit, location, maps, media, nfc, nlp, notification, open, photos, player, reminders, speak, speech, vision, weather). "
-            + "All output JSON (--compact to minify, -q for data-only). Run any tool with --help for full usage. "
-            + "apple-maps supports search (find nearby POIs), route (directions), and eta (travel time). "
-            + "apple-open <url> opens a URL via the system handler. Use shell_execute to run `apple-open <url>` when you want to open something immediately. To offer a tappable link instead, write a standard Markdown link with the URL directly (e.g. [Open in Maps](maps://?daddr=lat,lon)) — the app handles system URL schemes like maps://, tel:, https:// natively. "
-            + "apple-player play <file> opens a native audio/video player and returns a session_id; use pause/resume/seek/status/stop to control playback. "
-            + "apple-healthkit covers the full HealthKit catalog — 100+ quantity types (body, vitals, cardio fitness, mobility, sleep, audio exposure, nutrition, ...), 60+ category types (symptoms, reproductive, sleep, cardio events), characteristics (sex, DOB, blood type), and special samples (workouts, ECG, audiogram, vision-rx, GAD-7/PHQ-9, state-of-mind). Run `apple-healthkit types` to discover every supported metric with one-line descriptions, then use `apple-healthkit batch --types t1,t2,... --days N` to fetch MULTIPLE metrics in a single call (one authorization prompt, one envelope). Prefer batch over multiple per-metric calls. Use `log --type ... --value ...` to write samples.\n"
-            + "apple-homekit controls HomeKit smart home devices. Use progressive disclosure: list (compact overview) → search --query/--type/--room (filter) → get --name (full detail with characteristics). set --name --characteristic --value to control devices. scenes lists scenes, trigger --name executes one.\n"
-            + "apple-alarm sets alarms and timers via AlarmKit (iOS 26+). Alarms can only be viewed in the Minis home screen (alarm icon in the top-right toolbar) or by opening minis://views/alarm. "
-            + "After setting an alarm, tell the user it is visible on the Minis home screen and they can tap the alarm icon or open minis://views/alarm to manage it.\n"
-            + "apple-vision provides image analysis via the Vision framework. Subcommands: ocr (text recognition, --lang, --level fast/accurate), barcode (QR/barcode detection), classify (image classification), detect (rectangle detection), faces (face detection), analyze (combined ocr+classify+barcode+faces), "
-            + "similarity <img1> <img2> [img3...] (feature-print based image similarity comparison with --threshold 0.0-1.0, returns pairwise distance/similarity scores and duplicate groups), "
-            + "overlap <img1> <img2> [img3...] (detect vertical overlapping regions between consecutive image pairs — uses anchor row scan + multi-row verification to find exact stitch points; returns overlap_px, confidence, and region coordinates). Both similarity and overlap accept --threshold 0.0-1.0 (default 0.9). overlap also accepts --skip-top <px> and --skip-bottom <px> to exclude fixed UI (status bar, tab bar) that would cause false matches.\n"
-            + "minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: `minis-open https://example.com`, `minis-open /var/minis/workspace/report.md`, `minis-open /var/minis/attachments/chart.png`. Prefer this over `apple-open` for anything that can be previewed in-app so the user doesn't lose conversation context. Use `apple-open` for non-web schemes (tel:, mailto:, maps://, settings, etc.) or when the user explicitly wants the system handler.\n"
-            + "minis-sessions-cli: Manage chat sessions. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read, `send` to create/continue a session, `retry` to re-run, `status` to check, `open` to navigate the app UI. Run --help for full options.\n"
-            + "minis-model-use: Invoke other LLM models pre-configured by the user. "
-            + "You have \(ProviderConfigStore.shared.resolvedAgentLoopEntries.count) model(s) available. "
-            + "Use `minis-model-use list` to see them (includes each model's modality capabilities like image_output, audio_output, etc.), "
-            + "`search <query>` to filter by name/provider. "
-            + "`run --model <id_or_name>` sends an OpenAI Chat Completions request; pass input via --input <json_file> or stdin, "
-            + "output goes to stdout or --output <path>. "
-            // [T-agent-prompt-consistency-pass] Synced with the passthrough-era CLI
-            // (T-model-use-passthrough-mode): the old unconditional "Never hand-write
-            // provider-native bodies" predated extra_body/--endpoint/passthrough and
-            // blocked the model from ever discovering them via --help.
-            + "The input JSON is OpenAI Chat Completions shape — a `messages` array — as the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. "
-            + "For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), `--endpoint <kind|/custom/path>`, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. "
-            + "Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. "
-            + "Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. "
-            + "For image_output models, put the prompt in the user message and image params under `generation_config`: OpenAI image models use `generation_config.{n,size,quality}`, Gemini image models use `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}`. "
-            + "Example: {\"messages\":[{\"role\":\"user\",\"content\":\"<prompt>\"}],\"generation_config\":{\"size\":\"1024x1024\",\"n\":1}}. "
-            + "IMPORTANT: image generation is SLOW (typically 1-5 min) — a single long blocking call with a large timeout (e.g. timeout: 600) is correct here (one render, one wait); use `delay` chains only when repeatedly CHECKING on something, not for one slow command. "
-            + "Run with --help for full usage.\n"
-            + "minis-browser-use: CLI wrapper around the in-app browser_use tool — accepts the exact same actions and parameters as the browser_use tool call, just exposed as `<action> --flag value` pairs (or `--json '<obj>'`). "
-            + "Run `minis-browser-use` with no arguments (or --help) for the full action list. "
-            + "Example: `minis-browser-use navigate --url https://example.com`. "
-            + "Prefer this over the browser_use tool call when you need multi-step or batch browser flows: write a bash script that chains multiple minis-browser-use invocations (scrape N pages in a loop, click-through forms, navigate→extract→navigate pipelines) and run it with shell_execute. "
-            + "Output is JSON, same shape as the tool call result.\n"
-            + "Interactive terminal: minis://open_terminal opens a terminal for tasks that require interactive stdin (passwords, ssh, TUI apps like htop/vi). "
-            + "Write it as a Markdown link in your response — the app opens it when tapped. "
-            + "The optional init_command parameter pre-fills (NOT executes) a command; it MUST be fully percent-encoded (spaces → %20, & → %26, | → %7C, etc.). "
-            + "Only use this for genuinely interactive sessions — for everything else, use shell_execute. "
-            + "Examples: [Open Terminal](minis://open_terminal), [Login to SSH](minis://open_terminal?init_command=ssh%20user%40host).\n\n"
-            + "minis-config: read or change Minis settings programmatically. Run `minis-config --help` to see subcommands and `minis-config topic-help <topic>` for details on a specific area. For array-valued fields (e.g. `models`, `groups`, `envvars`, `defaults.agentLoopEntries`) the `get` subcommand accepts `--filter <keywords>` (whitespace-AND, case-insensitive substring match against each element's JSON) and `--page <N> --page-size <N>` (default 20, max 100) — use these instead of dumping the full list when you only need a subset, and check the response's `pagination` / `agent_hint` fields for the next-page command. Every write triggers a confirmation sheet in-app and is logged to a revertable audit (1000-entry rolling log). After a successful change the response includes a `user_message` field — relay it (or paraphrase) so the user knows how to review or revert via Logs → Config Changes. If the call returns `permission_denied`, the user has disabled minis-config in Settings → Permissions; relay that message and don't retry. You CAN add a provider (`add providers` with providerType + label, optional customBaseURL/appendV1Suffix/imageEndpointMode) and write its API key — set `providers.<id>.apiKey` (or include `apiKey` in the add payload) with either a literal key or a `$$ENV_VAR` reference resolved from the user's environment variables. Secrets are write-only: `get` never echoes an API key, and reading `providers.<id>.apiKey` / `.oauthToken` still returns permission_denied. Do not try to read API keys/OAuth tokens, or to set OAuth tokens (minted by the in-app login), permission levels, or environment-variable values — those stay locked.\n\n"
-            + "Environment variables:\n"
-            + "- Shell environment variables may contain sensitive API keys, tokens, or passwords. "
-            + "NEVER echo, print, cat, or otherwise output their values to stdout/stderr. "
-            + "Always reference them by variable name (e.g. $API_KEY) inside scripts or commands — never inline the literal value.\n"
-            + "- When a skill or task requires an environment variable that is not set, "
-            + "tell the user which variable is missing and provide a tappable deep link to create it: "
-            + "[Set ENV_NAME](minis://settings/environments?create_key=ENV_NAME&create_value=&create_note=Used%20by%20XYZ) — "
-            + "the user can tap it to open the Environment Variables page with the key and optional note pre-filled. "
-            + "create_note is optional; fill it with a brief description of what the variable is used for (e.g. 'API key for OpenAI', 'Used by XYZ skill'); URL-encode it.\n"
-            + "- Settings deep links: when you tell the user \"go to Settings → X\" or want to point them at a specific setting, prefer a Markdown link `[Label](minis://settings/<path>)` over plain prose. Available paths: providers (list), providers/<instanceId> (one provider), model-groups (incl. Agent Loop), model-groups/<groupId>, usage (token usage), skills, memory, storage, shared-folders (Shared Folders: /var/minis/{shared,skills,memory}), mount-external (Mount External Folders), logs, appearance, background, about, permissions, environments[?create_key=K&create_value=V[&create_note=N]], scheduled-tasks (Scheduled Tasks — the pause/edit/delete management screen), rootfs (also reachable as mirrors). Unknown paths fall back to Settings home, but prefer the exact path so users land where they want. These settings/action links are app deep links — render them as Markdown links in chat (same action-vs-resource rule as the minis:// section above: only /var/minis resource URLs may go to browser_use).\n"
-            + "- To check if a variable is set, use `[ -n \"$VAR\" ] && echo 'set' || echo 'not set'`. "
-            + "NEVER use echo $VAR, printenv VAR, or any command that would output the actual value into the conversation context.\n\n"
-            + "Memory system:\n"
-            + "- memory_write writes to today's daily log (YYYY-MM-DD.md) — use it for session notes, key facts, project context, things learned, and action items.\n"
-            + "- GLOBAL.md (/var/minis/memory/GLOBAL.md) stores persistent preferences, settings, and general-purpose conventions. To read it, use file_read (NOT memory_get). To update it, use file_read first then file_edit. If GLOBAL.md does not exist yet, use file_write to create it directly.\n"
-            + "- IMPORTANT: Only write to GLOBAL.md when the user explicitly asks (e.g. 'remember this globally', 'save to global memory'). Before editing, deduplicate and clean up — avoid ambiguity, repetition, or daily-log-style entries. GLOBAL.md should contain only concise, reusable knowledge (preferences, settings, conventions), NOT session logs or transient context.\n"
-            + "- Use memory_get to recall past knowledge before starting tasks — check if there are relevant memories that can help.\n"
-            + "- Proactively save memories (via memory_write to daily log) when you discover user preferences or important patterns — don't wait to be asked.\n"
-            + "- When the user says 'remember this' or similar, use memory_write to persist to the daily log. Only write to GLOBAL.md if the user specifically asks for global/persistent storage.\n"
-            + "- What NOT to remember: passwords, API keys, tokens, secrets, or any sensitive credentials. Warn the user about the risk first; only proceed if they explicitly confirm.\n"
-            + "- Keep memories concise, factual, and general-purpose — avoid noise that won't be useful later.\n\n"
-            + "Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended, so in-app scheduled scripts may not run as expected. "
-            + "For recurring tasks that must fire beyond the current conversation, tell the user to set up an automation in Apple Shortcuts — it is the only reliable way to trigger periodic execution on iOS. "
-            + "(Waiting or polling WITHIN the current turn is different — that is what shell_execute `delay` chains are for, per the shell_execute notes above.)"
-    }
-
-    /// [T-memory-toggle-gates-injection-and-tools-ios]
-    /// One-paragraph addendum that tells the model the current memory
-    /// gate state. Appended to baseSystemPrompt at every assemble site.
-    ///
-    /// When memory is OFF, the earlier "Available tools" and "Memory system"
-    /// sections in baseSystemPrompt still describe memory_get / memory_write
-    /// as if they existed. We don't surgically rewrite those (a giant
-    /// string concat that's already on the type-checker's edge); instead
-    /// we land an authoritative override at the end of the prompt so the
-    /// model knows the tools won't be registered, the memory files won't
-    /// be injected, and what to tell the user if they ask about memory.
-    private var memoryStatusFragment: String {
-        if memoryEnabled {
-            return "\n\nMemory status: ENABLED for this session. GLOBAL.md and recent daily logs have been injected above (if non-empty), and memory_get / memory_write are available in the tool list."
-        } else {
-            return "\n\nMemory status: DISABLED for this session. "
-                + "The user has turned off memory for this conversation. "
-                + "Despite any earlier mentions in this prompt:\n"
-                + "- GLOBAL.md and daily logs have NOT been injected — you do not have access to past memories.\n"
-                + "- The memory_get and memory_write tools are NOT registered — do not attempt to call them; they will not appear in your tool list.\n"
-                + "- If the user asks you to recall memories, save a memory, or wonders why earlier memories aren't visible, tell them memory is currently disabled for this session and they can re-enable it via the /memory slash command or in Settings.\n"
-                + "- This toggle is per-session. Other sessions may still have memory enabled.\n"
-                + "- SOUL.md (your persona / identity) is unaffected and remains active above."
-        }
-    }
-
-    // MARK: - Environment profile prompt snippet
-
-    /// Builds a system-prompt fragment describing the active environment
-    /// profile and the names of all available environment variables (global +
-    /// profile-merged).  Returns `nil` when the session has no profile or the
-    /// profile cannot be resolved.
-    ///
-    /// Values are intentionally NOT revealed — only variable names are listed.
-    private func envProfileSystemPromptSnippet() async -> String? {
-        guard let sid = sessionId,
-              let session = await ChatStore.shared.getSession(sid),
-              let profileId = session.envProfileId,
-              let profile = EnvProfileStore.shared.profile(id: profileId) else {
-            return nil
-        }
-
-        // Collect all resolved env var names: global vars plus profile vars
-        // (profile values override global vars with the same key, but for
-        // name-listing we just need the union of keys).
-        let globalKeys = Set(EnvVarStore.shared.entries.map(\.key))
-        let profileKeys = Set(EnvProfileStore.shared.vars(for: profileId).map(\.key))
-        let allKeys = globalKeys.union(profileKeys).sorted()
-
-        var lines: [String] = []
-        lines.append("## Environment Profile: \(profile.name)")
-        lines.append("")
-        lines.append("The current environment profile \"\(profile.name)\" is active. The following environment variables are available (profile values override global values with the same name):")
-        lines.append("")
-        for key in allKeys {
-            lines.append("- \(key)")
-        }
-        lines.append("")
-        lines.append("You can use these environment variables in shell commands and code. Do NOT reveal or print the values of environment variables to the user.")
-
-        return lines.joined(separator: "\n")
-    }
-
-    // MARK: - Deep mode scope context (Phase 3)
-
-    /// Build the scope context for rule matching from recent messages.
-    ///
-    /// Phase 3: extracts file paths mentioned in recent conversation and
-    /// keywords from the latest user message so DeepModeStore can select
-    /// only the rules that are relevant to the current turn.
-    // [T-perf-scope-cache] Cache for buildDeepModeScopeContext() result.
-    // The scope context depends on the last user message + recent 10 messages'
-    // file path mentions. Between send() and runAgentLoop entry, messages don't
-    // change, so the cache hits and skips the regex traversal.
-    var _cachedScopeContext: DeepModeScopeContext?
-    var _cachedScopeLastUserMessage: String = ""
-
-    /// [T-deep-mode-perf-fragment-cache] Cache for the computed
-    /// `deepModeFragment` string (the large multi-KB deep-agent behavior
-    /// fragment). It is recomputed on every send/resume/fallback/auto-continue
-    /// turn today (AIChatViewModel.swift deepModeFragment), hitting expensive
-    /// paths (scope-context regex traversal + rule glob NSPredicate builds +
-    /// multi-KB string concat) each time. Caching it keyed on its true inputs
-    /// (level + memory flag + scope signature + rules file mod-time) makes all
-    /// the within-turn recomputations O(1) cache hits.
-    ///
-    /// Total-switch safe: this cache is only ever READ inside `deepModeFragment`,
-    /// which is only invoked under `if deepModeEnabled`. When the switch is off
-    /// the fragment is never read and the cache is never touched; we additionally
-    /// clear it in `deepModeDidDisableCleanup()` so no state survives a toggle-off.
-    var _cachedDeepModeFragment: String?
-    var _cachedDeepModeFragmentKey: String?
-    /// [T-perf-deepmode-modtime-ttl] TTL-cached rules file mod time. The old code
-    /// called DeepModeStore.rulesFileModTime() (a file system stat) on every
-    /// single deepModeFragment access — including cache hits — adding I/O latency
-    /// to the main thread. We now cache the result for 2 seconds, so the 3–8
-    /// inference calls within a turn only stat the file once.
-    var _cachedRulesModTime: Double = -1
-    var _cachedRulesModTimeTS: CFAbsoluteTime = 0
-
-    private func buildDeepModeScopeContext() -> DeepModeScopeContext {
-        // [T-perf-scope-cache] Return cached result when the last user message
-        // hasn't changed (same send flow → same scope context → no recomputation).
-        let lastUserMessage = messages
-            .last(where: { $0.role == .user })?.content ?? ""
-
-        if let cached = _cachedScopeContext,
-           lastUserMessage == _cachedScopeLastUserMessage {
-            return cached
-        }
-
-        // Extract file paths from recent messages (last 10 messages)
-        let recentMessages = messages.suffix(10)
-        var mentionedPaths: Set<String> = []
-        for msg in recentMessages {
-            let paths = Self.extractFilePaths(from: msg.content)
-            mentionedPaths.formUnion(paths)
-            // Also extract from assistant blocks (tool_use descriptions, etc.)
-            for block in msg.blocks {
-                let blockPaths = Self.extractFilePaths(from: block.content)
-                mentionedPaths.formUnion(blockPaths)
-            }
-        }
-
-        let ctx = DeepModeScopeContext(
-            mentionedFilePaths: Array(mentionedPaths),
-            userInputLowercased: lastUserMessage.lowercased()
-        )
-        _cachedScopeContext = ctx
-        _cachedScopeLastUserMessage = lastUserMessage
-        return ctx
-    }
-
-    // [T-deep-mode-scope-perf] Precompiled regexes — compiled ONCE per process.
-    //
-    // Before: the bare-filename scan looped over 41 extensions and called
-    // `NSRegularExpression(pattern:)` INSIDE the loop on every invocation, then
-    // ran each of those 42 regexes over the full text. Because
-    // `buildDeepModeScopeContext()` runs this over the last 10 messages and
-    // every block inside them, one scope build performed thousands of ICU regex
-    // compilations plus thousands of full-text scans — measured as 1.2-4.5s of
-    // main-thread hang in long DeepMode sessions (HangDetector stack:
-    // extractFilePaths <- buildDeepModeScopeContext <- deepModeFragment).
-    //
-    // Now: one alternation covers all extensions, so a scan costs 2 regexes
-    // (0 compilations) instead of 42 compilations + 42 scans.
-    private static let slashPathRegex: NSRegularExpression? = try? NSRegularExpression(
-        pattern: #"[^\s]*/[^\s]*"#, options: [])
-
-    private static let bareFilenameRegex: NSRegularExpression? = try? NSRegularExpression(
-        pattern: #"[\w\-.]+\.(?:markdown|storyboard|swiftpm|podspec|bash|zsh|swift|tsx|jsx|scss|html|yaml|toml|json|plist|php|css|xml|yml|ini|cfg|txt|env|java|cpp|hpp|sql|xib|rb|go|rs|sh|ts|js|py|kt|mm|md|m|c|h)\b"#,
-        options: [.caseInsensitive])
-
-    /// Upper bound on how much of a single text is scanned for file paths.
-    /// DeepMode tool results routinely reach hundreds of KB; paths buried deep
-    /// in a giant log dump are useless for rule scoping, and scanning them made
-    /// the cost scale with accumulated output size — so it got worse the longer
-    /// a session ran.
-    private static let maxPathScanCharacters = 8_192
-
-    /// Extract potential file paths / filenames from text using heuristics.
-    /// Matches:
-    ///   - Paths containing slashes: /foo/bar.swift, src/main.py
-    ///   - Bare filenames with known extensions: file.swift, script.py
-    private static func extractFilePaths(from text: String) -> [String] {
-        guard !text.isEmpty else { return [] }
-
-        var paths: Set<String> = []
-
-        // [T-deep-mode-scope-perf] Only scan a bounded prefix. DeepMode tool
-        // results can be hundreds of KB; without this cap the cost of a scope
-        // build scaled with accumulated output size, so it degraded the longer
-        // a session ran.
-        let scanned: String
-        if text.count > Self.maxPathScanCharacters {
-            scanned = String(text.prefix(Self.maxPathScanCharacters))
-        } else {
-            scanned = text
-        }
-        guard !scanned.isEmpty else { return [] }
-
-        let nsRange = NSRange(scanned.startIndex..., in: scanned)
-
-        // Pattern 1: paths with slashes (e.g. /a/b/c.swift, src/foo/bar.py)
-        // Match sequences of non-whitespace that contain at least one /
-        // and end with a known extension or a filename-like component.
-        Self.slashPathRegex?.enumerateMatches(in: scanned, options: [], range: nsRange) { match, _, _ in
-            guard let match = match,
-                  let range = Range(match.range, in: scanned) else { return }
-            var path = String(scanned[range])
-            // Trim trailing punctuation that's unlikely to be part of a path
-            while path.last?.isPunctuation == true && path.last != "/" && path.last != "." {
-                path.removeLast()
-            }
-            if !path.isEmpty {
-                paths.insert(path)
-            }
-        }
-
-        // Pattern 2: bare filenames with common code extensions.
-        // One combined regex (see bareFilenameRegex) replaces the previous
-        // per-extension loop that recompiled 41 regexes on every call.
-        Self.bareFilenameRegex?.enumerateMatches(in: scanned, options: [], range: nsRange) { match, _, _ in
-            guard let match = match,
-                  let range = Range(match.range, in: scanned) else { return }
-            paths.insert(String(scanned[range]))
-        }
-
-        return Array(paths)
-    }
-
-    /// [T-deep-mode] Extra "deep agent" behavior fragment injected just before
-    /// the memory footer when the global 深度龙虾Ai toggle is on. It upgrades
-    /// the agent from the default "act immediately" posture to a
-    /// plan → execute → verify loop modelled on TRAE's autonomous workflow,
-    /// WITHOUT touching `baseSystemPrompt` (which sits on a type-check
-    /// boundary and must not be edited).
-    ///
-    /// Phase 3 evolution: rules are scoped to the current conversation context
-    /// (file paths mentioned + user input keywords) rather than always injecting
-    /// the full rule set. This reduces token waste and keeps the prompt focused.
-    ///
-    /// [T-ios-orphan-scan-perf] Incremental orphan scan cursor. Tracks how far
-    /// into agentHistory we have already verified tool-use/result pairing.
-    /// On each runAgentLoop entry we only scan from this cursor forward,
-    /// reducing O(n*m) to O(d*m) where d is the number of new messages
-    /// since the last scan. Reset to 0 on resume (partial re-scan needed).
-    var orphanScanCursor = 0
-
-    /// [T-perf-orphan-incremental] Cumulative set of toolResult IDs from the
-    /// clean prefix (0..<orphanScanCursor). The old code re-scanned the entire
-    /// clean prefix for toolResult IDs on every send — twice (Phase 1 + Phase 2).
-    /// This set lets us skip both prefix scans: we just merge it into the
-    /// working set in O(1). Reset alongside orphanScanCursor.
-    var orphanScanPrefixToolResultIds = Set<String>()
-
-    private var deepModeFragment: String {
-        // [T-deep-mode-perf-fragment-cache] Cache hit fast-path. The fragment
-        // is a pure function of: deep-mode level, memory flag, the scope context
-        // (itself cached/derived from the last user message), and the rules
-        // file mod-time. When none of those changed since the last build, reuse
-        // the cached string instead of re-running the scope regex traversal +
-        // rule glob NSPredicate builds + multi-KB concat.
-        let scopeCtx = buildDeepModeScopeContext()
-        let level = deepModeLevel
-        // [T-perf-deepmode-modtime-ttl] Only stat the rules file once every 2s.
-        // The old code called rulesFileModTime() on every access — a file system
-        // stat that blocked the main thread even on cache hits. Within a turn
-        // (3–8 inference calls) the file can't change, so this is safe.
-        let now = CFAbsoluteTimeGetCurrent()
-        if now - _cachedRulesModTimeTS > 2.0 {
-            _cachedRulesModTime = DeepModeStore.rulesFileModTime() ?? -1
-            _cachedRulesModTimeTS = now
-        }
-        // [T-perf-deepmode-cachekey-hash] Use a hash of the user input instead
-        // of the full text. The old key embedded the entire user message, which
-        // made key comparison O(n) on every access. A hash is O(1) and captures
-        // the same validity signal: different messages → different hash → miss.
-        let inputHash = scopeCtx.userInputLowercased.hashValue
-        let cacheKey = "\(level.rawValue)|\(memoryEnabled)|\(inputHash)|\(scopeCtx.mentionedFilePaths.joined())|\(_cachedRulesModTime)"
-        if let cached = _cachedDeepModeFragment, _cachedDeepModeFragmentKey == cacheKey {
-            return cached
-        }
-        var s = "\n\nDeep Agent Mode (深度龙虾Ai) is ENABLED (intensity: \(level.rawValue)). Adopt a deliberate, senior-engineer working style for this turn:\n"
-        // [T-deep-mode-rules-phase3] Behavior rules are scoped to current context.
-        // Phase 3: only rules matching the current scope (file globs + keywords
-        // + alwaysApply) are injected, replacing the old flat full-list injection.
-        s += DeepModeStore.rulesFragment(for: scopeCtx) + "\n"
-        // [T-deep-mode-plan-gate] Layer B: deterministic plan-gate instruction.
-        // For multi-step tasks the model must first emit ONLY a plan inside a
-        // fenced ```plan``` code block and issue no tool calls; the client then
-        // raises a confirm/edit bar and pauses execution until the user acts.
-        // Trivial single-command tasks skip the plan and act immediately.
-        s += "PLAN GATE — if a request needs more than one step, your FIRST reply must be ONLY a plan: a fenced ```plan``` code block listing numbered steps, with no tool calls. Stop there and wait for the user to confirm before executing anything. For a trivial single-command task, skip the plan and act immediately.\n"
-        // [T-deep-mode-goal-runner] Layer C: deterministic goal sentinel. After
-        // executing (a turn that used tools), the model appends exactly one
-        // status line; the client auto-continues on `pending` until `done` or
-        // the cap. Emitting nothing is always safe (no auto-continuation).
-        s += "GOAL AUTO-CONTINUE — at the very END of a turn where you used tools, append exactly one line (and do NOT put other text after it):\n  • <<GOAL_STATE>> done   (the task is fully complete)\n  • <<GOAL_STATE>> pending: <one-line next step>   (still incomplete; the client will auto-continue)\n"
-        // [T-deep-mode-verify-gate] Phase 2: deterministic self-verification.
-        // When in the verification phase (client injected a verify prompt), the
-        // model MUST re-read its own results, run / preview / compare them, and
-        // append exactly one VERIFY_STATE line at the very end. The client uses
-        // this to decide whether to finish the workflow or loop back to fix.
-        s += "SELF-VERIFY — when the client asks you to verify your work, re-read all changed files, run/preview/test the results, and check against the original goal. At the very END of your reply append exactly one line:\n  • <<VERIFY_STATE>> passed   (everything works correctly, matches the requirements)\n  • <<VERIFY_STATE>> failed: <one-line summary of what's wrong + how to fix>   (issues found; the client will let you fix them)\n"
-        // [T-deep-mode-memory-proactive-phase3] Phase 3: proactive memory with
-        // categories. The agent should classify memories by type (preference /
-        // convention / fact / taboo / project) when writing them.
-        if memoryEnabled {
-            s += "Additionally (fixed behavior, always on in deep mode): REMEMBER PROACTIVELY — at the end of this turn, if the user expressed a long-term preference, convention, project fact, or taboo worth keeping, persist it via memory_write with an appropriate category (preference/convention/fact/taboo/project) and mention it in a single line, rather than waiting to be asked."
-        }
-        // [T-deep-mode-cognitive-p0] Phase 4.5 P0: cognitive thinking abilities.
-        // Five prompt-injected directives that make the agent "think more like a
-        // human". All are pure prompt additions inside deepModeFragment, so the
-        // master switch controls them implicitly — when deepModeEnabled is off,
-        // deepModeFragment is never appended to the system prompt, and none of
-        // these directives appear. Zero runtime state, zero UI, zero persistence.
-        // These C1-C5 directives are included at ALL levels (low/medium/high).
-        s += "\n"
-        s += "COGNITIVE ABILITIES (think like a senior engineer, not just execute):\n"
-        // C1: Three-layer intent decoding
-        s += "1. THREE-LAYER INTENT — Before acting on a request, silently decode three layers: (a) What is the user literally asking? (b) What is the real underlying need behind this request? (c) After this is solved, what will the user likely ask next? Design your solution for layer (b), not just (a). If layers (a) and (b) conflict, address (b) and briefly explain why.\n"
-        // C2: Reverse verification
-        s += "2. ADVERSARIAL SELF-CHECK — After reaching a conclusion or producing output, actively search for evidence that could DISPROVE your solution. Try to break your own work: what edge case fails? What assumption might be wrong? Only if you cannot find a disproof is the conclusion reliable. State what you tried to break and why it held.\n"
-        // C3: First-principles reasoning
-        s += "3. FIRST PRINCIPLES — Do not rely on \"this worked last time\". For each non-trivial decision, reason from fundamental constraints (what the platform/language/runtime actually guarantees), not from pattern-matching prior solutions. Past success does not justify current reuse if the fundamentals have changed.\n"
-        // C4: Proactive risk anticipation
-        s += "4. PROACTIVE RISK FORESIGHT — Before the user asks, identify risks they haven't mentioned. If your plan has potential side effects, breaking changes, performance implications, or security concerns, surface them proactively in one line. Don't wait to be asked \"what could go wrong\" — tell the user first.\n"
-        // C5: Fail-three-times-switch-method
-        s += "5. FAIL-SWITCH — If the same approach fails 3 consecutive times (same error pattern or same dead-end), STOP and switch to a fundamentally different strategy. Do not attempt a 4th iteration of the same method. State: \"Approach X failed 3 times — switching to Y because Z.\" The auto-continue budget (3 rounds) exists for this: if you've used all 3 rounds without success, the next step must be a different approach, not a retry.\n"
-        // [T-deep-mode-level] Medium/High only: C12 multi-path, C9 sentinel,
-        // C10 need_more_context, C14 cross-session. Low level skips these
-        // for a more natural, less sentinel-heavy conversation experience.
-        if level.forcesMultiPath {
-            // [T-deep-mode-cognitive-p2-c12] C12: Multi-path parallel thinking.
-            s += "6. MULTI-PATH THINKING — When you produce a plan (fenced ```plan``` block), if the task is complex (more than 3 steps, or involves architecture/design decisions), generate AT LEAST 3 candidate paths. Format each path as:\n  ## PATH 1: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 2: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  ## PATH 3: <short title>\n  <numbered steps>\n  RISK: low|medium|high\n  RECOMMENDED: PATH <N>\n  Briefly explain why you recommend this path over the others (1-2 sentences). For trivial tasks (≤3 steps, no design decisions), use a standard single-path plan as before.\n"
-        }
-        if level.enablesRootCause {
-            // [T-deep-mode-cognitive-p2-c13] C13: Error → root cause → strategy
-            s += "7. ROOT CAUSE LEARNING — When verification fails and you receive a root-cause analysis prompt, do NOT just fix the surface symptom. Analyze the FUNDAMENTAL reason it went wrong (wrong assumption? missing step? platform constraint?), fix it, then produce a single reusable rule that would prevent this class of error. Wrap the rule in <<ROOT_CAUSE_RULE>> ... <<ROOT_CAUSE_RULE>> tags. The rule will be auto-saved to your behavior rules for future sessions.\n"
-        }
-        if level.forcesCognitiveLoadSentinel {
-            // [T-deep-mode-cognitive-p2-c9] C9: Cognitive load real-time monitoring.
-            s += "8. COGNITIVE LOAD MONITORING — At the END of each turn where you used tools, assess your cognitive load and append exactly one line:\n  • <<COGNITIVE_LOAD>> low    (on track, confident, context is clear)\n  • <<COGNITIVE_LOAD>> medium  (some complexity, but manageable)\n  • <<COGNITIVE_LOAD>> high: <one-line note>   (losing track, context getting long, multiple failures)\n  • <<COGNITIVE_LOAD>> critical: <one-line note>   (context near limit, severe confusion, need to step back)\n  Be honest — under-reporting load leads to degraded output quality. If the client also detects high load from its own metrics, it will warn the user.\n"
-        }
-        if level.enablesNeedMoreContext {
-            // [T-deep-mode-cognitive-p2-c10] C10: Dynamic autonomy exit.
-            s += "9. DYNAMIC AUTONOMY EXIT — If you are in an auto-continue loop and discover you need information you don't have (ambiguous requirements, missing file access, need a design decision only the user can make), do NOT guess. Instead emit:\n  • <<GOAL_STATE>> need_more_context: <one-line description of what you need>\n  The client will STOP the auto-continuation loop and surface your question to the user. This is preferable to 3 rounds of increasingly-wrong assumptions.\n"
-        }
-        if level.enablesCrossSession {
-            // [T-deep-mode-cognitive-p2-c14] C14: Unified cross-mode context.
-            s += "10. CROSS-SESSION CONTEXT — When you complete a meaningful workflow (not a trivial single-step task), append a one-line summary of what was accomplished. The client will persist this as cross-session context so future sessions can pick up where you left off. Also, when you start a new workflow, briefly state the current project context so the client can persist it as the active project.\n"
-        }
-        if level.registersSequentialThinking {
-            // [T-deep-mode-cognitive-p2-c11] C11: On-demand sequential thinking.
-            s += "11. ON-DEMAND SEQUENTIAL THINKING — You have a `sequential_thinking` tool. Call it when you encounter a sub-problem that genuinely needs structured multi-step deduction (architecture decisions, complex debugging, algorithm design). The tool returns a hypothesis→verification→conclusion framework you fill in. Do NOT call it for simple tasks (2-3 step problems). Do NOT call it as a replacement for planning — it's for mid-execution thinking when you hit a wall or a fork in the road. If your cognitive load is high, the tool will suggest fewer steps to keep you focused.\n"
-        }
-        // [T-deep-mode-skill-accumulate] Phase B B2: Skill accumulation hint.
-        // Teaches the model to notice a RECURRING task pattern and propose a
-        // reusable skill, instead of only acting on explicit skill requests.
-        // Pure prompt addition inside deepModeFragment — fully governed by
-        // the master switch (never injected when deep mode is off).
-        s += "13. SKILL ACCUMULATION — If about the 3rd time in this session you're handling the SAME type of task (a recurring workflow: producing a docx report, generating a slide deck, the same class of code fix), that workflow is a candidate for a reusable skill. Mention it to the user in one line and offer to create one using the skill format. Do NOT propose a skill on the first or second occurrence — only when a reliable pattern has clearly emerged.\n"
-        // [T-deep-mode-phase-d] Phase D: Inline-visualization guidance. Teaches
-        // the model when and how to use the render_widget tool. Pure prompt
-        // addition inside deepModeFragment — governed by the master switch.
-        s += "14. VISUALIZATION — You have a `render_widget` tool that renders an SVG diagram/chart or an isolated HTML widget INLINE in the chat (not saved as a file). Use it when a visual communicates better than prose: for flowcharts and architecture/sequence diagrams, comparison tables, small data charts, or interactive demos. Provide well-formed inline SVG for 'diagram'/'chart'/'comparison' and self-contained HTML (inline <script> allowed, NO external network assets) for 'interactive'. Keep it compact and readable; width auto-fits the container. Fall back to normal markdown text when prose or a table is clearer. Do NOT use render_widget for content that is better as a real saved file the user can open elsewhere.\n"
-        // [T-deep-mode-phase-e] Phase E: Scheduled-automation guidance. Teaches
-        // the model when and how to use the schedule_task tool. Pure prompt
-        // addition inside deepModeFragment — governed by the master switch.
-        // The tool is only registered in deep mode; created tasks stay
-        // manageable in Settings regardless of the switch.
-        s += "15. SCHEDULED AUTOMATION — You have a `schedule_task` tool that creates a repeating AI action (run daily / weekdays / on specific days at a set time). Use it when the user asks to set up anything recurring: '每天 9 点生成日报', '每个工作日早上整理邮件', '每周一运行安全检查'. Parse the natural-language request into the structured arguments: a short `label`, a fully self-contained `prompt` (the task starts in a FRESH chat, so include all necessary context), a 24-hour `time` (HH:MM), and a `repeat` mode (daily / weekdays / custom + days). After creating, tell the user the next-fire time and that they can manage the task in [Settings → Agent Runtime → Scheduled Tasks](minis://settings/scheduled-tasks). The task runs on a best-effort schedule via a local notification + open-time catch-up; a missed fire is caught the next time the app is opened, never silently dropped.\n"
-        // [T-deep-mode-phase-f] Phase F: Spec-mode guidance. Injected ONLY when
-        // the Spec toggle is on (deep-mode fragment is already gated on the
-        // master switch, so `SpecGate.modeEnabled && deepModeEnabled` together
-        // gate this). Pure prompt addition — zero runtime state.
-        if SpecGate.modeEnabled {
-            s += "16. SPECIFICATION (SPEC) MODE — an OPTIONAL phase AFTER verification passes. Only activate when BOTH deep mode is on AND Spec mode is enabled (the client will already have entered the spec-writing phase and told you to start). Formalize the completed work into THREE documents with file_write (create_dirs=true): spec.md (goal / scope-in / scope-out / feature list / acceptance criteria), checklist.md (a verification checklist derived from the acceptance criteria), tasks.md (task breakdown, marking independent tasks with [PARALLEL]). Keep each document precise, structured markdown; reuse the actual work you just did — do NOT invent new requirements. At the END of your turn, after all three files are written, append exactly one line:\n  <<SPEC_STATE>>\nDo NOT start new execution work during the spec-writing phase — only write the three specification documents.\n"
-        }
-        _cachedDeepModeFragment = s
-        _cachedDeepModeFragmentKey = cacheKey
-        return s
-    }
-
-    // MARK: - P1 Cognitive Abilities (C6/C7/C8)
-
-    /// [T-deep-mode-cognitive-p1] C7: Guard flag ensuring the retrospective runs
-    /// at most once per workflow completion. Set when the retrospective begins,
-    /// cleared when a new workflow starts (beginExecution). Total-switch safe:
-    /// the retrospective only runs inside `if deepModeEnabled`, and this flag is
-    /// in-memory only — never persisted.
-    var retrospectiveHasRun = false
-
-    /// [T-deep-mode-cognitive-p1] C7 fix: Flag that is true while the
-    /// retrospective's runAgentLoop() is executing. Checked by
-    /// maybeAutoContinueGoal to prevent the retrospective turn from
-    /// accidentally triggering a goal auto-continue (if the review text
-    /// coincidentally contains a <<GOAL_STATE>> sentinel). Total-switch
-    /// safe: only set inside maybeRunRetrospective(), which is guarded by
-    /// `guard deepModeEnabled`.
-    var isRetrospectiveRunning = false
-
-    // [T-phase5] Subagent orchestration was removed — activeSubagents is gone.
-
-    /// [T-deep-mode-cognitive-p1] C8: Detect uncertainty markers in the model's
-    /// output text. Returns true if any uncertainty marker is found. Pure
-    /// function — no side effects, no state. Called only inside `if deepModeEnabled`.
-    /// Markers cover both Chinese and English common uncertainty expressions.
-    private static func detectUncertainty(in text: String) -> Bool {
-        // Chinese uncertainty markers
-        // Note: "应该" alone is too broad (used in confident statements like
-        // "应该使用X"), but "我应该是" / "应该是吧" carry uncertainty tone.
-        let zhMarkers = ["不确定", "不太确定", "无法确定", "可能", "大概", "也许",
-                         "似乎", "好像", "不太清楚", "不敢确定",
-                         "我应该是", "应该是吧", "大概吧", "可能吧"]
-        // English uncertainty markers (case-insensitive)
-        // Note: "i think" alone is too broad ("I think this is correct" is
-        // confident), so only match "i think maybe/perhaps/so" variants.
-        let enMarkers = ["i'm not sure", "i am not sure", "not sure",
-                         "maybe", "perhaps", "probably",
-                         "might be", "could be", "uncertain", "unclear",
-                         "i believe", "i guess", "as far as i know",
-                         "i think maybe", "i think so", "i think perhaps"]
-        let lower = text.lowercased()
-        for m in zhMarkers { if text.contains(m) { return true } }
-        for m in enMarkers { if lower.contains(m) { return true } }
-        return false
-    }
-
-    /// [T-deep-mode-cognitive-p1] C7: Post-task retrospective hook. Called after
-    /// a meaningful workflow completes (workflow phase transitions back to idle).
-    /// Injects a structured review prompt, runs one agent loop turn to get the
-    /// model's self-reflection, and persists the result to StructuredMemoryStore
-    /// as a project-category memory entry.
-    ///
-    /// Total-switch safe: guarded by `deepModeEnabled` at entry. The injected
-    /// message is a normal AgentMessage (persisted as conversation history), and
-    /// the memory entry is only written when deep mode is on. When the master
-    /// switch is off, this method returns immediately — zero behavioral residue.
-    /// The `retrospectiveHasRun` flag prevents double-injection across multiple
-    /// scheduleWorkflowFinish calls.
-    private func maybeRunRetrospective() async {
-        guard deepModeEnabled else { return }
-        guard !retrospectiveHasRun else {
-            logger.info("[Retrospective] C7 skipped — already ran for this workflow")
-            return
-        }
-        retrospectiveHasRun = true
-        logger.info("[Retrospective] C7 beginning post-task retrospective")
-
-        let reviewPrompt = AgentMessage(role: .user, parts: [
-            .text("<system-reminder>深度模式任务后复盘（C7）：本次任务已完成，请快速复盘以下四个维度：\n1. 意图理解准确吗？（用户要什么 vs 你做了什么）\n2. 难度评估准吗？（预估难度 vs 实际难度）\n3. 工具选择最优吗？（有无更优工具/路径）\n4. 边界声明到位吗？（做了什么 / 没做什么 / 为什么）\n请简洁回答，提炼一条可复用的经验教训。如果你的复盘包含值得长期记住的经验，请使用 memory_write 工具保存。</system-reminder>")
-        ])
-        let ci = agentHistory.count
-        agentHistory.append(reviewPrompt)
-        if let pid = await persistAgentMessage(reviewPrompt), ci < agentHistory.count {
-            agentHistory[ci].dbMessageId = pid
-        }
-
-        // [T-deep-mode-cognitive-p1] C7 fix: Set isProcessing and background
-        // processing BEFORE calling runAgentLoop(), matching send()'s pattern.
-        // Without this, the UI wouldn't show the processing state, and the
-        // user could send another message during the retrospective — causing
-        // a race condition. Total-switch safe: this entire method is guarded
-        // by `guard deepModeEnabled` at entry.
-        isProcessing = true
-        beginBackgroundProcessing()
-        // [T-deep-mode-cognitive-p1] C7 fix: Set this flag so
-        // maybeAutoContinueGoal skips auto-continue during the retrospective.
-        // Without it, if the review text coincidentally contains a
-        // <<GOAL_STATE>> sentinel, the retrospective's runAgentLoop would
-        // trigger an unintended auto-continue chain.
-        isRetrospectiveRunning = true
-        // [T-deep-mode-cognitive-p1] C7 fix: Use defer for ALL cleanup to
-        // guarantee isProcessing and background processing are always
-        // restored, even if the guard below returns early or the loop
-        // throws. This matches send()'s epilogue pattern but is more robust
-        // because it handles the early-return case that send() doesn't have.
-        defer {
-            isRetrospectiveRunning = false
-            isProcessing = false
-            endBackgroundProcessing()
-        }
-
-        do {
-            try await runAgentLoop()
-            // [T-deep-mode-cognitive-p1] C7 fix: Re-check deepModeEnabled
-            // before saving — the user might have turned off the master
-            // switch while the retrospective's runAgentLoop was executing.
-            // If so, skip the memory save to honor the "no residual state"
-            // contract. The conversation history already has the review
-            // (as a normal AgentMessage), which is consistent with P0 C5
-            // fail-switch behavior.
-            guard deepModeEnabled else {
-                logger.info("[Retrospective] C7 skipping memory save — deep mode disabled during retrospective")
-                return
-            }
-            // After the review turn, check if the model's response is worth
-            // saving. We look at the last assistant message in agentHistory.
-            if let lastAssistant = agentHistory.last(where: { $0.role == .assistant }) {
-                let reviewText = lastAssistant.parts.compactMap { part -> String? in
-                    if case .text(let t) = part { return t }
-                    return nil
-                }.joined(separator: "\n")
-                if !reviewText.isEmpty {
-                    // Save the review to structured memory as a project note.
-                    // Source tag "auto:deep-mode-c7" distinguishes it from
-                    // user-written entries and makes it easy to filter/delete.
-                    try? StructuredMemoryStore.add(
-                        content: "任务复盘: \(reviewText.prefix(500))",
-                        category: .project,
-                        tags: ["retrospective", "auto", "deep-mode"],
-                        source: "auto:deep-mode-c7"
-                    )
-                    logger.info("[Retrospective] C7 review saved to StructuredMemoryStore (\(reviewText.count) chars)")
-                    // [T-deep-mode-cognitive-p2-c14] C14: Also save a one-line
-                    // summary to the cross-session store so future sessions
-                    // have continuity. Use the first sentence of the review.
-                    let summary = String(reviewText.prefix(200)).components(separatedBy: "\n").first ?? String(reviewText.prefix(100))
-                    try? CrossSessionContextStore.appendWorkflowSummary(summary, sessionId: sessionId)
-                    logger.info("[CrossSession] C14: workflow summary saved to cross-session store")
-                }
-            }
-        } catch is CancellationError {
-            logger.info("[Retrospective] C7 cancelled")
-        } catch {
-            logger.error("[Retrospective] C7 error: \(String(describing: error))")
-        }
-    }
+    var _cachedTimeString: String = ""
+    var _cachedTimeDate: Date = .distantPast
 
     /// Session ID for persistence integration. Set by the view on appear.
     var sessionId: String? {
-        didSet { browserTabPool.sessionId = sessionId }
+        didSet {
+            // A helper shares its parent's pool; never restamp it with the
+            // child's id (that would move tab persistence to the child).
+            if helperConfig == nil { browserTabPool.sessionId = sessionId }
+            // [T-opencode-dedicated-channel] Keep the off-MainActor mirror in
+            // step. This `didSet` is the single choke point every promotion
+            // path flows through (ensureSessionReturningId, loadSession, the
+            // RPC/intent entry points), so mirroring here means no caller has
+            // to remember to do it.
+            openCodeSessionBox.value = sessionId
+        }
     }
+
+    /// [T-opencode-dedicated-channel] Off-MainActor mirror of `sessionId`, read
+    /// by the OpenCode channel's per-request header hook.
+    ///
+    /// The hook runs wherever the request is built, which is not guaranteed to
+    /// be the MainActor, while `sessionId` is MainActor-isolated state — so it
+    /// cannot be read directly from a `@Sendable` closure. This box is the
+    /// hand-off: written on main by the `didSet` above, read under a lock by
+    /// the hook. Held by the VM (not global) because the id is per
+    /// conversation.
+    let openCodeSessionBox = OpenCodeSessionBox()
 
     /// The draft ID assigned by the parent view (e.g. "__new__<UUID>").
     /// Included in `.sessionDidCreate` notification so the parent can correlate.
@@ -3643,6 +1560,21 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Whether a title generation request is currently in-flight.
     var isTitleGenerating = false
 
+    /// [T-ios-switch-model-ghost-retry] Generation token for the detached
+    /// title-generation Task.
+    ///
+    /// That Task resolves its model ONCE (`resolveSubEntry()`, which with no
+    /// per-session sub model is the PRIMARY entry) and then retries up to 3
+    /// times with a 1.5s gap. Without a token, a model switch during that
+    /// window left it calling the model the user had just abandoned — one of
+    /// the two ghost-retry sources in this bug.
+    ///
+    /// `cancelWorkBoundToPreviousModel` bumps this; the Task compares it
+    /// before each attempt and bails on a mismatch. A plain bool could not do
+    /// the job: title generation legitimately re-runs later (more turns
+    /// arrive), and a bool would either block the new run or be reset by it.
+    var titleGenEpoch: UInt = 0
+
     /// Unified conversation history used by both Anthropic and Gemini agent loops.
     var agentHistory: [AgentMessage] = []
 
@@ -3662,9 +1594,9 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     // MARK: - Cache Keep-Alive State
     /// Snapshot of agent loop state for cache keep-alive warmup requests.
     /// Updated each iteration so the manager can replay the same prefix.
-    private(set) var keepAliveHistory: [AgentMessage] = []
-    private(set) var keepAliveSystemPrompt: String?
-    private(set) var keepAliveTools: [AgentToolDefinition] = []
+    var keepAliveHistory: [AgentMessage] = []
+    var keepAliveSystemPrompt: String?
+    var keepAliveTools: [AgentToolDefinition] = []
 
     // MARK: - Compact Marker (Phase B)
     /// Cached latest compact marker for this session. Phase B agent loop uses this
@@ -3672,50 +1604,18 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// of mutating agentHistory. Updated by loadSession, compactBefore, and any
     /// path that writes a new marker.
     var cachedLatestMarker: CompactMarker?
-    /// [T-perf-effective-history-cache] Cached result of effectiveAgentHistory().
-    /// Invalidated whenever agentHistory.count changes or cachedLatestMarker changes.
-    /// Avoids repeating the O(n×m) dropOrphanedToolParts scan on every inference
-    /// call within the same turn (Plan-First + Self-Verify + retries = 3–8 calls).
-    ///
-    /// [T-perf-effective-history-incremental] toolUseIds / toolResultIds track the
-    /// cumulative id sets so the NEXT call can do an O(Δ×m) incremental build
-    /// instead of an O(n×m) full rebuild when only new messages were appended.
-    ///
-    /// [T-perf-marker-incremental] anchorIdx stores the resolved anchor index
-    /// for marker sessions. When markerId and anchorIdx are unchanged and history
-    /// only grew, the preAnchor + summary injection are stable — only the
-    /// postAnchor tail needs appending. This extends the incremental path to
-    /// compacted sessions (DeepMode long conversations).
-    var _cachedEffectiveHistory: (
-        result: [AgentMessage],
-        historyCount: Int,
-        markerId: String?,
-        anchorIdx: Int?,  // nil for non-marker sessions
-        toolUseIds: Set<String>,
-        toolResultIds: Set<String>
-    )?
+    /// [T-offload-scan-cache] Per-part verdicts of the context-offload scanner,
+    /// so a re-trigger does not re-judge and re-tokenize the whole history.
+    /// In memory only; an empty cache (new VM, relaunch) simply rebuilds on the
+    /// next scan. See `OffloadScanCache`.
+    let offloadScanCache = OffloadScanCache()
     /// The session's persisted model id (from ChatStore.getSession). Cached at
     /// loadSession time so resolveCurrentEntry can fall back to it without an
     /// async hop to the actor. Empty string means "not yet loaded" — treat as
     /// no fallback.
     var cachedSessionModelId: String = ""
-    /// [T-perf-tools-cache] Cached result of makeAgentTools().
-    /// Tool definitions depend on deepModeEnabled + memoryEnabled + vision
-    /// capability — all slow-changing. Invalidated implicitly: the next call
-    /// sees a different key and rebuilds.
-    var _cachedAgentTools: (
-        deepModeEnabled: Bool,
-        memoryEnabled: Bool,
-        nativeVision: Bool,
-        visionGroupConfigured: Bool,
-        tools: [AgentToolDefinition]
-    )?
     /// The ModelEntry used in the current/last agent loop, for rebuilding the provider.
     var keepAliveEntry: ModelEntry?
-    /// [T-perf-history-bg-warmup] Background task pre-computing effectiveAgentHistory()
-    /// so the first call in runAgentLoop hits the cache instead of blocking the main
-    /// thread. Started at send() time, runs in parallel with attachment processing.
-    var _historyWarmupTask: Task<Void, Never>?
     /// Pending thought signatures loaded from persisted session, keyed by tool call ID.
     /// Applied to GeminiAgentProvider when the agent loop starts.
     var pendingThoughtSignatures: [String: ToolCallMetadata] = [:]
@@ -3724,6 +1624,28 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     // task so cancel() can stop it. [T-compact-queued-drain]
     var currentTask: Task<Void, Never>?
     var compactTask: Task<Void, Never>?
+
+    /// [T-ios-compact-task-binding] Which entry point started the compaction
+    /// `compactTask` is currently holding.
+    ///
+    /// This exists because cancel()'s cleanup is NOT uniform across entry
+    /// points: only compact-and-send has queued prompts to roll back. Once
+    /// every entry point binds `compactTask` (previously only two of five did),
+    /// cancelling a long-press compaction would otherwise run the
+    /// compact-and-send rollback — emptying `promptQueue` and bouncing someone
+    /// else's queued message into the input box. The origin lets cancel() undo
+    /// only what this particular compaction actually set up.
+    enum CompactOrigin {
+        /// `/compact` slash command, or the toolbar item.
+        case slashCommand
+        /// Long-press a message → "Compact Above".
+        case longPress
+        /// User sent a message that needed compaction first; prompts are queued.
+        case beforeSend
+        /// Debug JSON-RPC (DEBUG builds only).
+        case debugRPC
+    }
+    var compactOrigin: CompactOrigin?
     var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     /// [T-ios-bgkeepalive-diag] Process-wide count of LIVE
@@ -3753,6 +1675,97 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// Set by cancel() so the task's error handler knows this was a user stop.
     /// Internal-access so concurrent tool extensions can read it. [T-concurrent-tools]
     var userDidCancel = false
+    /// [T-stop-queued-cancel-error] Whether a turn's error epilogue is looking
+    /// at the end of a Stop rather than a real failure.
+    ///
+    /// `userDidCancel` alone is not enough. It is shared by every turn of this
+    /// vm, and when Stop leaves queued prompts behind, `resumeQueueAfterCancel`
+    /// resets it to false after 200 ms so the drained turn can run. A turn
+    /// stopped before its first token is usually still waiting on the HTTP
+    /// response at that point, so its `LLMError.cancelled` ("Request was
+    /// cancelled") arrives after the reset, reads as a real failure, and is
+    /// pinned (with Retry) to the last assistant row — by then the NEW drained
+    /// turn's bubble, whose start-of-turn error sweep already ran, so it never
+    /// goes away. `Task.isCancelled` belongs to the stopped task itself and
+    /// cannot be reset from outside, so it catches that late error.
+    var turnWasStopped: Bool { userDidCancel || Task.isCancelled }
+    /// [T-stop-sibling-subagent] Set when the user stops a sub agent from its
+    /// card rather than stopping this conversation outright.
+    ///
+    /// Kept separate from `userDidCancel` on purpose. `userDidCancel` is read
+    /// all over the loop's ending path — it removes placeholder blocks, marks
+    /// the turn interrupted and drives `handleUserCancelledCleanup`. Setting it
+    /// from a card would put the parent through a stop it never asked for. This
+    /// flag says only "results delivered from now on must not restart the
+    /// conversation", which is the whole of what the card's Stop means for the
+    /// parent. Cleared whenever a new turn begins.
+    var delegationResultsMuted = false
+    /// [T-p0-programmatic-prompt] True while the current turn was started by
+    /// `submitProgrammaticPrompt(silent: true)`; suppresses the send and
+    /// completion haptics for that turn only. Cleared on every
+    /// isProcessing → false transition.
+    var programmaticSilentTurn = false
+    /// [T-user-ask] Origin of a programmatic prompt that STARTED the current
+    /// run (Shortcut / CLI / job) — such a run has no one to ask, so user_ask
+    /// is not exposed. Cleared on every isProcessing → false transition.
+    var programmaticTurnOrigin: ProgrammaticPromptOrigin?
+    /// [T-user-ask] Whether this run exposes user_ask, decided with the tool
+    /// list so the system prompt's fragment agrees with it for the whole run.
+    var userAskExposedThisRun: Bool?
+    /// [T-user-ask-deferred] This run exposes user_ask in deferred mode (no
+    /// one can answer while it runs): the call returns `deferred` at once.
+    var userAskDeferredThisRun: Bool?
+    /// [T-user-ask-fallback] user_ask was called in this run (any outcome), so
+    /// a question in the final text is not a missed ask. Reset per run.
+    var userAskAskedThisRun = false
+    /// [T-user-ask] The assistant row (tool_use included) of the tool batch
+    /// now executing, and its tool ids — the loop writes that row only after
+    /// the batch, so user_ask keeps a copy for recovery after a kill.
+    var currentBatchAssistantRaw: RawMessage?
+    var currentBatchToolUseIds: [String] = []
+    /// [T-p1-delegate-task] Non-nil on a helper (child) vm. Drives the
+    /// helper-specific prompt, tool set, turn cap and skill scope.
+    var helperConfig: HelperConfig?
+    /// [T-agent-model-identity] What the latest served turn of this vm's
+    /// loop actually ran on (entry after fallback + the API-reported model).
+    /// Read by the parent's HelperRunner / AgentJobRegistry for agent
+    /// sessions; harmless bookkeeping on every other vm.
+    @Published var lastEffectiveModel: EffectiveModelRecord?
+    /// [T-agent-wrapup-turn] Set by the parent's budget watcher when a
+    /// helper's wall-clock budget runs out: the loop then gives the child ONE
+    /// more turn without tools to write its deliverable (see runAgentLoop).
+    var helperWrapUpRequested = false
+    /// [T-subagent-timeout-reason] Set by HelperRunner right before it
+    /// cancels this helper because the budget AND the wrap-up grace ran out.
+    /// That `cancel()` also sets `userDidCancel`; this flag is what tells the
+    /// runner's timeout stop apart from a real user / parent Stop when the
+    /// ending is classified. Reset when the runner starts a run.
+    var helperStoppedForTimeout = false
+    /// [T-subagent-termination] The loop sent this helper its one-shot
+    /// closing request after a turn that ended with no text. Read by
+    /// HelperRunner when it records how the run ended.
+    var helperClosingAttempted = false
+    /// [T-sub-agents-steer] Course corrections the parent queued for a running
+    /// sub agent, delivered at the top of its next loop turn.
+    ///
+    /// Deliberately NOT delivered by interrupting: an in-flight tool call is
+    /// never cut, so a steer that lands while the child is inside a 2-minute
+    /// shell command is read when that command returns. That is the whole point
+    /// of steering rather than cancelling — the work so far is kept.
+    ///
+    /// Written by the parent's tool call on the main actor and drained by the
+    /// child's loop on the same actor, so no lock is needed.
+    var pendingSteerMessages: [String] = []
+    /// [T-p0-programmatic-prompt] Ids of queued prompts that arrived through
+    /// `submitProgrammaticPrompt(silent: true)`. A drain started by
+    /// `startDrainIfIdle` consults this to decide whether the turn it runs is
+    /// silent (only when EVERY prompt it drains is programmatic).
+    var silentQueuedPromptIds = Set<UUID>()
+    /// [T-scheduled-preset-tool] Preset first steps of scheduled fires handed
+    /// to this session, keyed by job id, waiting for the request that answers
+    /// the fire's envelope (see `takePresetToolStream`). A later fire of the
+    /// same job replaces its entry.
+    var pendingPresetToolCalls: [String: ScheduledPresetToolCallRequest] = [:]
     /// Reentrancy guard for `drainQueuedPrompts()`. After a Stop with queued
     /// prompts, `cancel()` hands off to a fresh Task via `resumeQueueAfterCancel()`,
     /// but the original (superseded) send/retry/resume Task ALSO reaches its own
@@ -3761,7 +1774,10 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// reply — TWICE. Set/cleared only on @MainActor, so the check-and-set is
     /// atomic and spans the `await runAgentLoop()` suspension where the second
     /// drainer would otherwise slip in. [T-ios-concurrent-stop-double-request]
-    private var isDrainingQueue = false
+    var isDrainingQueue = false
+    /// [T-queue-drain-handover] A drain was requested while another task held
+    /// `isDrainingQueue`; the holder re-offers it when it releases the guard.
+    var drainRequestedWhileBusy = false
     /// [T-compact-queued-drain] True while a post-compact queue drain has been
     /// scheduled (task created) but not finished. Dedup guard so the two
     /// schedulers (compactBefore's success tail + compactAndSend's failure
@@ -3770,6 +1786,17 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// When non-nil, the next send() acts as an edit: truncates conversation from this
     /// message index and re-sends. Cleared after the edit is applied.
     @Published var editingMessageIndex: Int?
+    /// [T-bubble-span] The edited bubble's id and its pre-edit text, captured
+    /// by editMessage() and cleared with editingMessageIndex. In memory only.
+    /// send() uses them to re-find the bubble (the index can go stale between
+    /// Edit and Send) — see resolveEditedBubbleIndex.
+    var editingMessageId: UUID?
+    var editingOriginalText: String?
+    /// [T-bubble-span] Bubbles an edit / delete-from-here removed while their
+    /// send() had not yet appended the history entry (`awaitingHistoryEntry`).
+    /// That send consumes its id here and drops the stale turn instead of
+    /// appending the removed message behind the cut.
+    var abandonedPendingSendIds: Set<UUID> = []
     /// Set when the background task expires mid-agent-loop; cleared on resume.
     var backgroundSuspended = false
     /// Continuation used to pause the agent loop while suspended in background.
@@ -3812,2593 +1839,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
         ProviderConfigStore.shared.instances.contains { $0.isEnabled }
     }
 
-    // MARK: - Send Message
-
-    func send() {
-        // Read-only mode — cannot send messages
-        guard remoteDeviceId == nil else { return }
-
-        // [T-perf-estimate-incremental] Do NOT invalidate the estimate cache
-        // here. The incremental cache handles the normal case (agentHistory
-        // grew by 1-2 messages since last computation) in O(delta) instead of
-        // O(n). Compaction/offloading already invalidate the cache when they
-        // mutate agentHistory, so the only case where the cache is stale is
-        // already covered. Removing the unconditional invalidate here avoids
-        // forcing a full O(n) recompute on every send — the primary cause of
-        // send-message lag on long sessions.
-
-        // [T-ios-photo-pick-placeholder] Drop any non-ready attachments (failed
-        // photo loads, or a stray still-loading placeholder) so only fully-loaded
-        // files are sent. `canSend` already blocks sending while anything loads,
-        // so in practice this just prunes failed chips the user left in place.
-        attachments.removeAll { $0.loadState != .ready }
-
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let pendingAttachments = attachments
-        #if DEBUG
-        logger.info("🔑DRAFT [vm=\(self.vmInstanceId)] send() text=\(text.count)ch attachments=\(pendingAttachments.count) isProcessing=\(self.isProcessing) sessionId=\(self.sessionId ?? "nil") draftId=\(self.draftId ?? "nil") inputText='\(String(self.inputText.prefix(30)))'")
-        #else
-        logger.info("🔑DRAFT [vm=\(self.vmInstanceId)] send() text=\(text.count)ch attachments=\(pendingAttachments.count) isProcessing=\(self.isProcessing) sessionId=\(self.sessionId ?? "nil") draftId=\(self.draftId ?? "nil")")
-        #endif
-        guard !text.isEmpty || !pendingAttachments.isEmpty, !isProcessing else {
-            logger.warning("🔑DRAFT [vm=\(self.vmInstanceId)] send() GUARD FAILED — text.isEmpty=\(text.isEmpty) attachments.isEmpty=\(pendingAttachments.isEmpty) isProcessing=\(self.isProcessing)")
-            return
-        }
-
-        // [T-deep-mode-clarify-gate] Phase 2: handle the clarification gate.
-        // Two paths:
-        //   (a) We were awaiting clarification and the user just replied: merge
-        //       the original request with the answer and proceed normally.
-        //   (b) Fresh request, deep mode on, text-only: check for ambiguity.
-        //       If found, raise the gate and pause — don't send yet.
-        var clarifiedText: String?
-        if case .awaitingClarification(let question, let original) = clarifyState {
-            // User replied to our clarification question — combine the original
-            // request with their answer into a single clarified request, then
-            // clear the gate and continue the normal send path.
-            clarifiedText = "\(original)\n\n（澄清答复：\(text)）"
-            clarifyState = .idle
-            // Fall through to normal send flow with the clarified text.
-            logger.info("[ClarifyGate] user replied to clarification — proceeding with clarified request")
-        } else if deepModeEnabled, !text.isEmpty, pendingAttachments.isEmpty, !skipClarifyCheck {
-            // Fresh request: check for ambiguity before we commit to sending.
-            // Only for text-only requests (attachments usually mean a concrete
-            // task with context, less likely to be ambiguous).
-            // Skipped when `skipClarifyCheck` is true (user clicked "直接执行").
-            // Also skipped for shortcut sessions — they can't display the
-            // clarification UI, so we'd rather let the model guess than hang.
-            if sessionSource != "shortcut", let question = ClarifyGate.detectAmbiguity(in: text) {
-                clarifyState = .awaitingClarification(question: question, originalRequest: text)
-                logger.info("[ClarifyGate] ambiguity detected — pausing for clarification")
-                return // Don't send; wait for the user to reply / skip / cancel.
-            }
-        }
-        // If we have a clarified text, use it as the actual send text.
-        let sendText = clarifiedText ?? text
-
-        // Don't stop TTS here — let the previous reply finish playing. The stream
-        // handler will clear the queue on the FIRST textDelta of the new reply, so
-        // the old audio plays until actual new content starts arriving.
-        resetReplyTTSEngine()
-        // Re-arm the once-per-turn TTS clear: the agent loop creates a fresh
-        // StreamResult per iteration, so the "stopped previous TTS" flag must
-        // live HERE (per-send), not on the StreamResult — otherwise every loop
-        // iteration's first textDelta re-cleared the queue and cut off the
-        // previous iteration's still-playing speech mid-sentence.
-        hasClearedTTSForCurrentTurn = false
-
-        // [T-voice-mode-memory-refine-ios] The SEND commits the composer mode.
-        // "voice" is recorded ONLY here — when a voice-composed message is
-        // actually sent — so an accidental mic tap that never leads to a send
-        // can't flip the default (mic-start no longer writes "voice"). A typed
-        // send with no voice session records "text". Attachment-only sends say
-        // nothing about typing. (text is also written eagerly on switch-to-text
-        // in the composer; saveInputModePreference no-ops when unchanged.)
-        if !text.isEmpty {
-            SpeechRecognitionManager.saveInputModePreference(voiceUsedInComposition ? "voice" : "text")
-        }
-
-        // [T-voice-correction-productionize] Harvest typed vocabulary from sent
-        // messages (cold-start data for the voice corrector, design §3.3).
-        // Fire-and-forget at background priority — buildIfNeeded() throttles
-        // itself (1h min interval + batch threshold) and the write layer is
-        // consent-gated (VoiceCorrectionCollectionConsent, default OFF), so
-        // without opt-in this is a cheap early return.
-        if !text.isEmpty {
-            Task.detached(priority: .background) {
-                await TypedVocabularyBuilder.shared.buildIfNeeded()
-            }
-        }
-
-        // [T-perf-send-optimistic-ui] Skip the synchronous context check on the
-        // main thread — it could trigger O(n×m) history scans and cause a visible
-        // stall when tapping Send. Instead we:
-        //   1. Update the UI immediately (message inserted, scroll to bottom)
-        //   2. Check context in the background Task before running the agent
-        //   3. If context needs attention, cancel and present the prompt
-        // This way the Send button feels instant in the common case (context ok).
-        let shouldCheckContext = !skipCompactCheck
-        if skipCompactCheck {
-            skipCompactCheck = false
-        }
-
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        autoRetryAttempt = 0
-        autoRetryCountdown = 0
-        canResume = false
-        committedBlockCount = 0
-        prevCommittedBlockCount = 0
-        userDidCancel = false
-        // [T-deep-mode-plan-gate] Any fresh user send supersedes a pending plan.
-        planGateState = .idle
-        // [T-deep-mode-session-workflow] Session-scoped workflow: a fresh task
-        // (.idle) resets the workflow + auto-continuation budgets on send. When
-        // a workflow is already in flight (.executing) or under review
-        // (.verifying), a new user message is treated as an INTERJECTION merged
-        // into the current session workflow — phase, steps, verify budget and
-        // goal budget are preserved, so "pause / interject / continue the same
-        // task" keeps its progress capsule. Total-switch safe: read below; when
-        // deep mode is off the phase is always .idle, so the reset proceeds.
-        // [T-deep-mode-session-workflow] P2: also honor the keepSessionWorkflow
-        // rollback switch — when it is OFF, inFlightWorkflow is always false here
-        // and every send resets (legacy per-request workflow behavior).
-        let inFlightWorkflow = (sessionWorkflowEnabled &&
-            (workflowPhase == .executing || workflowPhase == .verifying))
-        if !inFlightWorkflow {
-            // [T-deep-mode-workflow] A fresh user send also ends any in-flight
-            // workflow; confirmPlan() re-enters `.executing` right after send()
-            // returns, so the confirm path is unaffected.
-            resetWorkflow()
-            // [T-deep-mode-goal-runner] A fresh user send also restarts the
-            // auto-continuation budget — each new prompt may chain up to
-            // GoalRunner.maxAutoRounds rounds again.
-            goalRunnerRoundsLeft = GoalRunner.maxAutoRounds
-            // [T-deep-mode-strip-sentinel] A fresh send owns a fresh sentinel decision.
-            pendingGoalSentinel = nil
-        } else {
-            // [T-deep-mode-session-workflow] Audit L1: an interjection merges
-            // into the ACTIVE workflow, so any stale pause-chosen snapshot must
-            // not be kept around (it would restore to a pre-interjection state on
-            // a later resume). resetWorkflow() is NOT called here, so phase/steps/
-            // budgets stay intact — we only drop the now-obsolete snapshot.
-            savedWorkflowState = nil
-        }
-        // [T-deep-mode-clarify-gate] Phase 2: a fresh user send also clears the
-        // clarification gate. If the user typed something new while the gate
-        // was open, treat it as a fresh start rather than a clarification reply.
-        clarifyState = .idle
-        // [T-deep-mode-clarify-gate] Also reset the one-shot skip flag so it
-        // only applies to the send that set it.
-        skipClarifyCheck = false
-
-        inputText = ""
-
-        // If editing a previous message, truncate conversation from that point first
-        if let editIdx = editingMessageIndex {
-            editingMessageIndex = nil
-            // Remove the edited message and everything after it from UI
-            if editIdx < messages.count {
-                messages.removeSubrange(editIdx...)
-            }
-            // Trim agentHistory: count remaining user BUBBLES (not synthetic
-            // user-role entries — see isUserBubbleEntry), then keep all
-            // history entries through the assistant reply (+ tool results)
-            // that follow the last remaining user bubble.
-            let remainingUserCount = messages.filter { $0.role == .user }.count
-            var usersSeen = 0
-            var keepUpTo = -1
-            for (i, entry) in agentHistory.enumerated() {
-                if Self.isUserBubbleEntry(entry) {
-                    usersSeen += 1
-                    if usersSeen > remainingUserCount {
-                        // This is the edited message's entry — stop before it
-                        break
-                    }
-                }
-                keepUpTo = i
-            }
-            if remainingUserCount == 0 {
-                agentHistory.removeAll()
-                orphanScanCursor = 0
-                orphanScanPrefixToolResultIds.removeAll() // [T-perf-orphan-incremental]
-            } else if keepUpTo + 1 < agentHistory.count {
-                agentHistory.removeSubrange((keepUpTo + 1)...)
-                // [T-perf-orphan-incremental] History was truncated — the
-                // cumulative prefix set may contain IDs that are no longer in
-                // agentHistory. Reset both the cursor and the set so the next
-                // send does a full re-scan (safe, and edit is infrequent).
-                orphanScanCursor = 0
-                orphanScanPrefixToolResultIds.removeAll()
-            }
-            // Trim persisted messages.
-            // Phase B: agentHistory is no longer mutated by compact, so agentHistory.count
-            // is 1:1 with the DB row count; passing it as keepCount is semantically correct.
-            let persistedKeepCount = agentHistory.count
-            let hasMarker = cachedLatestMarker != nil
-            logger.info("[DeleteAfter] edit path: sid=\(sessionId?.prefix(8) ?? "nil") keepCount=\(persistedKeepCount) hasMarker=\(hasMarker)")
-            if let sessionId {
-                Task { await ChatStore.shared.deleteMessagesAfter(sessionId: sessionId, keepCount: persistedKeepCount) }
-            }
-            // Rebuild toolSnapshots from remaining messages
-            toolSnapshots = messages
-                .filter { $0.role == .assistant }
-                .flatMap { msg in
-                    msg.blocks.compactMap { block -> ToolSnapshotItem? in
-                        guard let tuId = block.toolUseId else { return nil }
-                        return toolSnapshots.first(where: { $0.id == tuId })
-                    }
-                }
-            logger.info("✏️ send() edit applied: truncated to \(self.messages.count) messages, \(self.agentHistory.count) history entries")
-        }
-
-        // Close any stale tool blocks still showing as streaming/running from a
-        // previous interrupted response so the UI stops showing loading indicators.
-        for msg in messages where msg.role == .assistant {
-            for block in msg.blocks {
-                if let status = block.toolStatus {
-                    switch status {
-                    case .streaming, .running:
-                        block.toolStatus = .cancelled
-                    default: break
-                    }
-                }
-            }
-        }
-
-        // Note: toolSnapshots are NOT cleared here so the floating toolbar shows the full session history
-        let displayText = sendText.isEmpty && pendingAttachments.isEmpty ? "" : sendText
-        let userMsg = ChatMessage(role: .user, content: displayText)
-        // [T-ios-user-attach-two-phase-birth] Attach the user's OWN selection before
-        // the row is inserted, so the cell is born with its final height.
-        //
-        // The list's height estimator already prefers `attachments` and falls back to
-        // `inputAttachments` (CollectionViewMessageListV3 ~3036 and ~3334), and the tile
-        // block is pure geometry — `UserAttachmentTileMetrics.blockHeight(count:availableWidth:)`
-        // takes only a COUNT and a width (tile 64pt, gap 6pt). Nothing in `AttachmentMeta`
-        // (path / size / modified) feeds the height, so the count is fully known here and
-        // never needed the file I/O below.
-        //
-        // Without this line the fallback always read 0: `attachments` is only assigned
-        // after the copy/compress/upload pass (~2500), so the row was inserted as
-        // text-only, estimated short, and grew a second time when the metas landed —
-        // an UNDER-estimate, the harmful direction (f1304a3e1 measured est=48 at insert
-        // vs est=118 some 350ms later). That two-phase birth is the race the mount-time
-        // invalidations (988f67b8, 9be8058f) were added to chase; seeding here removes
-        // the window itself rather than reacting to it. The later
-        // `userMsg.attachments = attachmentMetas` then only adds metadata and no longer
-        // changes the height.
-        //
-        // `enqueuePrompt` (AIChatViewModel+Misc ~72) has always done exactly this before
-        // its own append; this is the send path catching up, not a new mechanism.
-        userMsg.inputAttachments = pendingAttachments
-        messages.append(userMsg)
-
-        // Snapshot and clear attachments synchronously so the UI clears immediately
-        clearAttachments()
-        scrollToBottomSignal.send()
-
-        isProcessing = true
-        errorMessage = nil
-        logger.info("🔄SESSION [vm=\(self.vmInstanceId)] send START session=\(self.sessionId ?? "nil")")
-
-        // Ensure kernel is booted before running
-        ensureKernelBooted()
-        beginBackgroundProcessing()
-
-        currentTask = Task { [weak self] in
-            guard let self else { return }
-
-            // [T-perf-warmup-at-loop] The O(n×m) effective-history warmup used to
-            // be kicked off here. It now lives at the top of runAgentLoop() — the
-            // single funnel every send path goes through (normal send, Compact &
-            // Send's queued drain, resume). Two reasons:
-            //   1. Compact & Send never calls send(), so it never got warmed up.
-            //   2. Warming up here ran BEFORE this turn's agentHistory.append, so
-            //      for compacted sessions the snapshot lacked the just-typed user
-            //      message — the summary injection target — and the result had to
-            //      be discarded. Warming up inside runAgentLoop sees the final
-            //      history and becomes an exact cache hit (zero main-thread work).
-
-            // Lazily create session before persisting anything
-            await self.ensureSession()
-
-            // Defensive: ensure tracker reflects the real session ID after draft→real migration.
-            if let sid = self.sessionId, self.isProcessing {
-                SessionActivityTracker.shared.setActive(sid, source: "vm=\(self.vmInstanceId) send/ensureSession draft→real")
-            }
-
-            // [T-perf-send-optimistic-ui] Check context AFTER the UI has already
-            // been updated (message inserted, composer cleared). In the common
-            // case (context ok) this adds zero latency to the Send tap. In the
-            // rare case (near capacity / exhausted) we cancel the in-flight
-            // task and fall back to the prompt flow — the user sees a brief
-            // "sending → queued" transition instead of a frozen Send button.
-            if shouldCheckContext {
-                let contextResult = self.checkContextBeforeSend()
-                if contextResult != .ok {
-                    await MainActor.run {
-                        self.handleSendContextFailure(
-                            result: contextResult,
-                            sendText: sendText,
-                            attachments: pendingAttachments
-                        )
-                    }
-                    return
-                }
-            }
-
-            // Copy attachment files to session uploads dir and build metadata
-            let fm = FileManager.default
-            let sid = self.sessionId ?? "unknown"
-            let uploadsDir = Self.minisUploadsDir(for: sid)
-            try? fm.createDirectory(at: uploadsDir, withIntermediateDirectories: true)
-
-            let isoFormatter = ISO8601DateFormatter()
-            isoFormatter.formatOptions = [.withInternetDateTime]
-            let now = Date()
-            let nowStr = isoFormatter.string(from: now)
-
-            var attachmentMetas: [AttachmentMeta] = []
-            var userParts: [AgentContentPart] = []
-
-            // User attachments always take priority over history images — see
-            // the same rationale in buildUserMessageParts. Stale history
-            // images will be evicted by the trim pass before the next API
-            // call.
-            let inlineBudget = Self.kImageContextKeepCount
-            var inlinedImages = 0
-            // Cumulative bytes of all inlined image payloads in this message.
-            // Once this passes kMessageImageMaxBytes the remaining images are
-            // dropped to a text placeholder instead of being base64-inlined.
-            // T-imgsize-13b7d81c.
-            var cumulativeImageBytes = 0
-
-            logger.info("📎[SEND-ASYNC] Processing \(pendingAttachments.count) attachments, uploadsDir=\(uploadsDir.path), imageBudget=\(inlineBudget) byteBudget=\(Self.kMessageImageMaxBytes)")
-            for (i, attachment) in pendingAttachments.enumerated() {
-                let fileExists = fm.fileExists(atPath: attachment.cacheURL.path)
-                logger.info("📎[SEND-ASYNC] attachment[\(i)] kind=\(String(describing: attachment.kind)) file=\(attachment.fileName) cacheExists=\(fileExists)")
-
-                guard fileExists else {
-                    logger.error("📎[SEND-ASYNC]   FAILED — source missing at \(attachment.cacheURL.path)")
-                    continue
-                }
-
-                // [T-ios-attachment-oom-bg-kill] Read file metadata (date + size)
-                // WITHOUT loading the file into memory. Previously this did
-                // `Data(contentsOf:)` on every attachment just to copy it to the
-                // uploads dir and record its size — for a large attachment (e.g. a
-                // 368 MB sysdiagnose) that spiked the app footprint by the file's
-                // full size (~370 MB → ~690 MB total) for several seconds per send.
-                // Backgrounding inside that window let iOS jetsam-SIGKILL the
-                // process (it reclaims high-memory background apps first), which
-                // looked like "the message stopped instantly / was never sent".
-                let attrs = try? fm.attributesOfItem(atPath: attachment.cacheURL.path)
-                // Preserve original file date if available (e.g. PHAsset creation date)
-                let fileDate: Date = (attrs?[.modificationDate] as? Date) ?? now
-                let fileSize = (attrs?[.size] as? Int) ?? 0
-
-                let safeName = Self.uniqueFileName(for: attachment.fileName, in: uploadsDir)
-                let destURL = uploadsDir.appendingPathComponent(safeName)
-                // Stream the file on disk (near-zero RAM) instead of materializing
-                // it as Data and writing it back out. copyItem won't overwrite, and
-                // uniqueFileName already guarantees a fresh name, so no clobber.
-                do {
-                    try fm.copyItem(at: attachment.cacheURL, to: destURL)
-                } catch {
-                    logger.error("📎[SEND-ASYNC]   FAILED to copy \(attachment.cacheURL.lastPathComponent) → \(destURL.path): \(error.localizedDescription)")
-                    continue
-                }
-                try? fm.setAttributes([.creationDate: fileDate, .modificationDate: fileDate], ofItemAtPath: destURL.path)
-                let linuxPath = "/var/minis/attachments/uploads/\(safeName)"
-                let meta = AttachmentMeta(path: linuxPath, size: fileSize, modified: fileDate)
-                attachmentMetas.append(meta)
-                logger.info("📎[SEND-ASYNC]   saved \(safeName): \(fileSize) bytes → \(linuxPath)")
-
-                // [T-ios-attachment-oom-bg-kill] Only IMAGES need the bytes in
-                // memory (for resize/compress/inline below). Non-image attachments
-                // are already persisted via the streaming copy above — never load
-                // them into RAM. Images are small (camera/screenshot/photo), so
-                // loading them here is bounded and safe.
-                guard attachment.kind == .image else { continue }
-                guard let data = try? Data(contentsOf: attachment.cacheURL) else {
-                    logger.error("📎[SEND-ASYNC]   image load failed (kept on disk) \(attachment.cacheURL.path)")
-                    continue
-                }
-
-                // For images: send a resized + size-budgeted copy to the
-                // model. Two budgets layered on top of the existing 20-image
-                // count cap:
-                //   1. Per-image: if the resize-to-2000px output is still
-                //      over 5 MB, run the compressor ladder (smaller edges,
-                //      lower JPEG quality) until it fits or until we've
-                //      shrunk it as far as we usefully can.
-                //   2. Per-message: cap cumulative inlined bytes at 20 MB.
-                //      Once that's hit, remaining images fall through to
-                //      the same text placeholder the count cap uses.
-                // T-imgsize-13b7d81c.
-                // (Reaching here implies .image — the non-image guard above
-                // already `continue`d. Kept as an explicit guard for clarity.)
-                if attachment.kind == .image {
-                    if inlinedImages < inlineBudget {
-                        let resized = await MainActor.run { Self.resizedImageData(data, maxLongEdge: 2000) } ?? data
-                        let compressed: Data = await MainActor.run {
-                            Self.compressedImageDataUnderBudget(resized, targetMaxBytes: Self.kPerImageMaxBytes).data
-                        }
-                        let stillOversize = compressed.count > Self.kPerImageMaxBytes
-                        let wouldOverflowMessage = (cumulativeImageBytes + compressed.count) > Self.kMessageImageMaxBytes
-                        if wouldOverflowMessage {
-                            // Drop to placeholder rather than risk a 413 on
-                            // the whole message — the user keeps the file on
-                            // disk and can still reference it via shell tools.
-                            let placeholder = Self.imagePlaceholderText(data: data, originalPath: linuxPath, snapshotPath: nil)
-                            userParts.append(.text(placeholder))
-                            logger.warning("📎[SEND-ASYNC]   image \(i) dropped to placeholder — cumulative \(cumulativeImageBytes) + this \(compressed.count) > \(Self.kMessageImageMaxBytes) message budget")
-                        } else {
-                            let ext = attachment.cacheURL.pathExtension.lowercased()
-                            let mime: String
-                            if compressed.count != data.count {
-                                // We re-encoded (resize or compressor ladder
-                                // ran). Output is always JPEG.
-                                mime = "image/jpeg"
-                            } else {
-                                switch ext {
-                                case "png":  mime = "image/png"
-                                case "gif":  mime = "image/gif"
-                                case "webp": mime = "image/webp"
-                                default:     mime = "image/jpeg"
-                                }
-                            }
-                            userParts.append(.text("[attached image: \(linuxPath)]"))
-                            userParts.append(.imageData(data: compressed, mimeType: mime, linuxPath: linuxPath))
-                            inlinedImages += 1
-                            cumulativeImageBytes += compressed.count
-                            logger.info("📎[SEND-ASYNC]   image \(inlinedImages)/\(inlineBudget) inlined: orig=\(data.count) resized=\(resized.count) final=\(compressed.count) cumulative=\(cumulativeImageBytes)/\(Self.kMessageImageMaxBytes) mime=\(mime) stillOversize=\(stillOversize)")
-                            if stillOversize {
-                                logger.warning("📎[SEND-ASYNC]   image \(i) still over per-image budget after compression ladder — Provider may 413; sent anyway")
-                            }
-                        }
-                    } else {
-                        let placeholder = Self.imagePlaceholderText(data: data, originalPath: linuxPath, snapshotPath: nil)
-                        userParts.append(.text(placeholder))
-                        logger.info("📎[SEND-ASYNC]   image not inlined (count budget \(inlineBudget) exhausted), placeholder for \(linuxPath)")
-                    }
-                }
-            }
-
-            // Clean up cached attachment files now that data has been copied
-            Self.cleanupAttachmentFiles(pendingAttachments)
-
-            // Update ChatMessage with structured attachment metadata for UI display
-            //
-            // [T-ios-user-attach-mount-invalidate] THIRD mount site. 988f67b8
-            // covered only the two queued-drain sites (both keyed on
-            // `queuedPromptId`); this is the ORDINARY send path, and it has the
-            // same two-phase birth: `messages.append(userMsg)` runs
-            // synchronously before this Task, so the message is inserted
-            // TEXT-ONLY and the tiles arrive here, one attachment-I/O later. If
-            // the cell's first real self-size lands in that window it caches a
-            // tile-less height, and without an invalidation pair the width-
-            // matched cell cache (b4268586) plus the streaming-window
-            // short-circuit (81e43b58) serve it for the rest of the turn —
-            // the truncated bubble with a seemingly detached tile.
-            //
-            // Field report 2026-08-09 (msg F70F81DD, image via the system share
-            // sheet) reproduced exactly this on a build where `AttachMount` had
-            // zero hits across the whole log: est=48 attachCount=0 at insert,
-            // est=118 attachCount=1 some 350ms later, and no idx=0 real measure
-            // in between. Share/voice sends widen the window precisely because
-            // they do more attachment I/O — which 988f67b8's own message called
-            // out while still leaving this site unpatched.
-            await MainActor.run {
-                userMsg.attachments = attachmentMetas
-                if !attachmentMetas.isEmpty {
-                    NotificationCenter.default.post(name: .minisUserAttachmentsMounted,
-                                                    object: userMsg.id)
-                }
-            }
-
-            // Build <user-attached-files> XML metadata for the model (no base64 data)
-            if !attachmentMetas.isEmpty {
-                var xml = "<user-attached-files>\n"
-                for meta in attachmentMetas {
-                    let modifiedStr = isoFormatter.string(from: meta.modified)
-                    xml += "  <file path=\"\(meta.path)\" url=\"\(meta.minisURL)\" size=\"\(meta.size)\" modified=\"\(modifiedStr)\" />\n"
-                }
-                xml += "</user-attached-files>"
-                userParts.append(.text(xml))
-            }
-
-            // Batch-reading tip when images were omitted
-            let totalImageAttachments = pendingAttachments.filter { $0.kind == .image }.count
-            if totalImageAttachments > inlinedImages {
-                let omitted = totalImageAttachments - inlinedImages
-                userParts.append(.text(
-                    "<system-reminder>Only \(inlinedImages) of \(totalImageAttachments) images are inlined above."
-                    + " The remaining \(omitted) are saved to disk — use read_image to view them."
-                    + " To stay within the context image limit (\(Self.kImageContextKeepCount)),"
-                    + " process images in batches: read a batch, analyze, then summarize your findings"
-                    + " before reading the next batch.</system-reminder>"
-                ))
-            }
-
-            if !text.isEmpty {
-                userParts.append(.text(text))
-            }
-            let userMessage = AgentMessage(role: .user, parts: userParts)
-            let userIdx = self.agentHistory.count
-            self.agentHistory.append(userMessage)
-
-            // Persist user message and write the DB id back into agentHistory so
-            // compact can later resolve boundaries by id.
-            if let persistedId = await self.persistAgentMessage(userMessage), userIdx < self.agentHistory.count {
-                self.agentHistory[userIdx].dbMessageId = persistedId
-            }
-
-            // Wait for kernel to finish booting
-            while self.kernelStatus == .booting {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            }
-
-            if case .failed(let msg) = self.kernelStatus {
-                self.errorMessage = "Kernel not available: \(msg)"
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-
-            // Concurrency gate: wait for a processing slot
-            let concurrency = SessionConcurrencyManager.shared
-            self.isSuspended = concurrency.runningSessions.count >= concurrency.maxConcurrent
-            do {
-                try await concurrency.acquireSlot(sessionId: sid)
-                self.isSuspended = false
-            } catch {
-                self.isSuspended = false
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-            defer { concurrency.releaseSlot(sessionId: sid) }
-
-            do {
-                // [T-perf-keyboard-yield-phase2] Wait for the keyboard dismissal
-                // animation to complete before kicking off heavy main-thread
-                // work (prompt assembly + orphan scan + effective history build).
-                //
-                // performSend() dismisses the keyboard (inputFocused=false +
-                // resignFirstResponder) right before calling vm.send(). The
-                // standard iOS keyboard slide-down animation takes ~250ms.
-                // A single Task.yield() (16ms / 1 frame) is not enough for
-                // DeepMode long sessions where runAgentLoop setup blocks the
-                // main thread for 100–400ms — the animation freezes mid-way
-                // ("底部空了", input bar left floating).
-                //
-                // Attachment processing above runs concurrently, so the
-                // effective wait is often shorter than 250ms (file I/O
-                // overlaps with the keyboard animation). This sleep only
-                // pads the remaining time to ensure the animation finishes
-                // before we saturate the main thread.
-                //
-                // Zero impact on retry/resume/auto-continue: those paths call
-                // runAgentLoop() directly and do not go through send().
-                try await Task.sleep(nanoseconds: 250_000_000)
-
-                try await self.runAgentLoop()
-            } catch is CancellationError {
-                logger.info("Agent loop cancelled")
-                self.handleUserCancelledCleanup()
-            } catch {
-                let rawDesc = String(describing: error)
-                logger.error("Agent loop error: \(rawDesc)")
-                if let llmErr = error as? LLMError {
-                    logger.error("Agent loop LLMError detail: \(llmErr.errorDescription ?? "nil")")
-                }
-                if self.userDidCancel {
-                    self.handleUserCancelledCleanup()
-                } else {
-                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
-                    // [T-ios-retry-tool-blocks-invisible / T-stream-empty-banner-trace]
-                    // Resolve the streaming assistant by the last ASSISTANT row,
-                    // not messages.last. A queued .user message (enqueuePrompt
-                    // appends one mid-tool) sits AFTER the candidate, so
-                    // messages.last would be that user row — the error then fell
-                    // through to the top red banner (vm.errorMessage) instead of
-                    // attaching to the assistant bubble. Same root cause as the
-                    // Stop-loses-content fix.
-                    if let last = self.messages.last(where: { $0.role == .assistant }) {
-                        last.error = displayDesc
-                        last.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
-                        // Cancel stale tool blocks left in streaming/running state
-                        for block in last.blocks {
-                            if case .streaming = block.toolStatus { block.toolStatus = .cancelled }
-                            else if case .running = block.toolStatus { block.toolStatus = .cancelled }
-                        }
-                        Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
-                    } else {
-                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
-                    }
-                }
-            }
-            // If the user tapped Stop while the loop was finishing, still mark as interrupted.
-            if self.userDidCancel { self.handleUserCancelledCleanup() }
-
-            // [T-stop-with-queue-render-desync] Stop hands ownership to cancel():
-            // it already set isProcessing=false / endBackgroundProcessing(), and
-            // with queued prompts it spawned a fresh drain task that sets
-            // isProcessing=true for the continued run. Running this epilogue from
-            // the superseded task would drain concurrently and force
-            // isProcessing=false mid-run — the chat stops rendering the live tool
-            // loop while the preview bar / Live Activity keep updating.
-            guard !Task.isCancelled else {
-                logger.info("🔄SESSION [vm=\(self.vmInstanceId)] send epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
-                return
-            }
-
-            await self.drainQueuedPrompts()
-
-            // Refresh lastKnownDbSortOrder from the actual DB so iCloud sync
-            // doesn't mistake our own persisted messages for remote ones.
-            // The in-memory += 1 tracking can drift if messages are batched or retried.
-            if let sid = self.sessionId {
-                let dbMessages = await ChatStore.shared.loadMessages(sessionId: sid)
-                self.lastKnownDbSortOrder = dbMessages.last?.sortOrder ?? self.lastKnownDbSortOrder
-                self.lastKnownDbCount = dbMessages.count
-                // T-baseline-hash-drift: also refresh lastKnownDbOrderHash —
-                // otherwise reloadMessagesFromDB's hasReorderedMessages check
-                // sees the old (pre-INSERT) hash vs the new (post-INSERT)
-                // row set, flags a fake reorder, and fires loadSession()
-                // (spinner ON ~460ms) on the next iCloud fetch notification.
-                self.lastKnownDbOrderHash = Self.computeOrderHash(of: dbMessages)
-            }
-
-            logger.info("🔄SESSION [vm=\(self.vmInstanceId)] send DONE session=\(self.sessionId ?? "nil")")
-            self.playCompletionHaptic()
-            self.isProcessing = false
-            self.endBackgroundProcessing()
-        }
-    }
-
-    /// Retry the next agent loop iteration (continue from where the error occurred,
-    /// keeping all previously completed tool blocks and conversation history).
-    func retry() {
-        guard !isProcessing else { return }
-        guard let lastMsg = messages.last, lastMsg.role == .assistant else { return }
-
-        autoRetryAttempt = 0
-        autoRetryCountdown = 0
-        canResume = false
-        userDidCancel = false
-
-        // Clear the error on the existing assistant message
-        lastMsg.error = nil
-        lastMsg.streamInterruptCount = 0
-
-        // Remove blocks from the incomplete/interrupted iteration.
-        // committedBlockCount tracks how many blocks were fully committed before the
-        // interruption. Anything beyond that is partial streaming content that should
-        // be discarded so the retry starts cleanly from the last committed state.
-        //
-        // [T-ios-retry-wipes-prior-text] Use clearUncommittedStreamTail instead of a
-        // blind `removeSubrange(committedBlockCount...)`. committedBlockCount is a
-        // shared instance property; error-interrupted (non-cancel) paths don't update
-        // it, so on retry it can LAG behind the message's actual committed+persisted
-        // block count. A blind removeSubrange then wipes already-committed non-empty
-        // text/terminal-tool blocks the user had on screen (the "retry makes all prior
-        // output vanish" report; DB intact since retry only mutates the in-memory
-        // array). The shared helper drops only the uncommitted tail's partial text +
-        // streaming/running tools and ALWAYS keeps non-empty text and terminal tool
-        // results — identical to the blind trim in the normal case (tail is empty/
-        // partial text + in-flight tools), but it never removes committed output.
-        AppLogger(category: "RetryDiag").info("[RetryDiag] retry() pre-trim committedBlockCount=\(self.committedBlockCount) blocks=\(lastMsg.blocks.count) kinds=[\(lastMsg.blocks.map { $0.kind == .text ? "t\($0.content.isEmpty ? "0" : "\($0.content.count)")" : "tool(\($0.toolStatus.map { String(describing: $0) } ?? "nil"))" }.joined(separator: ","))]")
-        Self.clearUncommittedStreamTail(lastMsg, committedBlockCount: committedBlockCount)
-        // Also remove any trailing empty text blocks left by prior iterations
-        lastMsg.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
-
-        // [T-error-persist-retry-clear-ios] Also clear the PERSISTED error_info,
-        // and do it BEFORE agentHistory.removeLast() below severs the only link
-        // to the stalled row's dbMessageId. `lastMsg.error = nil` above only
-        // clears the in-memory banner: the DB row written by persistErrorInfo at
-        // stall time kept its error_info, because the resumed loop persists its
-        // turns into NEW rows (the loop-end unconditional error write at
-        // [T-error-persist-ios] edge #5 keys off the NEW persistedId, never the
-        // orphaned old row). Observed on device (GH#181 family): a DeepSeek
-        // stream died silently mid-turn (no finish/[DONE]), the 120s stall
-        // watchdog fired and persisted the error, retry() resumed and the
-        // conversation completed — but the next session load re-materialised
-        // the stale banner from the DB, mid-way through a visibly finished
-        // conversation (row: created==updated, untouched since the stall).
-        if let staleDbId = agentHistory.last(where: { $0.role == .assistant && $0.dbMessageId != nil })?.dbMessageId {
-            Task { await ChatStore.shared.updateMessageErrorInfo(messageId: staleDbId, errorInfo: nil) }
-            logger.info("[ErrorPersist] retry() clearing persisted error_info on msg=\(staleDbId.prefix(8))")
-        }
-
-        // Roll back only the last failed assistant entry from conversation history.
-        // The history at this point looks like:
-        //   ... user(tool_results) assistant(failed/partial)
-        // We need to remove just the trailing assistant entry so the API call retries
-        // with the tool results as the last message.
-        if agentHistory.last?.role == .assistant {
-            agentHistory.removeLast()
-        }
-
-        // Clean orphaned tool_results that reference tool_uses no longer in history.
-        // This fixes API 400: "unexpected tool_use_id found in tool_result blocks"
-        // which occurs after partial cancellation or interrupted streaming.
-        var allRetryToolUseIds = Set<String>()
-        for msg in agentHistory { for part in msg.parts {
-            if case .toolUse(let id, _, _) = part { allRetryToolUseIds.insert(id) }
-        }}
-        for i in (0..<agentHistory.count).reversed() {
-            guard agentHistory[i].role == .user else { continue }
-            let cleaned = agentHistory[i].parts.filter { part in
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part { return allRetryToolUseIds.contains(id) }
-                return true
-            }
-            if cleaned.isEmpty { agentHistory.remove(at: i) }
-            else if cleaned.count < agentHistory[i].parts.count {
-                agentHistory[i] = AgentMessage(role: .user, parts: cleaned)
-            }
-        }
-
-        let existingMsgIdx = messages.count - 1
-        let existingBlockCount = lastMsg.blocks.count
-        errorMessage = nil
-        isProcessing = true
-        isNearBottom = true
-        forceScrollToBottom.send()
-
-        ensureKernelBooted()
-        beginBackgroundProcessing()
-
-        currentTask = Task { [weak self] in
-            guard let self else { return }
-
-            while self.kernelStatus == .booting {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            if case .failed(let msg) = self.kernelStatus {
-                self.errorMessage = "Kernel not available: \(msg)"
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-
-            // Concurrency gate: wait for a processing slot
-            let retrySid = self.sessionId ?? "unknown"
-            let concurrency = SessionConcurrencyManager.shared
-            self.isSuspended = concurrency.runningSessions.count >= concurrency.maxConcurrent
-            do {
-                try await concurrency.acquireSlot(sessionId: retrySid)
-                self.isSuspended = false
-            } catch {
-                self.isSuspended = false
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-            defer { concurrency.releaseSlot(sessionId: retrySid) }
-
-            do {
-                try await self.runAgentLoop(resumingAt: existingMsgIdx, committedBlocks: existingBlockCount)
-            } catch is CancellationError {
-                logger.info("Agent loop cancelled (retry)")
-                self.handleUserCancelledCleanup()
-            } catch {
-                let rawDesc = String(describing: error)
-                logger.error("Agent loop error (retry): \(rawDesc)")
-                if let llmErr = error as? LLMError {
-                    logger.error("Agent loop LLMError detail: \(llmErr.errorDescription ?? "nil")")
-                }
-                if self.userDidCancel {
-                    self.handleUserCancelledCleanup()
-                } else {
-                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
-                    // [T-ios-retry-tool-blocks-invisible / T-stream-empty-banner-trace]
-                    // Resolve the streaming assistant by the last ASSISTANT row,
-                    // not messages.last. A queued .user message (enqueuePrompt
-                    // appends one mid-tool) sits AFTER the candidate, so
-                    // messages.last would be that user row — the error then fell
-                    // through to the top red banner (vm.errorMessage) instead of
-                    // attaching to the assistant bubble. Same root cause as the
-                    // Stop-loses-content fix.
-                    if let last = self.messages.last(where: { $0.role == .assistant }) {
-                        last.error = displayDesc
-                        Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
-                        last.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
-                        for block in last.blocks {
-                            if case .streaming = block.toolStatus { block.toolStatus = .cancelled }
-                            else if case .running = block.toolStatus { block.toolStatus = .cancelled }
-                        }
-                    } else {
-                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
-                    }
-                }
-            }
-            if self.userDidCancel { self.handleUserCancelledCleanup() }
-            // [T-stop-with-queue-render-desync] See send(): Stop's cancel() owns
-            // state teardown; a superseded task must not drain or flip isProcessing.
-            guard !Task.isCancelled else {
-                logger.info("🔄SESSION [vm=\(self.vmInstanceId)] retry epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
-                return
-            }
-            await self.drainQueuedPrompts()
-            logger.info("🔄SESSION [vm=\(self.vmInstanceId)] retry DONE session=\(self.sessionId ?? "nil")")
-            self.playCompletionHaptic()
-            self.isProcessing = false
-            self.endBackgroundProcessing()
-        }
-    }
-
-    /// Resume an interrupted agent loop. Injects a "Continue" user message
-    /// into agentHistory so the model knows to pick up where it left off.
-    func resume() {
-        guard !isProcessing, canResume else { return }
-        guard let lastMsg = messages.last else { return }
-
-        // [T-ios-orphan-user-tail GH#262/#263] A tail of "user turn with no
-        // reply at all" (process died before assistant content reached the
-        // store) needs a different resume path — there is nothing partial to
-        // continue, so we start a fresh assistant turn instead.
-        if lastMsg.role == .user {
-            resumeUnansweredUserTurn()
-            return
-        }
-        guard lastMsg.role == .assistant else { return }
-
-        // [T-perf-estimate-incremental] Do NOT invalidate the estimate cache
-        // here. The incremental cache handles the resume case (agentHistory
-        // grew by the continue-reminder message) in O(delta) instead of O(n).
-        // Compaction/offloading already invalidate the cache when they mutate
-        // agentHistory. Removing this avoids a full O(n) recompute on every
-        // resume — the primary cause of pause/resume lag on long sessions.
-
-        // [T-deep-mode-resume-log] Log resume trigger with workflow state
-        logger.info("[WorkflowLog] resume() called - workflowPhase=\(workflowPhase) canResume=\(canResume) stepsCount=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft)")
-        
-        // [T-deep-mode-resume-opt] Check if we have saved state from pause.
-        // [fix] Guard on deepModeEnabled: if the master switch was turned
-        // off while paused, deepModeDidDisableCleanup already cleared
-        // savedWorkflowState, so this branch is unreachable in normal flow.
-        // The guard is defensive — if a race somehow left savedWorkflowState
-        // non-nil after the switch-off, we must NOT restore workflow UI state
-        // (phase / steps / verifyRoundsLeft) that contradicts a disabled
-        // deep mode. That would violate the total-switch contract.
-        // [T-deep-mode-session-workflow] P2: restore only when session-scoped
-        // workflow is active. The guard on deepModeEnabled stays (if the master
-        // switch was turned off while paused, deepModeDidDisableCleanup already
-        // cleared savedWorkflowState); adding keepSessionWorkflow means in
-        // Fallback mode (rollback switch off) we never re-materialize a workflow
-        // the legacy behavior would not have.
-        if let saved = savedWorkflowState, sessionWorkflowEnabled {
-            logger.info("[WorkflowLog] resume() - using saved state, skipping re-evaluation")
-            workflowPhase = saved.phase
-            workflowSteps = saved.steps
-            verifyRoundsLeft = saved.verifyRoundsLeft
-            goalRunnerRoundsLeft = saved.goalRunnerRoundsLeft
-            savedWorkflowState = nil
-        } else if savedWorkflowState != nil {
-            // Session workflow is off (deep mode disabled or rollback switch
-            // off) while we had saved state — discard it and reset the workflow
-            // tracker. [T-deep-mode-session-workflow] Audit H2: previously this
-            // only cleared the snapshot, leaving phase/steps/tracker alive so the
-            // capsule kept rendering in a fallback (legacy) run. resetWorkflow()
-            // is the true legacy exit — it also clears steps/phase/verify budget.
-            logger.info("[WorkflowLog] resume() - discarding saved workflow state (session workflow off)")
-            resetWorkflow()
-        }
-
-        canResume = false
-        userDidCancel = false
-
-        // Safety: trim any uncommitted blocks (should be no-op with new cancel flow).
-        // [T-ios-retry-wipes-prior-text] Same fix as retry(): the blind
-        // removeSubrange(committedBlockCount...) here wiped committed post-tool text
-        // when committedBlockCount lagged (the warning below literally predicted it).
-        // clearUncommittedStreamTail preserves non-empty text + terminal tools while
-        // still dropping the uncommitted partial/streaming tail.
-        if committedBlockCount < lastMsg.blocks.count {
-            logger.info("⏹️[StopDiag] resume() pre-trim committed=\(self.committedBlockCount) blocks=\(lastMsg.blocks.count) — preserving committed text/tools via clearUncommittedStreamTail")
-            Self.clearUncommittedStreamTail(lastMsg, committedBlockCount: committedBlockCount)
-        } else {
-            logger.info("⏹️[StopDiag] resume() no trim (committed=\(self.committedBlockCount) >= blocks=\(lastMsg.blocks.count))")
-        }
-
-        // Mark any remaining tool blocks with nil status as cancelled
-        for block in lastMsg.blocks {
-            if block.toolStatus == nil, block.kind != .text {
-                block.toolStatus = .cancelled
-            }
-        }
-
-        // Inject a "Continue" user message only when history ends with assistant
-        // (Case 2a: text streaming cancel). For Case 1 (tool cancel), history already
-        // ends with tool_result (user role) and is valid for the next API call.
-        if agentHistory.last?.role == .assistant {
-            let continueMsg = AgentMessage(role: .user, parts: [
-                .text("<system-reminder>The user stopped the previous response but now wants to continue. Pick up exactly where you left off.</system-reminder>")
-            ])
-            let continueIdx = agentHistory.count
-            agentHistory.append(continueMsg)
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let pid = await self.persistAgentMessage(continueMsg), continueIdx < self.agentHistory.count {
-                    self.agentHistory[continueIdx].dbMessageId = pid
-                }
-            }
-        }
-
-        let existingMsgIdx = messages.count - 1
-        let existingBlockCount = lastMsg.blocks.count
-        errorMessage = nil
-        isProcessing = true
-
-        ensureKernelBooted()
-        beginBackgroundProcessing()
-
-        currentTask = Task { [weak self] in
-            guard let self else { return }
-
-            while self.kernelStatus == .booting {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            if case .failed(let msg) = self.kernelStatus {
-                self.errorMessage = "Kernel not available: \(msg)"
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-
-            let resumeSid = self.sessionId ?? "unknown"
-            let concurrency = SessionConcurrencyManager.shared
-            self.isSuspended = concurrency.runningSessions.count >= concurrency.maxConcurrent
-            do {
-                try await concurrency.acquireSlot(sessionId: resumeSid)
-                self.isSuspended = false
-            } catch {
-                self.isSuspended = false
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-            defer { concurrency.releaseSlot(sessionId: resumeSid) }
-
-            do {
-                try await self.runAgentLoop(resumingAt: existingMsgIdx, committedBlocks: existingBlockCount)
-            } catch is CancellationError {
-                logger.info("Agent loop cancelled (resume)")
-                self.handleUserCancelledCleanup()
-            } catch {
-                let rawDesc = String(describing: error)
-                logger.error("Agent loop error (resume): \(rawDesc)")
-                if let llmErr = error as? LLMError {
-                    logger.error("Agent loop LLMError detail: \(llmErr.errorDescription ?? "nil")")
-                }
-                if self.userDidCancel {
-                    self.handleUserCancelledCleanup()
-                } else {
-                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
-                    // [T-ios-retry-tool-blocks-invisible / T-stream-empty-banner-trace]
-                    // Resolve the streaming assistant by the last ASSISTANT row,
-                    // not messages.last. A queued .user message (enqueuePrompt
-                    // appends one mid-tool) sits AFTER the candidate, so
-                    // messages.last would be that user row — the error then fell
-                    // through to the top red banner (vm.errorMessage) instead of
-                    // attaching to the assistant bubble. Same root cause as the
-                    // Stop-loses-content fix.
-                    if let last = self.messages.last(where: { $0.role == .assistant }) {
-                        last.error = displayDesc
-                        Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
-                        last.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
-                        for block in last.blocks {
-                            if case .streaming = block.toolStatus { block.toolStatus = .cancelled }
-                            else if case .running = block.toolStatus { block.toolStatus = .cancelled }
-                        }
-                    } else {
-                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
-                    }
-                }
-            }
-            if self.userDidCancel { self.handleUserCancelledCleanup() }
-            // [T-stop-with-queue-render-desync] See send(): Stop's cancel() owns
-            // state teardown; a superseded task must not drain or flip isProcessing.
-            guard !Task.isCancelled else {
-                logger.info("🔄SESSION [vm=\(self.vmInstanceId)] resume epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
-                return
-            }
-            await self.drainQueuedPrompts()
-            logger.info("🔄SESSION [vm=\(self.vmInstanceId)] resume DONE session=\(self.sessionId ?? "nil")")
-            self.playCompletionHaptic()
-            self.isProcessing = false
-            self.endBackgroundProcessing()
-        }
-    }
-
-    /// [T-ios-orphan-user-tail GH#262/#263] Ask for the reply to a user turn
-    /// that never got one.
-    ///
-    /// Reached only from `resume()`, and only for the tail shape described in
-    /// `recheckCanResumeFromHistory` — the user message was persisted, then the
-    /// process died (backgrounded app reclaimed by iOS) before any assistant
-    /// content reached the store. There is no partial reply to continue, so
-    /// this deliberately does NOT reuse resume()'s machinery:
-    ///
-    ///   * no `<system-reminder>` "the user stopped the previous response" turn
-    ///     is injected. That text describes a USER cancelling mid-reply; here
-    ///     the reply never began, and telling the model otherwise would make it
-    ///     apologise for or "pick up" something that does not exist. It is also
-    ///     unnecessary — agentHistory already ends with a user turn, which is
-    ///     exactly the shape the API expects.
-    ///   * `resumingAt` is nil, so runAgentLoop appends a FRESH assistant row
-    ///     rather than resuming into one (there is none to resume into).
-    ///
-    /// The result is that Resume on this session means "answer my last
-    /// message", which is what the user is actually asking for.
-    private func resumeUnansweredUserTurn() {
-        guard let lastUser = messages.last, lastUser.role == .user else { return }
-        logger.info("[OrphanTail] resume on unanswered user turn — requesting a fresh reply session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count)")
-
-        // Same origin marker as retry()/resume(): this turn was started by the
-        // user re-running an old message, so the auto-focus observer must not
-        // treat its completion as "a reply arrived". [T-ios-retry-keyboard]
-        turnStartedByRetry = true
-
-        canResume = false
-        userDidCancel = false
-        errorMessage = nil
-        // Nothing partial to preserve, so the resume()/retry() block-trimming
-        // has no counterpart here: the new reply starts from an empty row.
-        committedBlockCount = 0
-        isProcessing = true
-        isNearBottom = true
-        forceScrollToBottom.send()
-
-        ensureKernelBooted()
-        beginBackgroundProcessing()
-
-        currentTask = Task { [weak self] in
-            guard let self else { return }
-
-            while self.kernelStatus == .booting {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            if case .failed(let msg) = self.kernelStatus {
-                self.errorMessage = "Kernel not available: \(msg)"
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-
-            let sid = self.sessionId ?? "unknown"
-            let concurrency = SessionConcurrencyManager.shared
-            self.isSuspended = concurrency.runningSessions.count >= concurrency.maxConcurrent
-            do {
-                try await concurrency.acquireSlot(sessionId: sid)
-                self.isSuspended = false
-            } catch {
-                self.isSuspended = false
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-            defer { concurrency.releaseSlot(sessionId: sid) }
-
-            do {
-                try await self.runAgentLoop()
-            } catch is CancellationError {
-                logger.info("Agent loop cancelled (orphan-tail resume)")
-                self.handleUserCancelledCleanup()
-            } catch {
-                let rawDesc = String(describing: error)
-                logger.error("Agent loop error (orphan-tail resume): \(rawDesc)")
-                if self.userDidCancel {
-                    self.handleUserCancelledCleanup()
-                } else {
-                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
-                    // runAgentLoop appended the assistant row, so this attaches
-                    // to the bubble; reportTurnFailure is the fallback for the
-                    // window before that append. [T-ios-error-banner-lost]
-                    if let last = self.messages.last(where: { $0.role == .assistant }) {
-                        last.error = displayDesc
-                        Task { await self.persistErrorInfo(displayDesc) }
-                        last.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
-                    } else {
-                        self.reportTurnFailure(displayDesc)
-                    }
-                }
-            }
-            if self.userDidCancel { self.handleUserCancelledCleanup() }
-            guard !Task.isCancelled else {
-                logger.info("🔄SESSION [vm=\(self.vmInstanceId)] orphan-tail resume epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
-                return
-            }
-            await self.drainQueuedPrompts()
-            logger.info("🔄SESSION [vm=\(self.vmInstanceId)] orphan-tail resume DONE session=\(self.sessionId ?? "nil")")
-            self.playCompletionHaptic()
-            self.isProcessing = false
-            self.endBackgroundProcessing()
-        }
-    }
-
-    /// Retry from a specific user message: roll back UI and history to the state
-    /// just after that user message was sent, then re-run the agent loop.
-    /// [T-ios-retry-anchor-synthetic-user] True when this agentHistory entry
-    /// corresponds to a user bubble in `messages`. The agent loop also appends
-    /// user-role entries that have NO bubble: pure tool_result carriers, the
-    /// resume() stop-continue `<system-reminder>` message (see resume()), and
-    /// the browser-takeover note (text + screenshot, AIChatViewModel+
-    /// BackgroundTask.waitIfBrowserTakeover). Counting those against the UI
-    /// bubble ordinal made retry/edit truncation anchor one user message too
-    /// early — silently dropping the retried message plus the whole last turn,
-    /// so the model "re-answered" the previous instruction instead.
-    /// A user entry counts as a bubble iff it carries user-visible payload:
-    /// a non-synthetic text part, or a non-tool payload (image/attachment)
-    /// not accompanied by synthetic text.
-    static func isUserBubbleEntry(_ entry: AgentMessage) -> Bool {
-        guard entry.role == .user else { return false }
-        var hasVisibleText = false
-        var hasSyntheticText = false
-        var hasNonToolPayload = false
-        for part in entry.parts {
-            switch part {
-            case .text(let t):
-                let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty { continue }
-                if trimmed.hasPrefix("<system-reminder>") || trimmed.hasPrefix("[Browser takeover]") {
-                    hasSyntheticText = true
-                } else {
-                    hasVisibleText = true
-                }
-            case .imageData:
-                hasNonToolPayload = true
-            case .toolUse, .toolResult:
-                continue
-            }
-        }
-        return hasVisibleText || (hasNonToolPayload && !hasSyntheticText)
-    }
-
-    func retryFromMessage(_ messageId: UUID, replacementAttachments: [InputAttachment]? = nil) {
-        guard !isProcessing else { return }
-        // [T-ios-retry-keyboard] Mark this turn as retry-initiated so the UI
-        // can skip the "reply arrived → auto-focus composer" behavior.
-        turnStartedByRetry = true
-        // [T-ios-retry-usermsg-vanish] Guard the whole truncation window so a
-        // deferred iCloud-sync reload can't rebuild `messages` from a
-        // mid-truncation DB snapshot and drop the retried user message. Cleared
-        // once the DB truncation Task below finishes; isProcessing=true (set in
-        // launchRerunAgentLoop) keeps suppressing reloads afterward.
-        isTruncatingForRetry = true
-        canResume = false
-        userDidCancel = false
-        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
-              messages[idx].role == .user else {
-            isTruncatingForRetry = false
-            return
-        }
-
-        // Remove everything AFTER the selected user message (keep the user message itself)
-        if idx + 1 < messages.count {
-            messages.removeSubrange((idx + 1)...)
-        }
-        // [T-ios-retry-ui-clear] symmetric with retryFromToolBlock's paths —
-        // force a top-level publish so the UI clears synchronously on this
-        // tick. The vm.$messages sink already fires off-tick (main-queue
-        // receive), so without this the stale cells linger one runloop.
-        if !transitionSuspended { objectWillChange.send() }
-        AppLogger(category: "RetryDiag").info("[RetryDiag] retryFromMessage truncated userIdx=\(idx) messagesCount=\(self.messages.count)")
-
-        // Trim agentHistory: count how many user BUBBLES (not synthetic
-        // user-role entries — see isUserBubbleEntry) up to and including this
-        // one, then find the matching entry in agentHistory and remove
-        // everything after it.
-        let targetUserCount = messages[...idx].filter { $0.role == .user }.count
-        var usersSeen = 0
-        var keepUpTo = -1  // index of the last entry to keep (inclusive)
-        for (i, entry) in agentHistory.enumerated() {
-            if Self.isUserBubbleEntry(entry) {
-                usersSeen += 1
-            }
-            if usersSeen == targetUserCount {
-                keepUpTo = i
-                break
-            }
-        }
-        // [T-ios-retry-anchor-synthetic-user] Fail OPEN on a UI↔history
-        // mismatch: anchor to the end (truncation becomes a no-op) and let the
-        // rerun proceed with full history. Keeping too much is recoverable;
-        // the old behavior (keepUpTo = 0) silently nuked the session down to
-        // one entry.
-        if keepUpTo < 0 {
-            logger.error("[RetryDiag] retryFromMessage anchor NOT FOUND (targetUserCount=\(targetUserCount), history=\(self.agentHistory.count)) — keeping full history")
-            keepUpTo = agentHistory.count - 1
-        }
-        // Keep entries 0...keepUpTo, remove the rest
-        if keepUpTo + 1 < agentHistory.count {
-            agentHistory.removeSubrange((keepUpTo + 1)...)
-        }
-
-        // Replace attachments in the last user message of agentHistory if new ones are provided
-        if let newAttachments = replacementAttachments, !newAttachments.isEmpty {
-            let uploadsDir = Self.minisUploadsDir(for: sessionId ?? "draft")
-            let fm = FileManager.default
-            try? fm.createDirectory(at: uploadsDir, withIntermediateDirectories: true)
-            let nowStr = ISO8601DateFormatter().string(from: Date())
-            let (newParts, newMetas) = processAttachments(newAttachments, uploadsDir: uploadsDir, nowStr: nowStr)
-            Self.cleanupAttachmentFiles(newAttachments)
-
-            // Replace parts in the last user agentHistory entry:
-            // keep only .text parts that are NOT <user-attached-files>, then append new parts
-            if !agentHistory.isEmpty {
-                var lastEntry = agentHistory[keepUpTo]
-                let filteredParts = lastEntry.parts.filter { part in
-                    if case .text(let t) = part, t.contains("<user-attached-files>") { return false }
-                    if case .imageData = part { return false }
-                    return true
-                }
-                lastEntry.parts = filteredParts + newParts
-                agentHistory[keepUpTo] = lastEntry
-            }
-
-            // Update the ChatMessage's attachments for display
-            messages[idx].attachments = newMetas
-            // [T-ios-user-attach-mount-invalidate] FOURTH mount site. Unlike the
-            // send/drain sites this one has no two-phase race — it rewrites the
-            // attachments of an EXISTING message — but that is precisely why it
-            // needs the pair: the cell has certainly measured and cached a
-            // height by now, and swapping the tile set is an in-place height
-            // change on an item whose identity does not move, so the cached
-            // value would be served until something else forced a relayout.
-            if !newMetas.isEmpty {
-                NotificationCenter.default.post(name: .minisUserAttachmentsMounted,
-                                                object: messages[idx].id)
-            }
-        }
-
-        // Trim persisted messages to match.
-        // Phase B: agentHistory is no longer mutated by compact, so keepCount is valid.
-        let persistedKeepCount = agentHistory.count
-        let hasMarkerResend = cachedLatestMarker != nil
-        logger.info("[DeleteAfter] resend path: sid=\(sessionId?.prefix(8) ?? "nil") keepCount=\(persistedKeepCount) hasMarker=\(hasMarkerResend)")
-        if let sessionId {
-            Task { @MainActor [weak self] in
-                await ChatStore.shared.deleteMessagesAfter(sessionId: sessionId, keepCount: persistedKeepCount)
-                // DB truncation done — the truncation window is closed. By now
-                // launchRerunAgentLoop has set isProcessing=true, so reloads
-                // stay suppressed through the rerun; this just releases the
-                // retry-specific guard.
-                self?.isTruncatingForRetry = false
-            }
-        } else {
-            isTruncatingForRetry = false
-        }
-
-        rebuildToolSnapshotsFromMessages()
-        launchRerunAgentLoop(label: "retryFromMessage")
-    }
-
-    /// Delete the selected user message and every message after it.
-    ///
-    /// Truncation rules are the same as retry — the anchor must be a user
-    /// bubble, and history is trimmed by user-bubble count rather than array
-    /// index, so tool_use/tool_result pairs stay intact.
-    ///
-    /// The one difference from retry: the anchor user message is removed too
-    /// (`keepUpTo - 1`), so the surviving history ends on the PREVIOUS
-    /// assistant turn — still a valid, self-consistent context.
-    func deleteFromMessage(_ messageId: UUID) {
-        guard !isProcessing else { return }
-        // Same truncation guard as retry: a deferred iCloud-sync reload landing
-        // mid-truncation would rebuild `messages` from a stale DB snapshot and
-        // resurrect the rows we are deleting. Unlike retry there is no
-        // `isProcessing = true` afterwards to keep suppressing reloads, so this
-        // flag must stay set until the DB delete has actually committed.
-        isTruncatingForRetry = true
-        canResume = false
-        userDidCancel = false
-        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
-              messages[idx].role == .user else {
-            isTruncatingForRetry = false
-            return
-        }
-
-        let deletedCount = messages.count - idx
-
-        // Remove the selected user message AND everything after it.
-        messages.removeSubrange(idx...)
-        // [T-ios-retry-ui-clear] Force a top-level publish so the cells clear on
-        // this tick; the $messages sink alone fires off-tick.
-        if !transitionSuspended { objectWillChange.send() }
-
-        // Anchor in agentHistory by user-bubble count, exactly as retry does.
-        // `messages` is already truncated, so its remaining .user rows are
-        // precisely the bubbles that must survive; the deleted bubble is the
-        // (keepUserCount + 1)-th one in agentHistory, and we keep everything
-        // strictly before it.
-        // The bubble being deleted is the (keepUserCount + 1)-th in
-        // agentHistory. Find its index and keep everything strictly before it;
-        // that index IS the cut point whether or not more bubbles follow.
-        let keepUserCount = messages.filter { $0.role == .user }.count
-        var usersSeen = 0
-        var keepUpTo = -1  // index of the last agentHistory entry to keep
-        var anchorFound = false
-        for (i, entry) in agentHistory.enumerated() where Self.isUserBubbleEntry(entry) {
-            usersSeen += 1
-            if usersSeen == keepUserCount + 1 {
-                keepUpTo = i - 1
-                anchorFound = true
-                break
-            }
-        }
-        // [T-ios-retry-anchor-synthetic-user] Fail OPEN on a UI↔history
-        // mismatch, same as retry: keep the full history rather than silently
-        // nuking the session. The UI + DB still truncate, so the worst case is
-        // an over-long context, not a corrupt one. Deleting the FIRST user
-        // bubble legitimately yields keepUpTo = -1 with anchorFound = true —
-        // that clears the whole history and is not an error.
-        if !anchorFound {
-            logger.error("[DeleteDiag] deleteFromMessage anchor NOT FOUND (keepUserCount=\(keepUserCount), history=\(self.agentHistory.count)) — keeping full history")
-            keepUpTo = agentHistory.count - 1
-        }
-        if keepUpTo + 1 < agentHistory.count {
-            agentHistory.removeSubrange((keepUpTo + 1)...)
-        }
-
-        logger.info("[DeleteDiag] deleteFromMessage idx=\(idx) deleted=\(deletedCount) messagesLeft=\(self.messages.count) historyLeft=\(self.agentHistory.count)")
-
-        let persistedKeepCount = agentHistory.count
-        if let sessionId {
-            Task { @MainActor [weak self] in
-                await ChatStore.shared.deleteMessagesAfter(sessionId: sessionId, keepCount: persistedKeepCount)
-                self?.isTruncatingForRetry = false
-            }
-        } else {
-            isTruncatingForRetry = false
-        }
-
-        rebuildToolSnapshotsFromMessages()
-    }
-
-    /// Rebuild `toolSnapshots` to only those still referenced by a tool_use
-    /// block in the (post-truncation) messages list. Shared by the user-
-    /// message retry path and the tool-block re-run path.
-    private func rebuildToolSnapshotsFromMessages() {
-        toolSnapshots = messages
-            .filter { $0.role == .assistant }
-            .flatMap { msg in
-                msg.blocks.compactMap { block -> ToolSnapshotItem? in
-                    guard let tuId = block.toolUseId else { return nil }
-                    return toolSnapshots.first(where: { $0.id == tuId })
-                }
-            }
-    }
-
-    /// Shared re-run tail used by retryFromMessage and retryFromToolBlock:
-    /// reset transient UI state, flip isProcessing, boot the kernel, and
-    /// launch the agent loop on `currentTask`. Caller must have already
-    /// truncated messages / agentHistory / persisted rows to the desired
-    /// re-entry point. [T-ios-rerun-from-tool-block-position]
-    ///
-    /// `resumeAt`/`resumeBlocks`: when the truncated tail still ends in an
-    /// assistant message that the new generation should CONTINUE (the
-    /// block-boundary re-run keeps the surviving earlier blocks of that
-    /// turn), pass its index + surviving block count so runAgentLoop reuses
-    /// it instead of appending a fresh assistant message — otherwise the UI
-    /// shows two consecutive assistant headers (the trimmed turn + the new
-    /// stream). The user-message retry path leaves `messages.last` as the
-    /// user message and passes nil, so a fresh assistant is appended as
-    /// before. [T-ios-retry-double-header]
-    ///
-    /// Immediate thinking UI [T-ios-retry-thinking-ui]: the agent loop's own
-    /// assistant-message creation runs inside the async Task (after kernel
-    /// boot + concurrency gate), so without preparing UI here the user sees
-    /// no feedback for hundreds of ms after pressing "Retry" / "Re-run From
-    /// Here". Synchronously prepare the message that the TypingIndicator
-    /// keys off:
-    ///   * resumeAt == nil → append a placeholder assistant ChatMessage and
-    ///     set `isAwaitingModelResponse = true`. runAgentLoop is then
-    ///     instructed to RESUME into that placeholder (resumingAt =
-    ///     placeholderIdx, committedBlocks = 0) so it does NOT append a
-    ///     second assistant message and we don't double-create.
-    ///   * resumeAt != nil → caller already has a surviving assistant turn
-    ///     they want to continue (sub-message cut); just flip its
-    ///     `isAwaitingModelResponse = true` so the typing indicator shows on
-    ///     it until the new content starts streaming.
-    /// TypingIndicator's gate is
-    /// `isLast && vm.isProcessing && (!hasVisibleContent || isAwaiting…)`
-    /// — covered for both cases since `isProcessing = true` is set below and
-    /// `messages.last` is the prepared assistant in each case.
-    private func launchRerunAgentLoop(label: String, resumeAt: Int? = nil, resumeBlocks: Int? = nil) {
-        AppLogger(category: "RetryDiag").info("[RetryDiag] launchRerunAgentLoop called label=\(label) resumeAt=\(resumeAt.map(String.init) ?? "nil") resumeBlocks=\(resumeBlocks.map(String.init) ?? "nil") messagesCount=\(self.messages.count)")
-        errorMessage = nil
-        // Clear interrupt badge on the last assistant message if present
-        if let lastAssistant = messages.last(where: { $0.role == .assistant }) {
-            lastAssistant.streamInterruptCount = 0
-        }
-
-        // Immediate thinking-state prep (see doc comment above).
-        let effectiveResumeAt: Int?
-        let effectiveResumeBlocks: Int?
-        if let r = resumeAt {
-            let inBounds = r < messages.count
-            let isAsst = inBounds && messages[r].role == .assistant
-            if inBounds, isAsst {
-                messages[r].isAwaitingModelResponse = true
-            } else {
-                // [RetryDiag] resumeAt points outside the array or at a non-
-                // assistant row — an off-by-one in the caller's index math. The
-                // loop will still try to resume at r; surface it loudly.
-                AppLogger(category: "RetryDiag").warning("[RetryDiag] launchRerunAgentLoop SUSPECT resumeAt=\(r) inBounds=\(inBounds) isAssistant=\(isAsst) messagesCount=\(self.messages.count) — index may be off-by-one")
-            }
-            effectiveResumeAt = r
-            effectiveResumeBlocks = resumeBlocks
-        } else {
-            // Append placeholder assistant so the typing indicator can latch
-            // on instantly; tell runAgentLoop to resume into it.
-            let placeholder = ChatMessage(role: .assistant, content: "", blocks: [])
-            placeholder.isAwaitingModelResponse = true
-            messages.append(placeholder)
-            effectiveResumeAt = messages.count - 1
-            effectiveResumeBlocks = 0
-        }
-
-        isProcessing = true
-        forceScrollToBottom.send()
-
-        ensureKernelBooted()
-        beginBackgroundProcessing()
-
-        currentTask = Task { [weak self] in
-            guard let self else { return }
-
-            while self.kernelStatus == .booting {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            if case .failed(let msg) = self.kernelStatus {
-                self.errorMessage = "Kernel not available: \(msg)"
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-
-            // Concurrency gate: wait for a processing slot
-            let retryFromSid = self.sessionId ?? "unknown"
-            let concurrency = SessionConcurrencyManager.shared
-            self.isSuspended = concurrency.runningSessions.count >= concurrency.maxConcurrent
-            do {
-                try await concurrency.acquireSlot(sessionId: retryFromSid)
-                self.isSuspended = false
-            } catch {
-                self.isSuspended = false
-                self.isProcessing = false
-                self.endBackgroundProcessing()
-                return
-            }
-            defer { concurrency.releaseSlot(sessionId: retryFromSid) }
-
-            do {
-                try await self.runAgentLoop(resumingAt: effectiveResumeAt, committedBlocks: effectiveResumeBlocks)
-            } catch is CancellationError {
-                logger.info("Agent loop cancelled (\(label))")
-                self.handleUserCancelledCleanup()
-            } catch {
-                let rawDesc = String(describing: error)
-                logger.error("Agent loop error (\(label)): \(rawDesc)")
-                if let llmErr = error as? LLMError {
-                    logger.error("Agent loop LLMError detail: \(llmErr.errorDescription ?? "nil")")
-                }
-                if self.userDidCancel {
-                    self.handleUserCancelledCleanup()
-                } else {
-                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
-                    // [T-ios-retry-tool-blocks-invisible / T-stream-empty-banner-trace]
-                    // Resolve the streaming assistant by the last ASSISTANT row,
-                    // not messages.last. A queued .user message (enqueuePrompt
-                    // appends one mid-tool) sits AFTER the candidate, so
-                    // messages.last would be that user row — the error then fell
-                    // through to the top red banner (vm.errorMessage) instead of
-                    // attaching to the assistant bubble. Same root cause as the
-                    // Stop-loses-content fix.
-                    if let last = self.messages.last(where: { $0.role == .assistant }) {
-                        last.error = displayDesc
-                        Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
-                        last.blocks.removeAll { $0.kind == .text && $0.content.isEmpty }
-                        for block in last.blocks {
-                            if case .streaming = block.toolStatus { block.toolStatus = .cancelled }
-                            else if case .running = block.toolStatus { block.toolStatus = .cancelled }
-                        }
-                    } else {
-                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
-                    }
-                }
-            }
-            if self.userDidCancel { self.handleUserCancelledCleanup() }
-            // [T-stop-with-queue-render-desync] See send(): Stop's cancel() owns
-            // state teardown; a superseded task must not drain or flip isProcessing.
-            guard !Task.isCancelled else {
-                logger.info("🔄SESSION [vm=\(self.vmInstanceId)] \(label) epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
-                return
-            }
-            await self.drainQueuedPrompts()
-            logger.info("🔄SESSION [vm=\(self.vmInstanceId)] \(label) DONE session=\(self.sessionId ?? "nil")")
-            self.playCompletionHaptic()
-            self.isProcessing = false
-            self.endBackgroundProcessing()
-        }
-    }
-
-    /// [T-ios-rerun-from-tool-block-position] Re-run the agent loop from the
-    /// point a specific tool_use was about to be issued. Block-boundary cut:
-    /// keep the blocks BEFORE the target tool_use in its assistant turn, drop
-    /// the target block + later blocks in that turn + all later messages, then
-    /// re-run so the model re-decides from that point.
-    ///
-    /// Anchor is the block's `toolUseId` (stable, unique) — NOT positional
-    /// counting — so streaming / multi-entry-per-UI-message alignment can't
-    /// drift.
-    ///
-    /// Degenerate case: if the target is the FIRST block of its assistant
-    /// message and nothing precedes it in that turn, this is equivalent to
-    /// truncating at the preceding user message — delegate to
-    /// retryFromMessage(precedingUser) and skip the sub-message rewrite.
-    func retryFromToolBlock(blockId: UUID) {
-        guard !isProcessing else { return }
-        // [T-ios-retry-keyboard] Mark this turn as retry-initiated so the UI
-        // can skip the "reply arrived → auto-focus composer" behavior.
-        turnStartedByRetry = true
-
-        // Locate the assistant UI message + the target block's index within it.
-        guard let asstMsgIdx = messages.firstIndex(where: { m in
-            m.role == .assistant && m.blocks.contains(where: { $0.id == blockId })
-        }) else { return }
-        let asstMsg = messages[asstMsgIdx]
-        guard let blockIdx = asstMsg.blocks.firstIndex(where: { $0.id == blockId }) else { return }
-        guard let targetToolUseId = asstMsg.blocks[blockIdx].toolUseId, !targetToolUseId.isEmpty else {
-            // Not a tool block — nothing to anchor on.
-            return
-        }
-
-        // Degenerate: target is the first block and no real content precedes it
-        // in this turn → fall back to the preceding-user-message truncation.
-        let hasPrecedingContent = asstMsg.blocks[..<blockIdx].contains { blk in
-            switch blk.kind {
-            case .text: return !blk.content.isEmpty
-            default: return true  // any earlier tool/info block counts
-            }
-        }
-        if !hasPrecedingContent {
-            if let userIdx = messages[..<asstMsgIdx].lastIndex(where: { $0.role == .user }) {
-                // Normal degenerate case: a user message precedes this turn —
-                // truncate at it and re-run (existing whole-turn path).
-                logger.info("[RerunToolBlock] degenerate → retryFromMessage(precedingUser) tuId=\(targetToolUseId.prefix(12))")
-                retryFromMessage(messages[userIdx].id)
-                return
-            }
-            // [T-ios-retry-double-header] No preceding user message (session
-            // opens with an assistant turn — e.g. SOUL greeting / system-
-            // triggered). Don't silently no-op: truncate from this assistant
-            // message's START (drop the whole message + everything after, drop
-            // its agentHistory entry + everything after) and re-run fresh.
-            canResume = false
-            userDidCancel = false
-            messages.removeSubrange(asstMsgIdx...)
-            // [T-ios-retry-ui-clear] mirror the sub-message path: force a
-            // top-level publish so the UI clears immediately on this tick
-            // even when the snapshot binding's main-queue receive hasn't
-            // fired yet.
-            if !transitionSuspended { objectWillChange.send() }
-            retrySnapshotReloadSignal.send()
-            AppLogger(category: "RetryDiag").info("[RetryDiag] degenerate(noPrecedingUser) truncated asstMsgIdx=\(asstMsgIdx) messagesCount=\(self.messages.count)")
-            // Find this assistant turn's agentHistory entry via the target's
-            // toolUseId and drop it + all later entries.
-            var dropFromEntry: Int? = nil
-            outer0: for (ei, entry) in agentHistory.enumerated() where entry.role == .assistant {
-                for part in entry.parts {
-                    if case .toolUse(let id, _, _) = part, id == targetToolUseId {
-                        dropFromEntry = ei
-                        break outer0
-                    }
-                }
-            }
-            if let ei = dropFromEntry, ei < agentHistory.count {
-                agentHistory.removeSubrange(ei...)
-            }
-            let keepCount = agentHistory.count
-            logger.info("[RerunToolBlock] degenerate (no precedingUser) → truncate from assistant start tuId=\(targetToolUseId.prefix(12)) keepCount=\(keepCount)")
-            if let sessionId {
-                Task { await ChatStore.shared.deleteMessagesAfter(sessionId: sessionId, keepCount: keepCount) }
-            }
-            rebuildToolSnapshotsFromMessages()
-            // No resume target — a fresh assistant message is appended by the
-            // agent loop (messages.last is now whatever preceded this turn).
-            launchRerunAgentLoop(label: "retryFromToolBlock")
-            return
-        }
-
-        canResume = false
-        userDidCancel = false
-
-        // --- Sub-message cut ---
-        // 1. UI: trim this assistant message's blocks to before the target,
-        //    and drop all later messages.
-        // [T-ios-retry-ui-clear] Mutating `messages[asstMsgIdx].blocks` only
-        // fires the *nested* ChatMessage.$blocks publisher; the collection
-        // view's `lastMessageBlockCountSub` is wired to the CURRENT last
-        // message (which at this moment is something AFTER asstMsgIdx, not
-        // asstMsgIdx itself), so that publisher fires on an unrelated
-        // message — no snapshot rebuild keys off the trim. The
-        // removeSubrange below DOES publish on `vm.$messages` and triggers
-        // applySnapshot, but the in-snapshot identifiers come from
-        // `block.id` so the stale block items can linger one runloop tick
-        // before the cells are dropped. Force a top-level publish so SwiftUI
-        // / the collection-view bindings see the cut synchronously.
-        messages[asstMsgIdx].blocks = Array(asstMsg.blocks[..<blockIdx])
-        if asstMsgIdx + 1 < messages.count {
-            messages.removeSubrange((asstMsgIdx + 1)...)
-        }
-        if !transitionSuspended { objectWillChange.send() }
-        retrySnapshotReloadSignal.send()
-        AppLogger(category: "RetryDiag").info("[RetryDiag] blocks truncated asstMsgIdx=\(asstMsgIdx) blockIdx=\(blockIdx) remainingBlocks=\(self.messages[asstMsgIdx].blocks.count) messagesCount=\(self.messages.count)")
-
-        // 2. agentHistory: find the assistant entry carrying the target
-        //    .toolUse(id==targetToolUseId), trim its parts to before that
-        //    part, and drop every entry after it.
-        var cutEntryIdx: Int? = nil
-        var cutPartIdx: Int? = nil
-        outer: for (ei, entry) in agentHistory.enumerated() where entry.role == .assistant {
-            for (pi, part) in entry.parts.enumerated() {
-                if case .toolUse(let id, _, _) = part, id == targetToolUseId {
-                    cutEntryIdx = ei
-                    cutPartIdx = pi
-                    break outer
-                }
-            }
-        }
-        guard let entryIdx = cutEntryIdx, let partIdx = cutPartIdx else {
-            // Anchor not found in agentHistory — abort without mutating further
-            // to avoid a half-applied truncation. (Shouldn't happen: UI block
-            // implies a persisted tool_use entry.)
-            logger.warning("[RerunToolBlock] toolUseId \(targetToolUseId.prefix(12)) not found in agentHistory — aborting sub-message cut")
-            return
-        }
-
-        // [RetryDiag] Index/parts alignment for the sub-message cut. asstMsgIdx
-        // is the UI message; entryIdx/partIdx are the agentHistory cut point.
-        // Under merged rendering one UI message maps to MANY agentHistory
-        // entries, so blockIdx (UI) and partIdx (history) are NOT expected to
-        // match — log both to confirm the anchor resolved to the right entry.
-        AppLogger(category: "RetryDiag").info("[RetryDiag] sub-cut anchor tuId=\(targetToolUseId.prefix(12)) UI(asstMsgIdx=\(asstMsgIdx) blockIdx=\(blockIdx) blocks=\(self.messages[asstMsgIdx].blocks.count)) history(entryIdx=\(entryIdx) partIdx=\(partIdx) entryParts=\(self.agentHistory[entryIdx].parts.count) totalEntries=\(self.agentHistory.count))")
-
-        dumpHistoryPairing("subcut-BEFORE entryIdx=\(entryIdx) partIdx=\(partIdx) targetTU=\(targetToolUseId.prefix(8))")
-        let trimmedEntryDbId = agentHistory[entryIdx].dbMessageId
-        let partsBefore = agentHistory[entryIdx].parts.count
-        // Log exactly which parts the cut removes from this entry (partIdx...).
-        // A tool_use here whose tool_result lives in a kept entry → orphan.
-        let removedParts = agentHistory[entryIdx].parts[partIdx...].map { p -> String in
-            switch p {
-            case .text(let t): return "text(\(t.count)ch)"
-            case .toolUse(let id, let name, _): return "TU(\(name),\(id.prefix(8)))"
-            case .toolResult(let id, _, _, _, _, _, _, _): return "TR(\(id.prefix(8)))"
-            case .imageData: return "image"
-            }
-        }
-        AppLogger(category: "PairDiag").info("[PairDiag] subcut removes entry[\(entryIdx)].parts[\(partIdx)...]: [\(removedParts.joined(separator: ", "))]")
-        agentHistory[entryIdx].parts = Array(agentHistory[entryIdx].parts[..<partIdx])
-        let droppedEntries = (entryIdx + 1 < agentHistory.count) ? (agentHistory.count - (entryIdx + 1)) : 0
-        if entryIdx + 1 < agentHistory.count {
-            agentHistory.removeSubrange((entryIdx + 1)...)
-        }
-        AppLogger(category: "RetryDiag").info("[RetryDiag] sub-cut applied entry[\(entryIdx)] parts \(partsBefore)→\(self.agentHistory[entryIdx].parts.count), droppedTrailingEntries=\(droppedEntries), newHistoryCount=\(self.agentHistory.count), trimmedRowDbId=\(trimmedEntryDbId?.prefix(8) ?? "nil")")
-        // If this fires ORPHANS, the sub-cut stranded a tool_result — i.e. the
-        // (entryIdx, partIdx) cut point removed a tool_use whose tool_result
-        // sits in an entry that was NOT dropped. That's the bug to chase.
-        dumpHistoryPairing("subcut-AFTER")
-
-        // 3. Persist: delete rows after the trimmed assistant entry, then
-        //    rewrite the trimmed entry's row in place.
-        let persistedKeepCount = agentHistory.count
-        logger.info("[RerunToolBlock] sub-message cut tuId=\(targetToolUseId.prefix(12)) keepCount=\(persistedKeepCount) trimmedRow=\(trimmedEntryDbId?.prefix(8) ?? "nil")")
-        if let sessionId {
-            // [T-ios-retry-from-tool-block-oob] Snapshot the whole trimmed entry
-            // (a value type) SYNCHRONOUSLY, before the Task suspends. The Task
-            // below first awaits deleteMessagesAfter; during that suspension the
-            // re-run agent loop (launchRerunAgentLoop, started further down) runs
-            // runAgentLoop's "remove orphaned tool_result" pass, which can shrink
-            // agentHistory (e.g. 19→18). If we then read `agentHistory[entryIdx]`
-            // after the await, entryIdx is stale and the subscript traps with
-            // "Index out of range" (ContiguousArrayBuffer.swift:692, crash
-            // 2026-05-31). buildRawMessage takes an AgentMessage by value, so the
-            // captured snapshot is all we need — never index the live array here.
-            let trimmedEntry = agentHistory[entryIdx]
-            let trimmedParts = trimmedEntry.parts
-            let dbId = trimmedEntryDbId
-            Task {
-                await ChatStore.shared.deleteMessagesAfter(sessionId: sessionId, keepCount: persistedKeepCount)
-                if let dbId {
-                    let raw = await self.buildRawMessage(trimmedEntry)
-                    await ChatStore.shared.updateMessageParts(messageId: dbId, parts: raw?.parts ?? Self.contentPartsFallback(trimmedParts))
-                }
-            }
-        }
-
-        // 4. toolSnapshots + re-run.
-        // [T-ios-retry-double-header] The trimmed assistant message survives
-        // at asstMsgIdx (now the last message) with `blockIdx` surviving
-        // blocks. Resume INTO it so the new generation continues that turn
-        // rather than appending a second assistant message (which rendered a
-        // duplicate header). Mark its still-streaming/running tool blocks
-        // cancelled first (none should remain before the cut point, but guard).
-        for block in messages[asstMsgIdx].blocks {
-            if case .streaming = block.toolStatus { block.toolStatus = .cancelled }
-            else if case .running = block.toolStatus { block.toolStatus = .cancelled }
-        }
-        rebuildToolSnapshotsFromMessages()
-        launchRerunAgentLoop(label: "retryFromToolBlock", resumeAt: asstMsgIdx, resumeBlocks: blockIdx)
-    }
-
-    /// Fallback ContentPart serialization if buildRawMessage returns nil
-    /// (e.g. empty session id). Encodes only text/toolUse/toolResult parts —
-    /// imageData parts are dropped (they're re-fetchable and not part of the
-    /// truncation invariant). [T-ios-rerun-from-tool-block-position]
-    private static func contentPartsFallback(_ parts: [AgentContentPart]) -> [ContentPart] {
-        parts.compactMap { p in
-            switch p {
-            case .text(let t): return .text(t)
-            default: return nil
-            }
-        }
-    }
-
-    /// Append text to the chat input, separated by a single space on each side
-    /// of an existing draft so quoted snippets stay visually distinct. A
-    /// trailing space is always appended so the caret lands after a separator
-    /// when the input regains focus. Whitespace-only inserts are dropped.
-    ///
-    /// Wired up to the `chatInputAppendRequested` notification posted by the
-    /// long-press selection menu's "Add to Chat Input" action across markdown
-    /// bubbles, table cells, etc.
-    func appendToInputText(_ snippet: String) {
-        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let existing = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if existing.isEmpty {
-            inputText = trimmed + " "
-        } else {
-            inputText = existing + " " + trimmed + " "
-        }
-    }
-
-    /// Populate the input bar with the content of a user message for editing.
-    /// The next call to send() will truncate the conversation from this message
-    /// and re-run the agent loop with the edited content.
-    func editMessage(_ messageId: UUID) {
-        guard !isProcessing else { return }
-        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
-              messages[idx].role == .user else { return }
-
-        let msg = messages[idx]
-
-        // Strip <user-attached-files> XML from content to get clean user text
-        var text = msg.content
-        if let start = text.range(of: "<user-attached-files>") {
-            let end = text.range(of: "</user-attached-files>")
-            let endBound = end?.upperBound ?? text.endIndex
-            text = String(text[text.startIndex..<start.lowerBound] + text[endBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        inputText = text
-        editingMessageIndex = idx
-
-        // Restore attachments: convert AttachmentMeta back to InputAttachment
-        // by locating the files in the session uploads directory.
-        if !msg.attachments.isEmpty, let sid = sessionId {
-            let uploadsDir = Self.minisUploadsDir(for: sid)
-            var restored: [InputAttachment] = []
-            for meta in msg.attachments {
-                let fileName = (meta.path as NSString).lastPathComponent
-                let fileURL = uploadsDir.appendingPathComponent(fileName)
-                guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
-                // Copy to Caches so the normal send() flow works
-                let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("InputAttachments")
-                try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-                let cacheURL = cacheDir.appendingPathComponent(fileName)
-                try? FileManager.default.removeItem(at: cacheURL)
-                try? FileManager.default.copyItem(at: fileURL, to: cacheURL)
-
-                let ext = (fileName as NSString).pathExtension.lowercased()
-                let kind: InputAttachment.Kind
-                if ["jpg", "jpeg", "png", "gif", "webp", "heic"].contains(ext) {
-                    kind = .image
-                } else if ["mp4", "mov", "m4v"].contains(ext) {
-                    kind = .video
-                } else {
-                    kind = .document
-                }
-                restored.append(InputAttachment(fileName: fileName, cacheURL: cacheURL, kind: kind))
-            }
-            attachments = restored
-        }
-
-        scrollToBottomSignal.send()
-        logger.info("✏️ editMessage idx=\(idx) text=\(text.count)ch attachments=\(msg.attachments.count)")
-    }
-
-    func cancelEdit() {
-        editingMessageIndex = nil
-        inputText = ""
-        attachments = []
-        logger.info("✏️ cancelEdit")
-    }
-
-    func cancel() {
-        let lastBlocks = (messages.last?.role == .assistant) ? messages.last!.blocks.count : -1
-        let lastRole = messages.last.map { $0.role == .assistant ? "assistant" : "user" } ?? "nil"
-        logger.info("⏹️ cancel() START session=\(self.sessionId ?? "nil") isProcessing=\(self.isProcessing) lastRole=\(lastRole) lastBlocks=\(lastBlocks) currentTask=\(self.currentTask != nil)")
-        dumpCandidateState("cancel-START")
-        // [T-deep-mode-resume-opt] Save workflow state before cancel for fast resume
-        // [T-deep-mode-session-workflow] P2: only save the session snapshot when
-        // session-scoped workflow is active (master switch AND keepSessionWorkflow).
-        // In Fallback mode (keepSessionWorkflow off) we keep the legacy behavior:
-        // a pause does not preserve any workflow that a later resume would restore.
-        if sessionWorkflowEnabled && workflowPhase != .idle {
-            savedWorkflowState = (workflowPhase, workflowSteps, verifyRoundsLeft, goalRunnerRoundsLeft)
-            logger.info("[WorkflowLog] cancel() - saved workflow state phase=\(workflowPhase) steps=\(workflowSteps.count) verifyRoundsLeft=\(verifyRoundsLeft) goalRoundsLeft=\(goalRunnerRoundsLeft)")
-        }
-        // [T-ios-queued-candidate-not-onscreen] Snapshot the queue + on-screen
-        // messages at Stop time, and again 500ms later, so we can see whether a
-        // queued candidate that drains after Stop actually lands on screen.
-        dumpQueueSnapshot("stop-BEFORE")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.dumpQueueSnapshot("stop-AFTER+500ms")
-        }
-        isSuspended = false
-        if let sid = sessionId {
-            SessionConcurrencyManager.shared.cancelWait(sessionId: sid)
-        }
-        stopCurrentCommand()
-        // If the loop is suspended waiting for foreground, resume it so
-        // Task cancellation can propagate through the continuation.
-        backgroundSuspended = false
-        if let c = foregroundContinuation {
-            foregroundContinuation = nil
-            c.resume()
-        }
-        // If the loop is suspended for browser takeover, resume it.
-        browserTakeoverActive = false
-        takeoverTimeoutTask?.cancel()
-        takeoverTimeoutTask = nil
-        if let c = takeoverContinuation {
-            takeoverContinuation = nil
-            c.resume()
-        }
-        if let c = midActionTakeoverContinuation {
-            midActionTakeoverContinuation = nil
-            c.resume()
-        }
-        if let obs = foregroundObserver {
-            NotificationCenter.default.removeObserver(obs)
-            foregroundObserver = nil
-        }
-        userDidCancel = true
-        currentTask?.cancel()
-        currentTask = nil
-        autoRetryAttempt = 0
-        autoRetryCountdown = 0
-        if let sid = sessionId {
-            logger.info("🔥 cache keep-alive: cancelling on user cancel — session=\(sid.prefix(8))")
-            CacheKeepAliveManager.shared.cancelKeepAlive(sessionId: sid)
-        }
-        // Don't modify blocks here — the cancelled task may still be writing to them.
-        // The task's error handler checks userDidCancel to mark as interrupted and
-        // set canResume. We set isProcessing = false immediately for responsive UI.
-        isProcessing = false
-        // Cancel compact task if running — the task's CancellationError handler
-        // will update the status message and clean up state.
-        if isCompacting {
-            compactTask?.cancel()
-            compactTask = nil
-            // Restore all queued compact-and-send messages back to input
-            // (use the last one for inputText since it's the most recent)
-            for queued in promptQueue {
-                messages.removeAll { $0.queuedPromptId == queued.id }
-            }
-            if let last = promptQueue.last {
-                inputText = last.text
-                attachments = last.attachments
-            }
-            promptQueue.removeAll()
-        }
-        endBackgroundProcessing()
-
-        // If there are queued prompts remaining, spawn a new task to continue
-        // processing them. The old task is cancelled (stops the current agent
-        // loop) but the queue should keep draining.
-        if !promptQueue.isEmpty && !isCompacting {
-            logger.info("⏹️ cancel() — \(promptQueue.count) queued prompt(s) remain, restarting drain")
-            resumeQueueAfterCancel()
-        }
-    }
-
-    /// Resume queue processing after the user stopped the current task.
-    /// Spawns a fresh Task (not cancelled) so the drain loop can call runAgentLoop().
-    private func resumeQueueAfterCancel() {
-        // Small delay to let the cancelled task's error handler finish cleanup.
-        currentTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            // Wait briefly for the previous task to complete cleanup
-            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
-            self.handleUserCancelledCleanup()
-            self.userDidCancel = false
-            // [T-stop-with-queue-render-desync] handleUserCancelledCleanup (run
-            // here or by the cancelled task's own catch) set canResume=true —
-            // correct for a plain Stop, but this drain immediately continues the
-            // conversation with the queued prompt, so the "Interrupted — tap
-            // Resume" banner / ⏸ badge must not stay up over a live run. Clearing
-            // it also lets the didSet replay any sync reload it deferred.
-            self.canResume = false
-            self.isProcessing = true
-            self.beginBackgroundProcessing()
-            logger.info("📨[DRAIN] Resuming queue in new task — \(self.promptQueue.count) prompt(s)")
-            await self.drainQueuedPrompts()
-
-            // [T-stop-with-queue-render-desync] A second Stop during this drained
-            // run cancels THIS task and may spawn yet another drain task — same
-            // handover as send()'s epilogue, so don't clobber its state either.
-            guard !Task.isCancelled else {
-                logger.info("📨[DRAIN] queue-resume epilogue skipped (task cancelled) session=\(self.sessionId ?? "nil")")
-                return
-            }
-
-            if let sid = self.sessionId {
-                let dbMessages = await ChatStore.shared.loadMessages(sessionId: sid)
-                self.lastKnownDbSortOrder = dbMessages.last?.sortOrder ?? self.lastKnownDbSortOrder
-                self.lastKnownDbCount = dbMessages.count
-                // T-baseline-hash-drift: see send DONE path for why hash
-                // must be refreshed alongside count/sortOrder.
-                self.lastKnownDbOrderHash = Self.computeOrderHash(of: dbMessages)
-            }
-            self.isProcessing = false
-            self.endBackgroundProcessing()
-        }
-    }
-
-    /// Drain any queued prompts after an agent loop finishes.
-    /// Called from send(), retry(), resume(), and retryFromMessage() before setting isProcessing=false.
-    /// Uses a while loop + final yield to catch prompts queued during the last streaming response.
-    /// Reentrancy-guarded entry point. Only ONE drain may be active at a time:
-    /// a Stop with queued prompts spawns a fresh resume Task whose drain races
-    /// the superseded original Task's post-loop drain, and without this guard
-    /// both would run the queued turn and double-fire the next request (every
-    /// tool call + reply twice). The guard is set/cleared only on @MainActor so
-    /// check-and-set is atomic and held across the inner `await runAgentLoop()`.
-    /// [T-ios-concurrent-stop-double-request]
-    /// `internal` (not `private`) so `compactAndSend` in the +Compaction
-    /// extension file can drain through this same path after a compact.
-    func drainQueuedPrompts() async {
-        guard !self.isDrainingQueue else {
-            logger.info("📨[DRAIN] Already draining in another task — skipping duplicate drain")
-            return
-        }
-        self.isDrainingQueue = true
-        defer { self.isDrainingQueue = false }
-        await drainQueuedPromptsInner()
-    }
-
-    /// The actual drain loop. Unguarded so its own tail-recursion for late
-    /// arrivals (below) doesn't trip the reentrancy guard — that guard only
-    /// gates cross-Task duplicate entry, which all goes through the wrapper.
-    private func drainQueuedPromptsInner() async {
-        while !self.userDidCancel && !self.promptQueue.isEmpty {
-            // If the Task itself is cancelled (e.g. user tapped stop), don't
-            // consume queue items — resumeQueueAfterCancel() handles them
-            // in a fresh Task.
-            guard !Task.isCancelled else {
-                logger.info("📨[DRAIN] Task cancelled — leaving \(self.promptQueue.count) prompt(s) in queue")
-                break
-            }
-            let queued = self.promptQueue
-            self.promptQueue.removeAll()
-            logger.info("📨[DRAIN] Draining \(queued.count) queued prompt(s)")
-
-            let queuedIds = Set(queued.map(\.id))
-            for msg in self.messages where msg.isQueued {
-                if let pid = msg.queuedPromptId, queuedIds.contains(pid) {
-                    // Queue drain: isQueued true -> false. The withdraw button
-                    // disappears here, so the bubble's wrap width widens by
-                    // ~28pt and any measurement taken while queued is
-                    // superseded from this point on.
-                    msg.isQueued = false
-                }
-            }
-            self.scrollToBottomSignal.send()
-
-            let sid = self.sessionId ?? "unknown"
-            let uploadsDir = Self.minisUploadsDir(for: sid)
-            let isoFmt = ISO8601DateFormatter()
-            isoFmt.formatOptions = [.withInternetDateTime]
-            let nowStr = isoFmt.string(from: Date())
-            try? FileManager.default.createDirectory(at: uploadsDir, withIntermediateDirectories: true)
-
-            var combinedParts: [AgentContentPart] = []
-            for prompt in queued {
-                if !prompt.attachments.isEmpty {
-                    let (attParts, attMetas) = self.processAttachments(prompt.attachments, uploadsDir: uploadsDir, nowStr: nowStr)
-                    combinedParts.append(contentsOf: attParts)
-                    Self.cleanupAttachmentFiles(prompt.attachments)
-                    if let chatMsg = self.messages.first(where: { $0.queuedPromptId == prompt.id }) {
-                        chatMsg.attachments = attMetas
-                        chatMsg.inputAttachments = []
-                        // [T-ios-user-attach-mount-invalidate #182-followup] The
-                        // mount above is an in-place +70pt/row content change on
-                        // a cell whose item identity does not move; without this
-                        // the tile-less height measured moments earlier stays
-                        // cached and the bubble truncates (see the Name's doc).
-                        NotificationCenter.default.post(name: .minisUserAttachmentsMounted, object: chatMsg.id)
-                    }
-                }
-                if !prompt.text.isEmpty {
-                    combinedParts.append(.text(prompt.text))
-                }
-            }
-
-            let queueAgentMsg = AgentMessage(role: .user, parts: combinedParts)
-            let qIdx = self.agentHistory.count
-            self.agentHistory.append(queueAgentMsg)
-            if let pid = await self.persistAgentMessage(queueAgentMsg), qIdx < self.agentHistory.count {
-                self.agentHistory[qIdx].dbMessageId = pid
-            }
-
-            do {
-                try await self.runAgentLoop()
-            } catch is CancellationError {
-                logger.info("Agent loop (queued-drain) cancelled")
-                self.handleUserCancelledCleanup()
-                // Don't consume remaining queue items — resumeQueueAfterCancel()
-                // will pick them up in a fresh Task.
-                break
-            } catch {
-                let rawDesc = String(describing: error)
-                logger.error("Agent loop (queued-drain) error: \(rawDesc)")
-                if self.userDidCancel {
-                    self.handleUserCancelledCleanup()
-                } else {
-                    let displayDesc = Self.friendlyErrorMessage((error as? LocalizedError)?.errorDescription ?? rawDesc)
-                    // [T-stream-empty-banner-trace] Diagnostic: log the
-                    // messages-tail state when an agent-loop error
-                    // surfaces so we can tell whether the placeholder
-                    // assistant message survived the failure (bubble
-                    // path) or got pruned beforehand (banner path).
-                    // Catalyst users have reported the loading
-                    // indicator flashing once and the error red banner
-                    // appearing at the top of the chat with no
-                    // placeholder bubble — that's the "else" branch
-                    // below and it shouldn't happen if runAgentLoop's
-                    // line 5124 placeholder is still in `messages`.
-                    let lastRoleStr = self.messages.last.map { "\($0.role)" } ?? "nil"
-                    let lastBlocks = self.messages.last?.blocks.count ?? -1
-                    let lastErr = self.messages.last?.error ?? "nil"
-                    let tail3 = self.messages.suffix(3).map { "\($0.role)(\($0.blocks.count)blk err=\($0.error ?? "nil"))" }.joined(separator: " > ")
-                    AppLogger(category: "StreamError").error("[StreamError] catch displayDesc=\"\(displayDesc.prefix(120))\" msgCount=\(self.messages.count) lastRole=\(lastRoleStr) lastBlocks=\(lastBlocks) lastErr=\(lastErr) tail=\(tail3)")
-                    // [T-ios-retry-tool-blocks-invisible / T-stream-empty-banner-trace]
-                    // Resolve the streaming assistant by the last ASSISTANT row,
-                    // not messages.last. A queued .user message (enqueuePrompt
-                    // appends one mid-tool) sits AFTER the candidate, so
-                    // messages.last would be that user row — the error then fell
-                    // through to the top red banner (vm.errorMessage) instead of
-                    // attaching to the assistant bubble. Same root cause as the
-                    // Stop-loses-content fix.
-                    if let last = self.messages.last(where: { $0.role == .assistant }) {
-                        last.error = displayDesc
-                        Task { await self.persistErrorInfo(displayDesc) }  // [T-error-persist-ios]
-                        AppLogger(category: "StreamError").error("[StreamError] → bubble path (set last.error)")
-                    } else {
-                        self.reportTurnFailure(displayDesc)   // [T-ios-error-banner-lost]
-                        AppLogger(category: "StreamError").error("[StreamError] → banner path (vm.errorMessage set)")
-                    }
-                }
-                break
-            }
-        }
-
-        // Yield once to let any last-moment enqueuePrompt() calls execute
-        await Task.yield()
-        if !Task.isCancelled && !self.userDidCancel && !self.promptQueue.isEmpty {
-            logger.info("📨[DRAIN] Late arrivals after yield: \(self.promptQueue.count)")
-            // Recurse on the INNER worker (we already hold the reentrancy guard)
-            // so late-arrival handling isn't skipped by our own guard.
-            await drainQueuedPromptsInner()
-        }
-    }
-
-    /// [T-ios-queued-message-continues-prev-turn] Drain any prompts the user
-    /// queued mid-run and append them as ONE standalone user turn, then start a
-    /// fresh assistant message so the next loop iteration produces a dedicated
-    /// response. Called ONLY from the agent loop's finish branch (after the
-    /// current turn's tool loop has fully converged to a no-tool-use assistant
-    /// reply), so the queued prompt never gets folded into a mid-loop tool_result
-    /// (which made the model treat it as in-loop context for the previous turn).
-    ///
-    /// Returns true if a prompt was injected (caller should `continue` the loop
-    /// instead of breaking). `msgIdx` / `committedBlockCount` are advanced to the
-    /// new assistant message. The caller must have already persisted the just-
-    /// finished assistant reply before calling this.
-    private func injectQueuedPromptsAsNewTurn(
-        msgIdx: inout Int,
-        committedBlockCount: inout Int,
-        turnUsage: TokenUsage
-    ) async -> Bool {
-        guard !promptQueue.isEmpty else { return false }
-        let queued = promptQueue
-        promptQueue.removeAll()
-        // Mark corresponding chat messages as no longer queued (remove dashed border + X)
-        let queuedIds = Set(queued.map(\.id))
-        for msg in messages where msg.isQueued {
-            if let pid = msg.queuedPromptId, queuedIds.contains(pid) {
-                msg.isQueued = false
-            }
-        }
-
-        // Build combined parts from all queued prompts (text + attachments)
-        let qSid = sessionId ?? "unknown"
-        let qUploadsDir = Self.minisUploadsDir(for: qSid)
-        let qIsoFormatter = ISO8601DateFormatter()
-        qIsoFormatter.formatOptions = [.withInternetDateTime]
-        let qNowStr = qIsoFormatter.string(from: Date())
-        try? FileManager.default.createDirectory(at: qUploadsDir, withIntermediateDirectories: true)
-
-        var qCombinedParts: [AgentContentPart] = []
-        for prompt in queued {
-            if !prompt.attachments.isEmpty {
-                let (attParts, attMetas) = processAttachments(prompt.attachments, uploadsDir: qUploadsDir, nowStr: qNowStr)
-                qCombinedParts.append(contentsOf: attParts)
-                Self.cleanupAttachmentFiles(prompt.attachments)
-                // Update the corresponding ChatMessage so attachment thumbnails appear in the UI
-                if let chatMsg = messages.first(where: { $0.queuedPromptId == prompt.id }) {
-                    chatMsg.attachments = attMetas
-                    chatMsg.inputAttachments = []
-                    // [T-ios-user-attach-mount-invalidate] See the sibling drain site.
-                    NotificationCenter.default.post(name: .minisUserAttachmentsMounted, object: chatMsg.id)
-                }
-            }
-            if !prompt.text.isEmpty {
-                qCombinedParts.append(.text(prompt.text))
-            }
-        }
-
-        // Guard: if every queued prompt was empty (no text, no attachments) the
-        // combined parts are empty — an empty user message is a 400. Skip.
-        guard !qCombinedParts.isEmpty else {
-            logger.warning("injectQueuedPromptsAsNewTurn: \(queued.count) queued prompt(s) produced no content, skipping")
-            return false
-        }
-
-        // [T-ios-queued-message-interrupt-on-toolclose] When we interrupt mid-tool-
-        // loop (right after a tool call closes), the agentHistory tail is
-        // assistant(tool_use) → user(tool_result). Appending the queued user
-        // message directly would make two consecutive .user entries that
-        // mergeConsecutiveSameRole folds into one (tool_result + queued text) —
-        // exactly the bug where the model reads the queued prompt as in-loop
-        // context instead of a new turn (#579). Insert a minimal assistant bridge
-        // so the sequence is …user(tool_result) → assistant(interrupted) →
-        // user(queued) → assistant(responds). Only needed when the tail is .user;
-        // in the no-tool finish-branch the tail is already an assistant reply.
-        if agentHistory.last?.role == .user {
-            // Text MUST stay byte-identical to RawMessage.internalBridgeText —
-            // that constant is how the session-reload path recognizes this row
-            // as internal and keeps it out of the visible chat.
-            // [T-bridge-message-ui-leak]
-            let bridge = AgentMessage(role: .assistant, parts: [.text(RawMessage.internalBridgeText)])
-            let bridgeIdx = agentHistory.count
-            agentHistory.append(bridge)
-            if let pid = await persistAgentMessage(bridge, snapshots: [:]), bridgeIdx < agentHistory.count {
-                agentHistory[bridgeIdx].dbMessageId = pid
-            }
-        }
-
-        let queueMsg = AgentMessage(role: .user, parts: qCombinedParts)
-        let queueIdx = agentHistory.count
-        agentHistory.append(queueMsg)
-        if let pid = await persistAgentMessage(queueMsg, snapshots: [:]), queueIdx < agentHistory.count {
-            agentHistory[queueIdx].dbMessageId = pid
-        }
-        // Cache markdown on the completed assistant message before starting a new one
-        if msgIdx < messages.count {
-            for i in messages[msgIdx].blocks.indices {
-                if case .text = messages[msgIdx].blocks[i].kind, !messages[msgIdx].blocks[i].content.isEmpty {
-                    messages[msgIdx].blocks[i].cachedMarkdown = MarkdownContent(prepareMarkdownForRender(messages[msgIdx].blocks[i].content))
-                    cacheAttributedString(for: messages[msgIdx].blocks[i])
-                }
-            }
-            // Clear "thinking" indicator + store usage on the just-finished assistant message
-            messages[msgIdx].isAwaitingModelResponse = false
-            messages[msgIdx].usage = turnUsage
-        }
-        // Start a new assistant message so the next response appears below the queued user message
-        messages.append(ChatMessage(role: .assistant, content: "", blocks: []))
-        msgIdx = messages.count - 1
-        committedBlockCount = 0
-        self.committedBlockCount = 0
-        scrollToBottomSignal.send()
-        logger.info("Injected \(queued.count) queued prompt(s) as new turn after tool loop, new msgIdx=\(msgIdx)")
-        return true
-    }
-
-    /// Handle post-cancellation cleanup on the assistant message.
-    /// Called from task error handlers after the agent loop has stopped writing to blocks.
-    /// Preserves visible content after user cancel and enables Resume.
-    ///
-    /// Case 1 (tool execution cancel): The tool loop already committed blocks and
-    ///   tool_result to agentHistory — just mark non-terminal tool blocks as .cancelled.
-    /// Case 2 (text/parameter streaming cancel): Preserve partial text, remove incomplete
-    ///   tool blocks, commit to agentHistory, and inject a "Continue" user message.
-    /// [T-ios-retry-orphan-toolresult] Compact dump of the agentHistory
-    /// tool_use ↔ tool_result pairing. One line per entry showing role + the
-    /// tool_use ids it issues (TU:) and tool_result ids it answers (TR:), then a
-    /// summary flagging every orphan: a TR whose TU is absent, or a TU with no
-    /// answering TR. Grep `[PairDiag]`. Used around retryFromToolBlock's
-    /// sub-message cut to see whether the cut leaves a tool_result stranded
-    /// (which runAgentLoop's orphan-removal pass then has to delete, and which
-    /// is the suspected source of the "AI discusses douban but the user prompt
-    /// is gone" state).
-    private func dumpHistoryPairing(_ tag: String) {
-        var tuIds = Set<String>()
-        var trIds = Set<String>()
-        var lines: [String] = []
-        for (i, msg) in agentHistory.enumerated() {
-            var tus: [String] = []
-            var trs: [String] = []
-            for part in msg.parts {
-                if case .toolUse(let id, _, _) = part { tus.append(String(id.prefix(8))); tuIds.insert(id) }
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part { trs.append(String(id.prefix(8))); trIds.insert(id) }
-            }
-            var hasText = false
-            for part in msg.parts { if case .text(let t) = part, !t.isEmpty { hasText = true } }
-            let tuStr = tus.isEmpty ? "" : " TU:[\(tus.joined(separator: ","))]"
-            let trStr = trs.isEmpty ? "" : " TR:[\(trs.joined(separator: ","))]"
-            let textStr = hasText ? " text" : ""
-            lines.append("  [\(i)] \(msg.role.rawValue)\(textStr)\(tuStr)\(trStr)")
-        }
-        // Orphan detection (full-id compare).
-        var orphanTR: [String] = []
-        var orphanTU: [String] = []
-        for (_, msg) in agentHistory.enumerated() {
-            for part in msg.parts {
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part, !tuIds.contains(id) {
-                    orphanTR.append(String(id.prefix(8)))
-                }
-                if case .toolUse(let id, _, _) = part, !trIds.contains(id) {
-                    orphanTU.append(String(id.prefix(8)))
-                }
-            }
-        }
-        let verdict = (orphanTR.isEmpty && orphanTU.isEmpty)
-            ? "PAIRING-OK"
-            : "ORPHANS orphanTR=[\(orphanTR.joined(separator: ","))] orphanTU=[\(orphanTU.joined(separator: ","))]"
-        AppLogger(category: "PairDiag").info("[PairDiag] \(tag) count=\(self.agentHistory.count) \(verdict)\n\(lines.joined(separator: "\n"))")
-    }
-
-    /// [T-ios-queued-candidate-not-onscreen] Snapshot the prompt queue
-    /// (`promptQueue`, the pending queued sends) and the on-screen message array
-    /// (`messages`) — last 20 of each as compact summaries — to trace the
-    /// "queued candidate executed but never rendered" bug. Grep `[QueueDiag]`.
-    func dumpQueueSnapshot(_ tag: String) {
-        // On-screen message array (last 20).
-        let msgTail = messages.suffix(20)
-        let msgStartIdx = messages.count - msgTail.count
-        var msgLines: [String] = []
-        for (offset, m) in msgTail.enumerated() {
-            let idx = msgStartIdx + offset
-            let roleStr: String = {
-                switch m.role {
-                case .user: return "user"
-                case .assistant: return "asst"
-                case .compactDivider: return "divider"
-                case .systemInfo: return "sysinfo"
-                }
-            }()
-            let queuedMark = m.isQueued ? " QUEUED(\(m.queuedPromptId?.uuidString.prefix(8) ?? "?"))" : ""
-            let text = m.content.isEmpty
-                ? (m.blocks.isEmpty ? "" : m.blocks.compactMap { $0.content.isEmpty ? nil : $0.content }.first ?? "")
-                : m.content
-            let preview = text.replacingOccurrences(of: "\n", with: "⏎").prefix(50)
-            msgLines.append("  msg[\(idx)] \(roleStr) blocks=\(m.blocks.count)\(queuedMark) id=\(m.id.uuidString.prefix(8)) \"\(preview)\"")
-        }
-        // Prompt queue (last 20).
-        let queueTail = promptQueue.suffix(20)
-        var queueLines: [String] = []
-        for p in queueTail {
-            let preview = p.text.replacingOccurrences(of: "\n", with: "⏎").prefix(50)
-            queueLines.append("  q[\(p.id.uuidString.prefix(8))] att=\(p.attachments.count) \"\(preview)\"")
-        }
-        logger.info("📋[QueueDiag] \(tag) — promptQueue=\(self.promptQueue.count) messages=\(self.messages.count) isProcessing=\(self.isProcessing)\nPROMPT-QUEUE (last \(queueTail.count)):\n\(queueLines.joined(separator: "\n"))\nMESSAGES (last \(msgTail.count)):\n\(msgLines.joined(separator: "\n"))")
-    }
-
-    /// [T-ios-stop-candidate-message-lost] One-line-per-block dump of the
-    /// candidate (last assistant) message + the committed-count cursors. Use
-    /// `xcrun simctl spawn booted log stream | grep StopDiag` (or read the
-    /// daily LoggingManager file) to trace which blocks survive a Stop.
-    private func dumpCandidateState(_ tag: String) {
-        let so = self.committedBlockCount
-        let pso = self.prevCommittedBlockCount
-        let histLast = agentHistory.last.map { "\($0.role.rawValue)[\($0.parts.count)p]" } ?? "nil"
-        // Resolve the candidate by the last ASSISTANT row (a queued .user
-        // message can sit after it), not messages.last.
-        guard let candidateIdx = messages.lastIndex(where: { $0.role == .assistant }) else {
-            logger.info("⏹️[StopDiag] \(tag) — no assistant message at all (messagesLast=\(self.messages.last?.role == .user ? "user" : "nil")) committed=\(so) prevCommitted=\(pso) histLast=\(histLast) canResume=\(self.canResume)")
-            return
-        }
-        let last = messages[candidateIdx]
-        let trailingQueued = candidateIdx < messages.count - 1
-        logger.info("⏹️[StopDiag] \(tag) — candidate idx=\(candidateIdx) trailingQueued=\(trailingQueued) blocks=\(last.blocks.count) committed=\(so) prevCommitted=\(pso) histLast=\(histLast) canResume=\(self.canResume) msgId=\(last.id.uuidString.prefix(8))")
-        for (i, b) in last.blocks.enumerated() {
-            let kindStr: String = {
-                switch b.kind {
-                case .text: return "text"
-                case .thinking: return "thinking"
-                case .shellTool: return "shellTool"
-                case .fileReadTool: return "fileRead"
-                case .fileWriteTool: return "fileWrite"
-                case .fileEditTool: return "fileEdit"
-                case .browserTool: return "browser"
-                case .readImageTool: return "readImage"
-                case .memoryTool: return "memory"
-                case .visualization: return "visualization"
-                case .info: return "info"
-                }
-            }()
-            let statusStr: String = {
-                guard let s = b.toolStatus else { return "-" }
-                switch s {
-                case .streaming: return "streaming"
-                case .running: return "running"
-                case .cancelled: return "cancelled"
-                default: return "\(s)"
-                }
-            }()
-            let committedMark = i < so ? "C" : "·"  // C = already committed to agentHistory
-            let preview = b.content.replacingOccurrences(of: "\n", with: "⏎").prefix(40)
-            logger.info("⏹️[StopDiag]   [\(committedMark)] block[\(i)] kind=\(kindStr) status=\(statusStr) len=\(b.content.count) tuId=\(b.toolUseId?.prefix(8) ?? "-") \"\(preview)\"")
-        }
-    }
-
-    private func playCompletionHaptic() {
-        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-    }
-
-    private func handleUserCancelledCleanup() {
-        let blockCount = (messages.last?.role == .assistant) ? messages.last!.blocks.count : -1
-        let hasContent = (messages.last?.role == .assistant) ? messages.last!.blocks.contains(where: { !$0.content.isEmpty }) : false
-        let lastRole = messages.last.map { $0.role == .assistant ? "assistant" : "user" } ?? "nil"
-        let historyLastRole = agentHistory.last?.role.rawValue ?? "nil"
-        logger.info("⏹️ handleUserCancelledCleanup userDidCancel=\(self.userDidCancel) lastRole=\(lastRole) blocks=\(blockCount) hasContent=\(hasContent) canResume=\(self.canResume) historyLast=\(historyLastRole)")
-        dumpCandidateState("cleanup-ENTER")
-        if userDidCancel {
-            userDidCancel = false
-            // [T-ios-retry-tool-blocks-invisible] The candidate (streaming)
-            // assistant message is NOT necessarily messages.last. If the user
-            // types + sends while tools are running, enqueuePrompt() appends a
-            // queued `.user` ChatMessage AFTER the candidate, so `messages.last`
-            // is that user row. The old `guard messages.last == .assistant`
-            // then bailed out entirely — the candidate's streamed text + tool
-            // blocks were never committed to agentHistory and committedBlockCount
-            // never advanced, so on Stop the just-generated answer vanished from
-            // the list (it only survived in the preview bar, which flatMaps
-            // vm.messages live). Resolve the candidate by the last *assistant*
-            // row and operate on its index, mirroring the collection view's
-            // `subscribeToLastMessage` (which already uses last(where: assistant)).
-            guard let candidateIdx = messages.lastIndex(where: { $0.role == .assistant }) else { return }
-            let last = messages[candidateIdx]
-
-            // Case 1: Cancel during tool execution — the tool loop already committed
-            // blocks and appended tool_result to agentHistory.
-            let lastHistoryIsToolResult = agentHistory.last?.role == .user
-                && agentHistory.last?.parts.contains(where: { if case .toolResult = $0 { return true }; return false }) == true
-            logger.info("⏹️[StopDiag] branch-decision lastHistoryIsToolResult=\(lastHistoryIsToolResult) → \(lastHistoryIsToolResult ? "Case 1 (tool cancel)" : "Case 2 (text/param cancel)")")
-            if lastHistoryIsToolResult {
-                for block in last.blocks {
-                    if let status = block.toolStatus {
-                        switch status {
-                        case .streaming, .running:
-                            block.toolStatus = .cancelled
-                        default: break
-                        }
-                    }
-                }
-
-                // [T-ios-stop-candidate-message-lost] Merged rendering accumulates
-                // every agentHistory iteration into ONE UI message (messages[msgIdx]).
-                // After a tool_result lands, the NEXT iteration can stream fresh text
-                // blocks into this same message before the user taps Stop — those
-                // blocks live past `committedBlockCount` and have NOT been committed
-                // to agentHistory yet (the iteration's commit at the end of the loop
-                // never ran). Without this flush, Case 1 returned immediately and that
-                // post-tool text was dropped from history; since `committedBlockCount`
-                // stayed behind it, a later resume/persist would also trim it from the
-                // UI — i.e. the just-generated answer vanished on Stop. Commit the
-                // uncommitted tail (text only — the cancelled tool blocks above are not
-                // re-issued) so it's both kept on screen and written to history.
-                let toolCancelStart = min(committedBlockCount, last.blocks.count)
-                logger.info("⏹️[StopDiag] Case1 flush-scan range=[\(toolCancelStart)..<\(last.blocks.count)] (committed=\(self.committedBlockCount))")
-                if toolCancelStart < last.blocks.count {
-                    var tailTextParts: [AgentContentPart] = []
-                    for i in toolCancelStart..<last.blocks.count {
-                        let block = last.blocks[i]
-                        if case .text = block.kind, !block.content.isEmpty {
-                            tailTextParts.append(.text(block.content))
-                            logger.info("⏹️[StopDiag]   Case1 flush-include block[\(i)] len=\(block.content.count)")
-                        } else {
-                            logger.info("⏹️[StopDiag]   Case1 flush-skip block[\(i)] (not non-empty text)")
-                        }
-                    }
-                    if !tailTextParts.isEmpty {
-                        tailTextParts.append(.text("<system-reminder>The user stopped this response. Content may be incomplete.</system-reminder>"))
-                        let assistantMsg = AgentMessage(role: .assistant, parts: tailTextParts)
-                        let asstIdx = agentHistory.count
-                        agentHistory.append(assistantMsg)
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            if let pid = await self.persistAgentMessage(assistantMsg), asstIdx < self.agentHistory.count {
-                                self.agentHistory[asstIdx].dbMessageId = pid
-                            }
-                        }
-                        // Advance committed counts so the kept blocks survive a later
-                        // resume's `removeSubrange(committedBlockCount...)` trim.
-                        self.prevCommittedBlockCount = self.committedBlockCount
-                        self.committedBlockCount = last.blocks.count
-                        logger.info("⏹️ Case 1: flushed \(tailTextParts.count) post-tool text part(s) to agentHistory before stopping")
-                    }
-                }
-
-                canResume = true
-                logger.info("⏹️ Case 1 (tool cancel): preserved \(last.blocks.count) blocks, canResume=true")
-                dumpCandidateState("cleanup-EXIT-case1")
-                return
-            }
-
-            // Case 0 (T-stop-clear-thinking-and-partial-ios): Stop fired in
-            // the pre-first-chunk thinking gap — the candidate has no real
-            // content, no committed prior iteration, and history does not
-            // end with a tool_result (would mean Case 1 owns it). The
-            // placeholder ChatMessage runAgentLoop pushed would otherwise
-            // render as a bare "Minis" header bubble with the typing
-            // indicator hosted on it. Drop the placeholder so the UI snaps
-            // back to idle. Boundary against #566/#569 8bb0bf83: a candidate
-            // with any non-empty text block or any tool_use block is kept
-            // (drops through to Case 2 below); only a thinking-only / 0-block
-            // placeholder is removed here. The placeholder is not persisted
-            // by runAgentLoop entry — agentHistory is written only when an
-            // iteration commits — so removing from messages alone is enough;
-            // no DB rollback needed.
-            let hasNonEmptyText = last.blocks.contains { block in
-                if case .text = block.kind, !block.content.isEmpty { return true }
-                return false
-            }
-            let hasAnyToolUse = last.blocks.contains { $0.toolStatus != nil }
-            if !hasNonEmptyText, !hasAnyToolUse, prevCommittedBlockCount == 0 {
-                logger.info("⏹️[StopDiag] Case0 REMOVING thinking-only placeholder at idx=\(candidateIdx) blocks=\(last.blocks.count) (no text, no tool_use, prevCommitted=0)")
-                messages.remove(at: candidateIdx)
-                dumpCandidateState("cleanup-EXIT-case0")
-                return
-            }
-
-            // Case 2: Cancel during text or parameter streaming.
-            // Remove incomplete tool blocks (parameters still streaming).
-            last.blocks.removeAll { block in
-                if case .streaming = block.toolStatus { return true }
-                return false
-            }
-
-            // A SSE chunk can flip a block from .streaming to .running between
-            // the user's tap and this cleanup running. Any .running block left
-            // here has no tool_result yet (Case 1 already returned) — mark it
-            // cancelled so the shimmer overlay stops, regardless of whether
-            // we keep or drop the surrounding blocks below.
-            for block in last.blocks {
-                if case .running = block.toolStatus {
-                    block.toolStatus = .cancelled
-                }
-            }
-
-            let hasVisibleContent = last.blocks.contains(where: { !$0.content.isEmpty })
-
-            logger.info("⏹️[StopDiag] Case2 hasVisibleContent=\(hasVisibleContent) prevCommitted=\(self.prevCommittedBlockCount) committed=\(self.committedBlockCount) blocks=\(last.blocks.count)")
-            if hasVisibleContent {
-                // Collect text from current iteration's blocks
-                var textParts: [AgentContentPart] = []
-                let safeStart = min(prevCommittedBlockCount, last.blocks.count)
-                for i in safeStart..<last.blocks.count {
-                    let block = last.blocks[i]
-                    if case .text = block.kind, !block.content.isEmpty {
-                        textParts.append(.text(block.content))
-                    }
-                }
-
-                // Commit partial text to agentHistory with a truncation marker
-                // so the model knows the response was interrupted.
-                let histLastIsAsst = agentHistory.last?.role == .assistant
-                logger.info("⏹️[StopDiag] Case2 collect textParts=\(textParts.count) safeStart=\(safeStart) histLastIsAsst=\(histLastIsAsst) → \(!textParts.isEmpty && !histLastIsAsst ? "WILL COMMIT" : "SKIP commit")")
-                if !textParts.isEmpty, agentHistory.last?.role != .assistant {
-                    textParts.append(.text("<system-reminder>The user stopped this response. Content may be incomplete.</system-reminder>"))
-                    let assistantMsg = AgentMessage(role: .assistant, parts: textParts)
-                    let asstIdx = agentHistory.count
-                    agentHistory.append(assistantMsg)
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        if let pid = await self.persistAgentMessage(assistantMsg), asstIdx < self.agentHistory.count {
-                            self.agentHistory[asstIdx].dbMessageId = pid
-                        }
-                    }
-                    logger.info("⏹️ Case 2: committed partial text (\(textParts.count) parts) with truncation marker to agentHistory")
-                }
-
-                // Update committed counts to preserve current blocks
-                self.prevCommittedBlockCount = self.committedBlockCount
-                self.committedBlockCount = last.blocks.count
-
-                canResume = true
-                logger.info("⏹️ Case 2 (text cancel): preserved \(last.blocks.count) blocks, canResume=true")
-            } else if prevCommittedBlockCount > 0 {
-                // No visible content in current iteration but prior iterations exist.
-                logger.info("⏹️[StopDiag] Case2-branchB no-visible-content, prevCommitted=\(self.prevCommittedBlockCount)>0 → trim blocks[\(self.prevCommittedBlockCount)...], drop trailing asst history if present")
-                if prevCommittedBlockCount < last.blocks.count {
-                    last.blocks.removeSubrange(prevCommittedBlockCount...)
-                }
-                committedBlockCount = prevCommittedBlockCount
-                if agentHistory.last?.role == .assistant {
-                    agentHistory.removeLast()
-                }
-                canResume = true
-                logger.info("⏹️ No visible content but prior iterations exist — canResume=true")
-            } else {
-                logger.warning("⏹️[StopDiag] Case2-branchC REMOVING empty candidate message at idx=\(candidateIdx) (no visible content, prevCommitted=0)")
-                // Remove the candidate by index — NOT removeLast() — because a
-                // queued `.user` message may sit after it (enqueued mid-tool).
-                messages.remove(at: candidateIdx)
-                if agentHistory.last?.role == .assistant {
-                    agentHistory.removeLast()
-                }
-                logger.info("⏹️ Removed empty assistant message")
-            }
-            dumpCandidateState("cleanup-EXIT")
-        } else {
-            // Non-user cancellation (e.g. concurrency gate) — just remove empty message
-            if let last = messages.last, last.role == .assistant,
-               !last.blocks.contains(where: { !$0.content.isEmpty }) {
-                messages.removeLast()
-            }
-        }
-    }
-
-    /// [T-ios-error-banner-lost] Surface a turn failure that has no assistant
-    /// bubble to attach to, in a form that SURVIVES leaving the session.
-    ///
-    /// The five error epilogues all ended with `self.errorMessage = displayDesc`
-    /// when `messages` held no assistant row — which happens whenever a request
-    /// dies before the first chunk (bad API key, refused connection, provider
-    /// 4xx). `errorMessage` is a @Published on this view model, and the view
-    /// model is a per-session @StateObject: switching sessions or letting the
-    /// scene tear down destroys it, taking the only record of the failure with
-    /// it. The user returns to a chat that looks like nothing was ever sent.
-    ///
-    /// Creating the assistant row here fixes both halves at once. It renders
-    /// through the normal inline-error path (`ChatMessageRow` draws
-    /// `inlineError` for assistant rows, and Retry hangs off the same row), and
-    /// `persistErrorInfo` now writes a carrier row when none exists, so a
-    /// reload restores it. This mirrors the shape the context-exhausted branch
-    /// in `send()` already uses.
-    ///
-    /// `errorMessage` is still set as well: it is what drives the top banner for
-    /// the current, still-live view, and clearing it is how the user dismisses
-    /// that banner. The durable copy is the addition, not a replacement.
-    private func reportTurnFailure(_ displayDesc: String) {
-        errorMessage = displayDesc
-        let carrier = ChatMessage(role: .assistant, content: "", blocks: [])
-        carrier.error = displayDesc
-        messages.append(carrier)
-        Task { await self.persistErrorInfo(displayDesc) }
-    }
-
     // MARK: - Session Persistence
 
     /// Load an existing session's messages from the database and rebuild UI + agent history.
@@ -6426,2082 +1866,6 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     /// grown since the last badge, i.e. this run genuinely produced a new
     /// completion. [T-ios-unread-dot-reappears]
     var lastBadgedAssistantTurnCount: Int = -1
-    // MARK: - Agent Loop
-
-    /// Clear ONLY the uncommitted streaming tail of an assistant message after a
-    /// mid-stream failure, preserving every block already committed+persisted in
-    /// an earlier round of the same loop. [T-ios-stream-retry-text-disappear]
-    ///
-    /// Blocks at index `[0, committedBlockCount)` are the committed prefix (text
-    /// and terminal tool results from prior rounds, already in the DB) and are
-    /// kept verbatim. From `committedBlockCount` onward we drop the in-flight
-    /// failed stream: text blocks (partial output that the retry will re-stream)
-    /// and tool blocks stuck in `.streaming` / `.running` (which would otherwise
-    /// stay orphaned in the UI, never reaching a terminal state). A completed
-    /// tool block in the tail (rare) is left alone so its result still shows.
-    @MainActor
-    static func clearUncommittedStreamTail(_ message: ChatMessage, committedBlockCount: Int) {
-        let lowerBound = max(0, min(committedBlockCount, message.blocks.count))
-        guard lowerBound < message.blocks.count else { return }
-        var kept = Array(message.blocks[0..<lowerBound])
-        for block in message.blocks[lowerBound...] {
-            if block.kind == .text { continue }
-            // [T-dup-thinking-block] Drop uncommitted thinking blocks — not persisted, retry stream will regenerate them.
-            if block.kind == .thinking { continue }
-            if case .streaming = block.toolStatus { continue }
-            if case .running = block.toolStatus { continue }
-            kept.append(block)
-        }
-        message.blocks = kept
-    }
-
-    private func runAgentLoop(resumingAt existingMsgIdx: Int? = nil, committedBlocks: Int? = nil) async throws {
-        // REPRO-DIAG(2026-05-16): bump global round counter and emit a clear
-        // BEGIN/END marker so the user can grep `ROUND \d+` to slice the log
-        // by attempt. A "round" = one runAgentLoop invocation, which is
-        // triggered by a new user message send or a retry.
-        let _diagRound = Self.bumpDiagRound()
-        AppLogger(category: "RoundMarker").warning("══════════════ ROUND BEGIN \(_diagRound) ══════════════ vm=\(self.vmInstanceId) session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) resuming=\(existingMsgIdx != nil)")
-        // [T-perf-estimate-cache] Defer blocks used to call
-        // estimateContextTokens() which triggers a full-history traversal
-        // + JSON serialization at round END — right when the UI is resuming
-        // interactivity. Now reuse the cached value from round start (the
-        // defer runs after history has grown, so this is a lower bound, but
-        // it's only a diagnostic log line — not worth blocking the UI for).
-        defer { AppLogger(category: "RoundMarker").warning("══════════════ ROUND END \(_diagRound) ════════════════ vm=\(self.vmInstanceId) session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(_cachedEstimateTokens ?? -1) tokens") }
-        logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop START session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) resuming=\(existingMsgIdx != nil)")
-        defer { logger.info("🔄SESSION [vm=\(self.vmInstanceId)] runAgentLoop END session=\(self.sessionId ?? "nil") history=\(self.agentHistory.count) estimated ~\(_cachedEstimateTokens ?? -1) tokens") }
-        // [T-deep-mode-session-workflow] P2: activity indicator. Reflect "a
-        // round is actively executing" so the progress capsule can pulse during
-        // long model reasoning or high-cost tool calls (shell/file) instead of
-        // looking like a frozen "0/x". Cleared on every exit path via defer, so
-        // it can never stay stuck true. Gated by sessionWorkflowEnabled so a
-        // non-deep / rollback-off session never flips it.
-        workflowBusy = sessionWorkflowEnabled
-        defer { workflowBusy = false }
-
-        // [T-perf-warmup-at-loop] Kick off the O(n×m) effective-history build on
-        // a background thread HERE — the single funnel every send path goes
-        // through (normal send / Compact & Send's queued drain / resume).
-        //
-        // Placement matters: by the time runAgentLoop is entered, every append to
-        // agentHistory for this turn is already done, so the warmup snapshot is
-        // the FINAL state. That is essential for compacted sessions, because
-        // effectiveAgentHistory() injects the summary into the first POST-anchor
-        // user message. The old send()-time placement ran before that user
-        // existed, produced a result that could not be reused, and was discarded
-        // by the parity guard in warmupEffectiveHistoryInBackground(). Warming up
-        // here instead yields an exact cache HIT at the effectiveAgentHistory()
-        // call in the loop below, so the main thread does zero rebuild work.
-        warmupEffectiveHistoryInBackground()
-
-        let loopSetupStart = CFAbsoluteTimeGetCurrent()
-        let t0 = CFAbsoluteTimeGetCurrent()
-        let isResume = existingMsgIdx != nil
-
-        // [T-deep-mode-perf] Track individual step timing
-        var perfTimings: [String: Double] = [:]
-
-        // [T-ios-empty-after-toolresult-reminder] Fresh turn → allow one reminder retry.
-        didInjectEmptyToolReminderThisRun = false
-        // [T-deep-mode-cognitive-p1] C8: Reset uncertainty check flag for this run.
-        didInjectUncertaintyCheckThisRun = false
-        // [T-deep-mode-cognitive-p2-c9] C9: Reset cognitive load model signal
-        // at the start of each agent loop. The @Published cognitiveLoadState
-        // is updated mid-loop; we don't reset it here so the last known load
-        // persists visually until the new turn's first signal arrives.
-        lastModelLoadSignal = nil
-        // [T-deep-mode-cognitive-p2-c10] C10: Clear the need-more-context state
-        // at the start of a fresh send — a new user message implies they've
-        // provided the context the model was asking for.
-        needMoreContextState = nil
-
-        // Resolve provider from ProviderConfigStore
-        guard let entry = resolveCurrentEntry() else {
-            let errMsg = ChatMessage(role: .assistant, content: "", blocks: [])
-            errMsg.error = AppLocalized("No model configured. Add a provider in Settings.")
-            messages.append(errMsg)
-            return
-        }
-        var provider = await makeAgentProvider(for: entry)
-
-        // Set extended cache TTL globally for Anthropic request patching
-        RequestBodyPatcher.setExtendedCacheTTL(self.enhancedCacheEnabled)
-
-        // Restore persisted thought signatures for Gemini session resume
-        if let geminiProvider = provider as? GeminiAgentProvider, !pendingThoughtSignatures.isEmpty {
-            geminiProvider.restoreToolCallMetadata(pendingThoughtSignatures)
-            pendingThoughtSignatures = [:]
-        }
-
-        var activeGroupId: String?  // non-nil when using a group (enables fallback)
-        var activeEntryId: String? = entry.id
-
-        // Check if this entry came from a group binding
-        if let sid = sessionId,
-           let binding = ProviderConfigStore.shared.binding(for: sid),
-           case .group(let gid, _) = binding.primarySource {
-            activeGroupId = gid
-        }
-
-        // When resolved via cachedSessionModelId (no binding at all — e.g. an
-        // iCloud-synced session whose binding row didn't sync), the entry may
-        // still belong to the default group. Enable fallback by discovering
-        // the group. Deliberately NOT applied when a .directEntry binding
-        // exists: that is an explicit user pin, and enabling group fallback
-        // would both switch models behind the user's back and overwrite the
-        // pin with a group binding on fallback success.
-        if activeGroupId == nil,
-           sessionId.flatMap({ ProviderConfigStore.shared.binding(for: $0) }) == nil {
-            let store = ProviderConfigStore.shared
-            if let gid = store.defaultPrimaryGroupId,
-               let group = store.group(for: gid),
-               group.memberEntryIds.contains(entry.id) {
-                activeGroupId = gid
-            }
-        }
-
-        // [T-perf-keyboard-yield] Give the main run loop one frame before the
-        // heavy synchronous prompt assembly + orphan scan begins. When the user
-        // taps send, performSend() dismisses the keyboard (inputFocused=false),
-        // then this Task starts. Without this yield the keyboard dismissal
-        // animation freezes mid-way — "底部空了" — because the main thread is
-        // immediately locked by the prompt build. The yield lets Core Animation
-        // advance 1–2 frames so the keyboard slides away smoothly before we
-        // start blocking. Zero cost on retry/resume (keyboard already down).
-        await Task.yield()
-
-        let tools = makeAgentTools()
-
-        var userSystemPrompt = baseSystemPrompt
-        let activeModel = ProviderConfigStore.shared.entry(for: entry.id)?.model ?? selectedModel
-        if let capFragment = activeModel.capabilityPromptFragment {
-            userSystemPrompt += "\n\n" + capFragment
-        }
-        if let behaviorFragment = activeModel.agentBehaviorPromptFragment {
-            userSystemPrompt += "\n\n" + behaviorFragment
-        }
-
-        // Inject enabled skill metadata into system prompt
-        if let sid = sessionId,
-           let skillFragment = SkillStore.shared.skillPromptFragment(for: sid) {
-            userSystemPrompt += "\n\n" + skillFragment
-        }
-
-        // [T-mcp-integration-ios] Inject Top-20 enabled MCP server metadata.
-        if let sid = sessionId,
-           let mcpFragment = MCPStore.shared.systemPromptSnippet(for: sid) {
-            userSystemPrompt += "\n\n" + mcpFragment
-        }
-
-        // Inject environment profile info (active profile + available env var names).
-        if let envProfileFragment = await envProfileSystemPromptSnippet() {
-            userSystemPrompt += "\n\n" + envProfileFragment
-        }
-
-        // [T-memory-toggle-gates-injection-and-tools-ios] Memory injection
-        // (GLOBAL.md + recent daily logs) is gated by the per-session
-        // memoryEnabled toggle. SOUL.md (identity / persona) is rendered
-        // by SystemPromptBuilder.identitySection() above and is NOT
-        // affected by this toggle.
-        // [T-memory-enabled-new-session-bug DIAG] vm.memoryEnabled is the
-        // value the injection actually keys off. Trace it against the
-        // session so a repro shows whether loadSession seeded it from the
-        // global default.
-        AppLogger(category: "MemDiag").info("[MemDiag] inject-decision sid=\(self.sessionId?.prefix(8) ?? "nil") vm.memoryEnabled=\(self.memoryEnabled)")
-        if memoryEnabled {
-            // [T-deep-mode-memory-phase3] Phase 3: when deep mode is on, inject
-            // categorized structured memory instead of flat GLOBAL.md. When deep
-            // mode is off, fall back to the legacy flat injection (total switch
-            // contract: 100% behavior parity when switch is off).
-            if deepModeEnabled,
-               let structuredFragment = StructuredMemoryStore.categorizedMemoryFragment() {
-                userSystemPrompt += "\n\n" + structuredFragment
-            } else if let memoryFragment = Self.loadGlobalMemoryFragment() {
-                userSystemPrompt += "\n\n" + memoryFragment
-            }
-            if let dailyFragment = Self.loadRecentDailyMemoryFragment() {
-                userSystemPrompt += "\n\n" + dailyFragment
-            }
-        }
-        // Authoritative memory-status footer (overrides any earlier
-        // baseSystemPrompt mentions when memory is disabled).
-        userSystemPrompt += memoryStatusFragment
-
-        // [T-deep-mode] Inject the deep-agent behavior fragment when the global
-        // 深度龙虾Ai toggle is on. Placed after the memory footer so deep mode's
-        // plan-first / self-verify posture is the LAST behavioral instruction
-        // the model sees before history.
-        if deepModeEnabled {
-            let t_deep = CFAbsoluteTimeGetCurrent()
-            userSystemPrompt += deepModeFragment
-            // [T-deep-mode-cognitive-p2-c14] C14: Inject cross-session context
-            // fragment so the model has continuity from previous deep-mode
-            // sessions (active project, recent workflows, learned patterns).
-            // Total-switch safe: only injected when deepModeEnabled is on.
-            if let crossSessionFragment = CrossSessionContextStore.contextFragment() {
-                userSystemPrompt += "\n\n" + crossSessionFragment
-            }
-            perfTimings["deepModeFragment"] = (t_deep - t0) * 1000
-        }
-
-        let promptBuildMs = (CFAbsoluteTimeGetCurrent() - loopSetupStart) * 1000
-        let perfSummary = perfTimings.map { "\($0.key)=\(String(format: "%.1f", $0.value))ms" }.joined(separator: ", ")
-        logger.info("⏱️ [runAgentLoop] prompt build elapsed=\(String(format: "%.1f", promptBuildMs))ms history=\(self.agentHistory.count) [perf: \(perfSummary)]")
-        await Task.yield()
-
-        // When resuming after error, reuse the existing assistant message; otherwise create new
-        var msgIdx: Int
-        if let existingMsgIdx {
-            msgIdx = existingMsgIdx
-            let okBounds = existingMsgIdx >= 0 && existingMsgIdx < messages.count
-            let role = okBounds ? (messages[existingMsgIdx].role == .assistant ? "assistant" : "user") : "OOB"
-            let blocks = okBounds ? messages[existingMsgIdx].blocks.count : -1
-            AppLogger(category: "RetryDiag").info("[RetryDiag] runAgentLoop RESUME existingMsgIdx=\(existingMsgIdx) role=\(role) blocks=\(blocks) committedBlocks=\(committedBlocks ?? -1) messagesCount=\(self.messages.count)")
-        } else {
-            messages.append(ChatMessage(role: .assistant, content: "", blocks: []))
-            msgIdx = messages.count - 1
-        }
-        // Capture the assistant message's stable id so we can re-find it
-        // when the `messages` array gets mutated mid-stream (user delete,
-        // reloadMessagesFromDB rebuild, compactBefore removeAll, etc.). On
-        // any retry / fallback catch path we resync `msgIdx` via this id
-        // before touching `messages[msgIdx]`; if the message is gone we
-        // bail out cleanly instead of crashing with Index out of range.
-        var runMsgId: UUID = msgIdx < messages.count ? messages[msgIdx].id : UUID()
-        /// Track how many blocks were already committed to agentHistory
-        /// so subsequent iterations only add new blocks.
-        var committedBlockCount = committedBlocks ?? 0
-        self.committedBlockCount = committedBlockCount
-        var turnUsage = TokenUsage()
-
-        // Log context baseline for offload diagnostics
-        let estimatedTokens = estimateContextTokens()
-        logger.info("📐 Context baseline: agentHistory=\(self.agentHistory.count) msgs, estimated ~\(estimatedTokens) tokens, turnUsage.latestContextTokens=\(turnUsage.latestContextTokens) (model window: \(ProviderConfigStore.shared.entry(for: entry.id)?.model.contextWindowTokens ?? 0))")
-
-        // Safety: scan the entire agentHistory for assistant messages with tool_use
-        // that lack corresponding tool_result messages. This can happen when:
-        // - User cancelled mid-tool-execution and cleanup missed an entry
-        // - Session was restored from persistence with incomplete state
-        // - A race condition between cancel cleanup and retry left orphaned tool_uses
-        //
-        // IMPORTANT: skip injection when the assistant message was stream-interrupted.
-        // A mid-stream network drop leaves tool_use blocks with empty/partial inputs
-        // (partialJson never completed). Injecting a tool_result for such a tool_use
-        // causes API 400 "unexpected tool_use_id" or "invalid input" errors.
-        // Instead, the interrupted assistant message is dropped so the model retries
-        // cleanly from the previous user/tool_result turn.
-        //
-        // First handle the last message specially (may need to be dropped entirely if interrupted).
-        if let lastAssistant = agentHistory.last, lastAssistant.role == .assistant, lastAssistant.isInterrupted {
-            agentHistory.removeLast()
-            logger.warning("Dropped interrupted assistant message with partial tool_use(s) — will retry from previous turn")
-        }
-
-        // [T-ios-retry-orphan-toolresult] Snapshot the pairing as runAgentLoop
-        // sees it on entry — BEFORE the orphan-removal below mutates anything.
-        // If this shows ORPHANS, the entry came in already-broken (the cut /
-        // a prior cancel / merged-render reorder stranded a tool_result); the
-        // removal pass is only papering over it. Compare against subcut-AFTER.
-        dumpHistoryPairing("runAgentLoop-entry (pre-orphan-scan)")
-        await Task.yield()
-
-        // [T-ios-orphan-scan-perf] Incremental orphan scan: only scan newly
-        // added messages since the last scan, not the entire agentHistory.
-        // The invariant is: once a message pair (tool_use / tool_result) is
-        // verified clean, it stays clean until a FUTURE operation appends
-        // more messages. Scanning the full history is O(n*m) where n is
-        // total messages and m is average parts — unacceptable once the
-        // conversation has 100+ turns.
-        //
-        // We track `orphanScanCursor`: the index in agentHistory up to which
-        // we have already verified pairing. On each runAgentLoop entry we
-        // only scan agentHistory[orphanScanCursor...], then advance the
-        // cursor to agentHistory.count. On resume (partial re-scan), we
-        // reset the cursor to 0 because an interrupted turn may have left
-        // earlier messages in an unknown state.
-        // [T-ios-crash-clearchat-send] Defensive clamp: if orphanScanCursor
-        // somehow ended up > agentHistory.count (e.g. clearChat() didn't
-        // reset it in an older build), clamp it to a valid range instead
-        // of letting it produce an empty scan that leaves all tool IDs
-        // undetected. This is a safety net — clearChat() now properly
-        // resets the cursor, so this should never trigger in practice.
-        let rawScanFrom = isResume ? 0 : orphanScanCursor
-        let scanFrom = min(max(0, rawScanFrom), max(0, agentHistory.count - 1))
-        var allToolUseIds = Set<String>()
-        var allToolResultIds = Set<String>()
-
-        // Phase 1: scan only the dirty suffix for IDs, and use the cumulative
-        // prefix set for toolResult IDs from the clean prefix.
-        // [T-perf-orphan-incremental] The old code re-scanned the entire clean
-        // prefix (0..<scanFrom) for toolResult IDs on every send. This was the
-        // primary O(n×m) bottleneck — hundreds of messages × parts each, twice
-        // per send. We now maintain orphanScanPrefixToolResultIds as a cumulative
-        // set, so this merge is O(1) instead of O(n×m).
-        for msg in scanFrom..<agentHistory.count {
-            let partList = agentHistory[msg].parts
-            for part in partList {
-                if case .toolUse(let id, _, _) = part {
-                    allToolUseIds.insert(id)
-                }
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                    allToolResultIds.insert(id)
-                }
-            }
-        }
-        // Merge the cumulative prefix toolResult IDs — replaces the old
-        // full-prefix scan. Covers the same "tool_result whose tool_use was
-        // added in the same batch" edge case the old scan handled.
-        allToolResultIds.formUnion(orphanScanPrefixToolResultIds)
-
-        // 1. Remove orphaned tool_results (tool_result without matching tool_use).
-        //    These cause API 400: "unexpected tool_use_id found in tool_result blocks".
-        var removedOrphanedResults = 0
-        // Only scan from scanFrom forward — earlier messages are already clean.
-        for i in (scanFrom..<agentHistory.count).reversed() {
-            let msg = agentHistory[i]
-            guard msg.role == .user else { continue }
-            let beforeCount = msg.parts.count
-            let cleanedParts = msg.parts.filter { part in
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                    if !allToolUseIds.contains(id) {
-                        logger.warning("Removing orphaned tool_result id=\(id) at history[\(i)]")
-                        removedOrphanedResults += 1
-                        return false
-                    }
-                }
-                return true
-            }
-            if cleanedParts.count < beforeCount {
-                if cleanedParts.isEmpty {
-                    // All parts were orphaned tool_results — remove entire message
-                    agentHistory.remove(at: i)
-                } else {
-                    agentHistory[i] = AgentMessage(role: .user, parts: cleanedParts)
-                }
-            }
-        }
-        if removedOrphanedResults > 0 {
-            logger.warning("Removed \(removedOrphanedResults) orphaned tool_result(s) without matching tool_use")
-        }
-
-        // 2. Inject placeholder tool_results for orphaned tool_uses (tool_use without matching tool_result).
-        // Rebuild allToolResultIds after removals above — only in the scanned range.
-        // [T-perf-orphan-incremental] Phase 2 previously re-scanned the entire
-        // clean prefix (0..<scanFrom) for toolResult IDs a SECOND time. We now
-        // reuse the cumulative prefix set — O(1) instead of O(n×m) again.
-        allToolResultIds = orphanScanPrefixToolResultIds
-        for i in scanFrom..<agentHistory.count {
-            let msg = agentHistory[i]
-            for part in msg.parts {
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                    allToolResultIds.insert(id)
-                }
-            }
-        }
-
-        var insertions: [(index: Int, message: AgentMessage)] = []
-        for i in scanFrom..<agentHistory.count {
-            let msg = agentHistory[i]
-            guard msg.role == .assistant else { continue }
-            let orphanedToolUses = msg.parts.compactMap { part -> (String, String)? in
-                if case .toolUse(let id, let name, _) = part, !allToolResultIds.contains(id) {
-                    return (id, name)
-                }
-                return nil
-            }
-            guard !orphanedToolUses.isEmpty else { continue }
-
-            let insertIdx = i + 1
-            let placeholderParts = orphanedToolUses.map { (id, name) in
-                AgentContentPart.toolResult(
-                    id: id, name: name,
-                    content: "Tool execution was interrupted by an unexpected error.",
-                    isError: true
-                )
-            }
-            let placeholderMsg = AgentMessage(role: .user, parts: placeholderParts)
-            insertions.append((index: insertIdx, message: placeholderMsg))
-            logger.warning("Found \(orphanedToolUses.count) orphaned tool_use(s) in assistant message at index \(i)")
-        }
-        for insertion in insertions.reversed() {
-            agentHistory.insert(insertion.message, at: insertion.index)
-        }
-        if !insertions.isEmpty {
-            logger.warning("Injected placeholder tool results for \(insertions.count) assistant message(s) with orphaned tool_use(s)")
-        }
-
-        let orphanScanMs = (CFAbsoluteTimeGetCurrent() - loopSetupStart) * 1000
-        // Advance the orphan scan cursor past all messages we've now verified.
-        // On resume we scan from 0 (dirty suffix), then advance to count so
-        // the next normal runAgentLoop starts from here.
-        orphanScanCursor = agentHistory.count
-        // [T-perf-orphan-incremental] Accumulate toolResult IDs from the range
-        // we just verified into the cumulative prefix set. This range is now
-        // part of the "clean prefix" for the next send — its toolResult IDs
-        // will be served from the set in O(1) instead of re-scanned in O(n×m).
-        // On resume (scanFrom == 0) the set is rebuilt from the full history.
-        if isResume {
-            orphanScanPrefixToolResultIds.removeAll()
-        }
-        for i in scanFrom..<agentHistory.count {
-            for part in agentHistory[i].parts {
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                    orphanScanPrefixToolResultIds.insert(id)
-                }
-            }
-        }
-        logger.info("⏱️ [runAgentLoop] setup complete elapsed=\(String(format: "%.1f", orphanScanMs))ms (prompt+orphanScan) scanFrom=\(scanFrom) cursor=\(orphanScanCursor) prefixToolResultIds=\(orphanScanPrefixToolResultIds.count)")
-        await Task.yield()
-
-        // Counted instead of `while true` so we have a hard backstop against
-        // runaway tool loops that slip past ToolLoopDetector. The post-loop
-        // tail uses `hitTurnLimit` (not `turnCount >= maxAgentTurns`) to
-        // distinguish "exhausted the ceiling" from any internal `break`:
-        // the defer below increments turnCount on *every* iteration end,
-        // including breaks, so a value-based check would false-positive
-        // when the happy-path break fires on the last allowed iteration.
-        // hitTurnLimit stays true only when the while-condition itself
-        // becomes false, never set false by any break path.
-        var turnCount = 0
-        var hitTurnLimit = true
-        // [T-chat-auto-compact-inloop] Count in-loop auto-compactions so a loop
-        // that keeps hitting the threshold can't compact forever; when the cap
-        // is reached and we're still near capacity, the loop stops as exhausted.
-        var compactionsThisLoop = 0
-        // [T-deep-mode-cognitive-p1] C6: Heartbeat self-check counter.
-        // Counts tool-bearing iterations within this runAgentLoop invocation.
-        // Every 5th tool-bearing iteration triggers a self-check injection
-        // that reminds the model to verify goal alignment. Per-loop (not
-        // persisted), so turning off deepMode mid-loop is safe — the counter
-        // simply ceases to be checked. Total-switch safe: the injection only
-        // fires inside `if deepModeEnabled`.
-        var heartbeatToolCallCount = 0
-        loopLabel: while turnCount < Self.maxAgentTurns {
-            defer { turnCount += 1 }
-            // [LoopHeartbeat] (#181) One line per loop iteration. If the loop
-            // wedges on an await, the last heartbeat pins which iteration it
-            // died in, even when every other diagnostic is missing.
-            logger.info("[LoopHeartbeat] turnCount=\(turnCount) session=\(self.sessionId ?? "nil") time=\(Self.diagTimestamp(Date()))")
-            try Task.checkCancellation()
-            if let sid = self.sessionId {
-                SessionActivityTracker.shared.updateLoopIteration(sid, iteration: turnCount + 1)
-            }
-
-            // [T-ios-inloop-compact-freeze] Re-anchor msgIdx by stable id every
-            // iteration. External mutations while the loop runs — in-loop
-            // compaction's divider insert / status-row removeAll, a mid-loop
-            // reloadMessagesFromDB wholesale rebuild, user delete — shift or
-            // replace array members; a raw index (or a bail-out `break`) then
-            // silently streams every later round into the wrong / a detached
-            // ChatMessage: the UI freezes on the last rendered block while the
-            // DB keeps advancing (field case 2026-07-31, sessions 35D4D2B2 /
-            // 7FDC5B52: vm froze at sortOrder≈130 while DB reached 138).
-            if msgIdx < 0 || msgIdx >= messages.count || messages[msgIdx].id != runMsgId {
-                if let resynced = messages.firstIndex(where: { $0.id == runMsgId }) {
-                    AppLogger(category: "BlocksLost").warning("[BlocksLost] LOOP-RESYNC msgIdx \(msgIdx)→\(resynced) after external messages mutation (count=\(messages.count))")
-                    msgIdx = resynced
-                } else if let lastIdx = messages.indices.last, messages[lastIdx].role == .assistant {
-                    // Array was rebuilt with fresh instances (reload) — adopt the
-                    // trailing assistant message, which the rebuild reconstructed
-                    // from the same rows this loop already persisted. Everything
-                    // it now holds came from the DB, so it is all committed.
-                    AppLogger(category: "BlocksLost").warning("[BlocksLost] LOOP-REBIND msgIdx \(msgIdx)→\(lastIdx) — streaming message instance gone, adopting trailing assistant (count=\(messages.count))")
-                    msgIdx = lastIdx
-                    runMsgId = messages[lastIdx].id
-                    committedBlockCount = messages[lastIdx].blocks.count
-                    self.committedBlockCount = committedBlockCount
-                } else {
-                    // No trailing assistant to adopt — append a fresh one so the
-                    // rest of the turn stays visible instead of streaming into a
-                    // detached object.
-                    AppLogger(category: "BlocksLost").warning("[BlocksLost] LOOP-REAPPEND — streaming message gone and no trailing assistant (count=\(messages.count)); appending fresh assistant message")
-                    messages.append(ChatMessage(role: .assistant, content: "", blocks: []))
-                    msgIdx = messages.count - 1
-                    runMsgId = messages[msgIdx].id
-                    committedBlockCount = 0
-                    self.committedBlockCount = 0
-                }
-            }
-
-            // Trim old images: keep only the most recent `kImageContextKeepCount`
-            // images in history; older ones become text placeholders so the model
-            // can re-view them via read_image. Runs before token-based offload so
-            // image bytes are removed first.
-            trimOldImagesFromHistory()
-
-            // Context window management: offload old tool content if approaching limit
-            let activeModelForOffload = ProviderConfigStore.shared.entry(for: activeEntryId ?? "")?.model ?? selectedModel
-            offloadContextIfNeeded(model: activeModelForOffload, lastContextTokens: turnUsage.latestContextTokens)
-
-            // [T-chat-auto-compact-inloop] In-loop context guard. checkContext-
-            // BeforeSend only runs at the SEND entry point; a single turn that
-            // fans out into many tool iterations can blow past the compact/
-            // exhausted thresholds mid-loop, where offload alone (which only
-            // moves tool payloads to files) can't recover if the bulk is the
-            // model's own text. Re-evaluate the policy each iteration, AFTER
-            // offload had its chance:
-            //   • .needsCompact → compact in place (allowDuringProcessing) and
-            //     continue; the next API call reads the freshly-compacted
-            //     effectiveAgentHistory() automatically, so no resume handoff.
-            //   • .exhausted (compaction couldn't get us under the ceiling) →
-            //     stop the loop with a resumable, user-visible notice; the loop
-            //     cannot present a modal and wait for a tap.
-            // Turn-budget rule: a compaction iteration is a space-management
-            // step, NOT a task iteration, so it must NOT consume a turnCount
-            // slot (`continue` runs the defer, so we pre-decrement to cancel
-            // it) — but the overall maxAgentTurns ceiling is NEVER reset by a
-            // compaction, or a loop that keeps compacting could run forever and
-            // defeat the runaway backstop.
-            switch checkContextBeforeSend() {
-            case .ok:
-                break
-            case .needsCompact:
-                let compactAnchorId = messages.last(where: {
-                    $0.role != .compactDivider && $0.role != .systemInfo && !$0.isCompactedHistory
-                })?.id
-                if compactionsThisLoop < Self.maxInLoopCompactions,
-                   let anchorId = compactAnchorId {
-                    compactionsThisLoop += 1
-                    logger.info("[Context] In-loop near capacity — auto-compacting (\(compactionsThisLoop)/\(Self.maxInLoopCompactions)) turnCount=\(turnCount)")
-                    await compactBefore(anchorId, allowDuringProcessing: true)
-
-                    // [T-ios-inloop-compact-divider-order] GH#235. Seal the
-                    // bubble this run has been writing into and continue in a
-                    // FRESH one below the divider.
-                    //
-                    // `compactBefore` inserts the divider immediately AFTER the
-                    // anchor row and greys everything up to it. In the in-loop
-                    // case the anchor resolves to `messages.last(active)` —
-                    // which is this run's own still-streaming assistant bubble.
-                    // So without this, the loop `continue`s and keeps appending
-                    // thinking / tool blocks into a bubble that now sits ABOVE
-                    // the divider and is flagged `isCompactedHistory`: new
-                    // output appears greyed out inside the "already compacted"
-                    // region, in the wrong chronological place. That is exactly
-                    // the reported symptom.
-                    //
-                    // Starting a new bubble (rather than moving the divider) is
-                    // what matches the user's mental model: everything produced
-                    // before the compaction really is pre-compaction history,
-                    // and everything after it belongs below the line. It also
-                    // keeps `compactBefore` untouched — the user-initiated
-                    // "Compact Above" path anchors on a finished message and is
-                    // already correct.
-                    //
-                    // The sealed bubble keeps whatever it had; if it never
-                    // produced anything (compaction fired before the first
-                    // block landed) it would render as an empty grey row, so
-                    // drop it in that case.
-                    if let sealedIdx = messages.firstIndex(where: { $0.id == runMsgId }) {
-                        let sealed = messages[sealedIdx]
-                        sealed.isAwaitingModelResponse = false
-                        if sealed.blocks.isEmpty && sealed.content.isEmpty {
-                            messages.remove(at: sealedIdx)
-                            logger.info("[Context] In-loop compact: dropped empty sealed bubble at \(sealedIdx)")
-                        }
-                    }
-                    let fresh = ChatMessage(role: .assistant, content: "", blocks: [])
-                    fresh.isAwaitingModelResponse = true
-                    messages.append(fresh)
-                    msgIdx = messages.count - 1
-                    runMsgId = fresh.id
-                    // Blocks already committed belong to the sealed bubble; the
-                    // fresh one starts from zero or the next round would skip
-                    // its first N blocks when syncing to agentHistory.
-                    committedBlockCount = 0
-                    self.committedBlockCount = 0
-                    logger.info("[Context] In-loop compact: continuing in fresh bubble idx=\(msgIdx) id=\(runMsgId.uuidString.prefix(8)) below the divider")
-
-                    turnCount -= 1   // cancel this iteration's defer increment
-                    continue
-                }
-                // Already compacted the cap this loop and still near capacity —
-                // fall through to the same stop path as exhaustion.
-                logger.info("[Context] In-loop still near capacity after \(compactionsThisLoop) compaction(s) — stopping loop as exhausted")
-                fallthrough
-            case .exhausted:
-                logger.info("[Context] In-loop exhausted — stopping loop with resumable notice (turnCount=\(turnCount))")
-                appendSystemInfo(AppLocalized("Context is full and could not be compacted further. Start a new session or clear the chat to continue."), icon: "exclamationmark.triangle")
-                canResume = true
-                hitTurnLimit = false
-                break loopLabel
-            }
-
-            CrashReporter.shared.setLastAPI(provider: provider.name, model: activeModelForOffload.id)
-            logger.info("Calling \(provider.name) API (streaming) with \(self.agentHistory.count) messages")
-            // [StreamDiag] (#181) Monotonic request sequence, so a
-            // [StreamDiag][STALL] line can be matched against the request it
-            // belongs to — or shown to belong to none, which would mean the
-            // request never went out (candidate 1).
-            Self.diagRequestSeq &+= 1
-            let diagReqSeq = Self.diagRequestSeq
-            logger.info("[StreamDiag] req#\(diagReqSeq) DISPATCH turnCount=\(turnCount) session=\(self.sessionId ?? "nil") provider=\(provider.name) model=\(activeModelForOffload.id) messages=\(self.agentHistory.count) at=\(Self.diagTimestamp(Date()))")
-
-            #if DEBUG
-            // Begin a new agent request trace
-            AgentRequestTrace.shared.begin()
-            AgentRequestTrace.shared.step("agentLoop.start", detail: "provider=\(provider.name) messages=\(agentHistory.count)")
-
-            // Log agent history summary for debugging tool result delivery.
-            // [T-ios-log-noise-reduction] The full dump ran on every agent-loop
-            // API call, re-printing the entire (growing) history each iteration
-            // — the single biggest Debug-log noise source (~13.6k lines). The
-            // structured AgentRequestTrace still records every entry (cheap,
-            // in-memory, not NSLog), but the NSLog `📋 agentHistory[i]` line now
-            // only fires for entries NEW since the last dump (delta), preceded
-            // by a one-line summary. `lastDumpedAgentHistoryCount` resets to 0
-            // whenever the history shrinks (retry truncation / new session) so
-            // the next dump re-prints from the cut point.
-            if agentHistory.count < lastDumpedAgentHistoryCount {
-                lastDumpedAgentHistoryCount = 0
-            }
-            let deltaStart = lastDumpedAgentHistoryCount
-            logger.debug("📋 agentHistory dump: total=\(agentHistory.count) newSince=\(deltaStart)")
-            for (i, msg) in agentHistory.enumerated() {
-                var partSummaries: [String] = []
-                for part in msg.parts {
-                    switch part {
-                    case .text(let t):
-                        let preview = String(t.prefix(200))
-                        partSummaries.append("text(\(t.count)ch): \"\(preview)\(t.count > 200 ? "..." : "")\"")
-                    case .toolUse(let id, let name, _):
-                        // Anthropic ids start with the literal 8-char prefix
-                        // `toolu_01`, so `prefix(8)` collapses every Anthropic
-                        // tool_use to the same string in the trace and masks
-                        // real id differences between parallel tool_uses
-                        // (T-ios-concurrent-toolcall-dup-id). Use prefix(20)
-                        // so concurrent calls are visibly distinct.
-                        partSummaries.append("tool_use(\(name), id:\(id.prefix(20)))")
-                    case .toolResult(let id, let name, let content, let isError, let imgData, _, _, _):
-                        let head = String(content.prefix(200))
-                        let tail = content.count > 400 ? String(content.suffix(200)) : ""
-                        let errTag = isError ? " [ERROR]" : ""
-                        let imgTag = imgData != nil ? " [IMG]" : ""
-                        // Same prefix(20) as the .toolUse branch above — see note there.
-                        partSummaries.append("tool_result(\(name), id:\(id.prefix(20)), \(content.count)ch\(errTag)\(imgTag)): head=\"\(head)\(content.count > 200 ? "..." : "")\"" + (tail.isEmpty ? "" : " tail=\"...\(tail)\""))
-                    case .imageData(_, let mime, _):
-                        partSummaries.append("image(\(mime))")
-                    }
-                }
-                AgentRequestTrace.shared.step("agentHistory[\(i)]", detail: "\(msg.role.rawValue): \(partSummaries.joined(separator: " | "))")
-                if i >= deltaStart {
-                    logger.debug("📋 agentHistory[\(i)] \(msg.role.rawValue): \(partSummaries.joined(separator: " | "))")
-                }
-            }
-            lastDumpedAgentHistoryCount = agentHistory.count
-            #endif
-
-            #if DEBUG
-            let iterationStart = Date()
-            var iterationUsage = TokenUsage()
-            AgentRequestTrace.shared.step("streamAgentMessage.call", detail: "maxTokens=\(provider.defaultMaxTokens)")
-            #endif
-            let iterationStreamStart = Date()
-            let prevEntryId = activeEntryId
-            fallbackReasons.removeAll()
-            // Phase B: route through effectiveAgentHistory() so compact summary is
-            // synthesized at inference time instead of baked into agentHistory.
-            // [T-perf-history-bg-warmup] Wait for the background warmup to finish
-            // before calling effectiveAgentHistory(). If warmup already finished
-            // this returns immediately; if not, we yield the main actor so the UI
-            // stays responsive while the O(n×m) scan completes.
-            if let warmup = _historyWarmupTask {
-                await warmup.value
-                _historyWarmupTask = nil
-            }
-            let contextHistory = effectiveAgentHistory()
-            let stream = try await streamWithGroupFallback(
-                provider: provider,
-                messages: contextHistory,
-                baseSystemPrompt: baseSystemPrompt,
-                systemPrompt: userSystemPrompt,
-                tools: tools,
-                model: activeModel,
-                lastContextTokens: turnUsage.latestContextTokens,
-                chatMessage: messages[msgIdx],
-                activeGroupId: &activeGroupId,
-                activeEntryId: &activeEntryId
-            )
-            // [StreamDiag] (#181) The stream object now exists. Note this is
-            // "request accepted / stream handle obtained", NOT first byte — the
-            // first actual SSE event is logged by [StreamDiag] event #1 in
-            // processStreamEvents. If a stall is logged with a DISPATCH and this
-            // line but no event #1, the connection produced no first byte; if
-            // event #1 appeared and it stalled later, the stream died mid-flight.
-            logger.info("[StreamDiag] req#\(diagReqSeq) STREAM-OPEN elapsed=\(String(format: "%.2f", Date().timeIntervalSince(iterationStreamStart)))s at=\(Self.diagTimestamp(Date()))")
-
-            // Helper: update provider & system prompt when fallback switched entries.
-            // Returns true if a switch occurred.
-            @discardableResult
-            func applyFallbackSwitch() async -> Bool {
-                guard activeEntryId != prevEntryId, let newEntryId = activeEntryId,
-                      let newEntry = ProviderConfigStore.shared.entry(for: newEntryId) else {
-                    return false
-                }
-                logger.info("🔀AGENT_LOOP provider updated after fallback: \(prevEntryId ?? "nil") → \(newEntryId)")
-                provider = await makeAgentProvider(for: newEntry)
-                userSystemPrompt = baseSystemPrompt
-                if let capFragment = newEntry.model.capabilityPromptFragment {
-                    userSystemPrompt += "\n\n" + capFragment
-                }
-                if let behaviorFragment = newEntry.model.agentBehaviorPromptFragment {
-                    userSystemPrompt += "\n\n" + behaviorFragment
-                }
-                if let sid = sessionId,
-                   let skillFragment = SkillStore.shared.skillPromptFragment(for: sid) {
-                    userSystemPrompt += "\n\n" + skillFragment
-                }
-                // [T-mcp-integration-ios] Inject Top-20 enabled MCP metadata.
-                if let sid = sessionId,
-                   let mcpFragment = MCPStore.shared.systemPromptSnippet(for: sid) {
-                    userSystemPrompt += "\n\n" + mcpFragment
-                }
-                // Inject environment profile info (active profile + available env var names).
-                if let envProfileFragment = await envProfileSystemPromptSnippet() {
-                    userSystemPrompt += "\n\n" + envProfileFragment
-                }
-                // [T-memory-toggle-gates-injection-and-tools-ios] Mirror
-                // the gate from the first injection site — fallback to a
-                // new provider must respect the per-session memoryEnabled
-                // toggle the same way the initial system prompt did.
-                        logger.info("[WorkflowLog] runAgentLoop() - loading categorizedMemoryFragment (fallback path)")
-                if memoryEnabled {
-                    // [T-deep-mode-memory-phase3] Phase 3: categorized memory
-                    // when deep mode is on, flat GLOBAL.md when off.
-                    if deepModeEnabled,
-                       let structuredFragment = StructuredMemoryStore.categorizedMemoryFragment() {
-                        userSystemPrompt += "\n\n" + structuredFragment
-                    } else if let memoryFragment = Self.loadGlobalMemoryFragment() {
-                        userSystemPrompt += "\n\n" + memoryFragment
-                    }
-                    if let dailyFragment = Self.loadRecentDailyMemoryFragment() {
-                        userSystemPrompt += "\n\n" + dailyFragment
-                    }
-                }
-                userSystemPrompt += memoryStatusFragment
-                // [T-deep-mode] Mirror the deep-mode fragment on the fallback
-                // rebuild path so a provider switch doesn't silently drop the
-                // deep agent posture.
-                if deepModeEnabled {
-                    userSystemPrompt += deepModeFragment
-                    // [T-deep-mode-cognitive-p2-c14] C14: Also inject cross-session
-                    // context on the fallback path, same as the primary path.
-                    if let crossSessionFragment = CrossSessionContextStore.contextFragment() {
-                        userSystemPrompt += "\n\n" + crossSessionFragment
-                    }
-                }
-                fallbackTrigger += 1
-                if !fallbackReasons.isEmpty {
-                    // Resync the assistant message index by its stable id before
-                    // mutating `messages`. applyFallbackSwitch performs several
-                    // awaits above (makeAgentProvider, fragment loads), during
-                    // which a concurrent path (user delete, reloadMessagesFromDB,
-                    // compactBefore, session switch) may have shrunk the array —
-                    // the captured `msgIdx` then points past the end and the raw
-                    // `messages[msgIdx]` subscript traps with "Index out of range"
-                    // (crash on AsyncRenderer-adjacent path, AIChatViewModel.swift
-                    // 2855). Every other messages[msgIdx] write in this loop already
-                    // resyncs-or-guards; this site was the lone unguarded one
-                    // (T-ios-fallback-switch-msgidx-oob). If the message is gone,
-                    // skip the notice — it's a non-critical UI hint.
-                    if let resynced = messages.firstIndex(where: { $0.id == runMsgId }) {
-                        msgIdx = resynced
-                        let trailLines = fallbackReasons.map { "⚠️ \($0.model) (\($0.instance)): \($0.reason)" }
-                        let instanceLabel = ProviderConfigStore.shared.instance(for: newEntry.providerInstanceId)?.label ?? newEntry.model.provider
-                        let noticeText = trailLines.joined(separator: "\n") + "\n" + AppLocalized("Switched to \(newEntry.model.displayName) (\(instanceLabel))")
-                        let infoBlock = AssistantBlock(kind: .info, content: noticeText)
-                        messages[msgIdx].blocks.insert(infoBlock, at: 0)
-                        fallbackReasons.removeAll()
-                    } else {
-                        logger.error("🔀AGENT_LOOP applyFallbackSwitch: assistant message id=\(runMsgId) no longer in messages (count=\(self.messages.count)) — skipping fallback notice")
-                        fallbackReasons.removeAll()
-                    }
-                }
-                return true
-            }
-
-            await applyFallbackSwitch()
-            scrollToBottomSignal.send()
-
-            // Helper: check if a StreamResult is empty (no content produced).
-            // Catches both the nil-stopReason path (Anthropic SSE error inside
-            // HTTP 200) and the endTurn-with-zero-output path (OpenAI gpt-5.5
-            // on long contexts: `finish_reason=stop` with no text/tool/reasoning).
-            func isEmptyResponse(_ r: StreamResult) -> Bool {
-                let hasReasoning = !(r.reasoningContent ?? "").isEmpty
-                return r.assistantText.isEmpty && r.toolEntries.isEmpty
-                    && !hasReasoning && !r.isStreamInterrupted
-                    && r.stopReason != .maxTokens
-                    // A refusal (Anthropic safety classifier decline) is deterministic:
-                    // the content is empty but retrying the identical request just gets
-                    // declined again and burns tokens. Don't route it through the
-                    // transient-retry / group-fallback path; let the .refusal branch in
-                    // the stop-reason handler surface it directly. [T-ios-fable5-empty-response]
-                    && r.stopReason != .refusal
-            }
-
-            // Process SSE stream events on a background thread to keep
-            // CFNetwork HTTP/2 HPACK decoding off the main RunLoop.
-            // If a retryable error (transient 5xx / network) occurs mid-stream,
-            // retry the entire request via streamWithAutoRetry before giving up.
-            // If auto-retry is also exhausted, re-enter streamWithGroupFallback
-            // to try the next model in the group.
-            let streamResult: StreamResult
-            do {
-                let result = try await processStreamEvents(
-                    stream: stream,
-                    msgIdx: msgIdx,
-                    provider: provider
-                )
-                // Detect empty responses — the stream completed without producing any
-                // content blocks or a stop reason.  This happens when the Anthropic API
-                // returns an SSE `event: error` (e.g. overloaded_error) inside an HTTP 200
-                // response: the SDK silently terminates the stream instead of throwing.
-                // Treat as a transient error so it enters the auto-retry path below.
-                if isEmptyResponse(result) {
-                    // [T-ios-empty-after-toolresult-reminder] Special case: the
-                    // server returned nothing right after we handed it a tool
-                    // result. The model owes a follow-up (next tool call or a
-                    // final answer) but stalled — from the user's side the chat
-                    // "stops" with no explanation. Inject a one-shot
-                    // <system-reminder> into the last tool result and retry a
-                    // SINGLE round. The per-run flag ensures this fires at most
-                    // once, so it can never loop; if the reminder round is also
-                    // empty we report an error (below) instead of a silent stall.
-                    guard !didInjectEmptyToolReminderThisRun, lastEffectiveMessageIsToolResult() else {
-                        logger.error("🔁STREAM empty response (no content, no stop reason) — treating as transient error")
-                        throw LLMError.transientError(message: "Server returned an empty response (overloaded or upstream error)")
-                    }
-                    didInjectEmptyToolReminderThisRun = true
-                    logger.error("🔁STREAM empty after tool result — injecting <system-reminder> and retrying one round")
-
-                    // [T-msgidx-oob] Re-resync before subscripting: the stream
-                    // we just consumed is a suspension point, so `messages` may
-                    // have been mutated meanwhile (iCloud inbound rebuild,
-                    // compaction sweep, user delete) and `msgIdx` gone stale.
-                    // Reproduced deterministically on device (mock provider
-                    // stalls, chat.debugRemoveMessages drops a row, provider
-                    // then returns empty): this exact subscript trapped, and the
-                    // reminder request below was never sent — matching the
-                    // field crash 1.11(15) .ips 2026-08-15 14:02, symbolicated
-                    // to this line. Same guard shape as the fallback paths below.
-                    if msgIdx < 0 || msgIdx >= messages.count || messages[msgIdx].id != runMsgId {
-                        guard let resynced = messages.firstIndex(where: { $0.id == runMsgId }) else {
-                            logger.error("🔁STREAM empty-reminder: assistant message id=\(runMsgId) vanished (count=\(messages.count)) — aborting round")
-                            throw LLMError.transientError(message: "Server returned an empty response (overloaded or upstream error)")
-                        }
-                        logger.warning("🔁STREAM empty-reminder: msgIdx resynced → \(resynced) (count=\(messages.count))")
-                        msgIdx = resynced
-                    }
-
-                    let reminderStream = try await streamWithAutoRetry(
-                        provider: provider,
-                        messages: applyRequestImageBudget(historyWithEmptyToolResultReminder()),
-                        systemPrompt: userSystemPrompt,
-                        tools: tools,
-                        maxTokens: dynamicMaxTokens(provider: provider, model: activeModel, lastContextTokens: turnUsage.latestContextTokens),
-                        chatMessage: messages[msgIdx]
-                    )
-                    let reminderResult = try await processStreamEvents(
-                        stream: reminderStream,
-                        msgIdx: msgIdx,
-                        provider: provider
-                    )
-                    if isEmptyResponse(reminderResult) {
-                        // Still empty after the nudge — a genuine failure, not a
-                        // transient blip. Surface it clearly instead of silently
-                        // looping so the user knows why the chat stopped.
-                        logger.error("🔁STREAM still empty after <system-reminder> retry — reporting error")
-                        throw LLMError.providerError(message: "The model returned no response after a tool result, even after a reminder. It may be overloaded — please retry or switch models.")
-                    }
-                    // Recovered — proceed with the reminder round's content.
-                    streamResult = reminderResult
-                } else {
-                    streamResult = result
-                }
-            } catch let streamError as LLMError where streamError.isRetryable {
-                logger.error("🔁STREAM mid-stream retryable error, entering autoRetry: \(streamError.localizedDescription)")
-                // Resync msgIdx by stable id before touching messages — the
-                // array may have been shrunk by a concurrent path (user
-                // delete, reloadMessagesFromDB, compactBefore) during the
-                // failed stream. If the assistant message is gone, bail.
-                if let resynced = messages.firstIndex(where: { $0.id == runMsgId }) {
-                    msgIdx = resynced
-                } else {
-                    logger.error("🔁STREAM mid-stream catch: assistant message id=\(runMsgId) no longer in messages (count=\(messages.count)) — aborting retry")
-                    throw streamError
-                }
-                // Clear text blocks AND incomplete tool blocks from the interrupted stream
-                // before retrying. Tool blocks stuck in .streaming or .running would otherwise
-                // remain orphaned in the UI forever (never transition to a terminal state).
-                //
-                // [T-ios-stream-retry-text-disappear] ONLY clear the UNCOMMITTED tail
-                // (blocks at index >= committedBlockCount). Earlier rounds of this same
-                // resumed loop already committed+persisted their text/tool blocks to the
-                // DB (committedBlockCount marks that boundary). The old unbounded
-                // `removeAll { kind == .text }` wiped those committed text blocks from the
-                // UI too, so a mid-stream retry made all prior post-tool text vanish on
-                // screen even though it was still in the DB (reappearing only on reload).
-                // Mirror resume()/Stop's `removeSubrange(committedBlockCount...)` boundary.
-                await MainActor.run {
-                    guard msgIdx < messages.count else { return }
-                    Self.clearUncommittedStreamTail(messages[msgIdx], committedBlockCount: committedBlockCount)
-                    messages[msgIdx].streamInterruptCount += 1
-                }
-                // If group uses "always" fallback strategy, skip auto-retry and go straight
-                // to group fallback for mid-stream errors too.
-                let midStreamFbStrategy = activeGroupId
-                    .flatMap { ProviderConfigStore.shared.group(for: $0) }?.fallbackStrategy ?? .limited
-                if midStreamFbStrategy == .always {
-                    logger.error("🔀STREAM always-strategy, skipping autoRetry — direct group fallback: \(streamError.localizedDescription)")
-                    if let eid = activeEntryId, let entry = ProviderConfigStore.shared.entry(for: eid) {
-                        let inst = ProviderConfigStore.shared.instance(for: entry.providerInstanceId)?.label ?? entry.model.provider
-                        fallbackReasons.append((model: entry.model.displayName, instance: inst, reason: streamError.fallbackReason))
-                    }
-                    // Re-resync after the await above — another task may have
-                    // mutated `messages` during the MainActor.run suspension.
-                    guard let resynced = messages.firstIndex(where: { $0.id == runMsgId }) else {
-                        logger.error("🔀STREAM always-strategy: assistant message id=\(runMsgId) vanished post-await (count=\(messages.count)) — aborting fallback")
-                        throw streamError
-                    }
-                    msgIdx = resynced
-                    streamResult = try await streamWithGroupFallbackUntilContent(
-                        provider: provider,
-                        messages: applyRequestImageBudget(effectiveAgentHistory()),
-                        baseSystemPrompt: baseSystemPrompt,
-                        systemPrompt: userSystemPrompt,
-                        tools: tools,
-                        model: activeModel,
-                        lastContextTokens: turnUsage.latestContextTokens,
-                        chatMessage: messages[msgIdx],
-                        msgIdx: msgIdx,
-                        activeGroupId: &activeGroupId,
-                        activeEntryId: &activeEntryId
-                    )
-                    await applyFallbackSwitch()
-                } else {
-                    // Re-resync after the MainActor.run above before the next
-                    // messages[msgIdx] read in the retry call.
-                    guard let resynced = messages.firstIndex(where: { $0.id == runMsgId }) else {
-                        logger.error("🔁STREAM autoRetry path: assistant message id=\(runMsgId) vanished post-await (count=\(messages.count)) — aborting retry")
-                        throw streamError
-                    }
-                    msgIdx = resynced
-                    do {
-                        let retryStream = try await streamWithAutoRetry(
-                            provider: provider,
-                            messages: applyRequestImageBudget(effectiveAgentHistory()),
-                            systemPrompt: userSystemPrompt,
-                            tools: tools,
-                            maxTokens: dynamicMaxTokens(provider: provider, model: activeModel, lastContextTokens: turnUsage.latestContextTokens),
-                            chatMessage: messages[msgIdx]
-                        )
-                        let retryResult = try await processStreamEvents(
-                            stream: retryStream,
-                            msgIdx: msgIdx,
-                            provider: provider
-                        )
-                        // If the retried stream is also empty, the provider is persistently
-                        // failing (e.g. Anthropic overloaded).  Trigger group fallback.
-                        if isEmptyResponse(retryResult) {
-                            logger.error("🔁STREAM autoRetry also returned empty — triggering group fallback")
-                            throw LLMError.providerError(message: "Server is overloaded")
-                        }
-                        streamResult = retryResult
-                    } catch let retryError as LLMError where retryError.isFallbackable || retryError.isRetryable {
-                        // Auto-retry exhausted or still empty — attempt group fallback.
-                        logger.error("🔀STREAM retries exhausted, attempting group fallback: \(retryError.localizedDescription)")
-                        if let eid = activeEntryId, let entry = ProviderConfigStore.shared.entry(for: eid) {
-                            let inst = ProviderConfigStore.shared.instance(for: entry.providerInstanceId)?.label ?? entry.model.provider
-                            fallbackReasons.append((model: entry.model.displayName, instance: inst, reason: retryError.fallbackReason))
-                        }
-                        // Resync before mutating — same rationale as outer catch.
-                        if let resynced = messages.firstIndex(where: { $0.id == runMsgId }) {
-                            msgIdx = resynced
-                        } else {
-                            logger.error("🔀STREAM retry-exhausted catch: assistant message id=\(runMsgId) gone (count=\(messages.count)) — aborting fallback")
-                            throw retryError
-                        }
-                        await MainActor.run {
-                            guard msgIdx < messages.count else { return }
-                            // [T-ios-stream-retry-text-disappear] Same committed-tail
-                            // guard as the outer catch — preserve persisted prior-round
-                            // blocks, clear only the failed in-flight tail.
-                            Self.clearUncommittedStreamTail(messages[msgIdx], committedBlockCount: committedBlockCount)
-                            messages[msgIdx].streamInterruptCount += 1
-                        }
-                        // Re-resync after MainActor.run before the messages[msgIdx]
-                        // read below — see outer catch for rationale.
-                        guard let resynced2 = messages.firstIndex(where: { $0.id == runMsgId }) else {
-                            logger.error("🔀STREAM retry-exhausted fallback: assistant message id=\(runMsgId) vanished post-await (count=\(messages.count)) — aborting")
-                            throw retryError
-                        }
-                        msgIdx = resynced2
-                        // Use streamWithGroupFallbackUntilContent to keep cycling through
-                        // group entries until one returns non-empty content.
-                        streamResult = try await streamWithGroupFallbackUntilContent(
-                            provider: provider,
-                            messages: applyRequestImageBudget(effectiveAgentHistory()),
-                            baseSystemPrompt: baseSystemPrompt,
-                            systemPrompt: userSystemPrompt,
-                            tools: tools,
-                            model: activeModel,
-                            lastContextTokens: turnUsage.latestContextTokens,
-                            chatMessage: messages[msgIdx],
-                            msgIdx: msgIdx,
-                            activeGroupId: &activeGroupId,
-                            activeEntryId: &activeEntryId
-                        )
-                        await applyFallbackSwitch()
-                    }
-                }
-            }
-
-            let streamEnd = Date()
-            // [T-deep-mode-strip-sentinel] Resolve + strip the goal sentinel from
-            // the final assistant text BEFORE it is flushed to the UI, folded into
-            // assistantParts, and persisted — so the technical `<<GOAL_STATE>>` line
-            // never reaches the visible UI, the markdown caches, or the DB (which
-            // would otherwise resurrect it on every reload). The parsed result is
-            // stashed in `pendingGoalSentinel` for the auto-continue step at turn
-            // end, which must run AFTER the text is stripped (two-phase split).
-            var assistantText = streamResult.assistantText
-            if deepModeEnabled {
-                pendingGoalSentinel = GoalRunner.parse(assistantText)
-                if let clean = GoalRunner.textWithoutSentinel(assistantText) {
-                    assistantText = clean
-                }
-                // [T-deep-mode-verify-gate] Phase 2: also resolve + strip the
-                // verify sentinel at text-capture time, same two-phase pattern.
-                pendingVerifySentinel = VerifyGate.parse(assistantText)
-                if let clean = VerifyGate.textWithoutSentinel(assistantText) {
-                    assistantText = clean
-                }
-                // [T-deep-mode-phase-f] Phase F: resolve + strip the SPEC_STATE
-                // sentinel at text-capture time, same two-phase pattern. Only
-                // engages when Spec mode is active (deepMode && specModeEnabled)
-                // and we're in the spec-writing phase.
-                if workflowPhase == .specWriting {
-                    pendingSpecSentinel = SpecGate.parse(assistantText)
-                    if let clean = SpecGate.textWithoutSpecSentinel(assistantText) {
-                        assistantText = clean
-                    }
-                }
-                // [T-deep-mode-cognitive-p2-c9] C9: Parse + strip the cognitive
-                // load sentinel. The model emits `<<COGNITIVE_LOAD>> level` at
-                // the end of tool-bearing turns. The parsed signal is merged
-                // with client-computed metrics to produce the final load state.
-                // The sentinel line is stripped from visible text, same pattern
-                // as GOAL_STATE and VERIFY_STATE.
-                if let signal = CognitiveLoadMonitor.parseSentinel(assistantText) {
-                    lastModelLoadSignal = signal
-                    if let clean = CognitiveLoadMonitor.textWithoutSentinel(assistantText) {
-                        assistantText = clean
-                    }
-                    logger.info("[CognitiveLoad] C9: model-assessed load = \(signal.level.displayName)")
-                }
-            }
-            let toolEntries = streamResult.toolEntries
-            let stopReason = streamResult.stopReason
-            turnUsage = streamResult.turnUsage
-            logger.info("📐 Context after API: latestContextTokens=\(turnUsage.latestContextTokens) (in:\(turnUsage.inputTokens) cache_read:\(turnUsage.cacheReadTokens) cache_create:\(turnUsage.cacheCreationTokens))")
-
-            // [T-deep-mode-cognitive-p1] C8: Uncertainty detection — scan the
-            // model's output for uncertainty markers ("不确定", "可能", "大概",
-            // "I'm not sure", "maybe", "probably", etc.). When detected and deep
-            // mode is on, a one-shot verification prompt is injected: appended
-            // to toolResultParts (if this turn has tool calls) or injected as a
-            // separate user message before the break (if no tool calls). Capped
-            // at 1 injection per runAgentLoop via didInjectUncertaintyCheckThisRun.
-            // Total-switch safe: the detection and injection are both inside
-            // `if deepModeEnabled` — when the master switch is off, no scan, no
-            // injection, no flag mutation, zero behavioral residue.
-            var shouldInjectUncertaintyCheck = false
-            if deepModeEnabled && !didInjectUncertaintyCheckThisRun && !assistantText.isEmpty {
-                if Self.detectUncertainty(in: assistantText) {
-                    shouldInjectUncertaintyCheck = true
-                    didInjectUncertaintyCheckThisRun = true
-                    logger.info("[UncertaintyCheck] C8 uncertainty markers detected — will inject verification prompt")
-                }
-            }
-
-            // [T-deep-mode-cognitive-p2-c9] C9: Compute client-side cognitive
-            // load from objective metrics and merge with the model's
-            // self-assessed sentinel (if any). The merged state drives the
-            // UI warning banner. Total-switch safe: only inside
-            // `if deepModeEnabled` — when off, cognitiveLoadState stays .empty.
-            if deepModeEnabled {
-                let maxCtx = ProviderConfigStore.shared.entry(for: activeEntryId ?? "")?.model.contextWindowTokens ?? 0
-                let clientLoad = CognitiveLoadMonitor.computeClientLoad(
-                    contextTokens: turnUsage.latestContextTokens,
-                    maxContextTokens: maxCtx,
-                    toolCallCount: heartbeatToolCallCount,
-                    workflowStepCount: workflowSteps.count,
-                    verifyFailures: VerifyGate.maxVerifyRounds - verifyRoundsLeft,
-                    goalRunnerRoundsUsed: GoalRunner.maxAutoRounds - goalRunnerRoundsLeft
-                )
-                let modelLevel = lastModelLoadSignal?.level
-                let merged = CognitiveLoadMonitor.merge(
-                    modelAssessed: modelLevel,
-                    clientComputed: clientLoad
-                )
-                let note = lastModelLoadSignal?.note
-                cognitiveLoadState = CognitiveLoadState(
-                    level: merged.level,
-                    modelAssessed: merged.modelAssessed,
-                    clientComputed: merged.clientComputed,
-                    note: note
-                )
-                if cognitiveLoadState.level >= .high {
-                    logger.info("[CognitiveLoad] C9: HIGH load detected — model=\(merged.modelAssessed.displayName) client=\(merged.clientComputed.displayName) merged=\(merged.level.displayName) ctx=\(turnUsage.latestContextTokens)/\(maxCtx) tools=\(heartbeatToolCallCount) steps=\(workflowSteps.count) verifyFails=\(VerifyGate.maxVerifyRounds - verifyRoundsLeft)")
-                }
-            }
-
-            // Track session-level token stats
-            let iterationStreamDuration = streamEnd.timeIntervalSince(iterationStreamStart)
-            let iterUsage = streamResult.turnUsage
-            sessionInputTokens += iterUsage.inputTokens
-            sessionOutputTokens += iterUsage.outputTokens
-            sessionCacheReadTokens += iterUsage.cacheReadTokens
-            sessionCacheWriteTokens += iterUsage.cacheCreationTokens
-            if iterationStreamDuration > 0 && iterUsage.outputTokens > 0 {
-                sessionStreamDuration += iterationStreamDuration
-                sessionStreamOutputTokens += iterUsage.outputTokens
-            }
-            #if DEBUG
-            iterationUsage = streamResult.iterationUsage
-            #endif
-
-            // Flush any throttled text delta that hasn't been pushed to the UI yet.
-            // Find the last text block (processStreamEvents may have left un-flushed text).
-            // Must also update cachedMarkdown — the render path uses it when present,
-            // so stale cachedMarkdown causes the final tokens to not display.
-            // Guard msgIdx again — messages may have been mutated during streaming.
-            if !assistantText.isEmpty, msgIdx >= 0, msgIdx < messages.count,
-               let textBlockIdx = messages[msgIdx].blocks.indices.last(where: { messages[msgIdx].blocks[$0].kind == .text }),
-               messages[msgIdx].blocks[textBlockIdx].content != assistantText {
-                // [DIAG-FINAL-1] Final text flush — this is the last chance to push
-                // content to the UI before streaming ends. If this is skipped or
-                // deferred (e.g. streamingUIUpdatesSuspended), the cell stays empty.
-                logger.info("[StreamEnd] FINAL FLUSH text len=\(assistantText.count) blockContent len=\(messages[msgIdx].blocks[textBlockIdx].content.count) uiSuspended=\(streamingUIUpdatesSuspended) appState=\(UIApplication.shared.applicationState.rawValue)")
-                setStreamingTextBlockContent(
-                    msgIdx: msgIdx,
-                    blockIdx: textBlockIdx,
-                    text: assistantText,
-                    parsedMarkdown: MarkdownContent(prepareMarkdownForRender(assistantText)),
-                    cacheAttributedString: true,
-                    requestScroll: true
-                )
-            } else if !assistantText.isEmpty, msgIdx >= 0, msgIdx < messages.count {
-                // [DIAG-FINAL-2] Text already matches — no flush needed.
-                // But if the cell is visually empty despite content being set,
-                // it means SwiftUI/UIKit didn't re-render after the last @Published update.
-                let textBlockIdx = messages[msgIdx].blocks.indices.last(where: { messages[msgIdx].blocks[$0].kind == .text })
-                let blockContent = textBlockIdx.map { messages[msgIdx].blocks[$0].content } ?? "<no text block>"
-                logger.info("[StreamEnd] SKIP FLUSH — content already matches. text len=\(assistantText.count) blockContent len=\(blockContent.count) hasCachedAttr=\(textBlockIdx.map { messages[msgIdx].blocks[$0].cachedAttributedString != nil } ?? false) hasCachedMD=\(textBlockIdx.map { messages[msgIdx].blocks[$0].cachedMarkdown != nil } ?? false)")
-            } else if assistantText.isEmpty {
-                // [DIAG-FINAL-3] No assistant text at all — tool-only response.
-                logger.info("[StreamEnd] NO TEXT — tool-only response, nothing to flush")
-            }
-
-            // Auto-play: scan assistant text for audio URLs with ?auto_play=true
-            // This works even when the app is in the background (e.g. Shortcuts intent)
-            // because it triggers GlobalAudioPlayer directly, bypassing UI rendering.
-            Self.triggerAutoPlayAudio(in: assistantText)
-
-            #if DEBUG
-            logger.debug("📊 Turn usage — in: \(turnUsage.inputTokens), out: \(turnUsage.outputTokens), cache_create: \(turnUsage.cacheCreationTokens), cache_read: \(turnUsage.cacheReadTokens)")
-            let elapsed = Int(Date().timeIntervalSince(iterationStart) * 1000)
-            LastAPIRequestBody.shared.updateLatest(
-                usage: CapturedUsage(
-                    inputTokens: iterationUsage.inputTokens,
-                    outputTokens: iterationUsage.outputTokens,
-                    cacheCreationTokens: iterationUsage.cacheCreationTokens,
-                    cacheReadTokens: iterationUsage.cacheReadTokens
-                ),
-                durationMs: elapsed
-            )
-            #endif
-
-            // Generate session title early — after first LLM response (text or tool call)
-            generateSessionTitleIfNeeded(toolEntries: toolEntries.map { (name: $0.name, args: $0.args) })
-
-            // Re-check bounds — messages may have been mutated during streaming.
-            guard msgIdx >= 0, msgIdx < messages.count else {
-                logger.error("⚠️ Agent loop: msgIdx \(msgIdx) out of bounds after streaming, breaking")
-                hitTurnLimit = false
-                break
-            }
-
-            // Flush any deferred UI updates so block.content is up-to-date before
-            // we read it for persistence. Without this, content deferred due to
-            // streamingUIUpdatesSuspended would be lost from the saved message.
-            flushDeferredStreamingTextUpdateIfNeeded()
-
-            // Build assistant content for agentHistory — only new blocks from this iteration
-            var assistantParts: [AgentContentPart] = []
-            let allBlocks = messages[msgIdx].blocks
-            for i in min(committedBlockCount, allBlocks.count)..<allBlocks.count {
-                let block = allBlocks[i]
-                if case .text = block.kind {
-                    // Prefer the fully-accumulated assistantText over block.content for the
-                    // LAST text block — block.content may be stale due to throttled UI updates.
-                    let isLastTextBlock = !allBlocks[(i+1)..<allBlocks.count].contains(where: { $0.kind == .text })
-                    let content = (isLastTextBlock && assistantText.count > block.content.count)
-                        ? assistantText : block.content
-                    if !content.isEmpty {
-                        assistantParts.append(.text(content))
-                        // Also fix up the block so UI and persistence stay in sync
-                        if content.count > block.content.count {
-                            block.content = content
-                        }
-                    }
-                }
-            }
-            for tu in toolEntries {
-                assistantParts.append(.toolUse(id: tu.id, name: tu.name, input: tu.args))
-            }
-            self.prevCommittedBlockCount = self.committedBlockCount
-            committedBlockCount = allBlocks.count
-            self.committedBlockCount = committedBlockCount
-            var assistantMessage = AgentMessage(role: .assistant, parts: assistantParts)
-            assistantMessage.isInterrupted = streamResult.isStreamInterrupted
-            assistantMessage.reasoningContent = streamResult.reasoningContent
-            assistantMessage.reasoningEcho = streamResult.reasoningEcho
-            let assistantAgentIdx = agentHistory.count
-            agentHistory.append(assistantMessage)
-
-            // Snapshot state for cache keep-alive warmup requests.
-            // Phase B: must use effectiveAgentHistory so the keep-alive prefix matches
-            // what we actually send to Anthropic (summary-prepended view).
-            if provider is AnthropicAgentProvider, let sid = sessionId {
-                keepAliveHistory = effectiveAgentHistory()
-                keepAliveSystemPrompt = userSystemPrompt
-                keepAliveTools = tools
-                keepAliveEntry = ProviderConfigStore.shared.entry(for: activeEntryId ?? "")
-                logger.info("🔥 cache keep-alive: snapshot updated — session=\(sid.prefix(8)) history=\(self.agentHistory.count) tools=\(tools.count) sysPromptLen=\(userSystemPrompt.count) enhancedCache=\(self.enhancedCacheEnabled) cacheRead=\(turnUsage.cacheReadTokens) cacheCreate=\(turnUsage.cacheCreationTokens)")
-                CacheKeepAliveManager.shared.recordRequest(sessionId: sid, vm: self)
-            }
-
-            // Build thoughtSignature map from tool entries for persistence
-            var sigMap: [String: String] = [:]
-            for tu in toolEntries {
-                if let sig = tu.metadata?.thoughtSignature { sigMap[tu.id] = sig }
-            }
-
-            // If no tool uses, this turn is done — persist and break.
-            guard !toolEntries.isEmpty else {
-                logger.info("Agent loop ending — no tool calls. stopReason=\(String(describing: stopReason))")
-
-                // [T-ios-stale-resume-banner] This turn produced a complete
-                // assistant reply, so the conversation is no longer in an
-                // interrupted/resumable state. canResume is only cleared at the
-                // send/retry ENTRY points — if an earlier turn in this session
-                // set it true (a prior interruption, a Stop, a transient empty
-                // response) and was then continued, a normally-finished turn
-                // never reset it, leaving the "Interrupted — tap Resume" banner
-                // dangling under a fully-answered message (seen on the weibo
-                // hot-search turn). Clear it here; the genuinely-incomplete
-                // sub-cases below re-set it to true.
-                canResume = false
-
-                // Surface unexpected stops: nil stopReason or maxTokens with no text
-                if stopReason == nil {
-                    logger.warning("Agent loop ended with nil stopReason (stream closed unexpectedly)")
-                    // [T-stream-drop-silent] A nil stopReason on the no-tool exit
-                    // means the SSE ended WITHOUT the server sending a terminal
-                    // finish_reason/message_stop — the stream returned instead of
-                    // throwing (a mid-flight throw would go through the fallback/
-                    // retry path, not here). This is an abnormal interruption, not a
-                    // normal completion: a normally-finished turn always carries a
-                    // concrete stopReason (endTurn/stop/…). Previously we only
-                    // surfaced this when the text was empty, so a *partial* reply
-                    // (bytes arrived, then the connection dropped on weak/handoff
-                    // cellular — the "断流无提示" report) was persisted silently as if
-                    // complete. Surface BOTH sub-cases now with a Resume entry, and
-                    // distinguish the wording so a partial reply reads as truncated
-                    // rather than empty.
-                    if assistantText.isEmpty {
-                        messages[msgIdx].error = AppLocalized("Response ended unexpectedly (no content received)")
-                    } else {
-                        messages[msgIdx].error = AppLocalized("The connection dropped — this reply may be incomplete. Tap Resume to continue.")
-                    }
-                    canResume = true
-                } else if stopReason == .maxTokens {
-                    logger.warning("Agent loop ended at max_tokens with no tool calls")
-                    messages[msgIdx].error = AppLocalized("Response truncated (max tokens reached)")
-                    canResume = true
-                } else if stopReason == .refusal {
-                    // [T-ios-fable5-empty-response] Anthropic safety classifier declined the
-                    // request (HTTP 200, stop_reason="refusal", input tokens billed, empty
-                    // content). On Fable 5 this fires as a false-positive on ordinary turns
-                    // that carry the large Claude Code agentic system prompt + tool set — the
-                    // exact reason the model detail page's Quick Test (no system prompt, no
-                    // tools) succeeds while a real conversation returns empty. Retrying the
-                    // identical request just gets declined again, so we surface it directly
-                    // and steer the user to switch models rather than looping.
-                    logger.warning("Agent loop ended with stop_reason=refusal — model declined the request")
-                    messages[msgIdx].error = AppLocalized("The model declined to respond to this request. Try rephrasing, or switch to a different model.")
-                    canResume = true
-                } else if stopReason == .endTurn && assistantText.isEmpty
-                            && (streamResult.reasoningContent ?? "").isEmpty {
-                    // Empty endTurn that survived all upstream retries — typically
-                    // OpenAI gpt-5.5 on long contexts returning `finish_reason=stop`
-                    // with no text/tool/reasoning. Surface it instead of silently
-                    // dropping (ChatStore's empty-assistant filter would otherwise
-                    // erase the row entirely).
-                    logger.warning("Agent loop ended at endTurn with empty content")
-                    // [T-error-persist-ios] If the context is nearly full, the empty
-                    // response is most likely a context-overflow symptom — steer the
-                    // user toward compacting rather than a blind retry.
-                    // Re-fetch the entry from the store: `entry` was captured at
-                    // loop start, so a context-window edit made during a long
-                    // agent run would otherwise judge by the stale value here.
-                    let freshModel = ProviderConfigStore.shared.entry(for: entry.id)?.model ?? entry.model
-                    let maxCtx = effectiveContextWindow(for: freshModel)
-                    let curCtx = estimateContextTokens()
-                    if maxCtx > 0 && curCtx > Int(Double(maxCtx) * 0.7) {
-                        messages[msgIdx].error = AppLocalized("The model returned an empty response. The conversation context may be too large — try compacting or starting a new session.")
-                    } else {
-                        messages[msgIdx].error = AppLocalized("Model returned an empty response. Please try again or switch models.")
-                    }
-                    canResume = true
-                }
-
-                // Flush any remaining unspoken text (streaming TTS already spoke most sentences)
-                let remainingSpeak: String
-                if streamResult.spokenTextOffset < streamResult.assistantText.count {
-                    let startIdx = streamResult.assistantText.index(streamResult.assistantText.startIndex, offsetBy: streamResult.spokenTextOffset)
-                    remainingSpeak = String(streamResult.assistantText[startIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else {
-                    remainingSpeak = ""
-                }
-                if !remainingSpeak.isEmpty { speakQueued(remainingSpeak) }
-                let interruptCount = await MainActor.run { messages[msgIdx].streamInterruptCount }
-                let uiBlockCount = await MainActor.run { msgIdx < messages.count ? messages[msgIdx].blocks.count : -1 }
-                logger.info("[BlocksLost] PERSIST final (no-tool) sid=\(sessionId?.prefix(8) ?? "nil") agentParts=\(assistantMessage.parts.count) uiBlocks=\(uiBlockCount)")
-                if turnCount > 0 && streamResult.assistantText.count < 10 {
-                    // [T-log-noise-privacy 2026-07-18] Content excerpt dropped —
-                    // the char count + token counts carry the diagnostic signal.
-                    logger.warning("[ModelDiag] SUSPICIOUS short final text after \(turnCount) tool turn(s): \(streamResult.assistantText.count) chars, sid=\(sessionId?.prefix(8) ?? "nil") outputTokens=\(turnUsage.outputTokens) contextTokens=\(turnUsage.latestContextTokens ?? 0)")
-                }
-                if let persistedId = await persistAgentMessage(assistantMessage, tokenUsage: turnUsage, thoughtSignatures: sigMap, streamInterruptCount: interruptCount),
-                   assistantAgentIdx < agentHistory.count {
-                    agentHistory[assistantAgentIdx].dbMessageId = persistedId
-                    // [T-error-persist-ios] Persist this turn's error state AFTER the
-                    // row exists + dbMessageId is assigned, keyed by that id, so the
-                    // indicator survives reload. Write UNCONDITIONALLY (incl. nil) so a
-                    // successful (re)stream CLEARS a previously-persisted error rather
-                    // than leaving the stale one in the DB (retry-then-succeed, edge #5).
-                    if msgIdx < messages.count {
-                        await ChatStore.shared.updateMessageErrorInfo(messageId: persistedId, errorInfo: messages[msgIdx].error)
-                    }
-                }
-                hitTurnLimit = false
-
-                // [T-ios-queued-message-continues-prev-turn] The current turn's
-                // tool loop has fully converged (no tool calls this iteration) and
-                // its final assistant reply is now persisted. If the user queued a
-                // message mid-run, NOW inject it as a clean standalone user turn and
-                // keep looping so the model produces a dedicated response — instead
-                // of the old mid-loop drain that folded it into a tool_result and
-                // made it read as in-loop context for this turn. Errors above
-                // (canResume true) still inject: the user's new message takes
-                // precedence over a stale interrupted-banner from this finished turn.
-                if await injectQueuedPromptsAsNewTurn(
-                    msgIdx: &msgIdx,
-                    committedBlockCount: &committedBlockCount,
-                    turnUsage: turnUsage
-                ) {
-                    // We're continuing with the user's new turn, so this session is
-                    // no longer in an interrupted/resumable state. Reset per-turn
-                    // usage for the fresh assistant message.
-                    // [T-ios-inloop-compact-freeze] msgIdx now points at the fresh
-                    // assistant message — retarget the stable anchor with it.
-                    if msgIdx < messages.count { runMsgId = messages[msgIdx].id }
-                    canResume = false
-                    turnUsage = TokenUsage()
-                    continue
-                }
-                // [T-deep-mode-cognitive-p1] C8: Uncertainty check for no-tool-call
-                // turns — if the model's output contained uncertainty markers and
-                // this turn had no tool calls (model finished but uncertain), inject
-                // a verification prompt and continue the loop so the model gets a
-                // chance to use web search. Capped at 1 per runAgentLoop via
-                // didInjectUncertaintyCheckThisRun (set above). Total-switch safe:
-                // the flag is only set inside `if deepModeEnabled`.
-                if shouldInjectUncertaintyCheck {
-                    logger.info("[UncertaintyCheck] C8 injecting verification prompt for no-tool-call turn")
-                    let verifyMsg = AgentMessage(role: .user, parts: [
-                        .text("<system-reminder>深度模式联网查证（C8）：检测到你在上一条回复中使用了不确定表述（如\"不确定\"、\"可能\"、\"大概\"等）。请使用联网工具（如 web_search 或 browser）查证相关不确定信息，确认后再给出确定结论。如果经查证后确认无法确定，请说明原因。</system-reminder>")
-                    ])
-                    let ci = agentHistory.count
-                    agentHistory.append(verifyMsg)
-                    if let pid = await persistAgentMessage(verifyMsg), ci < agentHistory.count {
-                        agentHistory[ci].dbMessageId = pid
-                    }
-                    canResume = false
-                    turnUsage = TokenUsage()
-                    continue
-                }
-                break
-            }
-
-            // Build assistant RawMessage now but defer DB write until tool results
-            // are ready, so both can be persisted in a single SQLite transaction.
-            let deferredAssistantRaw = await buildRawMessage(assistantMessage, thoughtSignatures: sigMap)
-            // Phase B: write the DB id back into agentHistory immediately — even though
-            // we defer the actual appendMessages to batch with the tool results below,
-            // the id is deterministic and compact lookups rely on it.
-            if let raw = deferredAssistantRaw, assistantAgentIdx < agentHistory.count {
-                agentHistory[assistantAgentIdx].dbMessageId = raw.id
-            }
-            // Flush any remaining unspoken text (streaming TTS already spoke most sentences)
-            do {
-                let remainingSpeak: String
-                if streamResult.spokenTextOffset < streamResult.assistantText.count {
-                    let startIdx = streamResult.assistantText.index(streamResult.assistantText.startIndex, offsetBy: streamResult.spokenTextOffset)
-                    remainingSpeak = String(streamResult.assistantText[startIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                } else {
-                    remainingSpeak = ""
-                }
-                if !remainingSpeak.isEmpty { speakQueued(remainingSpeak) }
-            }
-
-            // Execute each tool use and collect results
-            var toolResultParts: [AgentContentPart] = []
-            var pendingSnapshots: [String: (toolName: String, snapshot: ToolSnapshot)] = [:]
-            var cancelledDuringToolExecution = false
-
-            // Image budget for this batch of tool results.
-            //
-            // Was: `kImageContextKeepCount - existingImages` (double-count with
-            // trimOldImagesFromHistory). When trim left agentHistory near the
-            // 20-image cap, a fan-out batch of 5+ read_image calls would race
-            // for the few remaining slots and emit text placeholders for the
-            // losers — even though the next turn's trim would have evicted
-            // the old images anyway. Net effect: concurrent read_image
-            // silently lost frames for the user.
-            //
-            // Now: budget the full `kImageContextKeepCount` per batch. The
-            // single-turn cap is still 20 (worst case), and
-            // trimOldImagesFromHistory() at the top of the next turn handles
-            // historical pressure. [T-image-budget-double-count]
-            let imageBudgetActor = BatchImageBudget(initial: Self.kImageContextKeepCount)
-
-            #if DEBUG
-            // [T-ios-concurrent-toolcall-dup-id] Per-batch dispatch trace —
-            // logs each tool_use's full id + blockIdx so we can see whether
-            // parallel calls share ids or have collisions on toolUseId
-            // when the cancel-bubble bug reproduces.
-            let _batchBlockCount = (msgIdx >= 0 && msgIdx < self.messages.count) ? self.messages[msgIdx].blocks.count : -1
-            logger.info("[ConcurrentTools] BATCH START — entries=\(toolEntries.count) msgIdx=\(msgIdx) blocks=\(_batchBlockCount)")
-            for (idx, tu) in toolEntries.enumerated() {
-                logger.info("[ConcurrentTools]   DISPATCH [\(idx)] tu.id=\(tu.id) name=\(tu.name) blockIdx=\(tu.blockIdx)")
-            }
-            // toolUseId collision check across blocks in this assistant msg
-            if msgIdx < self.messages.count {
-                var seen: [String: Int] = [:]
-                for blk in self.messages[msgIdx].blocks {
-                    guard let tid = blk.toolUseId else { continue }
-                    seen[tid, default: 0] += 1
-                }
-                let dupes = seen.filter { $0.value > 1 }
-                if !dupes.isEmpty {
-                    logger.error("[ToolUseId] COLLISION! Duplicate toolUseId across blocks: \(dupes)")
-                }
-            }
-            #endif
-
-            // Reset the global stop-signal once for the whole batch.
-            // Concurrent tool tasks (below) only READ this flag; resetting
-            // inside any single task would race-clear a stop initiated for
-            // a sibling. [T-concurrent-tools 2026-05-25]
-            commandCancelledByUser = false
-
-            // Concurrent tool dispatch with maxConcurrentTools in-flight cap.
-            // Anthropic requires tool_result blocks in the same order as
-            // the originating tool_use blocks, so we tag each child task
-            // with its source index and stitch results back in order after
-            // every task completes.
-            let toolsSnapshot = tools
-            var outcomesByIndex: [Int: ToolExecOutcome] = [:]
-            await withTaskGroup(of: (Int, ToolExecOutcome).self) { group in
-                var added = 0
-                var harvested = 0
-                for (idx, tu) in toolEntries.enumerated() {
-                    // Rate-limit: hold here until we're below the in-flight cap.
-                    while added - harvested >= Self.maxConcurrentTools {
-                        if let pair = await group.next() {
-                            outcomesByIndex[pair.0] = pair.1
-                            harvested += 1
-                        } else {
-                            break
-                        }
-                    }
-                    logger.info("[ToolLifecycle] DISPATCHED toolId=\(tu.id.prefix(20)) tool=\(tu.name) sid=\(self.sessionId?.prefix(8) ?? "nil") appState=\(UIApplication.shared.applicationState == .active ? "fg" : "bg") suspended=\(self.streamingUIUpdatesSuspended) isProcessing=\(self.isProcessing)")
-                    group.addTask { [weak self] in
-                        guard let self else {
-                            // Self torn down mid-batch: synthesize a cancelled outcome
-                            let cancelMsg = "<system-reminder>The session was torn down before this tool could execute.</system-reminder>"
-                            return (idx, ToolExecOutcome(
-                                toolId: tu.id, toolName: tu.name,
-                                resultPart: .toolResult(id: tu.id, name: tu.name, content: cancelMsg, isError: true),
-                                snapshotEntry: nil, snapshotItem: nil, cancelled: true
-                            ))
-                        }
-                        let outcome = await self.executeSingleToolUse(
-                            tu: tu, msgIdx: msgIdx, tools: toolsSnapshot, batchBudget: imageBudgetActor
-                        )
-                        return (idx, outcome)
-                    }
-                    added += 1
-                }
-                // Drain the remainder.
-                for await pair in group {
-                    outcomesByIndex[pair.0] = pair.1
-                    harvested += 1
-                }
-            }
-
-            // Stitch outcomes back in original tool_use order so the
-            // tool_result blocks pair correctly with the assistant
-            // message's tool_use blocks for the next API call.
-            for idx in 0..<toolEntries.count {
-                guard let outcome = outcomesByIndex[idx] else { continue }
-                // [T-deep-mode-session-workflow] Event-level refresh: one advance
-                // per completed tool so the capsule ticks during the round. Safe:
-                // guard never finalizes the last step (see advanceStepOnToolEvent).
-                advanceStepOnToolEvent()
-                toolResultParts.append(outcome.resultPart)
-                if let se = outcome.snapshotEntry {
-                    pendingSnapshots[outcome.toolId] = se
-                }
-                if let si = outcome.snapshotItem {
-                    toolSnapshots.append(si)
-                }
-                if outcome.cancelled {
-                    cancelledDuringToolExecution = true
-                }
-            }
-
-            // If any tool images were stripped due to budget, append a batch-reading tip
-            let strippedImageCount = await imageBudgetActor.strippedSoFar
-            if strippedImageCount > 0 {
-                toolResultParts.append(.text(
-                    "<system-reminder>\(strippedImageCount) image(s) from read_image were replaced with text placeholders"
-                    + " because the context image limit (\(Self.kImageContextKeepCount)) was reached."
-                    + " Summarize your findings so far, then use read_image again"
-                    + " to view the remaining images in a new batch.</system-reminder>"
-                ))
-            }
-
-            // Add tool results as a user message
-            // [T-deep-mode-cognitive-p1] C6: Heartbeat self-check — every 5th
-            // tool-bearing iteration, append a self-check reminder to the tool
-            // result message so the model pauses to verify goal alignment. The
-            // injection is a text part appended to toolResultParts, so it rides
-            // alongside the tool results and the model sees it on its next turn.
-            // Guarded by deepModeEnabled: when the master switch is off, the
-            // counter is never incremented and no injection occurs — zero
-            // behavioral residue. The counter is per-loop (local variable), so
-            // it is never persisted and resets on every new runAgentLoop call.
-            if deepModeEnabled {
-                heartbeatToolCallCount += 1
-                if heartbeatToolCallCount % 5 == 0 {
-                    toolResultParts.append(.text(
-                        "<system-reminder>深度模式心跳自检（C6）：已完成 \(heartbeatToolCallCount) 次工具调用。请自检：原始目标是什么？当前第几步？当前动作是否服务于原始目标？有没有承诺要做但忘了的事？如有偏离，请调整方向。</system-reminder>"
-                    ))
-                    logger.info("[Heartbeat] C6 self-check injected at toolCallCount=\(heartbeatToolCallCount)")
-                }
-            }
-            // [T-deep-mode-cognitive-p1] C8: Uncertainty check — if the model's
-            // output contained uncertainty markers this turn, append a verification
-            // prompt to the tool result message so the model sees it on its next
-            // turn and uses web search to verify. The flag was set above after
-            // assistantText was resolved. Only fires once per runAgentLoop.
-            if shouldInjectUncertaintyCheck {
-                toolResultParts.append(.text(
-                    "<system-reminder>深度模式联网查证（C8）：检测到你在上一条回复中使用了不确定表述（如\"不确定\"、\"可能\"、\"大概\"等）。请使用联网工具（如 web_search 或 browser）查证相关不确定信息，确认后再给出确定结论。如果经查证后确认无法确定，请说明原因。</system-reminder>"
-                ))
-                logger.info("[UncertaintyCheck] C8 verification prompt appended to tool results")
-            }
-            let toolResultMessage = AgentMessage(role: .user, parts: toolResultParts)
-            logger.info("Appending tool result message with \(toolResultParts.count) part(s) to agentHistory (now \(self.agentHistory.count + 1) messages)")
-            let toolResultAgentIdx = agentHistory.count
-            agentHistory.append(toolResultMessage)
-
-            // Collect terminal tool statuses from the assistant blocks so persistence can
-            // distinguish failed vs cancelled (both have success == false).
-            var toolStatusStrings: [String: String] = [:]
-            if msgIdx < messages.count {
-                for block in messages[msgIdx].blocks {
-                    guard let id = block.toolUseId, let status = block.toolStatus else { continue }
-                    switch status {
-                    case .success: toolStatusStrings[id] = "success"
-                    case .failed: toolStatusStrings[id] = "failed"
-                    case .cancelled: toolStatusStrings[id] = "cancelled"
-                    case .streaming, .running: break
-                    }
-                }
-            }
-
-            // Batch-persist the deferred assistant message + tool results in one transaction
-            let uiBlockCountMid = await MainActor.run { msgIdx < messages.count ? messages[msgIdx].blocks.count : -1 }
-            logger.info("[BlocksLost] PERSIST mid-loop (tool) sid=\(sessionId?.prefix(8) ?? "nil") agentParts=\(assistantMessage.parts.count) uiBlocks=\(uiBlockCountMid)")
-            if let toolResultRaw = await buildRawMessage(toolResultMessage, snapshots: pendingSnapshots, toolStatuses: toolStatusStrings) {
-                var batch: [RawMessage] = []
-                if let assistantRaw = deferredAssistantRaw { batch.append(assistantRaw) }
-                batch.append(toolResultRaw)
-                await ChatStore.shared.appendMessages(batch)
-                // Phase B: write the DB id back into agentHistory entries so compact
-                // can resolve boundaries by id.
-                if toolResultAgentIdx < agentHistory.count {
-                    agentHistory[toolResultAgentIdx].dbMessageId = toolResultRaw.id
-                }
-            } else if let assistantRaw = deferredAssistantRaw {
-                await ChatStore.shared.appendMessage(assistantRaw)
-                // (assistantAgentIdx was already populated above via deferredAssistantRaw path)
-            }
-
-            // Signal that tools are done and we're waiting for the model's next response.
-            guard msgIdx < messages.count else { break }
-            messages[msgIdx].isAwaitingModelResponse = true
-
-            // If user cancelled during tool execution, commit everything and stop.
-            // History is now properly paired: assistant(tool_use) + user(tool_result).
-            if cancelledDuringToolExecution || self.userDidCancel {
-                logger.info("⏹️ User cancelled during tool execution — committed \(toolResultParts.count) tool result(s), stopping agent loop")
-                self.prevCommittedBlockCount = self.committedBlockCount
-                committedBlockCount = messages[msgIdx].blocks.count
-                self.committedBlockCount = committedBlockCount
-                messages[msgIdx].usage = turnUsage
-                hitTurnLimit = false
-                break
-            }
-
-            // [T-ios-queued-message-interrupt-on-toolclose] If the user queued a
-            // prompt while tools were running, interrupt as soon as the CURRENT
-            // tool call closes (its tool_result is now built + persisted) — don't
-            // keep grinding through the rest of the running plan. We break out of
-            // the tool loop here; the post-loop drainQueuedPrompts() then lands the
-            // queued prompt as a clean STANDALONE user turn and the model responds
-            // to it next.
-            //
-            // Why break instead of appending inline: appending the queued user
-            // message right after the tool_result lets mergeConsecutiveSameRole
-            // fold it into that tool_result as a trailing text block (Anthropic
-            // requires consecutive same-role messages merged), so the model read
-            // it as in-loop context for the previous turn and never gave it its
-            // own response (the #579 bug). Breaking → fresh turn avoids the merge
-            // entirely while still inserting/un-queuing the message immediately.
-            if !promptQueue.isEmpty {
-                logger.info("📨[QueueInterrupt] \(self.promptQueue.count) queued prompt(s) — interrupting after current tool call to start a standalone turn")
-                self.prevCommittedBlockCount = self.committedBlockCount
-                committedBlockCount = messages[msgIdx].blocks.count
-                self.committedBlockCount = committedBlockCount
-                // injectQueuedPromptsAsNewTurn un-queues the on-screen message
-                // (drops dashed border + X) so it appears inserted immediately,
-                // persists it as a standalone user turn, caches the just-finished
-                // assistant blocks, and starts a fresh assistant message. We then
-                // `continue` so the next iteration produces a dedicated response to
-                // the queued prompt — abandoning the rest of the running plan.
-                if await injectQueuedPromptsAsNewTurn(
-                    msgIdx: &msgIdx,
-                    committedBlockCount: &committedBlockCount,
-                    turnUsage: turnUsage
-                ) {
-                    // [T-ios-inloop-compact-freeze] Retarget the stable anchor
-                    // alongside msgIdx (fresh assistant message for the new turn).
-                    if msgIdx < messages.count { runMsgId = messages[msgIdx].id }
-                    canResume = false
-                    turnUsage = TokenUsage()
-                    continue
-                }
-            }
-
-            // If the background task expired while executing tools, pause here
-            // until the app returns to the foreground before making the next API call.
-            await waitIfBackgroundSuspended()
-
-            // If the user activated browser takeover, pause until they're done.
-            await waitIfBrowserTakeover()
-
-            // If stop reason was end_turn (not tool_use), break
-            if stopReason != .toolUse {
-                // maxTokens: the model ran out of output tokens mid-response.
-                // Show a warning and enable Resume so the user can continue.
-                if stopReason == .maxTokens {
-                    logger.warning("Agent loop stopped: max_tokens reached")
-                    messages[msgIdx].error = AppLocalized("Response truncated (max tokens reached)")
-                    canResume = true
-                }
-                // [T-stream-drop-silent] nil stopReason after tool turns means the
-                // stream ended without a proper terminal event — same abnormal
-                // interruption as the no-tool exit above. Surface with content-aware
-                // wording + Resume instead of the old bare "ended unexpectedly".
-                if stopReason == nil && toolEntries.isEmpty {
-                    logger.warning("Agent loop stopped: stream ended without stop reason")
-                    if assistantText.isEmpty {
-                        messages[msgIdx].error = AppLocalized("Response ended unexpectedly (no content received)")
-                    } else {
-                        messages[msgIdx].error = AppLocalized("The connection dropped — this reply may be incomplete. Tap Resume to continue.")
-                    }
-                    canResume = true
-                }
-                hitTurnLimit = false
-                break
-            }
-        }
-
-        // hitTurnLimit stays true only when the while-condition itself failed
-        // — meaning the model kept producing tool calls for maxAgentTurns
-        // iterations straight. Surface why we stopped + arm canResume so the
-        // user can continue from here. Mirrors Android ChatViewModel.
-        // finalizeAtTurnLimit. (Earlier draft used `turnCount >= max` which
-        // false-positived: the `defer { turnCount += 1 }` runs even on break,
-        // so a happy-path break on the final allowed iteration would inflate
-        // turnCount to max and slap a fake "200 turns hit" error on every
-        // ordinary completion — exactly the v1.4.0-dev bug user hit.)
-        if hitTurnLimit, msgIdx >= 0, msgIdx < messages.count {
-            logger.warning("⚠️ runAgentLoop hit maxAgentTurns=\(Self.maxAgentTurns) — finalizing as resumable")
-            messages[msgIdx].error =
-                "Stopped after \(Self.maxAgentTurns) agent turns to prevent runaway tool use. " +
-                "The model kept calling tools without finishing — tap Resume to continue from here, " +
-                "or send a new message to start over."
-            canResume = true
-        }
-
-        // Store accumulated usage on the assistant message
-        guard msgIdx < messages.count else { return }
-        messages[msgIdx].isAwaitingModelResponse = false
-        messages[msgIdx].usage = turnUsage
-
-        // Safety net: force-close any tool blocks still stuck in non-terminal status.
-        // This can happen when stream interruptions, retries, or edge cases leave
-        // tool blocks in .streaming or .running without transitioning to success/failed/cancelled.
-        for block in messages[msgIdx].blocks {
-            switch block.toolStatus {
-            case .streaming:
-                // [T-ios-concurrent-toolcall-dup-id] PRIMARY SUSPECT for the
-                // concurrent cancel-bubble bug: if outcome stitching drops an
-                // entry, that block stays .streaming and lands here.
-                logger.warning("[SafetyNet] force-closing .streaming → .cancelled toolUseId=\(block.toolUseId ?? "nil") kind=\(block.kind) content_len=\(block.content.count)")
-                block.toolStatus = .cancelled
-            case .running:
-                logger.warning("[SafetyNet] force-closing .running → .cancelled toolUseId=\(block.toolUseId ?? "nil") kind=\(block.kind) content_len=\(block.content.count)")
-                block.toolStatus = .cancelled
-            default:
-                break
-            }
-        }
-
-        // [T-deep-mode-plan-gate] After a clean end-turn, if deep mode is on and
-        // this turn was a plan-only reply (no tool calls + fenced plan marker),
-        // raise the confirm/edit gate. Guarded by "no error, not resumable" so
-        // truncated/interrupted turns never trigger the gate. The gate is the
-        // ONLY behavior here — execution resumes only via confirmPlan().
-        if deepModeEnabled, messages[msgIdx].error == nil, !canResume {
-            if let plan = PlanGate.detectPlan(in: messages[msgIdx]) {
-                // [T-deep-mode-cognitive-p2-c12] Multi-path thinking: if the
-                // plan contains multiple candidate paths (## PATH markers),
-                // extract the model's recommended path as the execution plan.
-                // The full multi-path text is still shown to the user in the
-                // plan gate UI; only the step tracker uses the recommended
-                // path. Total-switch safe: deepModeEnabled is checked above.
-                let multiPathResult = MultiPathPlanner.parse(plan)
-                let planForSteps: String
-                var detectedPaths: [CandidatePath] = []
-                var detectedRecommendedIndex = 1
-                switch multiPathResult {
-                case .multiPath(let paths, let recommendedIndex):
-                    let recommended = paths[recommendedIndex - 1]
-                    detectedPaths = paths
-                    detectedRecommendedIndex = recommendedIndex
-                    planForSteps = MultiPathPlanner.extractRecommendedPlan(from: multiPathResult) ?? plan
-                    logger.info("[MultiPath] C12: detected \(paths.count) paths, recommended #\(recommendedIndex): \(recommended.title) (risk: \(recommended.riskLevel.rawValue))")
-                case .singlePath:
-                    planForSteps = plan
-                }
-
-                if workflowPhase == .idle || workflowPhase == .planning {
-                    // [T-deep-mode-plan-gate] Layer B: a plan-only turn from an
-                    // idle/planning workflow raises the confirm/edit bar.
-                    // [T-deep-mode-floating-panel] Carry the detected paths and
-                    // the model's recommended index so the floating confirm
-                    // panel can offer Trae-style multi-select with the
-                    // recommended path pre-selected.
-                    planGateState = .awaitingApproval(planText: plan,
-                                                      paths: detectedPaths,
-                                                      recommendedIndex: detectedRecommendedIndex)
-                    // [T-deep-mode-floating-panel] Reset the user's selection so
-                    // a prior workflow's choice can never bleed in.
-                    selectedPathIndexes = []
-                    workflowPhase = .planning
-                    workflowSteps = WorkflowPlanParser.parseSteps(from: planForSteps)
-                } else {
-                    // [T-deep-mode-workflow] Mid-execution or mid-verification
-                    // plan-only turn: do NOT raise the top-level confirm gate
-                    // (that would yank the deterministic state machine back to
-                    // `.planning` and swap the live step tracker for a confirm
-                    // bar). Treat it as an ordinary turn and let the phase's
-                    // own sentinel (goal / verify) decide what to do next.
-                    planGateState = .idle
-                }
-                logger.info("[PlanGate] awaiting approval — plan=\(plan.count)ch steps=\(workflowSteps.count) msg=\(msgIdx)")
-            } else {
-                planGateState = .idle
-                // [T-deep-mode-workflow] A non-plan turn: leave the workflow
-                // phase untouched. A trivial task stays `.idle`; an execution
-                // turn stays `.executing` until the goal sentinel resolves it.
-            }
-        } else if deepModeEnabled, messages[msgIdx].error != nil {
-            // [T-deep-mode-workflow] A failed turn will not auto-continue, so
-            // clear the tracker to avoid a stale "执行中" bar after an error.
-            planGateState = .idle
-            resetWorkflow()
-        }
-
-        // Cache parsed MarkdownContent and NSAttributedString on completed text blocks
-        // to avoid re-parsing and re-rendering on cell recycling / SwiftUI refreshes.
-        for i in messages[msgIdx].blocks.indices {
-            if case .text = messages[msgIdx].blocks[i].kind, !messages[msgIdx].blocks[i].content.isEmpty {
-                messages[msgIdx].blocks[i].cachedMarkdown = MarkdownContent(prepareMarkdownForRender(messages[msgIdx].blocks[i].content))
-                cacheAttributedString(for: messages[msgIdx].blocks[i])
-            }
-        }
-
-        // [T-deep-mode-goal-runner] Layer C: the turn is fully closed out
-        // (markdown cached, tool statuses settled). Consult the goal sentinel
-        // and auto-continue if the model reported `pending` — bounded by
-        // goalRunnerRoundsLeft and gated by `deepModeEnabled` inside.
-        await maybeAutoContinueGoal(afterMsgIdx: msgIdx)
-
-        // [T-deep-mode-verify-gate] Phase 2: if we are in the verifying phase,
-        // process the verify sentinel and either finish the workflow or loop
-        // back to execution for a fix round. No-op in any other phase.
-        await maybeProcessVerifyResult(afterMsgIdx: msgIdx)
-
-        // [T-deep-mode-phase-f] Phase F: if we are in the spec-writing phase,
-        // process any produced spec documents and pause in `.specReviewing`
-        // for the user's approve / edit / reject. No-op in any other phase.
-        await maybeProcessSpecResult(afterMsgIdx: msgIdx)
-
-    }
-
-    /// Builds the final NSAttributedString for a completed text block and stores it
-    /// on the block. Must be called on the MainActor. No-op if content is empty.
-    @MainActor
-    func cacheAttributedString(for block: AssistantBlock) {
-        guard !block.content.isEmpty else { return }
-        // [T-ios-markdown-rerender-burst] Persist the parsed MarkdownContent back
-        // onto the block, not just the rendered attributed string. Previously
-        // this parsed `MarkdownContent(prepared)` to render the attributed
-        // string but threw the parse away, leaving `block.cachedMarkdown` nil
-        // for messages loaded from DB (loadSession calls this for every text
-        // block). The SelectableMarkdownView render path then re-ran cmark on
-        // EVERY updateUIView — and for table-containing messages (which
-        // [TablePathFix] forces through fresh render, bypassing
-        // cachedAttributedString) that re-parse fired 6–12× per scroll-decel
-        // second, dropping 5–8 frames. Caching the parse makes the render path
-        // hit `cachedContent` (skip re-parse) AND keys its content-hash off the
-        // stable `blocks.hashValue` so the per-coordinator hash-skip can land.
-        // No extra work: we were already computing this MarkdownContent here.
-        let content = block.cachedMarkdown ?? MarkdownContent(prepareMarkdownForRender(block.content))
-        block.cachedMarkdown = content
-        block.cachedAttributedString = autoreleasepool {
-            renderMarkdownBlocks(content.blocks)
-        }
-    }
-
-    @MainActor
-    func setStreamingUIUpdatesSuspended(_ suspended: Bool) {
-        guard streamingUIUpdatesSuspended != suspended else { return }
-        // [T-ios-scroll-suspend-leak] Full lifecycle trace of every true↔false
-        // transition. When UI/DB inconsistency is reported, this lets us see
-        // whether a SUSPEND ever got a matching RESUME (the leak = a SUSPEND with
-        // no RESUME before the session was switched away). `caller` is the direct
-        // caller frame (scrollViewWillBeginDragging / scenePhase / openSession …).
-        let caller = Thread.callStackSymbols.count > 1 ? Self.shortFrame(Thread.callStackSymbols[1]) : "?"
-        logger.info("[SuspendState] \(suspended ? "SUSPEND" : "RESUME") sid=\(sessionId?.prefix(8).description ?? "nil") caller=\(caller)")
-        if suspended {
-            streamingUIUpdatesSuspended = true
-        } else {
-            // [T-ios-ui-blocks-lost-suspend-resume] Flush VM-side deferred text
-            // FIRST so `messages` holds the freshest content, then clear the
-            // flag + fire the resume hook so the Coordinator rebuilds any
-            // snapshot it deferred during the suspend window.
-            flushDeferredStreamingTextUpdateIfNeeded()
-            clearStreamingUIUpdatesSuspended()
-            // [T-ios-tool-status-desync] Republish so tool-status views
-            // (FloatingToolBar, ToolStatusBar) pick up any toolBlocks /
-            // tool_use mutations that landed while suspended. Without this,
-            // @Published only fires on assignment — in-place mutations to
-            // `messages` during the suspend window are invisible to
-            // subscribers. Mirrors setSuspendedForTransition(false).
-            objectWillChange.send()
-        }
-    }
-
-    /// Gate UI invalidation while this vm is on the outgoing side of a
-    /// session-switch. ContentView calls `setSuspendedForTransition(true)` on
-    /// the previously-selected vm immediately before `selectedSessionId`
-    /// flips, then schedules a `setSuspendedForTransition(false)` after a
-    /// short delay so the next time the user comes back to this session the
-    /// streaming UI catches up.
-    /// See `transitionSuspended` doc-comment for the full crash motivation.
-    @MainActor
-    func setSuspendedForTransition(_ suspended: Bool) {
-        guard transitionSuspended != suspended else { return }
-        transitionSuspended = suspended
-        // While transition-suspended, also keep the streaming text path in
-        // defer mode. On resume, fall back to whatever explicit value the
-        // scroll-suppression callers had requested (we conservatively clear,
-        // since the most common case during a transition is no scroll).
-        if suspended {
-            streamingUIUpdatesSuspended = true
-        } else {
-            flushDeferredStreamingTextUpdateIfNeeded()
-            // [T-ios-ui-blocks-lost-suspend-resume] Clear via the chokepoint so
-            // the Coordinator's resume hook fires too (rebuilds any deferred
-            // snapshot), in addition to the republish below.
-            clearStreamingUIUpdatesSuspended()
-            // Republish so the new (or returning) message-list binding picks
-            // up the current `messages` snapshot — Published only fires on
-            // assignment, so any mutations that occurred during suspend are
-            // now reflected in `messages` but no subscriber has been notified.
-            objectWillChange.send()
-        }
-    }
-
-    @MainActor
-    func setStreamingTextBlockContent(
-        msgIdx: Int,
-        blockIdx: Int,
-        text: String,
-        parsedMarkdown: MarkdownContent?,
-        cacheAttributedString shouldCacheAttributedString: Bool,
-        requestScroll: Bool
-    ) {
-        guard msgIdx >= 0, msgIdx < messages.count,
-              blockIdx >= 0, blockIdx < messages[msgIdx].blocks.count else { return }
-        let message = messages[msgIdx]
-        let block = message.blocks[blockIdx]
-
-        // Record the streaming flush into the hang-logger's ring buffer so
-        // any main-thread stall that occurs during streaming is logged
-        // together with the most recent on-screen content tail. Cheap: a
-        // substring + struct push on a background queue. No-op when no
-        // streaming session is currently active.
-        StreamingHangLogger.shared.recordStreamingFlush(
-            messageId: message.id,
-            blockId: block.id,
-            text: text,
-            finalFlush: shouldCacheAttributedString
-        )
-
-        if streamingUIUpdatesSuspended {
-            // [DIAG-SUSPEND] UI updates are suspended (e.g. tool detail sheet is presented).
-            // If this is the FINAL flush (cacheAttributedString=true), the content will be
-            // deferred until the sheet is dismissed. If the sheet never dismisses properly,
-            // the cell stays empty.
-            logger.info("[StreamText] DEFERRED — uiSuspended=true text len=\(text.count) cacheAttr=\(shouldCacheAttributedString) blockId=\(block.id)")
-            let existing = deferredStreamingTextUpdates.first(where: {
-                $0.messageId == message.id && $0.blockId == block.id
-            })
-            let mergedCacheFlag = shouldCacheAttributedString || (existing?.cacheAttributedString == true)
-            let pending = DeferredStreamingTextUpdate(
-                messageId: message.id,
-                blockId: block.id,
-                text: text,
-                parsedMarkdown: parsedMarkdown,
-                cacheAttributedString: mergedCacheFlag
-            )
-            if let existingIdx = deferredStreamingTextUpdates.firstIndex(where: {
-                $0.messageId == message.id && $0.blockId == block.id
-            }) {
-                deferredStreamingTextUpdates[existingIdx] = pending
-            } else {
-                deferredStreamingTextUpdates.append(pending)
-            }
-            return
-        }
-
-        applyStreamingTextBlockContent(
-            block,
-            text: text,
-            parsedMarkdown: parsedMarkdown,
-            cacheAttributedString: shouldCacheAttributedString
-        )
-        if requestScroll && isNearBottom {
-            scrollToBottomSignal.send()
-        }
-    }
-
-    @MainActor
-    private func applyStreamingTextBlockContent(
-        _ block: AssistantBlock,
-        text: String,
-        parsedMarkdown: MarkdownContent?,
-        cacheAttributedString shouldCacheAttributedString: Bool
-    ) {
-        let wasEmpty = block.content.isEmpty
-        block.content = text
-        if let parsedMarkdown {
-            block.cachedMarkdown = parsedMarkdown
-        } else if block.cachedMarkdown == nil {
-            block.cachedMarkdown = MarkdownContent(prepareMarkdownForRender(text))
-        }
-        if shouldCacheAttributedString {
-            cacheAttributedString(for: block)
-        }
-        // When content transitions from empty to non-empty, signal the collection
-        // view to reconfigure the cell. UIHostingConfiguration doesn't always
-        // trigger preferredLayoutAttributesFitting when the SwiftUI body changes
-        // from emitting nothing (EmptyView) to emitting content — the cell can
-        // stay at ~0 height indefinitely without this explicit nudge.
-        if wasEmpty && !text.isEmpty,
-           let message = messages.first(where: { $0.blocks.contains(where: { $0.id == block.id }) }) {
-            let prefix = String(text.prefix(30))
-            let blockIdx = message.blocks.firstIndex(where: { $0.id == block.id }) ?? -1
-            let prevBlockKind: String = blockIdx > 0 ? "\(message.blocks[blockIdx - 1].kind)" : "none"
-            logger.info("[TextDrift] empty→filled blockIdx=\(blockIdx) prevBlockKind=\(prevBlockKind) len=\(text.count) text=\"\(prefix)\"")
-            blockContentFilledSignal.send((messageId: message.id, blockId: block.id))
-        }
-    }
-
-    @MainActor
-    private func flushDeferredStreamingTextUpdateIfNeeded() {
-        guard !deferredStreamingTextUpdates.isEmpty else { return }
-        let pendingUpdates = deferredStreamingTextUpdates
-        deferredStreamingTextUpdates.removeAll()
-
-        // [T-perf-flush-batch-merge] Merge pending updates by (messageId, blockId)
-        // so a long suspend window that accumulated hundreds of token deltas
-        // collapses to one apply per block. The O(updates) loop becomes O(blocks),
-        // eliminating the main-thread stall when flushing a large backlog.
-        var mergedByKey: [String: DeferredStreamingTextUpdate] = [:]
-        for update in pendingUpdates {
-            let key = update.messageId.uuidString + "|" + update.blockId.uuidString
-            mergedByKey[key] = update
-        }
-        let merged = Array(mergedByKey.values)
-
-        for pending in merged {
-            guard let message = messages.first(where: { $0.id == pending.messageId }),
-                  let block = message.blocks.first(where: { $0.id == pending.blockId }) else { continue }
-            applyStreamingTextBlockContent(
-                block,
-                text: pending.text,
-                parsedMarkdown: pending.parsedMarkdown,
-                cacheAttributedString: pending.cacheAttributedString
-            )
-        }
-        if isNearBottom {
-            scrollToBottomSignal.send()
-        }
-    }
 
     // MARK: - Slash Commands (stored state)
     // Method bodies live in AIChatViewModel+SlashCommands.swift; stored
@@ -8535,81 +1899,7 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
 
     /// In-memory thinking level for sessions not yet persisted (no sessionId yet).
     /// nil = user hasn't explicitly set one; fall back to the default group's level.
-    private var pendingThinkingLevel: ThinkingLevel?
-
-    /// Set thinking level — persists if session exists, otherwise holds in memory.
-    func setThinkingLevel(_ level: ThinkingLevel) {
-        let maxLevel = resolveCurrentEntry()?.effectiveMaxThinkingLevel ?? .xhigh
-        let clamped = level == .off ? level : min(level, maxLevel)
-        if let sid = sessionId {
-            var cfg = ProviderConfigStore.shared.inferenceConfig(for: sid) ?? SessionInferenceConfig()
-            cfg.thinkingLevel = clamped
-            ProviderConfigStore.shared.setInferenceConfig(cfg, for: sid)
-        } else {
-            pendingThinkingLevel = clamped
-        }
-        if !transitionSuspended { objectWillChange.send() }
-    }
-
-    /// Default thinking level inherited from the active default primary group, or .off.
-    private var defaultGroupThinkingLevel: ThinkingLevel {
-        let store = ProviderConfigStore.shared
-        guard let groupId = store.defaultPrimaryGroupId,
-              let group = store.group(for: groupId) else { return .off }
-        return group.defaultThinkingLevel ?? .off
-    }
-
-    /// Current thinking level for this session.
-    ///
-    /// [T-ios-stale-thinking-level-display] The stored value can exceed the
-    /// active model's current ceiling — e.g. a session/group config persisted
-    /// `.ultra` (or `.max`) while a model's `effectiveMaxThinkingLevel` was higher,
-    /// then the catalog cap was tightened (sol/terra .ultra→.max, etc.). The write
-    /// path (`setThinkingLevel`) clamps, but a value persisted under a looser cap
-    /// is never rewritten, so a raw read would surface a level the model no longer
-    /// supports — the "is thinking…" pill would show "Ultra/极限" when the user's
-    /// effective (and wire-sent) level is really "Max". Clamp on read so the
-    /// displayed level always matches what will actually be requested (the request
-    /// path re-clamps per-model too — AgentProvider: min(level, catalogMax)).
-    var currentThinkingLevel: ThinkingLevel {
-        let stored: ThinkingLevel = {
-            if let sid = sessionId, let cfg = ProviderConfigStore.shared.inferenceConfig(for: sid) {
-                return cfg.thinkingLevel
-            }
-            return pendingThinkingLevel ?? defaultGroupThinkingLevel
-        }()
-        guard stored.isEnabled else { return stored }
-        guard let entry = resolveCurrentEntry() else { return min(stored, .xhigh) }
-        let clamped = min(stored, entry.effectiveMaxThinkingLevel)
-        // [T-thinking-levels-data-driven] The offered set can be SPARSE (a model
-        // declaring ["high","max"] offers only High/Max), and a level persisted
-        // before that was known — or carried over from another model — may not
-        // be in it. Snap onto the nearest offered tier at or below, mirroring
-        // `clampEffort`'s prefer-downgrade rule, so the pill and the checkmark
-        // agree with the value actually sent.
-        let levels = entry.selectableThinkingLevels
-        guard !levels.isEmpty, !levels.contains(clamped) else { return clamped }
-        return levels.last(where: { $0 <= clamped }) ?? levels[0]
-    }
-
-    /// Flush pending thinking level to the store once sessionId is available.
-    /// Returns `true` if a user-chosen level was written, so the caller can
-    /// keep the group-default seeding (createInitialBinding) from clobbering it.
-    ///
-    /// [T-first-msg-thinking-level-clobber] Note the `pending != .off` guard:
-    /// `.off` is indistinguishable from "unset" in SessionInferenceConfig, so a
-    /// user who explicitly picks Off before the first send still inherits the
-    /// group default. That pre-existing limitation is unchanged here — this fix
-    /// only stops a real (enabled) override from being overwritten.
-    @discardableResult
-    func flushPendingThinkingLevel() -> Bool {
-        guard let pending = pendingThinkingLevel, pending != .off, let sid = sessionId else { return false }
-        var cfg = ProviderConfigStore.shared.inferenceConfig(for: sid) ?? SessionInferenceConfig()
-        cfg.thinkingLevel = pending
-        ProviderConfigStore.shared.setInferenceConfig(cfg, for: sid)
-        pendingThinkingLevel = nil
-        return true
-    }
+    var pendingThinkingLevel: ThinkingLevel?
 
     /// Append an ephemeral system info message (not sent to LLM).
     func appendSystemInfo(_ text: String, icon: String) {
@@ -8619,14 +1909,3 @@ final class AIChatViewModel: ObservableObject, SpeechControlling {
     }
 
 }
-
-enum LLMProviderError: LocalizedError {
-    case noCredentials
-
-    var errorDescription: String? {
-        switch self {
-        case .noCredentials: return "No API credentials available"
-        }
-    }
-}
-
