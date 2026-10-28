@@ -69,6 +69,9 @@ struct ChatSession: Identifiable, Codable, Hashable {
     /// nil for a child created without a tool block (scheduled, P2).
     var parentToolUseId: String?
 
+    /// Non-nil when the session pins a specific env-var profile; nil = global only.
+    var envProfileId: String? = nil
+
     /// Whether this session is a hidden child of another session.
     var isChild: Bool { parentSessionId != nil }
 

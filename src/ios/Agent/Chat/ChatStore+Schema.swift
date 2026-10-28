@@ -101,6 +101,8 @@ extension ChatStore {
         // no FK (orphan-tolerant like folder_id).
         addColumnIfMissing(table: "sessions", column: "parent_session_id", definition: "TEXT")
         addColumnIfMissing(table: "sessions", column: "parent_tool_use_id", definition: "TEXT")
+        // Per-session env-var profile pin (nil = global only).
+        addColumnIfMissing(table: "sessions", column: "env_profile_id", definition: "TEXT")
         // [T-ios-listsessions-perf] Denormalised sidebar preview, computed when
         // a message lands rather than re-derived for every session on every
         // refresh. `preview_sort_order` is the sort_order of the message the

@@ -417,7 +417,7 @@ extension ChatStore {
     }
 
     func getSession(_ id: String) -> ChatSession? {
-        let sql = "SELECT id, title, model_id, created_at, updated_at, category, source, pinned_at, folder_id, parent_session_id, parent_tool_use_id FROM sessions WHERE id = ?"
+        let sql = "SELECT id, title, model_id, created_at, updated_at, category, source, pinned_at, folder_id, parent_session_id, parent_tool_use_id, env_profile_id FROM sessions WHERE id = ?"
         var stmt: OpaquePointer?
         var session: ChatSession?
 
@@ -435,6 +435,7 @@ extension ChatStore {
                 let folderId = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
                 let parentSessionId = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
                 let parentToolUseId = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
+                let envProfileId = sqlite3_column_text(stmt, 11).map { String(cString: $0) }
 
                 session = ChatSession(
                     id: id, title: title, category: category, modelId: modelId,
@@ -443,11 +444,24 @@ extension ChatStore {
                 )
                 session?.parentSessionId = parentSessionId
                 session?.parentToolUseId = parentToolUseId
+                session?.envProfileId = envProfileId
             }
         }
         sqlite3_finalize(stmt)
 
         return session
+    }
+
+    func updateSessionEnvProfileId(_ id: String, envProfileId: String?) {
+        invalidateSessionListCache(sessionId: id)
+        let sql = "UPDATE sessions SET env_profile_id = ? WHERE id = ?"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindOptionalText(stmt, index: 1, value: envProfileId)
+            sqlite3_bind_text(stmt, 2, (id as NSString).utf8String, -1, nil)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
     }
 
     func updateSessionModelId(_ id: String, modelId: String) {

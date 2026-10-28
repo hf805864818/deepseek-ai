@@ -281,7 +281,8 @@ extension ChatStore {
                    s.parent_session_id, s.parent_tool_use_id,
                    -- [T-ios-listsessions-perf] Appended LAST, same reason as
                    -- folder_id above: the decode reads by index.
-                   s.preview_text, s.preview_sort_order
+                   s.preview_text, s.preview_sort_order,
+                   s.env_profile_id
             FROM sessions s\(whereClause)
             ORDER BY s.updated_at DESC
             """
@@ -369,6 +370,7 @@ extension ChatStore {
             let folderId = Self.colTextOpt(stmt, 14)
             let parentSessionId = Self.colTextOpt(stmt, 15)
             let parentToolUseId = Self.colTextOpt(stmt, 16)
+            let envProfileId = Self.colTextOpt(stmt, 19)
 
             var row = ChatSession(
                 id: id, title: title, category: category, modelId: modelId,
@@ -379,6 +381,7 @@ extension ChatStore {
             )
             row.parentSessionId = parentSessionId
             row.parentToolUseId = parentToolUseId
+            row.envProfileId = envProfileId
             // The sort_order the preview came from, so a later incremental
             // update compares against a real value instead of NULL.
             let winningOrder: Int? = {
