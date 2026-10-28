@@ -1088,21 +1088,1143 @@ class ChatViewModel(
     /** Re-point this vm at a pool owned elsewhere (a child adopting its parent's). */
     internal fun adoptBrowserTabPool(pool: BrowserTabPool) { _browserTabPoolRef = pool }
 
-    /** Browser tab pool for browser_use tool. Lazily created on first access. */
-    val browserTabPool: BrowserTabPool by lazy {
-        BrowserTabPool(context).also {
-            it.setSession(activeSessionId)
-            // Surface download start/finish/failure as system-info notices in
-            // this chat. May fire from the pool's IO scope — hop to Main since
-            // appendSystemInfo does a read-modify-write on _messages.
-            it.onDownloadEvent = { text ->
-                viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-                    appendSystemInfo(text, "info")
+    // ── Sub agent (delegate_task) execution state ──────────────────────
+    // [T-sub-agent-detach] Bumped when the user stops "this tool only" while
+    // waiting on a delegate_task; the wait loop reads it to convert to background.
+    private val delegateDetach = MutableStateFlow(0)
+
+    // [T-sub-agents] Live block overrides keyed by tool_use id, so a background
+    // sub agent's progress can update its card after the parent loop moved on.
+    private val delegateBlockOverrides = java.util.concurrent.ConcurrentHashMap<String, AssistantBlock>()
+
+    /** [T-agent-wrapup-turn] The parent called time on the budget: the child's
+     *  NEXT loop turn is the wrap-up turn (tools withdrawn, deliverable asked). */
+    @Volatile internal var helperWrapUpRequested = false
+    /** [T-subagent-termination] One-shot closing request after a no-text turn. */
+    @Volatile internal var helperClosingAttempted = false
+
+    internal fun agentHistorySnapshot(): List<LLMMessage> {
+        repeat(3) { runCatching { return agentHistory.toList() } }
+        return emptyList()
+    }
+
+    /** [T-sub-agents-steer] Course corrections queued by the parent model. */
+    private val pendingSteerMessages = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    internal fun enqueueSteer(message: String): Boolean {
+        if (helperConfig == null) return false
+        val wasIdle = !_isStreaming.value
+        pendingSteerMessages.add(message)
+        if (wasIdle) {
+            AppLogger.info(TAG, "[subagent_task] steer arrived while the child was idle — nudging its loop")
+            viewModelScope.launch {
+                runCatching {
+                    submitPrompt(com.openminis.app.agent.jobs.HelperRunner.STEER_NUDGE_PROMPT)
+                }.onFailure {
+                    AppLogger.warning(TAG, "[subagent_task] steer nudge failed: ${it.message}")
                 }
             }
-            _browserTabPoolRef = it
+        }
+        return true
+    }
+
+    internal fun drainMissedSteers(): List<String> = synchronized(pendingSteerMessages) {
+        val out = pendingSteerMessages.toList()
+        pendingSteerMessages.clear()
+        out
+    }
+
+    private fun childLiveMessages(childVm: ChatViewModel): List<ChatMessage> {
+        val msgs = childVm.messages.value
+        val stream = childVm.streamingById.value
+        return if (stream.isEmpty()) msgs else mergeStreamingOverlay(msgs, stream)
+    }
+
+    private fun childLiveToolBlock(childVm: ChatViewModel): AssistantBlock? =
+        childLiveMessages(childVm).lastOrNull { it.role == "assistant" }
+            ?.toolBlocks?.lastOrNull { it.kind == "tool_use" }
+
+    internal fun writeDelegateBlock(toolId: String, content: String, status: ToolBlockStatus?) {
+        val prev = delegateBlockOverrides[toolId]
+        delegateBlockOverrides[toolId] = AssistantBlock(
+            id = toolId, kind = "tool_use", content = content,
+            toolStatus = status ?: prev?.toolStatus, toolName = com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME,
+        )
+        fun patch(blocks: List<AssistantBlock>): List<AssistantBlock>? {
+            if (blocks.none { it.id == toolId }) return null
+            return blocks.map { if (it.id == toolId) it.copy(content = content, toolStatus = status ?: it.toolStatus) else it }
+        }
+        _messages.value = _messages.value.map { m ->
+            if (m.role != "assistant") m else patch(m.toolBlocks)?.let { m.copy(toolBlocks = it) } ?: m
+        }
+        val overlay = _streamingById.value
+        if (overlay.isNotEmpty()) {
+            var changed = false
+            val next = overlay.mapValues { (_, d) -> patch(d.toolBlocks)?.let { changed = true; d.copy(toolBlocks = it) } ?: d }
+            if (changed) _streamingById.value = next
         }
     }
+
+    internal fun clearDelegateOverride(toolId: String) { delegateBlockOverrides.remove(toolId) }
+
+    // ── subagent_task: resume / control / queue ─────────────────────────
+    private fun executeResumeAgents(argsJson: String): ToolExecutionResult {
+        val o = runCatching { JSONObject(argsJson) }.getOrElse { JSONObject() }
+        val toolTitle = o.optString("tool_title", "").ifEmpty { "resume sub agents" }
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        if (isHelper) {
+            return ToolExecutionResult(
+                hr.rejectionJson("depth_limit", "A sub agent cannot resume another."),
+                false, toolTitle = toolTitle,
+            )
+        }
+        val wanted = o.optString("child_session_id", "").trim()
+        val candidates = interruptedChildIds(activeSessionId)
+            .let { all -> if (wanted.isEmpty()) all else all.filter { it == wanted } }
+        if (candidates.isEmpty()) {
+            return ToolExecutionResult(
+                JSONObject()
+                    .put("ok", true).put("resumed", 0)
+                    .put(
+                        "detail",
+                        if (wanted.isEmpty()) {
+                            "No interrupted sub agents in this conversation."
+                        } else {
+                            "That sub agent is not interrupted; nothing to resume."
+                        },
+                    ).toString(),
+                true, toolTitle = toolTitle,
+            )
+        }
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val resumed = org.json.JSONArray()
+        val deferred = org.json.JSONArray()
+        val queued = org.json.JSONArray()
+        for (childId in candidates) {
+            when {
+                registry.canStartChildJob(activeSessionId) -> {
+                    if (resumeInterruptedChild(childId)) resumed.put(childId) else deferred.put(childId)
+                }
+                enqueueResume(childId) -> queued.put(childId)
+                else -> deferred.put(childId)
+            }
+        }
+        return ToolExecutionResult(
+            JSONObject()
+                .put("ok", resumed.length() > 0 || queued.length() > 0)
+                .put("resumed", resumed.length())
+                .put("child_session_ids", resumed)
+                .also { if (deferred.length() > 0) it.put("failed", deferred) }
+                .also { if (queued.length() > 0) it.put("queued", queued) }
+                .put(
+                    "detail",
+                    buildList {
+                        if (resumed.length() > 0) {
+                            add(
+                                "${resumed.length()} sub agent(s) restarted; each reports back as a new " +
+                                    "message when it finishes. Do not re-delegate them. Elapsed and turn " +
+                                    "counts cover only the resumed part.",
+                            )
+                        }
+                        if (queued.length() > 0) {
+                            add("All slots are busy; this resume is queued and starts when one frees.")
+                        }
+                        if (deferred.length() > 0 && resumed.length() == 0 && queued.length() == 0) {
+                            add("None could be resumed.")
+                        }
+                    }.joinToString(" "),
+                )
+                .toString(),
+            true, toolTitle = toolTitle,
+        )
+    }
+
+    private fun createChildViewModel(
+        childId: String,
+        parentSid: String,
+        toolId: String,
+        jobId: String,
+        subAgent: com.openminis.app.data.model.SubAgentDefinition,
+        maxTurns: Int,
+        title: String,
+    ): ChatViewModel =
+        com.openminis.app.debug.HeadlessChatRunner.viewModelFor(
+            context, childId, com.openminis.app.ui.chat.ChatViewModelStore.PoolKind.CHILD,
+        ).also {
+            it.helperConfig = com.openminis.app.agent.jobs.HelperConfig(
+                parentSessionId = parentSid, parentToolUseId = toolId, jobId = jobId,
+                maxTurns = maxTurns, title = title,
+                tierUsed = com.openminis.app.agent.jobs.HelperModelTier.PRIMARY,
+                agentName = subAgent.name.takeIf { !subAgent.isBuiltIn },
+                agentInstructions = subAgent.instructions,
+            )
+            it.adoptBrowserTabPool(browserTabPool)
+        }
+
+    private fun enqueueResume(childId: String): Boolean {
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val parentSid = activeSessionId
+        if (parentSid.isEmpty()) return false
+        registry.registerQueuedStarter(parentSid) { item ->
+            startQueuedDelegation(item.argsJson, item.toolUseId)
+        }
+        registry.registerInterruptedCounter(parentSid) { countInterruptedChildren(parentSid) }
+        val args = try {
+            JSONObject()
+                .put(com.openminis.app.agent.jobs.HelperRunner.QUEUED_RESUME_CHILD_KEY, childId)
+                .toString()
+        } catch (_: Exception) {
+            return false
+        }
+        return registry.enqueueDelegation(
+            com.openminis.app.agent.jobs.AgentJobRegistry.QueuedDelegation(
+                parentSessionId = parentSid,
+                argsJson = args,
+                toolUseId = resumeQueueKey(childId),
+            ),
+        )
+    }
+
+    private fun resumeInterruptedChild(childId: String): Boolean {
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val parentSid = activeSessionId
+        var toolId = ""
+        var title = ""
+        var agentName: String? = null
+        outer@ for (m in _messages.value) {
+            if (m.role != "assistant") continue
+            for (b in m.toolBlocks) {
+                if (b.kind != "tool_use") continue
+                if (!hr.isSubAgentToolName(b.toolName)) continue
+                val o = runCatching { JSONObject(b.content) }.getOrNull() ?: continue
+                if (o.optString("child_session_id") != childId) continue
+                toolId = b.id
+                title = b.toolTitle.ifEmpty { o.optString("title", "") }
+                agentName = o.optString("agent", "").ifEmpty { null }
+                break@outer
+            }
+        }
+        if (toolId.isEmpty()) {
+            AppLogger.warning(TAG, "[subagent_task] resume: no parent block for child ${childId.take(8)}")
+            return false
+        }
+        val roster = providerRepository.subAgents
+        val subAgent = com.openminis.app.data.model.SubAgentRoster.resolve(agentName, roster)
+            ?: roster.firstOrNull()
+            ?: return false
+
+        val job = registry.register(
+            title = title.ifEmpty { "agent" },
+            origin = com.openminis.app.agent.jobs.AgentJobOrigin.TOOL,
+            trigger = com.openminis.app.agent.jobs.AgentJobTrigger.Immediate,
+            target = com.openminis.app.agent.jobs.AgentJobTarget.ChildOfCurrent(parentSid, toolId),
+            prompt = null,
+            then = com.openminis.app.agent.jobs.AgentJobThen.FollowUpParent(null),
+            agentName = subAgent.name.takeIf { !subAgent.isBuiltIn },
+            runSessionId = childId,
+            wasResumed = true,
+        )
+        registry.registerInterruptedCounter(parentSid) { countInterruptedChildren(parentSid) }
+        registry.registerQueuedStarter(parentSid) { item ->
+            startQueuedDelegation(item.argsJson, item.toolUseId)
+        }
+        viewModelScope.launch {
+            try {
+                val childVm = withContext(Dispatchers.Main) {
+                    createChildViewModel(
+                        childId, parentSid, toolId, job.id, subAgent, hr.MAX_TURNS, title,
+                    )
+                }
+                registry.markRunning(job.id, childId) {
+                    viewModelScope.launch(Dispatchers.Main) { childVm.cancelStream() }
+                }
+                childVm.helperClosingAttempted = false
+                com.openminis.app.agent.jobs.SubAgentTerminationStore.shared.begin(childId, job.id, parentSid)
+                registry.registerSteerHook(job.id) { msg -> childVm.enqueueSteer(msg) }
+                registry.registerMissedSteerDrain(job.id) { childVm.drainMissedSteers() }
+                writeDelegateBlock(
+                    toolId,
+                    hr.progressJson(childId, title, "", "", 0L, background = true),
+                    ToolBlockStatus.RUNNING,
+                )
+                registry.setCompletionHook(job.id) { finished ->
+                    val termination = recordChildTermination(
+                        childVm, childId, finished.id, parentSid,
+                        loopStatus = hr.statusWord(finished.state),
+                        budgetExpired = childVm.helperWrapUpRequested,
+                        errorText = childVm.messages.value.lastOrNull { it.role == "assistant" }?.error,
+                        resultText = finished.resultText ?: "",
+                        delivery = com.openminis.app.agent.jobs.SubAgentTermination.Delivery.PENDING,
+                    )
+                    viewModelScope.launch(Dispatchers.IO) {
+                        val facts = hr.childRunFacts(chatRepository.dao.loadMessages(childId))
+                        val summary = hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead)
+                        registry.setSummaryLine(finished.id, summary)
+                        val result = finished.resultText ?: ""
+                        val status = hr.reportedStatus(hr.statusWord(finished.state), result, termination)
+                        val json = hr.resultJson(
+                            status, result, childVm.modelName.value,
+                            com.openminis.app.agent.jobs.HelperModelTier.PRIMARY, "",
+                            facts.turns, finished.elapsedMs ?: 0L, childId, finished.id,
+                            summary, deliveredAs = "new turn in this conversation",
+                            agentName = subAgent.name.takeIf { !subAgent.isBuiltIn },
+                            wasResumed = true,
+                            errorText = childVm.messages.value.lastOrNull { it.role == "assistant" }?.error,
+                            thinkingLevel = chatRepository.getSession(childId)?.thinkingOverride,
+                            termination = termination,
+                        )
+                        val blockStatus = when (finished.state) {
+                            com.openminis.app.agent.jobs.AgentJobState.DONE -> ToolBlockStatus.SUCCESS
+                            com.openminis.app.agent.jobs.AgentJobState.CANCELLED -> ToolBlockStatus.CANCELLED
+                            com.openminis.app.agent.jobs.AgentJobState.TIMEOUT -> ToolBlockStatus.TIMEOUT
+                            else -> ToolBlockStatus.FAILED
+                        }
+                        withContext(Dispatchers.Main) { writeDelegateBlock(toolId, json, blockStatus) }
+                        persistFinalDelegateResult(toolId, json, finished.state == com.openminis.app.agent.jobs.AgentJobState.DONE)
+                        AppLogger.info(TAG, "[subagent_task] RESUME END job=${finished.id.take(8)} state=${finished.state.wire}")
+                    }
+                }
+                val outcome = withContext(Dispatchers.Main) { childVm.submitPrompt(hr.resumeNotice()) }
+                if (outcome is SubmitOutcome.Rejected) {
+                    AppLogger.warning(TAG, "[subagent_task] resume not started for ${childId.take(8)}: ${outcome.reason}")
+                    registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
+                    return@launch
+                }
+                AppLogger.info(TAG, "[subagent_task] resumed child=${childId.take(8)} job=${job.id.take(8)}")
+                if (outcome is SubmitOutcome.Compacting) {
+                    childVm.isCompacting.first { !it }
+                    withTimeoutOrNull(5_000L) { childVm.isStreaming.first { it } }
+                }
+                childVm.isStreaming.first { !it }
+                val facts = hr.childRunFacts(chatRepository.dao.loadMessages(childId))
+                val state = if (childVm.messages.value.lastOrNull { it.role == "assistant" }?.error != null) {
+                    com.openminis.app.agent.jobs.AgentJobState.FAILED
+                } else {
+                    com.openminis.app.agent.jobs.AgentJobState.DONE
+                }
+                registry.setSummaryLine(job.id, hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead))
+                registry.finish(job.id, state, facts.lastText)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.CANCELLED, null)
+                throw e
+            } catch (e: Exception) {
+                AppLogger.warning(TAG, "[subagent_task] resume failed for ${childId.take(8)}: ${e.message}")
+                registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
+            }
+        }
+        return true
+    }
+
+    private fun interruptedChildIds(parentSessionId: String): List<String> {
+        if (parentSessionId.isEmpty()) return emptyList()
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val out = mutableListOf<String>()
+        for (m in _messages.value) {
+            if (m.role != "assistant") continue
+            for (b in m.toolBlocks) {
+                if (b.kind != "tool_use") continue
+                if (!com.openminis.app.agent.jobs.HelperRunner.isSubAgentToolName(b.toolName)) continue
+                val o = runCatching { JSONObject(b.content) }.getOrNull() ?: continue
+                if (o.optString("status") != "running") continue
+                val childId = o.optString("child_session_id", "")
+                if (childId.isEmpty() || childId in out) continue
+                if (registry.jobForSession(childId) != null) continue
+                out.add(childId)
+            }
+        }
+        return out
+    }
+
+    internal fun countInterruptedChildren(parentSessionId: String): Int {
+        if (parentSessionId.isEmpty()) return 0
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        var n = 0
+        for (m in _messages.value) {
+            if (m.role != "assistant") continue
+            for (b in m.toolBlocks) {
+                if (b.kind != "tool_use") continue
+                if (!com.openminis.app.agent.jobs.HelperRunner.isSubAgentToolName(b.toolName)) continue
+                val o = try {
+                    JSONObject(b.content)
+                } catch (_: Exception) {
+                    continue
+                }
+                if (o.optString("status") != "running") continue
+                val childId = o.optString("child_session_id", "")
+                if (childId.isEmpty()) continue
+                if (registry.jobForSession(childId) != null) continue
+                n += 1
+            }
+        }
+        return n
+    }
+
+    fun startNeverStartedDelegation(block: AssistantBlock): Boolean {
+        val args = block.toolArgs
+        if (args.isBlank()) return false
+        if (com.openminis.app.agent.jobs.HelperRunner.isControlOnly(args, block.content.ifEmpty { null })) {
+            return false
+        }
+        return startQueuedDelegation(args, block.id)
+    }
+
+    enum class CardResume { STARTED, QUEUED, REFUSED }
+
+    private fun resumeQueueKey(childId: String) = "resume:$childId"
+
+    fun resumeInterruptedFromCard(block: AssistantBlock): CardResume {
+        val childId = com.openminis.app.agent.jobs.HelperRunner.childSessionIdFrom(block.content)
+            ?: return CardResume.REFUSED
+        if (com.openminis.app.agent.jobs.HelperRunner.isQueuedLive(resumeQueueKey(childId))) {
+            return CardResume.QUEUED
+        }
+        if (childId !in interruptedChildIds(activeSessionId)) {
+            AppLogger.info(TAG, "[subagent_task] card resume: ${childId.take(8)} is not interrupted")
+            return CardResume.REFUSED
+        }
+        val outcome = when {
+            com.openminis.app.agent.jobs.AgentJobRegistry.canStartChildJob(activeSessionId) ->
+                if (resumeInterruptedChild(childId)) CardResume.STARTED else CardResume.REFUSED
+            enqueueResume(childId) -> CardResume.QUEUED
+            else -> CardResume.REFUSED
+        }
+        AppLogger.info(TAG, "[subagent_task] card resume child=${childId.take(8)} -> $outcome")
+        return outcome
+    }
+
+    fun startQueuedDelegation(argsJson: String, toolUseId: String): Boolean {
+        if (activeSessionId.isEmpty()) return false
+        val resumeChildId = runCatching {
+            JSONObject(argsJson)
+                .optString(com.openminis.app.agent.jobs.HelperRunner.QUEUED_RESUME_CHILD_KEY, "")
+        }.getOrDefault("").ifEmpty { null }
+        if (resumeChildId != null) {
+            return resumeInterruptedChild(resumeChildId)
+        }
+        val args = try {
+            JSONObject(argsJson)
+                .put(com.openminis.app.agent.jobs.HelperRunner.QUEUED_REENTRY_KEY, true)
+                .put("wait", false)
+                .toString()
+        } catch (_: Exception) {
+            return false
+        }
+        val scratch = mutableListOf(
+            AssistantBlock(
+                id = toolUseId,
+                kind = "tool_use",
+                content = "",
+                toolName = com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME,
+            ),
+        )
+        viewModelScope.launch {
+            runCatching {
+                executeDelegateTask(args, toolUseId, scratch, "", "")
+            }.onFailure {
+                AppLogger.warning(TAG, "[subagent_task] queued re-entry failed: ${it.message}")
+            }
+        }
+        return true
+    }
+
+    // ── subagent_task: delegation core ─────────────────────────────────
+    private fun recordChildTermination(
+        childVm: ChatViewModel,
+        childId: String,
+        jobId: String,
+        parentSessionId: String?,
+        loopStatus: String,
+        budgetExpired: Boolean,
+        errorText: String?,
+        resultText: String,
+        delivery: com.openminis.app.agent.jobs.SubAgentTermination.Delivery,
+    ): com.openminis.app.agent.jobs.SubAgentTermination? = runCatching {
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        val tool = hr.lastToolSnapshot(childVm.messages.value)
+        val t = hr.terminationOf(
+            childSessionId = childId, jobId = jobId, parentSessionId = parentSessionId,
+            loopStatus = loopStatus, budgetExpired = budgetExpired, errorText = errorText,
+            history = childVm.agentHistorySnapshot(), resultText = resultText,
+            lastTool = tool, closingAttempted = childVm.helperClosingAttempted, delivery = delivery,
+        )
+        com.openminis.app.agent.jobs.SubAgentTerminationStore.shared.end(t)
+        AppLogger.info(
+            TAG,
+            "[subagent_term] child=${childId.take(8)} job=${jobId.take(8)} reason=${t.reason.wire} " +
+                "lastTool=${tool?.name ?: "-"}/${tool?.status ?: "-"} partial=${t.partialOutputAvailable} " +
+                "closing=${t.closingAttempted} delivery=${delivery.wire}",
+        )
+        t
+    }.getOrElse {
+        AppLogger.warning(TAG, "[subagent_term] could not record child=${childId.take(8)}: ${it.message}")
+        null
+    }
+
+    private fun startBackgroundHelper(
+        jobId: String,
+        childVm: ChatViewModel,
+        childId: String,
+        toolId: String,
+        resolution: com.openminis.app.agent.jobs.HelperModelResolution,
+        args: com.openminis.app.agent.jobs.DelegateTaskArgs,
+        title: String,
+        startedAt: Long,
+        converted: Boolean,
+        subAgentWireName: String?,
+    ): ToolExecutionResult {
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        fun childCurrentTool(): Pair<String, String> {
+            val last = childLiveToolBlock(childVm) ?: return "" to ""
+            return last.toolName to last.toolTitle
+        }
+
+        val mirror = viewModelScope.launch(Dispatchers.Default) {
+            while (isActive && childVm.isStreaming.value) {
+                kotlinx.coroutines.delay(1_000L)
+                com.openminis.app.agent.jobs.AgentJobRegistry.drainIfStalled()
+                if (!isActive || !childVm.isStreaming.value) return@launch
+                val (tool, activity) = childCurrentTool()
+                withContext(Dispatchers.Main) {
+                    writeDelegateBlock(
+                        toolId,
+                        hr.progressJson(childId, title, tool, activity.ifEmpty { "running in background" }, System.currentTimeMillis() - startedAt, background = true),
+                        ToolBlockStatus.RUNNING,
+                    )
+                }
+            }
+        }
+
+        registry.setCompletionHook(jobId) { finished ->
+            mirror.cancel()
+            val termination = recordChildTermination(
+                childVm, childId, finished.id, finished.target.parentSessionIdOrNull,
+                loopStatus = hr.statusWord(finished.state),
+                budgetExpired = childVm.helperWrapUpRequested,
+                errorText = childVm.messages.value.lastOrNull { it.role == "assistant" }?.error,
+                resultText = finished.resultText ?: "",
+                delivery = com.openminis.app.agent.jobs.SubAgentTermination.Delivery.PENDING,
+            )
+            viewModelScope.launch(Dispatchers.IO) {
+                val facts = hr.childRunFacts(chatRepository.dao.loadMessages(childId))
+                val summary = hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead)
+                registry.setSummaryLine(finished.id, summary)
+                val result = finished.resultText ?: ""
+                val status = hr.reportedStatus(hr.statusWord(finished.state), result, termination)
+                val bgError = childVm.messages.value.lastOrNull { it.role == "assistant" }?.error
+                val json = hr.resultJson(
+                    status, result, resolution.modelLabel, resolution.tierUsed, args.tierRequested,
+                    facts.turns, finished.elapsedMs ?: (System.currentTimeMillis() - startedAt), childId, finished.id,
+                    summary, deliveredAs = "new turn in this conversation",
+                    agentName = subAgentWireName,
+                    modelOrigin = resolution.origin,
+                    modelGroupUnavailable = resolution.modelGroupUnavailable,
+                    modelGroupName = resolution.modelGroupName,
+                    wasResumed = finished.wasResumed,
+                    errorText = bgError,
+                    resolvedEntryId = resolution.resolvedEntryId,
+                    resolvedProviderLabel = resolution.resolvedProviderLabel,
+                    resolvedProviderType = resolution.resolvedProviderType,
+                    resolvedModelId = resolution.resolvedModelId,
+                    resolvedModelName = resolution.resolvedModelName,
+                    thinkingLevel = chatRepository.getSession(childId)?.thinkingOverride,
+                    termination = termination,
+                )
+                val blockStatus = when (finished.state) {
+                    com.openminis.app.agent.jobs.AgentJobState.DONE -> ToolBlockStatus.SUCCESS
+                    com.openminis.app.agent.jobs.AgentJobState.CANCELLED -> ToolBlockStatus.CANCELLED
+                    com.openminis.app.agent.jobs.AgentJobState.TIMEOUT -> ToolBlockStatus.TIMEOUT
+                    else -> ToolBlockStatus.FAILED
+                }
+                withContext(Dispatchers.Main) { writeDelegateBlock(toolId, json, blockStatus) }
+                persistFinalDelegateResult(toolId, json, finished.state == com.openminis.app.agent.jobs.AgentJobState.DONE)
+                AppLogger.info(TAG, "[delegate_task] BACKGROUND END job=${finished.id.take(8)} state=${finished.state.wire}")
+            }
+        }
+
+        viewModelScope.launch(Dispatchers.Default) {
+            val finishedInTime = withTimeoutOrNull(args.minutes * 60_000L) { childVm.isStreaming.first { !it }; true }
+            var timedOut = false
+            if (finishedInTime == null && childVm.isStreaming.value) {
+                AppLogger.warning(TAG, "[delegate_task] BACKGROUND budget over after ${args.minutes}m — asking child ${childId.take(8)} to wrap up")
+                childVm.helperWrapUpRequested = true
+                val idleAfterPatience = withTimeoutOrNull(hr.WRAP_UP_TOOL_PATIENCE_MS) { childVm.isStreaming.first { !it }; true } != null
+                if (!idleAfterPatience && childVm.isStreaming.value) {
+                    AppLogger.warning(TAG, "[delegate_task] BACKGROUND child ${childId.take(8)} still inside a tool — stopping it for the wrap-up turn")
+                    ExecutionCoordinator.stopCurrentCommand(childId)
+                    val idleAfterGrace = withTimeoutOrNull(hr.WRAP_UP_GRACE_MS - hr.WRAP_UP_TOOL_PATIENCE_MS) { childVm.isStreaming.first { !it }; true } != null
+                    if (!idleAfterGrace && childVm.isStreaming.value) {
+                        AppLogger.warning(TAG, "[delegate_task] BACKGROUND TIMEOUT (+grace) — cancelling child ${childId.take(8)}")
+                        timedOut = true
+                        withContext(Dispatchers.Main) { childVm.cancelStream() }
+                        withTimeoutOrNull(5_000L) { childVm.isStreaming.first { !it } }
+                    }
+                }
+            }
+            val facts = hr.childRunFacts(chatRepository.dao.loadMessages(childId))
+            val state = when {
+                timedOut -> com.openminis.app.agent.jobs.AgentJobState.TIMEOUT
+                childVm.messages.value.lastOrNull { it.role == "assistant" }?.error != null -> com.openminis.app.agent.jobs.AgentJobState.FAILED
+                else -> com.openminis.app.agent.jobs.AgentJobState.DONE
+            }
+            registry.setSummaryLine(jobId, hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead))
+            registry.finish(jobId, state, facts.lastText)
+        }
+
+        startProgressReporter(jobId, childVm, childId, title, startedAt, args.progressLevel)
+
+        val json = hr.backgroundStartJson(
+            jobId, childId, resolution.modelLabel, resolution.tierUsed, args.minutes, converted,
+            resolution = resolution,
+        )
+        AppLogger.info(TAG, "[delegate_task] BACKGROUND START job=${jobId.take(8)} child=${childId.take(8)} budget=${args.minutes}m converted=$converted")
+        return ToolExecutionResult(json, true, toolTitle = title)
+    }
+
+    private fun startProgressReporter(jobId: String, childVm: ChatViewModel, childId: String, title: String, startedAt: Long, level: String) {
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        val interval = when (level) {
+            "frequent" -> hr.PROGRESS_INTERVAL_FREQUENT_MS
+            "moderate" -> hr.PROGRESS_INTERVAL_MODERATE_MS
+            else -> return
+        }
+        val onlyOnChange = level == "frequent"
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        var lastSignature = ""
+        var pendingPromptId: String? = null
+        viewModelScope.launch(Dispatchers.Default) {
+            while (isActive) {
+                kotlinx.coroutines.delay(interval)
+                val job = registry.job(jobId) ?: return@launch
+                if (!childVm.isStreaming.value || job.state != com.openminis.app.agent.jobs.AgentJobState.RUNNING) return@launch
+                val lastAssistant = childLiveMessages(childVm).lastOrNull { it.role == "assistant" }
+                val tool = lastAssistant?.toolBlocks?.lastOrNull { it.kind == "tool_use" }
+                val lastMessage = lastAssistant?.toolBlocks?.filter { it.kind == "text" }?.joinToString("\n") { it.content }
+                    ?.ifBlank { null } ?: lastAssistant?.content.orEmpty()
+                val turn = childVm.messages.value.count { it.role == "assistant" }
+                val signature = "${tool?.toolName}|${tool?.toolTitle}|$turn|${lastMessage.take(200)}"
+                if (onlyOnChange && signature == lastSignature) {
+                    AppLogger.info(TAG, "[delegate_task] progress ${jobId.take(8)} unchanged — skipped")
+                    continue
+                }
+                lastSignature = signature
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                val facts = hr.childRunFacts(chatRepository.dao.loadMessages(childId))
+                val summary = hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead)
+                registry.setSummaryLine(jobId, summary)
+                val text = com.openminis.app.agent.jobs.AgentCallback(
+                    kind = com.openminis.app.agent.jobs.AgentCallback.Kind.PROGRESS,
+                    jobId = jobId, childSessionId = childId, title = title, status = "running",
+                    tier = job.tierUsed, elapsed = registry.elapsedClock(elapsedMs),
+                    tool = tool?.toolName, activity = tool?.toolTitle?.take(80), turn = turn,
+                    agentName = job.agentName,
+                    summary = summary.removePrefix("Summary: "),
+                    siblings = registry.siblingSummary(
+                        parentSessionId = activeSessionId,
+                        excludingJobId = jobId,
+                        interruptedCount = countInterruptedChildren(activeSessionId),
+                    ),
+                    body = if (lastMessage.isBlank()) "(no message from the agent yet)" else lastMessage.take(hr.PROGRESS_LAST_MESSAGE_MAX_CHARS),
+                ).xml
+                withContext(Dispatchers.Main) {
+                    pendingPromptId?.let { pid -> if (_promptQueue.value.any { it.id == pid }) removeQueuedPrompt(pid) }
+                    pendingPromptId = null
+                    val outcome = submitPrompt(text)
+                    if (outcome is SubmitOutcome.Queued) pendingPromptId = _promptQueue.value.lastOrNull()?.id
+                    AppLogger.info(TAG, "[delegate_task] progress ${jobId.take(8)} level=$level elapsed=${elapsedMs / 1000}s outcome=$outcome")
+                }
+            }
+        }
+    }
+
+    private suspend fun persistFinalDelegateResult(toolId: String, content: String, success: Boolean) {
+        val muted = com.openminis.app.agent.jobs.AgentJobRegistry.isDelegationMuted(activeSessionId)
+        if (muted) AppLogger.info(TAG, "[delegate_task] final result ${toolId.take(12)} kept out of agentHistory — batch stopped")
+        if (!muted) withContext(Dispatchers.Main) {
+            for (i in agentHistory.indices) {
+                val m = agentHistory[i]
+                if (m.contentParts.none { it is AgentContentPart.ToolResult && it.id == toolId }) continue
+                agentHistory[i] = m.copy(contentParts = m.contentParts.map { p ->
+                    if (p is AgentContentPart.ToolResult && p.id == toolId) p.copy(content = content, isError = !success) else p
+                })
+            }
+        }
+        val sid = realSessionId.ifEmpty { sessionId }
+        val rows = runCatching { chatRepository.dao.loadMessages(sid) }.getOrElse { return }
+        for (row in rows) {
+            if (row.role != "user" || !row.partsJson.contains(toolId)) continue
+            val arr = runCatching { org.json.JSONArray(row.partsJson) }.getOrNull() ?: continue
+            var hit = false
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.optString("type") != "toolResult") continue
+                val v = o.optJSONObject("value") ?: continue
+                if (v.optString("toolUseId") != toolId) continue
+                v.put("output", content); v.put("success", success)
+                v.optJSONObject("snapshot")?.let { snap -> if (snap.optString("type") == "text") snap.put("text", content) }
+                hit = true
+            }
+            if (hit) {
+                chatRepository.updateMessageParts(row.id, arr.toString())
+                AppLogger.info(TAG, "[delegate_task] persisted final result into message ${row.id.take(8)} tool=${toolId.take(12)}")
+                return
+            }
+        }
+        AppLogger.warning(TAG, "[delegate_task] final result NOT persisted — no stored tool_result for ${toolId.take(12)}")
+    }
+
+    private fun executeAgentStatus(argsJson: String): ToolExecutionResult {
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val o = runCatching { JSONObject(argsJson) }.getOrElse { JSONObject() }
+        val action = o.optString("action", "status").lowercase()
+        val jobIdArg = o.optString("job_id", "").trim()
+        val toolTitle = o.optString("tool_title", "").ifEmpty { "agent_status" }
+        val sid = activeSessionId
+        var jobs = registry.list().filter { it.target.parentSessionIdOrNull == sid }
+        if (jobIdArg.isNotEmpty()) {
+            jobs = jobs.filter { it.id == jobIdArg || it.id.startsWith(jobIdArg) }
+            if (jobs.isEmpty()) {
+                return ToolExecutionResult(JSONObject().put("ok", false).put("error", "job_not_found").put("job_id", jobIdArg).toString(), false, toolTitle = toolTitle)
+            }
+        }
+        if (action == "steer") {
+            val message = o.optString("message", "").trim()
+            if (jobIdArg.isEmpty()) {
+                return ToolExecutionResult(
+                    JSONObject().put("ok", false).put("error", "job_id_required_for_steer").toString(),
+                    false, toolTitle = toolTitle,
+                )
+            }
+            if (message.isEmpty()) {
+                return ToolExecutionResult(
+                    JSONObject().put("ok", false).put("error", "message_required_for_steer").toString(),
+                    false, toolTitle = toolTitle,
+                )
+            }
+            val target = jobs.firstOrNull()
+                ?: return ToolExecutionResult(
+                    JSONObject().put("ok", false).put("error", "job_not_found").put("job_id", jobIdArg).toString(),
+                    false, toolTitle = toolTitle,
+                )
+            if (!target.isActive) {
+                return ToolExecutionResult(
+                    JSONObject().put("ok", false).put("status", "rejected")
+                        .put("job_id", target.id)
+                        .put("reason", "already_finished")
+                        .put("state", target.state.wire)
+                        .put("detail", "That sub agent has already finished — its result stands. Delegate a new task instead.")
+                        .toString(),
+                    false, toolTitle = toolTitle,
+                )
+            }
+            val delivered = registry.steer(target.id, message)
+            if (!delivered) {
+                return ToolExecutionResult(
+                    JSONObject().put("ok", false).put("status", "rejected")
+                        .put("job_id", target.id)
+                        .put("reason", "child_not_running")
+                        .put("detail", "That sub agent has no live session to steer.")
+                        .toString(),
+                    false, toolTitle = toolTitle,
+                )
+            }
+            return ToolExecutionResult(
+                JSONObject().put("ok", true).put("status", "queued")
+                    .put("job_id", target.id)
+                    .also { j -> target.agentName?.let { j.put("agent", it) } }
+                    .put(
+                        "detail",
+                        "Queued. The sub agent reads it at its next turn; a tool call already running " +
+                            "is not interrupted. It may finish before consuming it.",
+                    )
+                    .toString(),
+                true, toolTitle = toolTitle,
+            )
+        }
+        if (action == "cancel") {
+            if (jobIdArg.isEmpty()) {
+                return ToolExecutionResult(JSONObject().put("ok", false).put("error", "job_id_required_for_cancel").toString(), false, toolTitle = toolTitle)
+            }
+            for (job in jobs) if (job.isActive) registry.cancel(job.id, "agent_status cancel by parent model")
+        }
+        val entries = org.json.JSONArray()
+        for (job0 in jobs) {
+            val job = registry.job(job0.id) ?: job0
+            val missed = registry.missedSteersFor(job.id)
+            val d = JSONObject()
+                .put("job_id", job.id)
+                .put("title", job.title)
+                .also { j -> job.agentName?.let { j.put("agent", it) } }
+                .also { j ->
+                    if (missed.isNotEmpty()) {
+                        j.put("missed_steer", org.json.JSONArray(missed))
+                        j.put(
+                            "missed_steer_note",
+                            "The run ended before reading these — the result does not reflect them.",
+                        )
+                    }
+                }
+                .put("state", job.state.wire)
+                .put("model_origin", job.modelOrigin ?: JSONObject.NULL)
+                .put("tier_used", job.tierUsed ?: JSONObject.NULL)
+                .put("elapsed_s", (job.elapsedMs ?: 0L) / 1000)
+                .put("child_session_id", job.runSessionId ?: JSONObject.NULL)
+                .put("delivery", if (job.then is com.openminis.app.agent.jobs.AgentJobThen.None) "tool_result" else "new_message_when_done")
+            val cid = job.runSessionId
+            if (cid != null && job.state == com.openminis.app.agent.jobs.AgentJobState.RUNNING) {
+                val cvm = runCatching {
+                    com.openminis.app.debug.HeadlessChatRunner.existingViewModel(cid)
+                }.getOrNull()
+                val msgs = cvm?.messages?.value.orEmpty()
+                val tool = cvm?.let { childLiveToolBlock(it) }
+                if (tool != null) { d.put("current_tool", tool.toolName); d.put("current_status", tool.toolTitle.take(120)) }
+                d.put("loop_iteration", msgs.count { it.role == "assistant" })
+            }
+            if (!job.isActive) job.resultText?.let { d.put("result", it.take(2000)) }
+            entries.put(d)
+        }
+        val queuedWaiting = registry.queuedCount(sid)
+        val baseNote = "Running agents deliver their final result automatically as a new message in this conversation; you do not need to poll for it."
+        val out = JSONObject()
+            .put("ok", true)
+            .put("action", action)
+            .put("count", entries.length())
+            .put("agents", entries)
+            .put("queued", queuedWaiting)
+            .put(
+                "note",
+                if (queuedWaiting > 0) {
+                    "$baseNote $queuedWaiting more are queued and will start as slots free — do not re-delegate them."
+                } else {
+                    baseNote
+                },
+            )
+        return ToolExecutionResult(out.toString(), true, toolTitle = toolTitle)
+    }
+
+    private suspend fun executeDelegateTask(
+        argsJson: String,
+        toolId: String,
+        toolBlocks: MutableList<AssistantBlock>,
+        assistantId: String,
+        currentText: String,
+    ): ToolExecutionResult {
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        val detachSeen = delegateDetach.value
+        val args = hr.parseArgs(argsJson)
+        val title = args.title.ifEmpty { "agent" }
+        fun reject(reason: String, detail: String): ToolExecutionResult {
+            AppLogger.warning(TAG, "[delegate_task] REJECTED $reason: $detail")
+            return ToolExecutionResult(hr.rejectionJson(reason, detail), false, toolTitle = title)
+        }
+        if (args.task.isEmpty()) return reject("empty_task", "`task` is required and must describe the whole job.")
+        if (isHelper) return reject("depth_limit", "Helpers cannot delegate further (max delegation depth is 1). Do the work yourself.")
+        if (!com.openminis.app.agent.jobs.AgentSettings.isEnabled(context)) {
+            return reject("disabled", "Delegation is turned off in Settings › Agents.")
+        }
+        val roster = providerRepository.subAgents
+        val subAgent = com.openminis.app.data.model.SubAgentRoster.resolve(args.agentName, roster)
+            ?: return reject(
+                "unknown_agent",
+                "No sub agent named \"${args.agentName.orEmpty()}\". " +
+                    "Available: ${roster.joinToString(", ") { it.name }}. " +
+                    "Omit `agent` to use the general one.",
+            )
+        val parentSid = activeSessionId
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val fromQueue = try {
+            JSONObject(argsJson).optBoolean(hr.QUEUED_REENTRY_KEY, false)
+        } catch (_: Exception) {
+            false
+        }
+        val myIdx = toolBlocks.indexOfFirst { it.id == toolId }
+        val priorDelegates = toolBlocks.take(myIdx.coerceAtLeast(0))
+            .count {
+                it.kind == "tool_use" && hr.isSubAgentToolName(it.toolName) &&
+                    !hr.isControlOnly(it.toolArgs.ifEmpty { null }, it.content.ifEmpty { null })
+            }
+        val overTurnAllowance = !fromQueue && priorDelegates >= hr.MAX_PER_ASSISTANT_TURN
+
+        if (overTurnAllowance || !registry.canStartChildJob(parentSid)) {
+            registry.registerQueuedStarter(parentSid) { item ->
+                startQueuedDelegation(item.argsJson, item.toolUseId)
+            }
+            registry.registerInterruptedCounter(parentSid) { countInterruptedChildren(parentSid) }
+            val queued = registry.enqueueDelegation(
+                com.openminis.app.agent.jobs.AgentJobRegistry.QueuedDelegation(
+                    parentSessionId = parentSid,
+                    argsJson = argsJson,
+                    toolUseId = toolId,
+                ),
+            )
+            if (!queued) {
+                return reject(
+                    "helper_limit",
+                    "${com.openminis.app.agent.jobs.AgentJobRegistry.maxConcurrentChildJobsPerParent} sub agents are " +
+                        "already running in this conversation and its queue is full " +
+                        "(${com.openminis.app.agent.jobs.AgentJobRegistry.MAX_QUEUED_DELEGATIONS_PER_PARENT} waiting). " +
+                        "Wait for some to finish, then delegate this task again — it was NOT queued.",
+                )
+            }
+            val detail = if (overTurnAllowance) {
+                "More than ${hr.MAX_PER_ASSISTANT_TURN} delegations in one turn. This task is QUEUED and will " +
+                    "start automatically as slots free; its result arrives as a new message like any other. " +
+                    "Do not re-delegate it."
+            } else {
+                "All ${com.openminis.app.agent.jobs.AgentJobRegistry.maxConcurrentChildJobsPerParent} sub agent " +
+                    "slots of this conversation are busy. " +
+                    "This task is QUEUED and will start automatically when one frees; its result arrives as a " +
+                    "new message like any other. Do not re-delegate it."
+            }
+            val json = hr.queuedJson(
+                queuedBehind = registry.runningChildJobCount(parentSid) + registry.queuedCount(parentSid) - 1,
+                detail = detail,
+            )
+            withContext(Dispatchers.Main) {
+                val i = toolBlocks.indexOfFirst { it.id == toolId }
+                if (i >= 0) {
+                    toolBlocks[i] = toolBlocks[i].copy(content = json, toolStatus = ToolBlockStatus.RUNNING)
+                    updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+                }
+            }
+            AppLogger.info(TAG, "[subagent_task] QUEUED tool=${toolId.take(12)} behind ${registry.runningChildJobCount(parentSid)} running in ${parentSid.take(8)}")
+            return ToolExecutionResult(json, true, toolTitle = title)
+        }
+        val parentRow = chatRepository.getSession(parentSid)
+        val resolution = com.openminis.app.agent.jobs.ModelTierResolver.resolveForSubAgent(
+            pinnedGroupId = subAgent.modelGroupId,
+            choice = args.modelChoice,
+            repo = providerRepository,
+            parentBindingJson = parentRow?.modelBinding, parentModelId = parentRow?.modelId ?: currentModel?.id,
+            parentActiveEntryId = _activeEntryId.value,
+        ) ?: return reject("no_model", "No model is configured for a helper to run on.")
+
+        val subAgentWireName = subAgent.name
+
+        val child = chatRepository.createSession(
+            modelId = resolution.seedModelId,
+            title = hr.childSessionTitle(context, title, subAgent.name.takeIf { !subAgent.isBuiltIn }),
+            memoryEnabled = false,
+            parentSessionId = parentSid,
+            parentToolUseId = toolId,
+        )
+        parentRow?.source?.let { chatRepository.dao.updateSource(child.id, it) }
+        resolution.bindingJson?.let { chatRepository.updateSessionBinding(child.id, it, resolution.seedModelId) }
+
+        var seededThinking: String? = null
+        run {
+            val pinnedGroupLevel = subAgent.modelGroupId
+                ?.let { providerRepository.group(it) }?.defaultThinkingLevel
+            val level = subAgent.thinkingLevelOverride
+                ?: pinnedGroupLevel
+                ?: parentRow?.thinkingOverride?.let { ThinkingLevel.decoded(it) }
+            if (level != null && level.isEnabled) {
+                chatRepository.dao.updateThinkingOverride(child.id, level.name)
+                seededThinking = level.name
+            }
+        }
+
+        val job = registry.register(
+            title = title, origin = com.openminis.app.agent.jobs.AgentJobOrigin.TOOL,
+            trigger = com.openminis.app.agent.jobs.AgentJobTrigger.Immediate,
+            target = com.openminis.app.agent.jobs.AgentJobTarget.ChildOfCurrent(parentSid, toolId),
+            prompt = args.task,
+            then = if (args.wait) com.openminis.app.agent.jobs.AgentJobThen.None
+            else com.openminis.app.agent.jobs.AgentJobThen.FollowUpParent(null),
+            agentName = subAgentWireName,
+        )
+        registry.setModelOrigin(job.id, resolution.origin.wire)
+        registry.registerInterruptedCounter(parentSid) { countInterruptedChildren(parentSid) }
+        registry.setTierUsed(job.id, resolution.tierUsed.wire)
+        registry.setProgressLevel(job.id, if (args.wait) "none" else args.progressLevel)
+
+        val childVm = withContext(Dispatchers.Main) {
+            com.openminis.app.debug.HeadlessChatRunner.viewModelFor(
+                context, child.id, com.openminis.app.ui.chat.ChatViewModelStore.PoolKind.CHILD,
+            ).also {
+                it.helperConfig = com.openminis.app.agent.jobs.HelperConfig(
+                    parentSessionId = parentSid, parentToolUseId = toolId, jobId = job.id,
+                    maxTurns = hr.MAX_TURNS, title = title, tierUsed = resolution.tierUsed,
+                    agentName = subAgent.name.takeIf { !subAgent.isBuiltIn },
+                    agentInstructions = subAgent.instructions,
+                )
+                it.adoptBrowserTabPool(browserTabPool)
+            }
+        }
+        registry.registerSteerHook(job.id) { msg -> childVm.enqueueSteer(msg) }
+        registry.registerMissedSteerDrain(job.id) { childVm.drainMissedSteers() }
+        registry.registerTabRelease(job.id) {
+            viewModelScope.launch { browserTabPool.releaseTabs(child.id) }
+        }
+        val startedAt = System.currentTimeMillis()
+        suspend fun writeBlock(content: String, status: ToolBlockStatus? = null) {
+            if (assistantId.isEmpty()) {
+                writeDelegateBlock(toolId, content, status)
+                return
+            }
+            val i = toolBlocks.indexOfFirst { it.id == toolId }
+            if (i >= 0) toolBlocks[i] = toolBlocks[i].copy(content = content, toolTitle = toolBlocks[i].toolTitle.ifEmpty { title })
+            withContext(Dispatchers.Main) {
+                writeDelegateBlock(toolId, content, status)
+                if (i >= 0) updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+            }
+        }
+        fun childCurrentTool(): Pair<String, String> {
+            val last = childLiveToolBlock(childVm) ?: return "" to ""
+            return last.toolName to last.toolTitle
+        }
+        writeBlock(hr.progressJson(child.id, title, "", "starting", 0, background = !args.wait), ToolBlockStatus.RUNNING)
+
+        val ready = withContext(Dispatchers.Default) {
+            withTimeoutOrNull(5_000L) { childVm.activeEntryId.first { it != null } }
+        }
+        if (ready == null) {
+            registry.setThen(job.id, com.openminis.app.agent.jobs.AgentJobThen.None)
+            registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
+            clearDelegateOverride(toolId)
+            return reject("child_start_failed", "The helper session could not resolve a provider.")
+        }
+        val outcome = withContext(Dispatchers.Main) { childVm.submitPrompt(hr.childPrompt(args)) }
+        if (outcome !is SubmitOutcome.Sent) {
+            registry.setThen(job.id, com.openminis.app.agent.jobs.AgentJobThen.None)
+            registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
+            clearDelegateOverride(toolId)
+            return reject("child_start_failed", "The helper session did not start ($outcome).")
+        }
+        registry.markRunning(job.id, child.id) {
+            if (childVm.isStreaming.value) childVm.cancelStream()
+        }
+        com.openminis.app.agent.jobs.SubAgentTerminationStore.shared.begin(child.id, job.id, parentSid)
+        AppLogger.info(TAG, "[delegate_task] START job=${job.id.take(8)} child=${child.id.take(8)} parent=${parentSid.take(8)} tier=${resolution.tierUsed.wire} model=${resolution.modelLabel} budget=${args.minutes}m wait=${args.wait} progress=${args.progressLevel}")
+
+        if (!args.wait) {
+            return startBackgroundHelper(job.id, childVm, child.id, toolId, resolution, args, title, startedAt, converted = false, subAgentWireName = subAgentWireName)
+        }
+
+        var finalStatus = "completed"
+        var wrapUpAskedAt: Long? = null
+        var wrapUpToolStopped = false
+        try {
+            while (childVm.isStreaming.value) {
+                val now = System.currentTimeMillis()
+                if (now - startedAt >= args.minutes * 60_000L) {
+                    val asked = wrapUpAskedAt
+                    if (asked == null) {
+                        wrapUpAskedAt = now
+                        childVm.helperWrapUpRequested = true
+                        AppLogger.warning(TAG, "[delegate_task] budget over after ${args.minutes}m — asking child ${child.id.take(8)} to wrap up")
+                    } else if (now - asked >= hr.WRAP_UP_GRACE_MS) {
+                        finalStatus = "timeout"
+                        AppLogger.warning(TAG, "[delegate_task] TIMEOUT after ${args.minutes}m (+grace) — cancelling child ${child.id.take(8)}")
+                        withContext(Dispatchers.Main) { childVm.cancelStream() }
+                        withTimeoutOrNull(5_000L) { childVm.isStreaming.first { !it } }
+                        break
+                    } else if (now - asked >= hr.WRAP_UP_TOOL_PATIENCE_MS && !wrapUpToolStopped) {
+                        wrapUpToolStopped = true
+                        AppLogger.warning(TAG, "[delegate_task] child ${child.id.take(8)} still inside a tool — stopping it for the wrap-up turn")
+                        ExecutionCoordinator.stopCurrentCommand(child.id)
+                    }
+                }
+                val userFollowUp = _promptQueue.value.any { it.origin == QueuedPromptOrigin.USER }
+                if (userFollowUp || delegateDetach.value != detachSeen) {
+                    AppLogger.info(
+                        TAG,
+                        "[delegate_task] ${if (userFollowUp) "user follow-up queued" else "user stopped the current tool"} " +
+                            "while waiting — converting job ${job.id.take(8)} to background",
+                    )
+                    registry.setThen(job.id, com.openminis.app.agent.jobs.AgentJobThen.FollowUpParent(null))
+                    return startBackgroundHelper(job.id, childVm, child.id, toolId, resolution, args, title, startedAt, converted = true, subAgentWireName = subAgentWireName)
+                }
+                val (tool, activity) = childCurrentTool()
+                writeBlock(hr.progressJson(child.id, title, tool, activity, now - startedAt))
+                withTimeoutOrNull(1_000L) { delegateDetach.first { it != detachSeen } }
+            }
+        } catch (e: CancellationException) {
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                if (childVm.isStreaming.value) childVm.cancelStream()
+                registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.CANCELLED, null)
+                recordChildTermination(
+                    childVm, child.id, job.id, parentSid, loopStatus = "cancelled",
+                    budgetExpired = childVm.helperWrapUpRequested,
+                    errorText = null, resultText = "",
+                    delivery = com.openminis.app.agent.jobs.SubAgentTermination.Delivery.INLINE,
+                )
+                clearDelegateOverride(toolId)
+            }
+            throw e
+        }
+
+        val elapsed = System.currentTimeMillis() - startedAt
+        val facts = hr.childRunFacts(chatRepository.dao.loadMessages(child.id))
+        val childError = childVm.messages.value.lastOrNull { it.role == "assistant" }?.error
+        if (finalStatus == "completed") {
+            finalStatus = when {
+                registry.job(job.id)?.state == com.openminis.app.agent.jobs.AgentJobState.CANCELLED -> "cancelled"
+                childError != null -> "failed"
+                else -> "completed"
+            }
+        }
+        val termination = recordChildTermination(
+            childVm, child.id, job.id, parentSid,
+            loopStatus = finalStatus,
+            budgetExpired = wrapUpAskedAt != null || childVm.helperWrapUpRequested,
+            errorText = childError,
+            resultText = facts.lastText,
+            delivery = com.openminis.app.agent.jobs.SubAgentTermination.Delivery.INLINE,
+        )
+        finalStatus = hr.reportedStatus(finalStatus, facts.lastText, termination)
+        val summary = hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead)
+        registry.setSummaryLine(job.id, summary)
+        registry.finish(
+            job.id,
+            when (finalStatus) {
+                "completed", com.openminis.app.agent.jobs.HelperRunner.NO_DELIVERABLE ->
+                    com.openminis.app.agent.jobs.AgentJobState.DONE
+                "cancelled" -> com.openminis.app.agent.jobs.AgentJobState.CANCELLED
+                "timeout" -> com.openminis.app.agent.jobs.AgentJobState.TIMEOUT
+                else -> com.openminis.app.agent.jobs.AgentJobState.FAILED
+            },
+            facts.lastText,
+        )
+        val json = hr.resultJson(
+            finalStatus, facts.lastText, resolution.modelLabel, resolution.tierUsed, args.tierRequested,
+            facts.turns, elapsed, child.id, job.id, summary,
+            agentName = subAgentWireName,
+            modelOrigin = resolution.origin,
+            modelGroupUnavailable = resolution.modelGroupUnavailable,
+            modelGroupName = resolution.modelGroupName,
+            wasResumed = job.wasResumed,
+            errorText = childError,
+            resolvedEntryId = resolution.resolvedEntryId,
+            resolvedProviderLabel = resolution.resolvedProviderLabel,
+            resolvedProviderType = resolution.resolvedProviderType,
+            resolvedModelId = resolution.resolvedModelId,
+            resolvedModelName = resolution.resolvedModelName,
+            thinkingLevel = seededThinking,
+            termination = termination,
+        )
+        clearDelegateOverride(toolId)
+        AppLogger.info(TAG, "[delegate_task] END job=${job.id.take(8)} status=$finalStatus turns=${facts.turns} elapsed=${elapsed / 1000}s result=${facts.lastText.length}ch")
+        return ToolExecutionResult(json, finalStatus == "completed", toolTitle = title)
+    }
+
+    /** Browser tab pool for browser_use tool. Lazily created on first access. */
+    val browserTabPool: BrowserTabPool
+        get() = _browserTabPoolRef ?: synchronized(this) {
+            _browserTabPoolRef ?: BrowserTabPool(context).also {
+                it.setSession(activeSessionId)
+                // Surface download start/finish/failure as system-info notices in
+                // this chat. May fire from the pool's IO scope — hop to Main since
+                // appendSystemInfo does a read-modify-write on _messages.
+                it.onDownloadEvent = { text ->
+                    viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                        appendSystemInfo(text, "info")
+                    }
+                }
+                _browserTabPoolRef = it
+            }
+        }
 
     internal val _showBrowserSheet = MutableStateFlow(false)
     val showBrowserSheet: StateFlow<Boolean> = _showBrowserSheet.asStateFlow()
@@ -10009,6 +11131,39 @@ class ChatViewModel(
             com.openminis.app.agent.SequentialThinkingTool.TOOL_NAME -> executeSequentialThinkingTool(
                 argsJson
             )
+            // [T-p2-agent-series] subagent_task is one entry point for five
+            // actions. Route on the ACTION, not the result shape: a control
+            // call (status/steer/cancel/resume) is a different operation from a
+            // delegation. A legacy agent_status block carries no action, so its
+            // own name selects the control path.
+            com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME,
+            com.openminis.app.agent.jobs.HelperRunner.LEGACY_TOOL_NAME,
+            com.openminis.app.agent.jobs.HelperRunner.LEGACY_STATUS_TOOL_NAME ->
+                if (com.openminis.app.tools.AgentToolSwitch.AGENTS.isEnabled(context)) {
+                    val action = try {
+                        JSONObject(argsJson).optString("action", "").trim().lowercase()
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    val isLegacyStatus =
+                        name == com.openminis.app.agent.jobs.HelperRunner.LEGACY_STATUS_TOOL_NAME
+                    when {
+                        action == "resume" -> executeResumeAgents(argsJson)
+                        action == "status" || action == "steer" || action == "cancel" ||
+                            (isLegacyStatus && action.isEmpty()) -> executeAgentStatus(argsJson)
+                        else ->
+                            executeDelegateTask(argsJson, toolId, toolBlocks, assistantId, currentText)
+                    }
+                } else {
+                    ToolExecutionResult(
+                        com.openminis.app.agent.jobs.HelperRunner.rejectionJson(
+                            "tools_disabled",
+                            "Agents are turned off in this app's settings; delegate_task cannot be used. " +
+                                "Do not try it again in this conversation.",
+                        ),
+                        false,
+                    )
+                }
             else -> ToolExecutionResult("Unknown tool: $name", false)
         }
     }
