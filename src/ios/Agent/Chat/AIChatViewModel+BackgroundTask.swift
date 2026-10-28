@@ -92,6 +92,17 @@ extension AIChatViewModel {
         startBackgroundStatusTimer()
     }
 
+    /// The current turn's last assistant message, or nil. Rows before the last
+    /// user-sent message belong to earlier turns and never count.
+    func currentTurnAssistantMessage() -> ChatMessage? {
+        let rows = messages
+        let idx = BackgroundTurnOutcome.currentTurnAssistantIndex(
+            count: rows.count,
+            isSentUser: { rows[$0].role == .user && !rows[$0].isQueued },
+            isAssistant: { rows[$0].role == .assistant })
+        return idx.map { rows[$0] }
+    }
+
     func endBackgroundProcessing() {
         // [T-ios-session-unread-badge / T-ios-unread-dot-reappears] Mark unread
         // when this session finished off-screen and produced NEW content. The
@@ -735,3 +746,39 @@ extension AIChatViewModel {
     }
 
 }
+// BEGIN BackgroundTurnOutcome
+/// [T-bgnotif-outcome] How a turn ended, for its background notification and Live Activity.
+enum BackgroundTurnOutcome: Equatable, CustomStringConvertible {
+    case completed
+    case failed
+    case interrupted
+
+    var description: String {
+        switch self {
+        case .completed: return "completed"
+        case .failed: return "failed"
+        case .interrupted: return "interrupted"
+        }
+    }
+
+    static func decide(backgroundTimeExpired: Bool, turnError: String?, errorMessage: String?,
+                       canResume: Bool, userStopped: Bool) -> BackgroundTurnOutcome {
+        if backgroundTimeExpired { return .interrupted }
+        if hasText(turnError) || hasText(errorMessage) { return .failed }
+        if canResume || userStopped { return .interrupted }
+        return .completed
+    }
+
+    static func currentTurnAssistantIndex(count: Int, isSentUser: (Int) -> Bool,
+                                          isAssistant: (Int) -> Bool) -> Int? {
+        guard count > 0 else { return nil }
+        let start = (0..<count).last(where: isSentUser).map { $0 + 1 } ?? 0
+        guard start < count else { return nil }
+        return (start..<count).last(where: isAssistant)
+    }
+
+    private static func hasText(_ s: String?) -> Bool {
+        !(s?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+}
+// END BackgroundTurnOutcome

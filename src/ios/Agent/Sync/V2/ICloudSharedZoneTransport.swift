@@ -276,6 +276,22 @@ final class ICloudSharedZoneTransport: NSObject, SyncTransport {
     private static func configTypeAnchoredKey(_ type: String) -> String {
         "cloudSync.v2.configAnchored.\(type)"
     }
+    private static func configTypeAnchorPendingCountKey(_ type: String) -> String {
+        "cloudSync.v2.configAnchorPendingCount.\(type)"
+    }
+    /// [T-provider-forcesync-v3] Forget the provider types' "history fully
+    /// pulled" anchors (and any pending confirmation counts) so the next
+    /// fetchRecentV2 re-pulls their FULL history.
+    static func resetProviderConfigAnchors() {
+        let types = ["ProviderInstanceV3", "ProviderModelEntryV3",
+                     "ProviderModelGroupV3", "ProviderThinkingRuleV3",
+                     "SubAgentV3", "ProviderConfigV2"]
+        for t in types {
+            UserDefaults.standard.removeObject(forKey: configTypeAnchoredKey(t))
+            UserDefaults.standard.removeObject(forKey: configTypeAnchorPendingCountKey(t))
+        }
+        logger.info("[iCloudTrace] provider config anchors reset — next fetchRecentV2 pulls full history for \(types.count) types")
+    }
     /// Consecutive fetchRecentV2 runs that hit at least one CKQuery error.
     /// Drives exponential backoff via `retryAfter`; reset to 0 on a clean run.
     private var consecutiveFetchFailures: Int = 0

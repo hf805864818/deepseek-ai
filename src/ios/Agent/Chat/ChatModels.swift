@@ -699,6 +699,8 @@ enum AssistantBlockKind: Equatable {
     /// questions come from `toolInputArgs`; `content` holds the result JSON
     /// once answered; live state is in UserAskCenter (keyed by toolUseId).
     case userAskTool
+    /// [T-deep-mode-phase-d] Inline visualization (render_widget) in deep mode.
+    case visualization
     case info
 }
 

@@ -589,6 +589,13 @@ actor ISHExecutionCoordinator {
         return mountedSidStorage
     }
 
+    /// Resolve which chat started a command from its fs_context, falling back
+    /// to the mounted session (interactive terminal) when the context is zero.
+    nonisolated static func callerSessionId(fsContext: UInt64) -> (sid: String?, source: String) {
+        if let sid = MinisFsRouter.shared.sid(for: fsContext) { return (sid, "fs_context") }
+        return (mountedSessionIdSnapshot, fsContext == 0 ? "mounted (no fs_context)" : "mounted (unknown fs_context)")
+    }
+
     static func setExternalMountSnapshot(_ snapshot: [ExternalMountSpec]) {
         externalMountLock.lock()
         externalMountSnapshotStorage = snapshot

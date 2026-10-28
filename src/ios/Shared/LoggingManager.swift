@@ -1,5 +1,9 @@
 import Foundation
 
+/// iSH kernel trace gate (C symbol from the vendored ish kernel).
+@_silgen_name("ish_set_verbose_trace")
+private func ish_set_verbose_trace(_ enabled: Bool)
+
 final class LoggingManager: ObservableObject {
     static let shared = LoggingManager()
 
