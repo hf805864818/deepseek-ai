@@ -1,4 +1,4 @@
-//
+﻿//
 //  AIChatViewModel.swift
 //  Minis - chat view model (Agent/Chat)
 //
@@ -3256,4 +3256,165 @@ extension AIChatViewModel {
     /// [T-deep-mode-cognitive-p1] C7: Guard flag ensuring the retrospective runs
     /// at most once per workflow completion. Set when the retrospective begins,
     /// cleared when a new workflow starts (beginExecution). Total-switch safe:
+    /// the retrospective only runs inside `if deepModeEnabled`, and this flag is
+    /// in-memory only — never persisted.
+    var retrospectiveHasRun = false
+
+    /// [T-deep-mode-cognitive-p1] C7 fix: Flag that is true while the
+    /// retrospective's runAgentLoop() is executing. Checked by
+    /// maybeAutoContinueGoal to prevent the retrospective turn from
+    /// accidentally triggering a goal auto-continue (if the review text
+    /// coincidentally contains a <<GOAL_STATE>> sentinel). Total-switch
+    /// safe: only set inside maybeRunRetrospective(), which is guarded by
+    /// `guard deepModeEnabled`.
+    var isRetrospectiveRunning = false
+
+    // [T-phase5] Subagent orchestration was removed — activeSubagents is gone.
+
+    /// [T-deep-mode-cognitive-p1] C8: Detect uncertainty markers in the model's
+    /// output text. Returns true if any uncertainty marker is found. Pure
+    /// function — no side effects, no state. Called only inside `if deepModeEnabled`.
+    /// Markers cover both Chinese and English common uncertainty expressions.
+    private static func detectUncertainty(in text: String) -> Bool {
+        // Chinese uncertainty markers
+        // Note: "应该" alone is too broad (used in confident statements like
+        // "应该使用X"), but "我应该是" / "应该是吧" carry uncertainty tone.
+        let zhMarkers = ["不确定", "不太确定", "无法确定", "可能", "大概", "也许",
+                         "似乎", "好像", "不太清楚", "不敢确定",
+                         "我应该是", "应该是吧", "大概吧", "可能吧"]
+        // English uncertainty markers (case-insensitive)
+        // Note: "i think" alone is too broad ("I think this is correct" is
+        // confident), so only match "i think maybe/perhaps/so" variants.
+        let enMarkers = ["i'm not sure", "i am not sure", "not sure",
+                         "maybe", "perhaps", "probably",
+                         "might be", "could be", "uncertain", "unclear",
+                         "i believe", "i guess", "as far as i know",
+                         "i think maybe", "i think so", "i think perhaps"]
+        let lower = text.lowercased()
+        for m in zhMarkers { if text.contains(m) { return true } }
+        for m in enMarkers { if lower.contains(m) { return true } }
+        return false
+    }
+
+    /// [T-deep-mode-cognitive-p1] C7: Post-task retrospective hook. Called after
+    /// a meaningful workflow completes (workflow phase transitions back to idle).
+    /// Injects a structured review prompt, runs one agent loop turn to get the
+    /// model's self-reflection, and persists the result to StructuredMemoryStore
+    /// as a project-category memory entry.
+    ///
+    /// Total-switch safe: guarded by `deepModeEnabled` at entry. The injected
+    /// message is a normal AgentMessage (persisted as conversation history), and
+    /// the memory entry is only written when deep mode is on. When the master
+    /// switch is off, this method returns immediately — zero behavioral residue.
+    /// The `retrospectiveHasRun` flag prevents double-injection across multiple
+    /// scheduleWorkflowFinish calls.
+    private func maybeRunRetrospective() async {
+        guard deepModeEnabled else { return }
+        guard !retrospectiveHasRun else {
+            logger.info("[Retrospective] C7 skipped — already ran for this workflow")
+            return
+        }
+        retrospectiveHasRun = true
+        logger.info("[Retrospective] C7 beginning post-task retrospective")
+
+        let reviewPrompt = AgentMessage(role: .user, parts: [
+            .text("<system-reminder>深度模式任务后复盘（C7）：本次任务已完成，请快速复盘以下四个维度：\n1. 意图理解准确吗？（用户要什么 vs 你做了什么）\n2. 难度评估准吗？（预估难度 vs 实际难度）\n3. 工具选择最优吗？（有无更优工具/路径）\n4. 边界声明到位吗？（做了什么 / 没做什么 / 为什么）\n请简洁回答，提炼一条可复用的经验教训。如果你的复盘包含值得长期记住的经验，请使用 memory_write 工具保存。</system-reminder>")
+        ])
+        let ci = agentHistory.count
+        agentHistory.append(reviewPrompt)
+        if let pid = await persistAgentMessage(reviewPrompt), ci < agentHistory.count {
+            agentHistory[ci].dbMessageId = pid
+        }
+
+        // [T-deep-mode-cognitive-p1] C7 fix: Set isProcessing and background
+        // processing BEFORE calling runAgentLoop(), matching send()'s pattern.
+        // Without this, the UI wouldn't show the processing state, and the
+        // user could send another message during the retrospective — causing
+        // a race condition. Total-switch safe: this entire method is guarded
+        // by `guard deepModeEnabled` at entry.
+        isProcessing = true
+        beginBackgroundProcessing()
+        // [T-deep-mode-cognitive-p1] C7 fix: Set this flag so
+        // maybeAutoContinueGoal skips auto-continue during the retrospective.
+        // Without it, if the review text coincidentally contains a
+        // <<GOAL_STATE>> sentinel, the retrospective's runAgentLoop would
+        // trigger an unintended auto-continue chain.
+        isRetrospectiveRunning = true
+        // [T-deep-mode-cognitive-p1] C7 fix: Use defer for ALL cleanup to
+        // guarantee isProcessing and background processing are always
+        // restored, even if the guard below returns early or the loop
+        // throws. This matches send()'s epilogue pattern but is more robust
+        // because it handles the early-return case that send() doesn't have.
+        defer {
+            isRetrospectiveRunning = false
+            isProcessing = false
+            endBackgroundProcessing()
+        }
+
+        do {
+            try await runAgentLoop()
+            // [T-deep-mode-cognitive-p1] C7 fix: Re-check deepModeEnabled
+            // before saving — the user might have turned off the master
+            // switch while the retrospective's runAgentLoop was executing.
+            // If so, skip the memory save to honor the "no residual state"
+            // contract. The conversation history already has the review
+            // (as a normal AgentMessage), which is consistent with P0 C5
+            // fail-switch behavior.
+            guard deepModeEnabled else {
+                logger.info("[Retrospective] C7 skipping memory save — deep mode disabled during retrospective")
+                return
+            }
+            // After the review turn, check if the model's response is worth
+            // saving. We look at the last assistant message in agentHistory.
+            if let lastAssistant = agentHistory.last(where: { $0.role == .assistant }) {
+                let reviewText = lastAssistant.parts.compactMap { part -> String? in
+                    if case .text(let t) = part { return t }
+                    return nil
+                }.joined(separator: "\n")
+                if !reviewText.isEmpty {
+                    // Save the review to structured memory as a project note.
+                    // Source tag "auto:deep-mode-c7" distinguishes it from
+                    // user-written entries and makes it easy to filter/delete.
+                    try? StructuredMemoryStore.add(
+                        content: "任务复盘: \(reviewText.prefix(500))",
+                        category: .project,
+                        tags: ["retrospective", "auto", "deep-mode"],
+                        source: "auto:deep-mode-c7"
+                    )
+                    logger.info("[Retrospective] C7 review saved to StructuredMemoryStore (\(reviewText.count) chars)")
+                    // [T-deep-mode-cognitive-p2-c14] C14: Also save a one-line
+                    // summary to the cross-session store so future sessions
+                    // have continuity. Use the first sentence of the review.
+                    let summary = String(reviewText.prefix(200)).components(separatedBy: "\n").first ?? String(reviewText.prefix(100))
+                    try? CrossSessionContextStore.appendWorkflowSummary(summary, sessionId: sessionId)
+                    logger.info("[CrossSession] C14: workflow summary saved to cross-session store")
+                }
+            }
+        } catch is CancellationError {
+            logger.info("[Retrospective] C7 cancelled")
+        } catch {
+            logger.error("[Retrospective] C7 error: \(String(describing: error))")
+        }
+    }
+    /// "大概", "I'm not sure", "maybe", "probably"), a one-shot verification
+    /// prompt is appended to the tool result message (or injected as a new user
+    /// message if the turn had no tool calls). Capped at 1 per run to prevent
+    /// loops. Reset at the start of each agent loop. Guarded by deepModeEnabled.
+    var didInjectUncertaintyCheckThisRun = false
+    /// for marker sessions. When markerId and anchorIdx are unchanged and history
+    /// only grew, the preAnchor + summary injection are stable — only the
+    /// postAnchor tail needs appending. This extends the incremental path to
+    /// compacted sessions (DeepMode long conversations).
+    var _cachedEffectiveHistory: (
+        result: [AgentMessage],
+        historyCount: Int,
+        markerId: String?,
+        anchorIdx: Int?,  // nil for non-marker sessions
+        toolUseIds: Set<String>,
+        toolResultIds: Set<String>
+    )?
+    /// [T-perf-history-bg-warmup] Background task pre-computing effectiveAgentHistory()
+    /// so the first call in runAgentLoop hits the cache instead of blocking the main
+    /// thread. Started at send() time, runs in parallel with attachment processing.
+    var _historyWarmupTask: Task<Void, Never>?
 }

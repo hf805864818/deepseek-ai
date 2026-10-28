@@ -2587,7 +2587,7 @@ extension SkillStore {
         let data: Data
     }
 
-    nonisolated static func readZipEntries(data: Data) throws -> [ZipEntry] {
+    static func readZipEntries(data: Data) throws -> [ZipEntry] {
         guard data.count >= 22 else { throw SkillError.invalidArchive }
 
         var eocdOffset = -1
