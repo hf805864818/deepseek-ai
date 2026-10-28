@@ -6,6 +6,38 @@ private let logger = AppLogger(category: "AIChatVM")
 
 extension AIChatViewModel {
 
+    /// [T-ios-longsession-coldload #278] How many trailing assistant messages
+    /// Phase 2b pre-renders during a cold session load.
+    ///
+    /// Sized against a SECOND cost, not just cold-load time. A block without a
+    /// `cachedAttributedString` is laid out from the coarse char-count estimate
+    /// (`estimateTextBlockHeight`, documented ±13–52pt off) and corrected to its
+    /// real TextKit height when it is first measured. During a drag or glide
+    /// `MessageListLayout.invalidationContext` deliberately applies NO
+    /// `contentOffsetAdjustment` (it would break momentum), so that correction
+    /// shifts visible content — the "settle jitter" of
+    /// [T-ios-scroll-decel-height-drift]. At ~3 blocks per screen and the
+    /// typical ±30pt error that is ~90pt, roughly four lines jumping under the
+    /// finger.
+    ///
+    /// 80 ≈ 27 screenfuls of scroll-back before a reader can reach un-pre-rendered
+    /// history, while still costing ~3.4× less than the old render-everything
+    /// behaviour on the 547-message session from #278. Past the tail the
+    /// exposure is bounded anyway: it is FIRST-PASS only, because
+    /// [T-ios-scroll-decel-height-drift] memoises each block's real height by
+    /// content key and re-seeds precalc from it on every later re-entry.
+    ///
+    /// Deliberately NOT solved by prewarming ahead of the scroll: UIKit's own
+    /// cell prefetch is disabled here on purpose (`isPrefetchingEnabled = false`,
+    /// CollectionViewMessageListV3) because pre-sizing off-screen cells cost
+    /// ~44ms each and produced the 2–3 frame stutter users perceive right before
+    /// a big cell scrolls in. Re-adding that work under another name would trade
+    /// this jitter for the stutter that was already removed.
+    ///
+    /// A session with this many assistant messages or fewer behaves EXACTLY as
+    /// before — the tail is the whole list, so the loop body is unchanged. Only
+    /// genuinely long sessions take the new path.
+    static let coldLoadPrecacheTailMessages = 80
 
     /// T-baseline-hash-drift: shared hasher used by reloadMessagesFromDB's
     /// reorder detector AND by send/drain paths that refresh the baseline
@@ -19,6 +51,18 @@ extension AIChatViewModel {
             hasher.combine(m.sortOrder)
         }
         return hasher.finalize()
+    }
+
+    /// Re-read the reload baselines (max sort_order, row count, order hash)
+    /// from the store after this view model has written its own rows, so the
+    /// next reloadMessagesFromDB does not mistake them for another writer's.
+    /// The send / queue-drain epilogues do the same inline.
+    func refreshDbBaselineFromStore() async {
+        guard let sid = sessionId else { return }
+        let dbMessages = await ChatStore.shared.loadMessages(sessionId: sid)
+        lastKnownDbSortOrder = dbMessages.last?.sortOrder ?? lastKnownDbSortOrder
+        lastKnownDbCount = dbMessages.count
+        lastKnownDbOrderHash = Self.computeOrderHash(of: dbMessages)
     }
 
     func reloadMessagesFromDB(reason: String = "unspecified") async {
@@ -123,16 +167,21 @@ extension AIChatViewModel {
             lastKnownDbCount = dbCount
             lastKnownDbOrderHash = hash
             // [T-ios-paused-badge-desync] SKIP-LOAD skips loadSession(), which
-            // [T-perf-loadsession-defer-resume-check] Skip recheckCanResume here —
-            // it will be called once at the end of loadSession() after all UI
-            // messages are rebuilt, avoiding a redundant O(n) parts scan on the
-            // cached-VM re-enter path.
+            // is the only place that evaluates the interrupted-loop tail and
+            // sets canResume. If reconcileInterruptedSessions (foreground
+            // reconcile) set a .paused badge while this cached VM's canResume
+            // is still false, the detail page shows no "Interrupted" banner
+            // even though the list shows ⏸. Re-run the lightweight check here.
+            recheckCanResumeFromHistory()
         }
     }
 
     /// For UI, we merge consecutive assistant + tool-result turns into a single ChatMessage,
     /// matching how they appeared during the live session.
     func loadSession() async {
+        // [T-offload-scan-cache] Verdicts belong to the session they were taken
+        // from; drop them rather than leave a different chat's entries to age out.
+        offloadScanCache.removeAll()
         guard let sessionId else { return }
 
         let sinceAppear = (CFAbsoluteTimeGetCurrent() - Self.onAppearTimestamp) * 1000
@@ -167,7 +216,14 @@ extension AIChatViewModel {
         let stack = Thread.callStackSymbols.prefix(10).joined(separator: " | ")
         logger.info("[ReloadTrace] loadSession() → spinner ON sid=\(sessionId.prefix(8)) callerStack=\(stack)")
 
-        Self.activeSessionId = sessionId
+        // [T-minisurl-wrong-active-session] Deliberately NOT setting
+        // Self.activeSessionId here: loadSession also runs for sessions the
+        // user is NOT looking at (debug RPC, sync-triggered reloads, share
+        // flows). The global means "session whose chat UI is frontmost" and is
+        // written only by AIChatView (onAppear + sessionId onChange) — a
+        // background write here made every relative minis:// resolution (tap
+        // preview, bubble thumbnails, edit-box images) land in the wrong
+        // session's directory ("无法找到" / broken previews).
         // [T-ios-session-unread-badge] Opening the session reads its new message,
         // so clear the transient red "unread" dot. Only `.unread` is removed; the
         // `.paused` entry (a different concern) is left to its canResume-driven
@@ -199,9 +255,6 @@ extension AIChatViewModel {
         // [T-deep-mode-clarify-gate] Phase 2: same lifetime for the clarification
         // gate — a reloaded session starts idle, never a stale pending question.
         clarifyState = .idle
-        // Also reset the one-shot skip flag for safety. (Reset on every send() too,
-        // but a stale true value could theoretically cause one ambiguous request
-        // to skip clarification after a session reload — better safe than sorry.)
         skipClarifyCheck = false
 
         // Load persisted memory-write toggle
@@ -209,10 +262,6 @@ extension AIChatViewModel {
         // [T-memory-enabled-new-session-bug DIAG] confirm loadSession set
         // vm.memoryEnabled from the DB/global default, and which session.
         AppLogger(category: "MemDiag").info("[MemDiag] loadSession sid=\(sessionId.prefix(8)) → vm.memoryEnabled=\(self.memoryEnabled)")
-
-        // [T-perf-memory-cache] Preload memory fragments in the background
-        // so the cache is warm by the time the user sends a message.
-        Self.preloadMemoryFragments()
 
         // Clear stale compact/pending state from previous lifecycle
         skipCompactCheck = false
@@ -225,6 +274,7 @@ extension AIChatViewModel {
             showCompactBeforeSendPrompt = false
             pendingSendText = nil
             pendingSendAttachments = []
+            pendingSendIsFromComposer = false
         }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
@@ -241,6 +291,10 @@ extension AIChatViewModel {
         // Track the highest sortOrder and count so iCloud sync reload triggers for new or removed messages.
         lastKnownDbSortOrder = rawMessages.last?.sortOrder ?? 0
         lastKnownDbCount = rawMessages.count
+        // ...and the order hash, from the same rows. Left at its old value (0 on
+        // a fresh view model), the first reload after a load could not tell a
+        // reorder from "no baseline yet" (hasReorderedMessages requires != 0).
+        lastKnownDbOrderHash = Self.computeOrderHash(of: rawMessages)
         // [T-ios-token-usage-reload-per-iteration] Zero the session token
         // accumulators BEFORE the empty-session early return below, so switching
         // this vm from a non-empty session to an empty one doesn't leave the old
@@ -266,98 +320,162 @@ extension AIChatViewModel {
         // Phase 2: Build UI messages and agent history
         let buildStart = CFAbsoluteTimeGetCurrent()
         let phase2aStart = CFAbsoluteTimeGetCurrent()
+        var loadedUIMessages: [ChatMessage] = []
+        var loadedHistory: [AgentMessage] = []
 
-        // [T-perf-loadsession-bg] Move the O(n) message-processing loop to a
-        // background thread. The loop iterates every raw DB row, calls
-        // toAgentMessage/toChatMessage (which parse JSON + decode media), and
-        // merges assistant continuation rows — all pure-value operations on
-        // value-type structs. Running this on the main thread caused the
-        // "entering old session" stall on sessions with 100+ messages. The
-        // detached task captures the inputs by value and returns the built
-        // arrays; only the final assignment to self.messages/agentHistory
-        // happens on the main thread.
+        // The current merged assistant ChatMessage (accumulates blocks across loop iterations)
+        var currentAssistant: ChatMessage? = nil
+
+        // Determine whether thinking blocks should be shown based on session config
         let showThinking = ProviderConfigStore.shared.inferenceConfig(for: sessionId)?.thinkingLevel.isEnabled ?? false
 
-        // Captured inputs for the background task — all value types or
-        // sendable references, safe to use off the main thread.
-        let rawInput = rawMessages
-        let resolverInput = resolver
-        let sid = sessionId
+        for raw in rawMessages {
+            // Always rebuild agent history (every message matters for API context).
+            // Phase B: stamp the DB row id into dbMessageId so compact can resolve
+            // boundaries by id after restore.
+            var agentMsg = raw.toAgentMessage(mediaResolver: resolver)
+            agentMsg.dbMessageId = raw.id
+            loadedHistory.append(agentMsg)
 
-        var (loadedUIMessages, loadedHistory) = await Task.detached(priority: .userInitiated) {
-            // [T-perf-loadsession-bg] All processing here is pure-value:
-            // RawMessage.toAgentMessage/toChatMessage are struct methods that
-            // parse JSON + decode media references, with no main-thread or
-            // shared-mutable-state dependencies.
-            var uiMsgs: [ChatMessage] = []
-            var history: [AgentMessage] = []
-            var currentAssistant: ChatMessage? = nil
-
-            for raw in rawInput {
-                // Always rebuild agent history (every message matters for API context).
-                var agentMsg = raw.toAgentMessage(mediaResolver: resolverInput)
-                agentMsg.dbMessageId = raw.id
-                history.append(agentMsg)
-
-                if raw.isInternalBridge { continue }
-
-                if raw.role == .user && raw.isToolResultOnly {
-                    if let assistant = currentAssistant {
-                        Self.applyToolResults(from: raw, to: assistant, mediaResolver: resolverInput)
-                    }
-                    continue
-                }
-
-                if raw.role == .assistant {
-                    if let assistant = currentAssistant {
-                        let continuation = raw.toChatMessage(mediaResolver: resolverInput, showThinking: showThinking)
-                        for block in continuation.blocks {
-                            assistant.blocks.append(block)
-                        }
-                        if let usage = continuation.usage {
-                            assistant.usage = usage
-                        }
-                        assistant.lastSourceSortOrder = raw.sortOrder
-                    } else {
-                        let msg = raw.toChatMessage(mediaResolver: resolverInput, showThinking: showThinking)
-                        msg.sourceSortOrder = raw.sortOrder
-                        msg.lastSourceSortOrder = raw.sortOrder
-                        currentAssistant = msg
-                        uiMsgs.append(msg)
-                    }
-                    continue
-                }
-
-                // Real user message
-                currentAssistant = nil
-                let msg = raw.toChatMessage(mediaResolver: resolverInput, showThinking: showThinking)
-                if msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   msg.attachments.isEmpty,
-                   msg.blocks.isEmpty {
-                    continue
-                }
-                msg.sourceSortOrder = raw.sortOrder
-                msg.lastSourceSortOrder = raw.sortOrder
-                uiMsgs.append(msg)
+            // [T-bridge-message-ui-leak] The #579 role-alternation bridge is
+            // LLM-context-only: it stays in loadedHistory (appended above, so
+            // the …user(tool_result) → assistant(bridge) → user(queued)…
+            // sequence survives reload) but must never surface as a chat
+            // bubble. Without this skip it either merged into the previous
+            // assistant message's blocks or rendered standalone after app
+            // restart. currentAssistant is deliberately left untouched — the
+            // bridge is invisible, so it must not affect the merge chain
+            // either (the queued user message that follows breaks it anyway).
+            if raw.isInternalBridge {
+                continue
             }
 
-            // Finalize orphaned tool blocks (same as before, runs on bg thread)
-            for uiMsg in uiMsgs {
-                for block in uiMsg.blocks {
-                    guard let status = block.toolStatus else { continue }
-                    switch status {
-                    case .running, .streaming:
-                        block.toolStatus = .cancelled
-                    default:
-                        break
-                    }
+            if raw.role == .user && raw.isToolResultOnly {
+                // Tool-result user messages: apply results to the current assistant's tool blocks
+                if let assistant = currentAssistant {
+                    Self.applyToolResults(from: raw, to: assistant, mediaResolver: resolver)
                 }
+                // Don't create a UI message for tool results
+                continue
             }
 
-            return (uiMsgs, history)
-        }.value
+            if raw.role == .assistant {
+                if let assistant = currentAssistant {
+                    // Continuation of an agent loop — append new blocks to
+                    // existing assistant message AND extend the source-sort
+                    // range so compact-marker resolution can map raw[i] back
+                    // to this merged UI row even when i is mid-stream.
+                    let continuation = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
+                    let textParts = raw.parts.compactMap { if case .text(let s) = $0 { return s }; return nil }
+                    let textBlockSummary = continuation.blocks.enumerated().compactMap { (i, b) -> String? in
+                        guard b.kind == .text else { return nil }
+                        return "len=\(b.content.count)"
+                    }.joined(separator: ",")
+                    // [T-log-noise-privacy 2026-07-18] info → debug: fires once
+                    // per raw assistant row on EVERY session load.
+                    logger.debug("[BlocksLost] RAW-MERGE so=\(raw.sortOrder) id=\(raw.id.prefix(8)) partsCount=\(raw.parts.count) textParts=\(textParts.count) rawTextLens=[\(textParts.map { "\($0.count)" }.joined(separator: ","))] blocks=\(continuation.blocks.count) textBlocks=[\(textBlockSummary)]")
+                    for block in continuation.blocks {
+                        assistant.blocks.append(block)
+                    }
+                    if let usage = continuation.usage {
+                        assistant.usage = usage
+                        // [T-usage-capsule-time] Carry the completion clock with
+                        // the usage it belongs to. These two are written as a
+                        // pair (live: both set when the turn is declared
+                        // finished; reload: both set from the same row), and the
+                        // capsule renders the clock INSIDE the usage capsule —
+                        // so a merge that moved one without the other produced a
+                        // capsule with the later row's numbers and no time at
+                        // all, which is exactly what was reported.
+                        //
+                        // Last-writer-wins, matching `usage`: a merged bubble
+                        // shows one agent run, and the run finished when its
+                        // FINAL row finished. Taking the first row's time would
+                        // report the moment the loop's opening turn ended, which
+                        // for a long run is minutes early.
+                        assistant.completedAt = continuation.completedAt
+                    }
+                    // [T-error-persist-retry-clear-ios] Resolve stale-vs-genuine
+                    // persisted errors across a merged agent run. A persisted
+                    // error_info always sits on the row that was LAST at stall
+                    // time; if further assistant rows follow, the loop provably
+                    // progressed past that error (a retry succeeded), so the
+                    // banner is stale — clear it rather than showing a red error
+                    // mid-way through a visibly completed conversation (observed
+                    // on device: DeepSeek stream stalled silently, watchdog
+                    // persisted the error, retry() resumed and finished, reload
+                    // re-materialised the banner from the orphaned row). A
+                    // NEWER row's error wins in the other direction: a run that
+                    // genuinely ends in a stall keeps its banner because the
+                    // final row carries it (this also fixes the inverse bug
+                    // where a mid-run continuation row's error was silently
+                    // dropped by this merge and the banner vanished on reload).
+                    if continuation.error != nil {
+                        logger.info("[ErrorPersist] reload: carrying error from so=\(raw.sortOrder) onto merged message")
+                        assistant.error = continuation.error
+                    } else if assistant.error != nil {
+                        logger.info("[ErrorPersist] reload: clearing stale mid-run error at so=\(raw.sortOrder) — later assistant rows exist")
+                        assistant.error = nil
+                    }
+                    assistant.lastSourceSortOrder = raw.sortOrder
+                } else {
+                    // First assistant message in this turn
+                    let msg = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
+                    msg.sourceSortOrder = raw.sortOrder
+                    msg.lastSourceSortOrder = raw.sortOrder
+                    currentAssistant = msg
+                    loadedUIMessages.append(msg)
+                }
+                continue
+            }
 
-        let phase2aElapsed = (CFAbsoluteTimeGetCurrent() - phase2aStart) * 1000
+            // [T-invisible-user-row-merge] A user row that renders nothing — the
+            // app's own mid-loop `<system-reminder>` (the persona reminder,
+            // persisted as its own row between a tool result and the next
+            // assistant row) — is not the user speaking. It used to end the
+            // merge chain here, so on reload one agent run came back as TWO
+            // assistant messages with nothing visible between them: the list
+            // looked unchanged, but anything per-message (tool-call folding)
+            // saw two halves. Live, that run is one message. Skip it before
+            // the chain break, not after.
+            //
+            // Its tool results, if any, go to the open message's calls exactly
+            // as a tool-result-only row's do. A tool-result row that also
+            // carries a hidden note (the image-budget reminder appended in the
+            // agent loop) is not `isToolResultOnly`, so it lands here, and its
+            // results used to reach no card: every call it answered reloaded
+            // as "cancelled" with no output.
+            let msg = raw.toChatMessage(mediaResolver: resolver, showThinking: showThinking)
+            if msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               msg.attachments.isEmpty,
+               msg.blocks.isEmpty {
+                if let assistant = currentAssistant {
+                    Self.applyToolResults(from: raw, to: assistant, mediaResolver: resolver)
+                }
+                continue
+            }
+
+            // Real user message — finalize any pending assistant and start fresh
+            if currentAssistant != nil {
+                let chainBreakBlocks = currentAssistant!.blocks.count
+                // [T-log-noise-privacy 2026-07-18] Log the tail LENGTH, not the
+                // tail text — message content must not land in log files.
+                let lastTextLen = currentAssistant!.blocks.last(where: { $0.kind == .text })?.content.count ?? -1
+                logger.info("[BlocksLost] MERGE-CHAIN-BREAK at so=\(raw.sortOrder) userParts=\(raw.parts.count) isToolResultOnly=\(raw.isToolResultOnly) prevAssistantBlocks=\(chainBreakBlocks) prevLastTextLen=\(lastTextLen) sid=\(sessionId.prefix(8))")
+            }
+            currentAssistant = nil
+            msg.sourceSortOrder = raw.sortOrder
+            msg.lastSourceSortOrder = raw.sortOrder
+            // [T-edit-anchor-link] Bubble and entry come from the same row.
+            msg.historyAnchorId = agentMsg.anchorId
+            loadedUIMessages.append(msg)
+        }
+
+        // [T-user-ask-notsent-merge] Not-sent user_ask runs, now that every
+        // tool result has set its block's status.
+        for msg in loadedUIMessages where msg.role == .assistant {
+            UserAskNotSentGrouping.annotate(msg.blocks)
+        }
 
         // [BlocksLost] MERGE TRACE — log every text block of the last assistant
         // message so we can confirm whether the final 839-char (or whatever)
@@ -395,7 +513,8 @@ extension AIChatViewModel {
             }
         }
 
-        // phase2aElapsed is already declared above (after Task.detached returns).
+        let phase2aElapsed = (CFAbsoluteTimeGetCurrent() - phase2aStart) * 1000
+
         // Phase 2.5 (Phase B): Apply compact marker if present.
         //
         // New model: marker.firstKeptMessageId is the authoritative boundary. agentHistory
@@ -408,26 +527,15 @@ extension AIChatViewModel {
         //   firstKeptMessageId → boundaryMessageId → firstKeptSortOrder
         let compactMarker = remoteDeviceId == nil ? await ChatStore.shared.latestCompactMarker(sessionId: sessionId) : nil
         self.cachedLatestMarker = compactMarker
-        _cachedEffectiveHistory = nil  // [T-perf-effective-history-cache] Marker loaded → invalidate cache
         if let marker = compactMarker {
             logger.info("[Compact] ━━━ Phase 2.5: restore (Phase B id-first) ━━━")
             logger.info("[Compact] marker: id=\(marker.id.prefix(8)) fkmId=\(marker.firstKeptMessageId?.prefix(8) ?? "nil") bmId=\(marker.boundaryMessageId?.prefix(8) ?? "nil") lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") fkSO=\(marker.firstKeptSortOrder) compactedCount=\(marker.compactedCount) summary=\(marker.summary.count)chars createdAt=\(marker.createdAt)")
             logger.info("[Compact] DB: totalRaw=\(rawMessages.count) range=\(rawMessages.first?.sortOrder ?? -1)...\(rawMessages.last?.sortOrder ?? -1)")
             logger.info("[Compact] Memory: history=\(loadedHistory.count) uiMessages=\(loadedUIMessages.count)")
-            // [T-perf-compact-id-dict] Build a single [id: RawMessage] lookup so
-            // every id-based resolution during Phase 2.5 is O(1) instead of O(n).
-            // Without this, v2 markers, compactAll markers, and boundary-marker
-            // resolutions each do their own `rawMessages.first(where: { $0.id == id })`
-            // linear scan — up to 6 O(n) passes in the worst case.
-            var rawById: [String: RawMessage] = [:]
-            rawById.reserveCapacity(rawMessages.count)
-            for raw in rawMessages {
-                rawById[raw.id] = raw
-            }
             // Diag: locate marker.lcmId in rawMessages so we can see the exact
             // sortOrder that needs to match a UI msg.sourceSortOrder later.
             if let lcmId = marker.lastCompactedMessageId,
-               let lcmRaw = rawById[lcmId] {
+               let lcmRaw = rawMessages.first(where: { $0.id == lcmId }) {
                 let uiHit = loadedUIMessages.firstIndex(where: { $0.sourceSortOrder == lcmRaw.sortOrder })
                 logger.info("[Compact] marker.lcmId → raw.sortOrder=\(lcmRaw.sortOrder) role=\(lcmRaw.role) → UIIdx=\(uiHit.map(String.init) ?? "MISS")")
             } else {
@@ -450,7 +558,7 @@ extension AIChatViewModel {
                 && marker.lastCompactedMessageId != nil
             var boundaryMsgId: String? = marker.firstKeptMessageId ?? marker.boundaryMessageId
             var boundaryResolutionPath: String = "none"
-            if let mid = boundaryMsgId, rawById[mid] != nil {
+            if let mid = boundaryMsgId, rawMessages.contains(where: { $0.id == mid }) {
                 boundaryResolutionPath = (marker.firstKeptMessageId == mid) ? "firstKeptMessageId" : "boundaryMessageId"
             } else if isCompactAllShape {
                 // Leave boundaryMsgId nil so the compactAll branch (which
@@ -493,7 +601,7 @@ extension AIChatViewModel {
                 // sortOrder, lastSourceSortOrder is the LAST. The marker's
                 // anchor can sit anywhere inside that range and still belongs
                 // to that UI message.
-                let lcmRaw = marker.lastCompactedMessageId.flatMap { rawById[$0] }
+                let lcmRaw = marker.lastCompactedMessageId.flatMap { id in rawMessages.first(where: { $0.id == id }) }
                 if let lcmId = marker.lastCompactedMessageId, let lcmRaw,
                    let lcmUIIdx = Self.uiIndexForAnchorRaw(lcmRaw, in: loadedUIMessages) {
                     insertIdx = lcmUIIdx + 1
@@ -535,7 +643,7 @@ extension AIChatViewModel {
             } else if boundaryMsgId == nil && marker.firstKeptMessageId == nil && marker.boundaryMessageId == nil {
                 // compactAll marker — use lastCompactedMessageId for cutoff.
                 if let lcmId = marker.lastCompactedMessageId,
-                   let lcmRaw = rawById[lcmId],
+                   let lcmRaw = rawMessages.first(where: { $0.id == lcmId }),
                    let lcmUIIdx = loadedUIMessages.firstIndex(where: { $0.sourceSortOrder == lcmRaw.sortOrder }) {
                     insertIdx = lcmUIIdx + 1
                     boundaryResolutionPath = "compactAll(lastCompactedMessageId)"
@@ -549,7 +657,7 @@ extension AIChatViewModel {
                     // — the underlying messages were re-indexed by a v1→v2 sync
                     // migration, leaving the marker's lcmId orphaned.
                     let lcmIdStr = marker.lastCompactedMessageId?.prefix(8) ?? "nil"
-                    let rawHit = marker.lastCompactedMessageId.flatMap { rawById[$0] }
+                    let rawHit = marker.lastCompactedMessageId.flatMap { id in rawMessages.first(where: { $0.id == id }) }
                     let stage: String
                     if marker.lastCompactedMessageId == nil {
                         stage = "marker.lcmId is nil"
@@ -604,7 +712,7 @@ extension AIChatViewModel {
                     }
                 }
             } else if let mid = boundaryMsgId,
-               let bmRaw = rawById[mid],
+               let bmRaw = rawMessages.first(where: { $0.id == mid }),
                let bmUIIdx = loadedUIMessages.firstIndex(where: { $0.sourceSortOrder == bmRaw.sortOrder }) {
                 insertIdx = bmUIIdx  // divider BEFORE boundary (boundary message is first active)
             } else {
@@ -633,7 +741,6 @@ extension AIChatViewModel {
         // Defer assigning messages until after Phase 3 (tool snapshots) so the
         // UI never sees messages without their corresponding snapshot data.
         agentHistory = loadedHistory
-        _cachedEffectiveHistory = nil  // [T-perf-effective-history-cache] Clear cache on full history reload
 
         // [T-ios-unread-dot-reappears] Opening the session means the user has
         // now seen every completed assistant turn in it, so align the unread
@@ -657,32 +764,54 @@ extension AIChatViewModel {
 
         let phase2sigElapsed = (CFAbsoluteTimeGetCurrent() - phase2sigStart) * 1000
 
-        // Phase 2b: Pre-cache NSAttributedString for all completed text blocks.
+        // Phase 2b: Pre-cache NSAttributedString for completed text blocks.
         // This ensures the first sizeThatFits call returns the correct height,
         // eliminating the estimated→actual contentSize oscillation that causes
         // scroll jitter when cells first enter the viewport.
         //
-        // [T-perf-attrstr-bg] Move the O(n×m) markdown parse + TextKit render
-        // off the main thread. On DeepMode long sessions this could be 50–150ms
-        // of main-thread work; moving it to a background task lets the UI
-        // render with estimated heights first, then the cached attr strings
-        // fill in before cells scroll into view. The writes to block properties
-        // are safe off-main because no UI code reads these concurrently during
-        // loadSession (messages hasn't been assigned to self yet).
-        let phase2bStart = CFAbsoluteTimeGetCurrent()
-        let baseFontSize = await FontSettings.shared.scaledMessage(16.5)
-        Task.detached(priority: .userInitiated) {
-            for msg in loadedUIMessages where msg.role == .assistant {
-                for block in msg.blocks where block.kind == .text && !block.content.isEmpty {
-                    autoreleasepool {
-                        let content = block.cachedMarkdown ?? MarkdownContent(prepareMarkdownForRender(block.content))
-                        block.cachedMarkdown = content
-                        block.cachedAttributedString = renderMarkdownBlocksOffMain(content.blocks, baseFontSize: baseFontSize)
-                    }
-                }
+        // [T-ios-longsession-coldload #278] Pre-caching is a MAIN-ACTOR cmark
+        // parse + UIKit render (UIFont/UIColor/NSTextAttachment) per block, so
+        // its cost scales with the session's total text volume, not its message
+        // count. A 547-message agent session measured ~4.2 MB of block text;
+        // rendering all of it before `messages` is even assigned is what makes
+        // the session appear to hang behind a spinner with no way out.
+        //
+        // The render path already handles a nil cache — it falls through to the
+        // same on-demand render the streaming path uses
+        // (SelectableMarkdownView, `if let prebuilt = cachedAttributedString …
+        // else { renderer.render(…) }`) — so skipping it costs a first-scroll
+        // render, not correctness.
+        //
+        // Only the TAIL is pre-cached, because that is what the user actually
+        // lands on (the list opens scrolled to the bottom). Everything above is
+        // rendered lazily by LazyVStack when scrolled to, which is what that
+        // container is for. Deliberately NOT dropped entirely: the prebuilt
+        // string is what lets a recycled cell present a correct first frame
+        // (T-ios-reuse-cachewipe / bea0ecfcf), so the visible region keeps it.
+        //
+        // The tail size is a two-sided trade — a block outside it lays out from
+        // the coarse estimate and visibly settles when first measured. See
+        // `coldLoadPrecacheTailMessages` for why 80 and why prewarming further
+        // ahead is the wrong lever here.
+        //
+        // Sessions at or below the threshold take the identical code path as
+        // before — same blocks, same order, same work — so short and medium
+        // sessions cannot regress.
+        let precacheTail = Self.coldLoadPrecacheTailMessages
+        let assistantMessages = loadedUIMessages.filter { $0.role == .assistant }
+        let precacheTargets = assistantMessages.count > precacheTail
+            ? Array(assistantMessages.suffix(precacheTail))
+            : assistantMessages
+        for msg in precacheTargets {
+            for block in msg.blocks where block.kind == .text && !block.content.isEmpty {
+                cacheAttributedString(for: block)
             }
         }
-        let phase2bElapsed = (CFAbsoluteTimeGetCurrent() - phase2bStart) * 1000
+        if assistantMessages.count > precacheTail {
+            logger.info("[SessionLoad] Phase 2b tail-limited: pre-cached \(precacheTargets.count)/\(assistantMessages.count) assistant messages (older ones render lazily on scroll)")
+        }
+
+        let phase2bElapsed = (CFAbsoluteTimeGetCurrent() - buildStart) * 1000 - phase2aElapsed - phase25Elapsed - phase2sigElapsed
         let buildElapsed = (CFAbsoluteTimeGetCurrent() - buildStart) * 1000
         let restoredEstimate = estimateContextTokens()
         logger.info("[SessionLoad] \(sessionId) — Phase 2 build messages: \(String(format: "%.1f", buildElapsed))ms (\(loadedUIMessages.count) UI messages, \(loadedHistory.count) history entries, estimated ~\(restoredEstimate) context tokens)")
@@ -690,30 +819,24 @@ extension AIChatViewModel {
 
         // Phase 3: Extract tool snapshots
         let snapshotStart = CFAbsoluteTimeGetCurrent()
-        // [T-perf-snapshot-toolname-dict] Build a single [toolUseId: toolName]
-        // lookup dictionary in O(n×m) so each tool_result snapshot resolves its
-        // tool name in O(1) instead of calling findToolName() which re-scans all
-        // rawMessages every time. DeepMode sessions with many tool calls saw
-        // O(t×n) time here (t = tool results, n = total messages).
-        // Also pre-extract file_write content so recoverFileWriteContent() —
-        // which was another O(n×m) per call — becomes a dictionary lookup.
+        var loadedSnapshots: [ToolSnapshotItem] = []
+        // [T-ios-longsession-coldload #278] Index toolUseId → name ONCE instead
+        // of calling findToolName() per tool result, which rescanned every
+        // message and every part each time — O(n²) on exactly the tool-heavy
+        // sessions this issue is about (547 messages ≈ 447 rescans).
+        //
+        // Semantics are identical to the old linear scan: it returned the FIRST
+        // match in message order, so the index keeps the first write for a
+        // duplicate id (`if index[id] == nil`) rather than letting a later one
+        // win. Unmatched ids still fall back to "tool" below.
         var toolNameById: [String: String] = [:]
-        var fileWriteContentById: [String: String] = [:]
         for raw in rawMessages {
             for part in raw.parts {
-                if case .toolUse(let tu) = part {
+                if case .toolUse(let tu) = part, toolNameById[tu.toolUseId] == nil {
                     toolNameById[tu.toolUseId] = tu.name
-                    if tu.name == "file_write" {
-                        if let data = tu.input.data(using: .utf8),
-                           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                           let content = dict["content"] as? String {
-                            fileWriteContentById[tu.toolUseId] = content
-                        }
-                    }
                 }
             }
         }
-        var loadedSnapshots: [ToolSnapshotItem] = []
         for raw in rawMessages {
             for part in raw.parts {
                 if case .toolResult(let tr) = part, let snap = tr.snapshot {
@@ -722,8 +845,8 @@ extension AIChatViewModel {
                     let finalSnap: ToolSnapshot
                     if toolName == "file_write",
                        let text = snap.text, text.hasPrefix("Wrote to ") || text.hasPrefix("Appended to ") {
-                        // Old-format snapshot — recover file content from pre-built dictionary
-                        let fileContent = fileWriteContentById[tr.toolUseId]
+                        // Old-format snapshot — recover file content from ToolUse input or disk
+                        let fileContent = Self.recoverFileWriteContent(for: tr.toolUseId, in: rawMessages)
                         if let fileContent, !fileContent.isEmpty {
                             let lines = fileContent.components(separatedBy: "\n")
                             let preview = lines.prefix(200).joined(separator: "\n")
@@ -744,6 +867,12 @@ extension AIChatViewModel {
         // complete data — prevents tables/images from rendering without snapshots.
         toolSnapshots = loadedSnapshots
         messages = loadedUIMessages
+        markLostQueuedDelegations()
+        // [T-user-ask-notsent-retry] Offer Retry on the last not-sent run.
+        if loadedUIMessages.contains(where: { m in m.blocks.contains { b in
+            if case .lead = UserAskNotSentStore.shared.role(b.id) { return true }; return false } }) {
+            trackUserAskRetry()
+        }
 
         // [T-ios-scroll-suspend-leak] UI/DB consistency snapshot. `rawMessages` is
         // the source of truth (one row per persisted turn/iteration); `messages`
@@ -786,27 +915,13 @@ extension AIChatViewModel {
         // the billed cumulative total. The Token Usage sheet uses billing
         // semantics (every iteration is charged), so sum the raw per-iteration
         // usage. Runtime totals were already correct via the per-iteration `+=`.
-        // [T-perf-token-sum-bg] Move the O(n) token accumulation to a background
-        // task so it doesn't block the main thread during session load. The UI
-        // reads these values asynchronously (Token Usage sheet), so a brief delay
-        // between load and correct totals is acceptable.
-        let rawMessagesForSum = rawMessages
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            var input = 0, output = 0, cacheRead = 0, cacheWrite = 0
-            for raw in rawMessagesForSum where raw.role == .assistant {
-                if let u = raw.tokenUsage {
-                    input += u.inputTokens
-                    output += u.outputTokens
-                    cacheRead += u.cacheReadTokens
-                    cacheWrite += u.cacheCreationTokens
-                }
-            }
-            await MainActor.run {
-                self.sessionInputTokens = input
-                self.sessionOutputTokens = output
-                self.sessionCacheReadTokens = cacheRead
-                self.sessionCacheWriteTokens = cacheWrite
+        // (Accumulators were already zeroed above, before the empty-session guard.)
+        for raw in rawMessages where raw.role == .assistant {
+            if let u = raw.tokenUsage {
+                sessionInputTokens += u.inputTokens
+                sessionOutputTokens += u.outputTokens
+                sessionCacheReadTokens += u.cacheReadTokens
+                sessionCacheWriteTokens += u.cacheCreationTokens
             }
         }
 
@@ -841,7 +956,7 @@ extension AIChatViewModel {
         // store has no SessionModelBinding for them. Without a binding, the
         // resolver falls into step 2 (cachedSessionModelId lookup), which can
         // pick an entry that lives outside the default group — observed bug:
-        // synced session routes to Anthropic(wsvn63) whose OAuth token is
+        // synced session routes to Anthropic(account A) whose OAuth token is
         // org-blocked, even though Default Model group's only sonnet-4-6
         // member is Anthropic(53) (and that's what the UI subtitle showed).
         //
@@ -859,6 +974,29 @@ extension AIChatViewModel {
         // Case B: last history entry is assistant with toolUse parts → model called tools, but they never executed
         // Case C: last history entry is user with synthetic "Continue" message → text streaming was cancelled
         recheckCanResumeFromHistory()
+        // [T-ios-context-usage-hint] The glow reflects the loaded history's
+        // last reported usage as soon as the session is on screen.
+        publishContextUsage()
+        // [T-ctx-measure-outbound] Re-seed the size meter's calibration from the
+        // loaded transcript. Only the ratio (report ÷ our estimate of the same
+        // request) is carried over, never a raw size: a raw size here is what
+        // used to keep a compacted session judged at its pre-compaction size
+        // forever, since the last stamped turn predates the compaction. Also
+        // runs after a revert (revertCompact → loadSession), which is what
+        // lets the restored full history be measured at its real size.
+        //
+        // When the transcript carries a calibration pair the glow switches to
+        // the measurement too; rows written before the pair existed keep the
+        // stamped report until the next response, rather than showing an
+        // uncalibrated number.
+        if seedContextCalibration() {
+            publishMeasuredContextUsage()
+        }
+        // [T-ios-context-usage-realtime-crossing] Adopt the loaded tier as the
+        // baseline: opening a session that is already at 75% is not a
+        // crossing, and the previous session's rate-limit state must not
+        // leak into this one.
+        contextTierTracker.reset(to: contextUsage?.tier ?? .normal)
 
         let totalElapsed = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
         let totalSinceAppear = (CFAbsoluteTimeGetCurrent() - Self.onAppearTimestamp) * 1000
@@ -871,7 +1009,7 @@ extension AIChatViewModel {
     /// matches the list's .paused badge.
     private func recheckCanResumeFromHistory() {
         guard let sessionId, !isProcessing, let lastEntry = agentHistory.last else { return }
-        var isInterrupted: Bool
+        let isInterrupted: Bool
         if lastEntry.role == .user {
             let allToolResults = !lastEntry.parts.isEmpty && lastEntry.parts.allSatisfy {
                 if case .toolResult = $0 { return true }; return false
@@ -883,17 +1021,16 @@ extension AIChatViewModel {
                 }
                 return false
             }()
-            isInterrupted = allToolResults || isContinueMessage
-
             // [T-ios-orphan-user-tail GH#262/#263] Third interrupted shape: a
             // plain-text user turn with NO reply after it at all.
             //
             // How it is produced: `send()` persists the user turn BEFORE the
-            // request goes out. If the process dies between that write and the
-            // reply landing — iOS reclaiming a backgrounded app is the
-            // reported case — the assistant side never reaches the store. And
-            // it cannot be reconstructed later, because ChatStore.appendMessages
-            // drops any assistant row with no echoable content (the filter that
+            // request goes out (AIChatViewModel ~2645). If the process dies
+            // between that write and the reply landing — iOS reclaiming a
+            // backgrounded app is the reported case, `BG task grants: 0` — the
+            // assistant side never reaches the store. And it cannot be
+            // reconstructed later, because ChatStore.appendMessages drops any
+            // assistant row with no echoable content (the ~2633 filter that
             // exists to avoid `400 content or tool_calls must be set`). The
             // same filter also swallows persistErrorInfo's empty-parts carrier
             // row, so an early network failure lands here too.
@@ -912,19 +1049,19 @@ extension AIChatViewModel {
             // False-positive safety — this must never fire on a turn that is
             // simply still waiting. Four independent gates already hold:
             //   1. `!isProcessing` (this function's guard) — send() sets it
-            //      true before persisting the user row, and only clears it in
-            //      the task epilogue, so the entire in-flight window is
-            //      excluded in-process.
+            //      true at ~2424, BEFORE persisting the user row at ~2645, and
+            //      only clears it in the task epilogue, so the entire in-flight
+            //      window is excluded in-process.
             //   2. `SessionActivityTracker.isActive` (checked below) — covers a
             //      second VM observing a session another VM is driving.
             //   3. This function only runs from loadSession() / the SKIP-LOAD
             //      re-enter — never mid-stream.
             //   4. The list cell re-checks `!vm.isProcessing && !trackerActive`
-            //      before drawing the banner.
+            //      before drawing the banner (CollectionViewMessageListV3 ~1462).
             // A cold start after a kill satisfies all four precisely because
             // the process that was processing no longer exists.
             let isUnansweredUserTurn = !allToolResults && !isContinueMessage
-            isInterrupted = isInterrupted || isUnansweredUserTurn
+            isInterrupted = allToolResults || isContinueMessage || isUnansweredUserTurn
         } else if lastEntry.role == .assistant {
             let hasToolUse = lastEntry.parts.contains {
                 if case .toolUse = $0 { return true }; return false
@@ -934,22 +1071,26 @@ extension AIChatViewModel {
             isInterrupted = false
         }
         if isInterrupted {
-            // [T-ios-group-pause-badge-restamp] This is a RE-DETECTION of an
-            // interruption that already happened (possibly days ago) — the
-            // persisted tail still looks unfinished. It is not a new entry
-            // into the paused state, so the badge must keep its original
-            // entry timestamp; otherwise merely opening or cold-start
-            // scanning an old chat resets the group card's 24h freshness
-            // window and a long-stale pause flags its group forever.
-            isRedetectingInterruptedTail = true
-            defer { isRedetectingInterruptedTail = false }
-
             // [T-ios-session-status-mismatch] Cross-check the tracker before
             // declaring "interrupted" — a live loop's DB tail looks identical
             // to a stopped one.
             if SessionActivityTracker.shared.isActive(sessionId) {
                 logger.info("[SessionLoad] \(sessionId.prefix(8)) — tail looks interrupted but tracker says active, skipping canResume=true")
+            } else if UserAskCenter.shared.hasPendingAsk(inSession: sessionId) {
+                // [T-user-ask] The tail is a user_ask waiting for its answer
+                // (restored after a kill): the card resumes the run when it is
+                // answered — a Resume button would only race it.
+                logger.info("[SessionLoad] \(sessionId.prefix(8)) — tail is a pending user_ask, no Resume")
             } else if !canResume {
+                // [T-ios-group-pause-badge-restamp] This is a RE-DETECTION of an
+                // interruption that already happened (possibly days ago) — the
+                // persisted tail still looks unfinished. It is not a new entry
+                // into the paused state, so the badge must keep its original
+                // entry timestamp; otherwise merely opening or cold-start
+                // scanning an old chat resets the group card's 24h freshness
+                // window and a long-stale pause flags its group forever.
+                isRedetectingInterruptedTail = true
+                defer { isRedetectingInterruptedTail = false }
                 canResume = true
                 if let lastAssistant = messages.last, lastAssistant.role == .assistant {
                     self.committedBlockCount = lastAssistant.blocks.count
@@ -962,18 +1103,6 @@ extension AIChatViewModel {
             canResume = false
             logger.info("[SessionLoad] \(sessionId.prefix(8)) — tail NOT interrupted, clearing stale canResume")
         }
-    }
-
-    /// Find the tool name for a given toolUseId by scanning all messages for a matching toolUse part.
-    private static func findToolName(for toolUseId: String, in messages: [RawMessage]) -> String {
-        for msg in messages {
-            for part in msg.parts {
-                if case .toolUse(let tu) = part, tu.toolUseId == toolUseId {
-                    return tu.name
-                }
-            }
-        }
-        return "tool"
     }
 
     /// Recover original file content for a file_write tool from persisted ToolUse input.
@@ -992,7 +1121,7 @@ extension AIChatViewModel {
     }
 
     /// Apply tool results from a tool-result RawMessage onto an assistant ChatMessage's tool blocks.
-    private nonisolated static func applyToolResults(from raw: RawMessage, to assistant: ChatMessage, mediaResolver: (MediaRef) -> URL) {
+    private static func applyToolResults(from raw: RawMessage, to assistant: ChatMessage, mediaResolver: (MediaRef) -> URL) {
         let toolResults: [ToolResult] = raw.parts.compactMap {
             if case .toolResult(let tr) = $0 { return tr }
             return nil
@@ -1005,7 +1134,7 @@ extension AIChatViewModel {
 
             let isToolBlock: Bool
             switch block.kind {
-            case .shellTool, .fileReadTool, .fileWriteTool, .fileEditTool, .browserTool, .readImageTool, .memoryTool:
+            case .shellTool, .fileReadTool, .fileWriteTool, .fileEditTool, .browserTool, .readImageTool, .memoryTool, .delegateTool, .userAskTool:
                 isToolBlock = true
             default:
                 isToolBlock = false
@@ -1028,17 +1157,20 @@ extension AIChatViewModel {
 
             let tr = toolResults[resultIdx]
             resultIdx += 1
+            // [T-tool-title-reminder] The one-time title note is for the model;
+            // never show it on the card.
+            let visibleOutput = ToolTitleReminder.stripForDisplay(tr.output)
 
             switch block.kind {
             case .shellTool(let cmd):
-                block.content = tr.output
+                block.content = visibleOutput
             case .browserTool, .readImageTool:
-                block.content = tr.output
+                block.content = visibleOutput
                 if let ref = tr.mediaRef {
                     block.imageFilePath = mediaResolver(ref).path
                 }
             default:
-                block.content = tr.output
+                block.content = visibleOutput
             }
             // Prefer the explicit persisted status (distinguishes cancelled from failed);
             // fall back to the success bool for rows written before the status field existed.
@@ -1083,12 +1215,12 @@ extension AIChatViewModel {
         let model = selectedModel
         let session = await ChatStore.shared.createSession(modelId: model.id, source: sessionSource)
         sessionId = session.id
-        Self.activeSessionId = session.id
-
-        // Apply default env profile to new sessions, if one is set.
-        if let defaultProfile = EnvProfileStore.shared.defaultProfile {
-            await ChatStore.shared.updateSessionEnvProfileId(session.id, envProfileId: defaultProfile.id)
-        }
+        // [T-minisurl-wrong-active-session] No Self.activeSessionId write:
+        // drafts are also created by non-UI flows (chat.prompt RPC, share
+        // extension, App Intents), and stealing the frontmost pointer from
+        // here broke minis:// resolution for the session the user was
+        // actually viewing. The on-screen draft case is covered by
+        // AIChatView's `.onChange(of: vm.sessionId)`.
         // [T-memory-enabled-new-session-bug] Sync the @Published memoryEnabled
         // to the value createSession just persisted from the global default.
         // A draft VM initializes memoryEnabled = true and never runs
@@ -1110,7 +1242,7 @@ extension AIChatViewModel {
         //
         // We also register a draftId→realId alias so sidebar rows that still
         // identify themselves by draftId (the `displaySessions` proxy in
-        // ContentView.swift keeps the draft tag to preserve List(selection:)
+        // ContentView+SidebarGrouping.swift keeps the draft tag to preserve List(selection:)
         // across the migration) can still query `isActive(draftId)` and get
         // the current running state of the real session underneath. Alias is
         // cleared in the $isProcessing sink's inactive branch.
@@ -1333,7 +1465,10 @@ extension AIChatViewModel {
     /// where the few most-recent sessions all used a model the user has
     /// since removed.
     private static func resolveLastUsedEntry(excludingSessionId: String, store: ProviderConfigStore) async -> ModelEntry? {
-        let recents = await ChatStore.shared.listSessions()
+        // [T-child-session-leak] Agent child sessions run on whatever tier the
+        // parent chose for them (often the Sub group); they are not a signal
+        // for "the model the user last picked".
+        let recents = await ChatStore.shared.listSessions().filter { !$0.isChild }
         let scanLimit = 20
         var scanned = 0
         for session in recents {
@@ -1437,16 +1572,82 @@ extension AIChatViewModel {
     /// which is the exact defect the snapshot exists to remove. nil simply
     /// leaves the row unattributed (rendered as "estimated") rather than
     /// recording a guess.
-    func buildRawMessage(_ msg: AgentMessage, tokenUsage: TokenUsage? = nil, snapshots: [String: (toolName: String, snapshot: ToolSnapshot)] = [:], thoughtSignatures: [String: String] = [:], reasoningContent: String? = nil, streamInterruptCount: Int = 0, toolStatuses: [String: String] = [:], modelEntryId: String? = nil) async -> RawMessage? {
+    /// [T-paste-single-split] `pastedParts` maps an expanded model text (as it
+    /// appears in the AgentMessage's `.text` part) to the compact
+    /// `.text`/`.mediaRef` run that `parts_json` should store instead — built
+    /// by `consumePastedDraft` at the draft→message boundary and passed
+    /// through by the three user-message persist sites. Persistence cannot
+    /// re-derive this itself: by the time we get here the literal is gone from
+    /// the text and the buffer entry is consumed.
+    func buildRawMessage(_ msg: AgentMessage, tokenUsage: TokenUsage? = nil, snapshots: [String: (toolName: String, snapshot: ToolSnapshot)] = [:], thoughtSignatures: [String: String] = [:], reasoningContent: String? = nil, streamInterruptCount: Int = 0, toolStatuses: [String: String] = [:], modelEntryId: String? = nil, pastedParts: [String: [ContentPart]] = [:]) async -> RawMessage? {
         await ensureSession()
         guard let sessionId else { return nil }
 
+        let parts = await Self.storedParts(for: msg, sessionId: sessionId, snapshots: snapshots,
+                                           thoughtSignatures: thoughtSignatures, toolStatuses: toolStatuses,
+                                           pastedParts: pastedParts)
+
+        let storedUsage: StoredTokenUsage? = tokenUsage.map {
+            StoredTokenUsage(
+                inputTokens: $0.inputTokens, outputTokens: $0.outputTokens,
+                cacheCreationTokens: $0.cacheCreationTokens, cacheReadTokens: $0.cacheReadTokens,
+                latestContextTokens: $0.latestContextTokens,
+                estimatedRequestTokens: $0.estimatedRequestTokens > 0 ? $0.estimatedRequestTokens : nil,
+                estimatedFixedTokens: $0.estimatedFixedTokens > 0 ? $0.estimatedFixedTokens : nil,
+                calibrationModelId: $0.estimatedRequestTokens > 0 ? $0.calibrationModelId : nil,
+                estimatorVersion: $0.estimatedRequestTokens > 0 && $0.estimatorVersion > 0 ? $0.estimatorVersion : nil
+            )
+        }
+
+        var raw = RawMessage(
+            id: UUID().uuidString, sessionId: sessionId,
+            role: msg.role == .user ? .user : .assistant,
+            parts: parts, createdAt: Date(), tokenUsage: storedUsage,
+            reasoningContent: reasoningContent ?? msg.reasoningContent,
+            streamInterruptCount: streamInterruptCount
+        )
+        // [T-responses-echo-persist] Carry the native reasoning head to disk.
+        // Taken off the AgentMessage itself, so every persist site gets it
+        // without a new parameter. `persistableJSON` drops `encrypted_content`
+        // and returns nil when there is nothing worth storing.
+        raw.reasoningEchoJSON = msg.reasoningEcho?.persistableJSON
+        // [T-token-attribution-snapshot] Resolved from the entry the caller
+        // says served this turn — the provider TYPE is stored as its rawValue
+        // so grouping never depends on a localized display string.
+        if let eid = modelEntryId, let entry = ProviderConfigStore.shared.entry(for: eid) {
+            raw.modelId = entry.model.id
+            raw.modelDisplayName = entry.model.displayName
+            raw.providerType = ProviderConfigStore.shared
+                .instance(for: entry.providerInstanceId)?.providerType.rawValue
+            raw.providerInstanceId = entry.providerInstanceId
+        }
+        return raw
+    }
+
+    /// [T-ctx-builder] The AgentMessage -> stored parts step of buildRawMessage,
+    /// moved verbatim: what a message turns into on disk (user images saved as
+    /// media through `store`, tool images as snapshot refs, pasted text as its
+    /// stored parts). The reload half is RawMessage.toAgentMessage. No
+    /// behaviour change.
+    static func storedParts(for msg: AgentMessage, sessionId: String,
+                            snapshots: [String: (toolName: String, snapshot: ToolSnapshot)] = [:],
+                            thoughtSignatures: [String: String] = [:], toolStatuses: [String: String] = [:],
+                            pastedParts: [String: [ContentPart]] = [:],
+                            store: ChatStore = .shared) async -> [ContentPart] {
         var parts: [ContentPart] = []
         for part in msg.parts {
             switch part {
             case .text(let s):
-                parts.append(.text(s))
-            case .toolUse(let id, let name, let input):
+                // [T-paste-single-split] A user text that came from a pasted
+                // draft is stored as the compact `.text`/`.mediaRef` run built
+                // at the split, so `parts_json` never carries the full blob and
+                // the bubble never has to typeset it.
+                if let stored = pastedParts[s] {
+                    parts.append(contentsOf: stored)
+                } else {
+                    parts.append(.text(s))
+                }
+            case .toolUse(let id, let name, let input, _):
                 let inputJSON: String
                 if let data = try? JSONSerialization.data(withJSONObject: input),
                    let str = String(data: data, encoding: .utf8) {
@@ -1459,54 +1660,22 @@ extension AIChatViewModel {
                     description: input["tool_title"] as? String,
                     thoughtSignature: thoughtSignatures[id]
                 )))
-            case .toolResult(let id, let name, let content, let isError, let imgData, _, let pageURL, _):
+            case .toolResult(let id, let name, let content, let isError, let imgData, _, let pageURL, _, _):
                 _ = name // name stored only in toolUse
                 let snap = snapshots[id]?.snapshot
-                // Only persist mediaRef for tool results that carried image data to the model
-                // (i.e. screenshot action). Snapshot images are for display only and should
-                // NOT be resent to the model on session reload.
-                let mediaRef: MediaRef? = imgData != nil ? snap?.mediaRef : nil
+                let mediaRef = Self.toolResultMediaRef(imageData: imgData, snapshot: snap)
                 let truncatedURL = pageURL.map { ToolResult.truncateURL($0) }
                 let statusStr = toolStatuses[id] ?? (isError ? "failed" : "success")
                 parts.append(.toolResult(ToolResult(
                     toolUseId: id, output: content, success: !isError, mediaRef: mediaRef, snapshot: snap, pageURL: truncatedURL, status: statusStr
                 )))
             case .imageData(let data, let mimeType, let linuxPath):
-                let ref = await ChatStore.shared.saveMedia(
-                    data: data, mimeType: mimeType, sessionId: sessionId,
-                    linuxPath: linuxPath
-                )
+                let ref = await Self.persistedUserImageRef(data: data, mimeType: mimeType, sessionId: sessionId, linuxPath: linuxPath,
+                                                           store: store)
                 parts.append(.mediaRef(ref))
             }
         }
-
-        let storedUsage: StoredTokenUsage? = tokenUsage.map {
-            StoredTokenUsage(
-                inputTokens: $0.inputTokens, outputTokens: $0.outputTokens,
-                cacheCreationTokens: $0.cacheCreationTokens, cacheReadTokens: $0.cacheReadTokens,
-                latestContextTokens: $0.latestContextTokens
-            )
-        }
-
-        var raw = RawMessage(
-            id: UUID().uuidString, sessionId: sessionId,
-            role: msg.role == .user ? .user : .assistant,
-            parts: parts, createdAt: Date(), tokenUsage: storedUsage,
-            reasoningContent: reasoningContent ?? msg.reasoningContent,
-            streamInterruptCount: streamInterruptCount
-        )
-
-        // [T-token-attribution-snapshot] Resolved from the entry the caller
-        // says served this turn — the provider TYPE is stored as its rawValue
-        // so grouping never depends on a localized display string.
-        if let eid = modelEntryId, let entry = ProviderConfigStore.shared.entry(for: eid) {
-            raw.modelId = entry.model.id
-            raw.modelDisplayName = entry.model.displayName
-            raw.providerType = ProviderConfigStore.shared
-                .instance(for: entry.providerInstanceId)?.providerType.rawValue
-            raw.providerInstanceId = entry.providerInstanceId
-        }
-        return raw
+        return parts
     }
 
     /// Phase B: Return the LLM-facing view of agentHistory.
@@ -1530,6 +1699,46 @@ extension AIChatViewModel {
         return last.parts.contains { if case .toolResult = $0 { return true }; return false }
     }
 
+    /// [T-ios-callback-tail-empty-turn] True when the history ends on a
+    /// sub-agent callback that carries no follow-up instruction.
+    ///
+    /// `<agent_callback kind="finished">` is delivered as a USER message
+    /// (AgentCallback.swift) and auto-starts a parent turn via
+    /// `AgentJobRegistry.runThen` → `submitProgrammaticPrompt`. The tail is
+    /// then a completion report and nothing else — no question, no task — and
+    /// GPT-5.6 Terra over Codex OAuth answers that ~70% of the time with one
+    /// round of empty reasoning and a stop: no text, no tool call. The user
+    /// sees the run end for no reason, and Retry re-sends the identical
+    /// history, so it usually stalls again.
+    ///
+    /// Same "the model owes us a follow-up" situation as a dangling tool
+    /// result, so it earns the same one-shot reminder — the tool-result
+    /// predicate above simply never matched it, because a callback's parts are
+    /// `.text`, never `.toolResult`.
+    ///
+    /// A callback followed by real user text is NOT this case: the user has
+    /// given the model something to do, and an empty answer to that is an
+    /// ordinary empty response.
+    func lastEffectiveMessageIsBareAgentCallback() -> Bool {
+        guard let last = effectiveAgentHistoryUncounted().last, last.role == .user else { return false }
+        var sawCallback = false
+        for part in last.parts {
+            switch part {
+            case .text(let t):
+                let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                // Any non-callback text means the turn has a real instruction.
+                guard AgentCallback.isCallbackText(trimmed) else { return false }
+                sawCallback = true
+            default:
+                // A tool result / image / anything else is a different tail
+                // shape; the tool-result path owns those.
+                return false
+            }
+        }
+        return sawCallback
+    }
+
     /// [T-ios-empty-after-toolresult-reminder] Returns the effective history
     /// with a `<system-reminder>` appended to the LAST tool result's text
     /// content, nudging the model to actually produce output after a tool
@@ -1545,11 +1754,15 @@ extension AIChatViewModel {
         if let partIdx = parts.indices.last(where: {
             if case .toolResult = parts[$0] { return true }; return false
         }) {
-            if case let .toolResult(id, name, content, isError, imageData, imageMimeType, pageURL, imageLinuxPath) = parts[partIdx] {
+            if case let .toolResult(id, name, content, isError, imageData, imageMimeType, pageURL, imageLinuxPath, isReadback) = parts[partIdx] {
                 parts[partIdx] = .toolResult(
                     id: id, name: name, content: content + reminder, isError: isError,
                     imageData: imageData, imageMimeType: imageMimeType,
-                    pageURL: pageURL, imageLinuxPath: imageLinuxPath
+                    // [T-offload-readback-loop] Carry the flag across the
+                    // rebuild. Appending a reminder must not launder a
+                    // read-back into a fresh offload candidate.
+                    pageURL: pageURL, imageLinuxPath: imageLinuxPath,
+                    isOffloadReadback: isReadback
                 )
                 history[lastIdx] = AgentMessage(
                     role: history[lastIdx].role,
@@ -1564,272 +1777,232 @@ extension AIChatViewModel {
         return history
     }
 
-    func effectiveAgentHistory() -> [AgentMessage] {
-        // [T-perf-effective-history-cache] Cache the dropOrphanedToolParts result
-        // so repeated calls within the same agent-history state are O(1) instead
-        // of O(n×m). DeepMode auto-continue can trigger 3–8 inference calls per
-        // turn (Plan-First + Self-Verify + retries), each calling this function
-        // before every request — that was 3–8× the same O(n×m) work per turn.
-        // Invalidation key: agentHistory.count (append-only during a turn) +
-        // cachedLatestMarker?.id (compaction changes the marker). If both match
-        // the last-computed state, the cleaned result is identical.
-        let currentCount = agentHistory.count
-        let currentMarkerId = cachedLatestMarker?.id
-        if let cached = _cachedEffectiveHistory,
-           cached.historyCount == currentCount,
-           cached.markerId == currentMarkerId {
-            logger.info("[Compact] effectiveAgentHistory: cache hit \(cached.result.count) msg(s) from agentHistory.count=\(currentCount) markerId=\(currentMarkerId?.prefix(8) ?? "nil")")
-            return cached.result
-        }
-
-        // ── [T-perf-effective-history-incremental] Incremental fast path ──
-        // When: marker unchanged, history only grew (append-only), and previous
-        // build had no orphans (so cached.result matches raw history prefix).
-        // Cost: O(Δ×m) instead of O(n×m) — 10–50× faster on long DeepMode sessions.
-        //
-        // [T-perf-marker-incremental] This incremental path now ALSO covers marker
-        // (compacted) sessions. When markerId is unchanged and anchorIdx is stable,
-        // the preAnchor slice + summary injection are identical to the cached copy
-        // — only the postAnchor tail grew. We append the new tail messages and
-        // orphan-check them against the cumulative id sets. This eliminates the
-        // 100–300ms full-build that previously fired on EVERY send in DeepMode
-        // long conversations (which are almost always compacted).
-        if let cached = _cachedEffectiveHistory,
-           cached.markerId == currentMarkerId,
-           currentCount > cached.historyCount {
-            let deltaStart = cached.historyCount
-            let newMessages = Array(agentHistory[deltaStart...])
-
-            // Incrementally update id sets from new messages only
-            var toolUseIds = cached.toolUseIds
-            var toolResultIds = cached.toolResultIds
-            for msg in newMessages {
-                for part in msg.parts {
-                    switch part {
-                    case .toolUse(let id, _, _): toolUseIds.insert(id)
-                    case .toolResult(let id, _, _, _, _, _, _, _): toolResultIds.insert(id)
-                    default: break
-                    }
-                }
-            }
-
-            // Check for orphans (mirrors dropOrphanedToolParts logic)
-            let orphanedResults = toolResultIds.subtracting(toolUseIds)
-            var orphanedUses = toolUseIds.subtracting(toolResultIds)
-
-            // In-flight exemption: tool_uses in the final assistant message
-            // are not orphans when the loop is between "model asked for tools"
-            // and "results appended".
-            if let last = agentHistory.last, last.role == .assistant {
-                for part in last.parts {
-                    if case .toolUse(let id, _, _) = part { orphanedUses.remove(id) }
-                }
-            }
-
-            if orphanedResults.isEmpty && orphanedUses.isEmpty {
-                // No orphans → simple append is safe.
-                // For non-marker sessions: cached.result == raw prefix (identity).
-                // For marker sessions: preAnchor + summary-injection are stable
-                // when markerId is unchanged; the new messages are all in the
-                // postAnchor tail, which maps 1:1 to the cached result's tail.
-                var result = cached.result
-                result.append(contentsOf: newMessages)
-                _cachedEffectiveHistory = (
-                    result: result,
-                    historyCount: currentCount,
-                    markerId: currentMarkerId,
-                    anchorIdx: cached.anchorIdx,
-                    toolUseIds: toolUseIds,
-                    toolResultIds: toolResultIds
-                )
-                let path = currentMarkerId == nil ? "no-marker" : "marker"
-                logger.info("[Compact] effectiveAgentHistory: incremental build (\(path)) +\(newMessages.count) msg(s), total=\(result.count) (Δ only, no full scan)")
-                return result
-            } else {
-                logger.info("[Compact] effectiveAgentHistory: incremental skipped (orphans found), falling back to full build")
-            }
-        }
-        // ── End incremental fast path ──
-
-        let rawHistory = effectiveAgentHistoryUncounted()
-        let result = Self.dropOrphanedToolParts(rawHistory, logger: logger)
-
-        // [T-perf-marker-incremental] Collect id sets from the RESULT (after
-        // orphan removal) for ALL sessions — including marker sessions. The
-        // old code only collected for non-marker sessions, which meant marker
-        // sessions could never use the incremental path.
-        var newToolUseIds: Set<String> = []
-        var newToolResultIds: Set<String> = []
-        for msg in result {
-            for part in msg.parts {
-                switch part {
-                case .toolUse(let id, _, _): newToolUseIds.insert(id)
-                case .toolResult(let id, _, _, _, _, _, _, _): newToolResultIds.insert(id)
-                default: break
-                }
-            }
-        }
-
-        // [T-perf-marker-incremental] Resolve anchorIdx for marker sessions so
-        // the next call can verify it hasn't shifted. This is a simple O(n)
-        // property scan — much cheaper than the O(n×m) dropOrphanedToolParts
-        // we just avoided. Only needed when a marker is present.
-        var resolvedAnchorIdx: Int? = nil
-        if let marker = cachedLatestMarker, marker.version >= 2,
-           let anchorId = marker.lastCompactedMessageId {
-            resolvedAnchorIdx = agentHistory.lastIndex(where: { $0.dbMessageId == anchorId })
-        }
-
-        _cachedEffectiveHistory = (
-            result: result,
-            historyCount: currentCount,
-            markerId: currentMarkerId,
-            anchorIdx: resolvedAnchorIdx,
-            toolUseIds: newToolUseIds,
-            toolResultIds: newToolResultIds
+    /// [T-ios-callback-tail-empty-turn] Same one-shot nudge as
+    /// `historyWithEmptyToolResultReminder`, for the other tail shape that
+    /// leaves the model owing a reply: a bare `<agent_callback>` completion
+    /// report with no instruction after it.
+    ///
+    /// The reminder is worded for THIS situation rather than reusing the
+    /// tool-result text: "a tool result was just provided" would be a false
+    /// statement here, and the useful nudge is different — the parent is meant
+    /// to act on a sub-agent's result (report it, use it, or delegate the next
+    /// step), not to continue its own tool chain.
+    ///
+    /// In-flight only, never persisted: the reminder exists solely on the
+    /// single retry request, exactly like the tool-result variant.
+    func historyWithEmptyCallbackReminder() -> [AgentMessage] {
+        var history = effectiveAgentHistory()
+        guard let lastIdx = history.indices.last else { return history }
+        let reminder = "\n\n<system-reminder>The previous response was empty. The message above is a sub agent's completion report, delivered by the system — the user has not typed anything new. You MUST still respond: tell the user what the sub agent found and what it means for the task, call the next tool if more work is needed, or delegate the next step. Do not return an empty response.</system-reminder>"
+        var parts = history[lastIdx].parts
+        guard let partIdx = parts.indices.last(where: {
+            if case .text = parts[$0] { return true }; return false
+        }), case let .text(existing) = parts[partIdx] else { return history }
+        parts[partIdx] = .text(existing + reminder)
+        history[lastIdx] = AgentMessage(
+            role: history[lastIdx].role,
+            parts: parts,
+            isInterrupted: history[lastIdx].isInterrupted,
+            reasoningContent: history[lastIdx].reasoningContent,
+            reasoningEcho: history[lastIdx].reasoningEcho,
+            dbMessageId: history[lastIdx].dbMessageId
         )
+        return history
+    }
+
+    // MARK: - [T-longctx-persona-reminder] Long-context persona reminder
+
+    /// Context size (API-reported input tokens) past which the outbound
+    /// request carries a reminder about the user's own SOUL.md / GLOBAL.md.
+    ///
+    /// Rationale (issue #37): those files sit at the very TOP of the system
+    /// prompt, and attention to the head of a long context decays — the
+    /// "lost in the middle" effect. The reported symptom was an agent that
+    /// stopped honouring a GLOBAL.md rule after enough turns and fell back to
+    /// its training-data default. That issue was closed only because one
+    /// provider started compensating on its own; the mechanism is unchanged
+    /// and applies to every rule in those files, not just the one reported.
+    static let kPersonaReminderContextTokens = 100_000
+
+    /// Re-remind roughly every this many additional context tokens.
+    ///
+    /// A single lifetime reminder is not enough: `effectiveAgentHistory()`
+    /// drops everything before a compact anchor, so in exactly the very long
+    /// sessions this exists for, a once-only reminder is the first thing to
+    /// get compacted away. Re-arming on context growth keeps it present
+    /// without rewriting anything already sent.
+    static let kPersonaReminderRearmTokens = 100_000
+
+    /// Marker that identifies one of our own persona reminders in history.
+    /// Kept deliberately greppable so `personaReminderAlreadyInHistory` can
+    /// recognise reminders that were persisted by an earlier launch.
+    static let kPersonaReminderMarker = "[Minis runtime reminder]"
+
+    /// True when the reminder should ride along with this request.
+    ///
+    /// Deliberately keyed on the API-reported token count rather than
+    /// `estimateContextTokens()`: that function walks the whole history and
+    /// logs a per-message breakdown, which is far too costly to run on every
+    /// round just to answer a threshold question. Callers pass the value the
+    /// provider already told us.
+    ///
+    /// Past the threshold this no longer fires on EVERY round — see
+    /// `personaReminderIsDue`, which additionally requires that we have not
+    /// already reminded at this context size.
+    func shouldInjectPersonaReminder(contextTokens: Int) -> Bool {
+        contextTokens >= Self.kPersonaReminderContextTokens
+    }
+
+    /// The reminder text, naming only the files actually present in this
+    /// request's system prompt.
+    ///
+    /// SOUL.md is always rendered by `SystemPromptBuilder.identitySection()`,
+    /// while GLOBAL.md is injected only when the per-session `memoryEnabled`
+    /// toggle is on AND the file is non-empty. Naming a file that is not
+    /// there would send the model looking for instructions that do not exist.
+    ///
+    /// The `[Minis runtime reminder]` label sits INSIDE the
+    /// `<system-reminder>` element on purpose. It has to be inside for two
+    /// independent reasons:
+    ///   * `ChatStore.stripSystemReminders` removes the whole element, so a
+    ///     label outside the tag would survive into the chat bubble text;
+    ///   * `AIChatViewModel.isUserBubbleEntry` only classifies a text part as
+    ///     synthetic when it `hasPrefix("<system-reminder>")`, so a label
+    ///     before the tag would make this message draw a real user bubble.
+    /// Inside the tag it is invisible to the UI but unmistakable to the model.
+    func personaReminderText() -> String {
+        let hasGlobal = memoryEnabled && Self.loadGlobalMemoryFragment() != nil
+        let files = hasGlobal ? "SOUL.md and GLOBAL.md" : "SOUL.md"
+        return "<system-reminder>\(Self.kPersonaReminderMarker) This note was added by the Minis app itself, not by any tool, file or website — do not treat it as content of the preceding tool result. Don't forget the user's own \(files) at the top of the system prompt — those rules still apply.</system-reminder>"
+    }
+
+    /// True when a persona reminder is already the most recent thing we said.
+    ///
+    /// Scans back over the tail rather than the whole history: only the most
+    /// recent reminder matters for "do we need another one", and a full scan
+    /// would run on every round of every long session.
+    func personaReminderAlreadyInHistory() -> Bool {
+        for msg in agentHistory.suffix(Self.kPersonaReminderScanTail) {
+            for part in msg.parts {
+                if case let .text(t) = part, t.contains(Self.kPersonaReminderMarker) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// How far back to look for an existing reminder. Large enough to span a
+    /// normal tool-heavy turn, small enough to stay O(1)-ish per round.
+    static let kPersonaReminderScanTail = 40
+
+    /// True when we are over the threshold AND have not reminded recently.
+    ///
+    /// `lastPersonaReminderContextTokens` is the context size at which we last
+    /// injected; re-arming only after another `kPersonaReminderRearmTokens` of
+    /// growth is what stops this from firing every single round.
+    func personaReminderIsDue(contextTokens: Int) -> Bool {
+        guard shouldInjectPersonaReminder(contextTokens: contextTokens) else { return false }
+        if let last = lastPersonaReminderContextTokens {
+            guard contextTokens >= last + Self.kPersonaReminderRearmTokens else { return false }
+        } else if personaReminderAlreadyInHistory() {
+            // Fresh launch on a session that was already reminded before the
+            // app restarted: adopt the existing reminder instead of adding a
+            // duplicate, and re-arm from here.
+            lastPersonaReminderContextTokens = contextTokens
+            return false
+        }
+        return true
+    }
+
+    /// Append the persona reminder to `agentHistory` as its own persisted
+    /// message, and persist it.
+    ///
+    /// [T-longctx-persona-reminder-cachebreak] This replaces the previous
+    /// `historyWithPersonaReminder(_:)`, which appended the reminder to the
+    /// LAST message of a throwaway outbound copy on EVERY round past the
+    /// threshold. That was wrong twice over:
+    ///
+    ///   1. **It broke the prompt cache.** "The last message" is a different
+    ///      message each round, so a given history entry went out WITH the
+    ///      reminder on one round and WITHOUT it on the next. Anthropic's
+    ///      cache matches on an exact byte prefix, so mutating a message the
+    ///      model has already seen invalidates that message and everything
+    ///      after it — every round paid `cache_creation` again (observed:
+    ///      2802 / 7228 / 7422 / 519 on four consecutive rounds of one
+    ///      session) even with the caching beta headers on.
+    ///   2. **It was indistinguishable from tool output.** The text was
+    ///      concatenated onto a `tool_result`'s content string, so when the
+    ///      last tool was `file_read` the reminder looked exactly like the
+    ///      tail of the fetched file. A model reading a file from GitHub
+    ///      concluded — reasonably, given the evidence — that the repository
+    ///      was carrying a prompt-injection payload, and said so in three
+    ///      consecutive turns.
+    ///
+    /// The fix is to APPEND rather than REWRITE. A new message at the end of
+    /// history leaves every earlier byte untouched, so the cache prefix up to
+    /// that point still hits; only content after the insertion point is
+    /// re-created, which is the normal, unavoidable cost of any new message.
+    /// Being its own message also means it is never fused with tool output.
+    func appendPersonaReminderToHistory(contextTokens: Int) {
+        let msg = AgentMessage(role: .user, parts: [.text(personaReminderText())])
+        let idx = agentHistory.count
+        agentHistory.append(msg)
+        lastPersonaReminderContextTokens = contextTokens
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let pid = await self.persistAgentMessage(msg), idx < self.agentHistory.count {
+                self.agentHistory[idx].dbMessageId = pid
+            }
+        }
+    }
+
+    func effectiveAgentHistory() -> [AgentMessage] {
+        let sliced = effectiveAgentHistoryUncounted()
+        return Self.effectiveHistoryFilters(sliced, agentHistoryCount: agentHistory.count, markerId: cachedLatestMarker?.id)
+    }
+
+    /// [T-ctx-builder] The request-side filters of effectiveAgentHistory(),
+    /// moved verbatim into a static so RequestContextBuilder runs the same
+    /// code: legacy bridge rows dropped, then the orphan tool-part pass (last).
+    /// No behaviour change.
+    static func effectiveHistoryFilters(_ sliced: [AgentMessage], agentHistoryCount: Int, markerId: String?) -> [AgentMessage] {
+        let withoutBridges = Self.droppingLegacyBridgeRows(sliced)
+        if withoutBridges.count != sliced.count {
+            logger.info("[Bridge] dropped \(sliced.count - withoutBridges.count) legacy bridge row(s) from the request")
+        }
+        let result = Self.dropOrphanedToolParts(withoutBridges, logger: logger)
         // One-line breadcrumb on every inference call so a "summary-only"
         // regression is visible in logs without scraping agent traces.
-        logger.info("[Compact] effectiveAgentHistory: full build \(result.count) msg(s) from agentHistory.count=\(self.agentHistory.count) markerId=\(self.cachedLatestMarker?.id.prefix(8) ?? "nil") anchorIdx=\(resolvedAnchorIdx ?? -1)")
+        logger.info("[Compact] effectiveAgentHistory: returning \(result.count) msg(s) from agentHistory.count=\(agentHistoryCount) markerId=\(markerId?.prefix(8) ?? "nil")")
         return result
     }
 
-    /// [T-perf-history-bg-warmup] Kick off a background task that pre-computes
-    /// effectiveAgentHistory() so the first call inside runAgentLoop hits the
-    /// cache instead of blocking the main thread.
-    ///
-    /// Why this matters: AIChatViewModel is @MainActor, so everything inside
-    /// `Task { ... }` still runs on the main thread. Without this warmup, the
-    /// first effectiveAgentHistory() call in runAgentLoop does a full O(n×m)
-    /// scan on the main thread — 100–300ms on long DeepMode sessions.
-    ///
-    /// With warmup: the scan runs on a background thread in parallel with
-    /// attachment processing (file copies, compression, uploads), so by the
-    /// time runAgentLoop needs the history, the cache is already warm.
-    ///
-    /// Safe to call multiple times — subsequent calls no-op if a warmup task
-    /// is already running or the cache is already valid for the current state.
-    func warmupEffectiveHistoryInBackground() {
-        let currentCount = agentHistory.count
-        let currentMarkerId = cachedLatestMarker?.id
-
-        // Already cached and valid → nothing to do
-        if let cached = _cachedEffectiveHistory,
-           cached.historyCount == currentCount,
-           cached.markerId == currentMarkerId {
-            return
+    /// [T-bridge-to-reminder] Bridge texts never go out again: the model
+    /// learned to write that line itself. Two shapes reach here from the
+    /// database:
+    ///   * assistant rows that are only a bridge — what builds before this
+    ///     change wrote between a tool_result and a queued user message;
+    ///   * a bridge text part inside a longer assistant reply — an echo the
+    ///     model already produced and that was saved (sid AA40533E).
+    /// The first is dropped, the second loses that one text part (and the row
+    /// goes if nothing is left). Dropping a bridge row leaves user(tool_result)
+    /// followed by user(queued), which every provider already accepts (the
+    /// persona reminder appends a user row after a tool_result the same way;
+    /// Anthropic merges the two with tool_result first). Only text parts are
+    /// removed, so no tool_use / tool_result pairing changes.
+    static func droppingLegacyBridgeRows(_ history: [AgentMessage]) -> [AgentMessage] {
+        func isBridgePart(_ part: AgentContentPart) -> Bool {
+            if case .text(let s) = part { return RawMessage.isInternalBridgeText(s) }
+            return false
         }
-
-        // Incremental fast path is already O(Δ×m) ≈ sub-ms — only worth
-        // offloading when a full build is needed (cold cache or marker change).
-        // [T-perf-marker-incremental] The incremental path now covers marker
-        // sessions too, so we skip warmup for those as well.
-        if let cached = _cachedEffectiveHistory,
-           cached.markerId == currentMarkerId,
-           currentCount > cached.historyCount {
-            // Incremental path on main thread is fast enough (just new messages)
-            return
-        }
-
-        // Capture a snapshot of the data we need for the full build.
-        // AgentMessage is a struct (@unchecked Sendable), so the array copy
-        // is safe to pass to a background thread for read-only traversal.
-        let historySnapshot = agentHistory
-        let markerSnapshot = cachedLatestMarker
-
-        _historyWarmupTask = Task.detached(priority: .userInitiated) { [weak self] in
-            // [T-perf-warmup-marker] Build the effective slice + drop orphaned
-            // tool parts — the O(n×m) heavy part — entirely off the main thread.
-            //
-            // Previously this bailed out whenever a compact marker was present
-            // (`else { return }`), on the assumption that marker sessions were
-            // "already shorter". In DeepMode long conversations that assumption
-            // is exactly backwards: compaction fires *because* the session is
-            // long, and compaction also clears _cachedEffectiveHistory. So the
-            // first send after a compaction found a cold cache, the warmup
-            // declined to help, and the full O(n×m) build ran on the main
-            // thread — the 100–300ms send-path freeze seen only with DeepMode on.
-            //
-            // effectiveAgentHistorySlice is now a pure nonisolated static func
-            // (value-type inputs only), so marker sessions can use the warmup
-            // too. Same inputs → same result as the main-thread full build.
-            // Resolve the marker anchor index (cheap O(n) scan) up front — both the
-            // parity guard below and the cached tuple need it.
-            var resolvedAnchorIdx: Int? = nil
-            if let marker = markerSnapshot, marker.version >= 2,
-               let anchorId = marker.lastCompactedMessageId {
-                resolvedAnchorIdx = historySnapshot.lastIndex(where: { $0.dbMessageId == anchorId })
-            }
-
-            // [T-perf-warmup-marker-parity] Parity guard for v2 markers: the full
-            // build injects the summary INTO the first user message after the
-            // anchor. If the snapshot has no such user yet, the user message the
-            // caller is about to append would become the injection target — and
-            // the incremental path (which only appends) would miss that
-            // injection, producing a prompt that differs from a full build.
-            // Decline the warmup in that narrow case so the main thread's full
-            // build stays authoritative.
-            if let marker = markerSnapshot, marker.version >= 2, let anchorIdx = resolvedAnchorIdx,
-               !historySnapshot[(anchorIdx + 1)...].contains(where: { $0.role == .user }) {
-                return
-            }
-
-            let slice: [AgentMessage]
-            if let marker = markerSnapshot {
-                slice = Self.effectiveAgentHistorySlice(
-                    agentHistory: historySnapshot,
-                    marker: marker,
-                    logger: logger
-                )
-            } else {
-                slice = historySnapshot
-            }
-            let result = Self.dropOrphanedToolParts(slice, logger: logger)
-
-            // Id sets are collected from `result` (post orphan removal) to match
-            // the full-build path in effectiveAgentHistory(), so the cached sets
-            // are identical no matter which path populated them.
-            var toolUseIds: Set<String> = []
-            var toolResultIds: Set<String> = []
-            for msg in result {
-                for part in msg.parts {
-                    switch part {
-                    case .toolUse(let id, _, _): toolUseIds.insert(id)
-                    case .toolResult(let id, _, _, _, _, _, _, _): toolResultIds.insert(id)
-                    default: break
-                    }
-                }
-            }
-
-            // Write result back to the cache on the main actor.
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                // [T-perf-warmup-race-fix] Only update if state is compatible.
-                // The old guard used `== currentCount` which rejected the result
-                // whenever agentHistory grew between warmup launch and completion
-                // (N → N+1 after agentHistory.append(userMessage)). This happened
-                // on virtually every send, making the warmup a pure waste.
-                //
-                // Fix: accept the result when count >= currentCount AND marker
-                // hasn't changed. The incremental path will handle the delta
-                // (new messages since currentCount) on the next effectiveAgentHistory()
-                // call — which is exactly what the warmup was trying to prevent
-                // (a cold-cache full build on the main thread).
-                guard self.agentHistory.count >= currentCount,
-                      self.cachedLatestMarker?.id == currentMarkerId else {
-                    logger.info("[Compact] history warmup: discarded (state changed during background build)")
-                    return
-                }
-                self._cachedEffectiveHistory = (
-                    result: result,
-                    historyCount: currentCount,
-                    markerId: currentMarkerId,
-                    anchorIdx: resolvedAnchorIdx,  // resolved off-main above
-                    toolUseIds: toolUseIds,
-                    toolResultIds: toolResultIds
-                )
-                logger.info("[Compact] history warmup: completed \(result.count) msg(s) (background build, cache is now warm)")
-            }
+        guard history.contains(where: { $0.role == .assistant && $0.parts.contains(where: isBridgePart) })
+        else { return history }
+        return history.compactMap { msg in
+            guard msg.role == .assistant, msg.parts.contains(where: isBridgePart) else { return msg }
+            var kept = msg
+            kept.parts.removeAll(where: isBridgePart)
+            return kept.parts.isEmpty ? nil : kept
         }
     }
 
@@ -1860,14 +2033,42 @@ extension AIChatViewModel {
     ///
     /// Messages emptied by the drop are removed, since a parts-less message is
     /// itself invalid on several providers.
-    nonisolated static func dropOrphanedToolParts(_ history: [AgentMessage], logger: AppLogger) -> [AgentMessage] {
+    /// [T-responses-tool-id-normalize] The identity two tool parts are PAIRED by.
+    ///
+    /// The OpenAI Responses path carries a COMBINED id, `"<call_id>|<fc_id>"`
+    /// (`OpenAIAgentProvider.combineResponsesAPIIds`), because the API needs
+    /// both the `call_id` that links a `function_call_output` back to its call
+    /// and the `fc_` item id. On the wire it splits that apart and matches on
+    /// the `call_id` half alone.
+    ///
+    /// This function used to compare the RAW ids, so the two layers were using
+    /// different notions of equality: a history that mixed a combined
+    /// `call_x|fc_y` with a bare `call_x` — a cross-provider fallback, a model
+    /// switch, history rehydrated from the DB, or a relay that rewrote ids —
+    /// looked PAIRED here and came apart at the wire, producing
+    ///     No tool call found for function call output with call_id …
+    /// with nothing downstream to catch it.
+    ///
+    /// Taking the part before "|" aligns this layer with the wire. For every
+    /// other provider (Anthropic, Gemini, Chat Completions) the ids contain no
+    /// "|", so this is the identity function and their behaviour is unchanged.
+    ///
+    /// Note this is used for COMPARISON only — parts keep their original ids,
+    /// and a synthesized tool result is built with the raw id so it still
+    /// matches the call it answers.
+    static func pairingKey(_ id: String) -> String {
+        guard let pipe = id.firstIndex(of: "|") else { return id }
+        return String(id[id.startIndex..<pipe])
+    }
+
+    static func dropOrphanedToolParts(_ history: [AgentMessage], logger: AppLogger) -> [AgentMessage] {
         var toolUseIds: Set<String> = []
         var toolResultIds: Set<String> = []
         for msg in history {
             for part in msg.parts {
                 switch part {
-                case .toolUse(let id, _, _): toolUseIds.insert(id)
-                case .toolResult(let id, _, _, _, _, _, _, _): toolResultIds.insert(id)
+                case .toolUse(let id, _, _, _): toolUseIds.insert(Self.pairingKey(id))
+                case .toolResult(let id, _, _, _, _, _, _, _, _): toolResultIds.insert(Self.pairingKey(id))
                 default: break
                 }
             }
@@ -1889,7 +2090,7 @@ extension AIChatViewModel {
         // an assistant tool_use is exactly what the API expects mid-round.
         if let last = history.last, last.role == .assistant {
             for part in last.parts {
-                if case .toolUse(let id, _, _) = part { orphanedUses.remove(id) }
+                if case .toolUse(let id, _, _, _) = part { orphanedUses.remove(Self.pairingKey(id)) }
             }
         }
 
@@ -1901,8 +2102,8 @@ extension AIChatViewModel {
         cleaned.reserveCapacity(history.count)
         for var msg in history {
             let kept = msg.parts.filter { part in
-                if case .toolResult(let id, _, _, _, _, _, _, _) = part {
-                    return !orphanedResults.contains(id)
+                if case .toolResult(let id, _, _, _, _, _, _, _, _) = part {
+                    return !orphanedResults.contains(Self.pairingKey(id))
                 }
                 return true
             }
@@ -1914,7 +2115,7 @@ extension AIChatViewModel {
             // placeholder results it never got, so the pair is complete.
             guard msg.role == .assistant else { continue }
             let unanswered = kept.compactMap { part -> (String, String)? in
-                if case .toolUse(let id, let name, _) = part, orphanedUses.contains(id) {
+                if case .toolUse(let id, let name, _, _) = part, orphanedUses.contains(Self.pairingKey(id)) {
                     return (id, name)
                 }
                 return nil
@@ -1935,21 +2136,57 @@ extension AIChatViewModel {
         return cleaned
     }
 
-    /// [T-perf-warmup-marker] Pure, `nonisolated` slice builder — the effective
-    /// (about-to-be-sent) history for a given raw `agentHistory` + compact
-    /// `marker`. Extracted verbatim from `effectiveAgentHistoryUncounted()` so
-    /// the O(n) slice work can run on a background thread (the send-path
-    /// warmup) instead of blocking the main actor. It reads only value-type
-    /// data (history / marker) plus static constants — never MainActor state —
-    /// so it is safe to call off-main.
-    ///
-    /// The parameter is deliberately named `agentHistory` so the moved body's
-    /// references stay identical to the instance-method form it replaced.
-    nonisolated static func effectiveAgentHistorySlice(
-        agentHistory: [AgentMessage],
-        marker: CompactMarker,
-        logger: AppLogger
-    ) -> [AgentMessage] {
+    /// [T-ctx-trim-ladder] The compaction slice with the frozen trim plan
+    /// applied. Measurement and requests both read this, so they always see
+    /// the same bytes.
+    func effectiveAgentHistoryUncounted() -> [AgentMessage] {
+        applyFrozenTrim(compactedAgentHistory())
+    }
+
+    /// The compaction slice + summary, before any trim: what the trim planner
+    /// plans on.
+    func compactedAgentHistory() -> [AgentMessage] {
+        var drop = warmUpDropByMarker
+        let result = Self.effectiveHistory(agentHistory, marker: cachedLatestMarker,
+                                           warmUpDrop: &drop, helpers: effectiveHistoryHelpers())
+        if drop != warmUpDropByMarker { warmUpDropByMarker = drop }
+        return result
+    }
+
+    /// [T-ctx-builder] The three history helpers effectiveHistory needs, bound
+    /// to this view model (they read `agentHistory` and the model's context
+    /// settings). Tests pass their own. Used synchronously and never stored on
+    /// the view model, so capturing self strongly makes no cycle.
+    func effectiveHistoryHelpers() -> EffectiveHistoryHelpers {
+        EffectiveHistoryHelpers(
+            walkBack: { self.walkBackUserTurnsBounded(anchorIdx: $0, maxUserTextTurns: $1, maxMessages: $2) },
+            nthFromLastUserText: { self.indexOfNthFromLastUserText($0) },
+            trimWarmUp: { self.trimWarmUpToFit($0, rest: $1, summaryText: $2) }
+        )
+    }
+
+    struct EffectiveHistoryHelpers {
+        let walkBack: (_ anchorIdx: Int, _ maxUserTextTurns: Int, _ maxMessages: Int) -> WalkBackResult
+        let nthFromLastUserText: (_ n: Int) -> Int?
+        let trimWarmUp: (_ warmUp: [AgentMessage], _ rest: [AgentMessage], _ summaryText: String) -> (kept: [AgentMessage], decided: Bool)
+    }
+
+    /// [T-ctx-builder] Moved verbatim from effectiveAgentHistoryUncounted():
+    /// the compaction slice + summary injection, with the view model's state
+    /// passed in (history, marker, warm-up cache, helpers). No behaviour change.
+    static func effectiveHistory(_ history: [AgentMessage], marker: CompactMarker?,
+                                 warmUpDrop warmUpDropByMarker: inout [String: Int],
+                                 helpers: EffectiveHistoryHelpers) -> [AgentMessage] {
+        // The view model's helpers, under the names the body has always called.
+        func walkBackUserTurnsBounded(anchorIdx: Int, maxUserTextTurns: Int, maxMessages: Int) -> WalkBackResult {
+            helpers.walkBack(anchorIdx, maxUserTextTurns, maxMessages)
+        }
+        func indexOfNthFromLastUserText(_ n: Int) -> Int? { helpers.nthFromLastUserText(n) }
+        func trimWarmUpToFit(_ warmUp: [AgentMessage], rest: [AgentMessage], summaryText: String) -> (kept: [AgentMessage], decided: Bool) {
+            helpers.trimWarmUp(warmUp, rest, summaryText)
+        }
+        guard let marker = marker else { return history }
+
         // ─── v2 markers (id-only model) ────────────────────────────────
         //
         // Marker semantics:
@@ -1976,13 +2213,13 @@ extension AIChatViewModel {
         //   [the new user input the caller is about to append]
         if marker.version >= 2 {
             guard let anchorId = marker.lastCompactedMessageId,
-                  let anchorIdx = agentHistory.lastIndex(where: { $0.dbMessageId == anchorId }) else {
+                  let anchorIdx = history.lastIndex(where: { $0.dbMessageId == anchorId }) else {
                 // Anchor unresolvable → degrade safely. Don't emit a
                 // standalone summary message (creates the empty-context loop
                 // when paired with hot tools). Fall back to full history;
                 // the user can `revertCompact` if the marker is corrupt.
-                logger.warning("[Compact] effectiveAgentHistory v2: anchorId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(agentHistory.count)) — degrading to full history (no summary)")
-                return agentHistory
+                logger.warning("[Compact] effectiveAgentHistory v2: anchorId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(history.count)) — degrading to full history (no summary)")
+                return history
             }
 
             // Step 1: walk back from anchor collecting user-text turns. Stop
@@ -1995,16 +2232,15 @@ extension AIChatViewModel {
             // priorIdx is always set to a `user` message — that's what the
             // API requires for the first message in a request.
             let preAnchorCap = 100
-            let walkBack = Self.walkBackUserTurnsBounded(
+            let walkBack = walkBackUserTurnsBounded(
                 anchorIdx: anchorIdx,
                 maxUserTextTurns: Self.compactKeepRecentUserTurns,
-                maxMessages: preAnchorCap,
-                in: agentHistory
+                maxMessages: preAnchorCap
             )
             let priorIdxResolved: Int? = walkBack.priorIdx
             let priorIdx = walkBack.priorIdx ?? (anchorIdx + 1)  // empty preAnchor sentinel
             if walkBack.stopReason != "userTextTargetMet" {
-                logger.info("[CompactDiag] eAH v2 walkBack stopped: reason=\(walkBack.stopReason) priorIdx=\(priorIdx) userTextTurnsFound=\(walkBack.userTextTurnsFound) preAnchorMsgs=\(walkBack.messageCount)")
+                logger.verbose("[CompactDiag] eAH v2 walkBack stopped: reason=\(walkBack.stopReason) priorIdx=\(priorIdx) userTextTurnsFound=\(walkBack.userTextTurnsFound) preAnchorMsgs=\(walkBack.messageCount)")
             }
 
             let summaryText = Self.compactSummaryWrappedText(marker.summary)
@@ -2022,12 +2258,26 @@ extension AIChatViewModel {
             // Drop any tool_result > 1000 chars in the preAnchor slice and
             // strip the matching tool_use part (same id) from the assistant
             // message so the model never sees a dangling tool_use/result.
-            let preAnchorRaw: [AgentMessage] = (priorIdx <= anchorIdx) ? Array(agentHistory[priorIdx...anchorIdx]) : []
+            //
+            // [T-ctx-pin-request] One round longer than the cap (a single
+            // "continue" driving 100+ tool messages) used to keep NO warm-up at
+            // all, so the user's own request survived only as the summary's
+            // paraphrase of it. Keep that one message verbatim instead: the
+            // last thing the user really asked before the anchor.
+            let pinnedRequestIdx: Int? = (priorIdxResolved == nil && walkBack.stopReason == "messageCapWouldExceed")
+                ? Self.lastRealUserTextIndex(in: history, upToIncluding: anchorIdx) : nil
+            let preAnchorRaw: [AgentMessage]
+            if let pinnedRequestIdx {
+                preAnchorRaw = [history[pinnedRequestIdx]]
+                logger.verbose("[CompactDiag] eAH v2 round over the \(preAnchorCap)-message cap: keeping the user's request at \(pinnedRequestIdx) verbatim")
+            } else {
+                preAnchorRaw = (priorIdx <= anchorIdx) ? Array(history[priorIdx...anchorIdx]) : []
+            }
             var droppedToolIds: Set<String> = []
             var droppedCount = 0
             for msg in preAnchorRaw {
                 for part in msg.parts {
-                    if case .toolResult(let id, _, let content, _, _, _, _, _) = part,
+                    if case .toolResult(let id, _, let content, _, _, _, _, _, _) = part,
                        content.count > 1000 {
                         droppedToolIds.insert(id)
                         droppedCount += 1
@@ -2040,9 +2290,9 @@ extension AIChatViewModel {
                 // Filter parts: drop the large toolResult AND its paired toolUse.
                 let kept = msg.parts.filter { part in
                     switch part {
-                    case .toolUse(let id, _, _):
+                    case .toolUse(let id, _, _, _):
                         return !droppedToolIds.contains(id)
-                    case .toolResult(let id, _, _, _, _, _, _, _):
+                    case .toolResult(let id, _, _, _, _, _, _, _, _):
                         return !droppedToolIds.contains(id)
                     default:
                         return true
@@ -2053,7 +2303,7 @@ extension AIChatViewModel {
                 preAnchorPruned.append(msg)
             }
             if droppedCount > 0 {
-                logger.info("[CompactDiag] eAH v2 preAnchor prune: dropped \(droppedCount) toolResult(>1kc) + paired toolUse, \(preAnchorRaw.count - preAnchorPruned.count) messages emptied; pruned slice=\(preAnchorPruned.count)")
+                logger.verbose("[CompactDiag] eAH v2 preAnchor prune: dropped \(droppedCount) toolResult(>1kc) + paired toolUse, \(preAnchorRaw.count - preAnchorPruned.count) messages emptied; pruned slice=\(preAnchorPruned.count)")
             }
 
             // ROLE ALIGNMENT: the API requires the first message to be `user`.
@@ -2066,12 +2316,39 @@ extension AIChatViewModel {
                 preAnchorPruned.removeFirst()
             }
 
+            let postAnchor = (anchorIdx + 1) < history.count
+                ? Array(history[(anchorIdx + 1)...])
+                : []
+
+            // [T-ctx-warmup-fit] The warm-up turns are optional context — the
+            // summary already covers them. When keeping all of them would leave
+            // the request over the compact line, drop them oldest-first instead
+            // of producing a compaction that cannot help (the loop would then
+            // stop as "full" with the summary unused).
+            //
+            // Decided ONCE per marker, then reused: re-deciding every request
+            // slid the warm-up window forward one turn per message (measured on
+            // device — each turn dropped the oldest warm-up turn to stay just
+            // under the line), which changed the request prefix every turn and
+            // defeated prompt caching. Fixed per marker, the prefix is stable,
+            // the request grows normally, and compaction fires at the line.
+            if pinnedRequestIdx != nil {
+                // The pinned request is not optional warm-up: it is never
+                // dropped to fit (the trim ladder brings the rest down).
+            } else if let drop = warmUpDropByMarker[marker.id] {
+                preAnchorPruned = Array(preAnchorPruned.dropFirst(min(drop, preAnchorPruned.count)))
+            } else {
+                let fitted = trimWarmUpToFit(preAnchorPruned, rest: postAnchor, summaryText: summaryText)
+                // [T-ctx-warmup-trim-undecided] Cache only a real decision; an
+                // undecided pass is retried on the next request.
+                if fitted.decided {
+                    warmUpDropByMarker[marker.id] = preAnchorPruned.count - fitted.kept.count
+                }
+                preAnchorPruned = fitted.kept
+            }
+
             var result: [AgentMessage] = []
             result.append(contentsOf: preAnchorPruned)
-
-            let postAnchor = (anchorIdx + 1) < agentHistory.count
-                ? Array(agentHistory[(anchorIdx + 1)...])
-                : []
 
             // DIAG: explain how the slice was sized — uses post-prune /
             // post-alignment counts so the log reflects what actually reaches
@@ -2080,7 +2357,7 @@ extension AIChatViewModel {
             let postAnchorCount = postAnchor.count
             let priorIdxSource = priorIdxResolved == nil ? "fallback=0(<\(Self.compactKeepRecentUserTurns) user-text turns before anchor)" : "userTextWalkBack(N=\(Self.compactKeepRecentUserTurns))"
             let preAnchorRawCount = max(0, anchorIdx - priorIdx + 1)
-            logger.info("[CompactDiag] eAH v2 slice: priorIdx=\(priorIdx) anchorIdx=\(anchorIdx) agentHistory.count=\(agentHistory.count) → preAnchorRaw=\(preAnchorRawCount) preAnchorSent=\(preAnchorCountSent) postAnchor=\(postAnchorCount) summaryChars=\(marker.summary.count) priorIdxSource=\(priorIdxSource) markerId=\(marker.id.prefix(8))")
+            logger.verbose("[CompactDiag] eAH v2 slice: priorIdx=\(priorIdx) anchorIdx=\(anchorIdx) agentHistory.count=\(history.count) → preAnchorRaw=\(preAnchorRawCount) preAnchorSent=\(preAnchorCountSent) postAnchor=\(postAnchorCount) summaryChars=\(marker.summary.count) priorIdxSource=\(priorIdxSource) markerId=\(marker.id.prefix(8))")
             // Show the post-prune / post-alignment preAnchor absolute indices,
             // not the raw walk-back range. This way "what is actually sent"
             // matches what the log shows.
@@ -2091,7 +2368,7 @@ extension AIChatViewModel {
             let postAnchorTags = postAnchor.enumerated().map { (off, m) -> String in
                 "\(anchorIdx + 1 + off):\(m.role.rawValue)"
             }
-            logger.info("[CompactDiag] eAH v2 layout: preAnchorSent=[\(preAnchorTags.joined(separator: ","))] | SUMMARY injected into first postAnchor user | postAnchorAbsIdx=[\(postAnchorTags.joined(separator: ","))]")
+            logger.verbose("[CompactDiag] eAH v2 layout: preAnchorSent=[\(preAnchorTags.joined(separator: ","))] | SUMMARY injected into first postAnchor user | postAnchorAbsIdx=[\(postAnchorTags.joined(separator: ","))]")
 
             if let firstUserOffset = postAnchor.firstIndex(where: { $0.role == .user }) {
                 // Splice: copy prefix as-is, mutate the first user, copy rest.
@@ -2099,7 +2376,21 @@ extension AIChatViewModel {
                     result.append(contentsOf: postAnchor[0..<firstUserOffset])
                 }
                 var injected = postAnchor[firstUserOffset]
-                injected.parts.insert(.text(summaryText), at: 0)
+                // [T-404-summary-after-tool-results] When that first user
+                // message is a tool-result carrier (the anchor was an
+                // assistant tool call), the summary goes AFTER its tool
+                // results: at parts[0] it serialized between function_call
+                // and function_call_output on Responses (400 through relays,
+                // issue #404), before functionResponse on Gemini, and was
+                // dropped outright by Chat Completions. A plain user message
+                // keeps the summary in front - same bytes as before.
+                if let lastToolResult = injected.parts.lastIndex(where: {
+                    if case .toolResult = $0 { return true }; return false
+                }) {
+                    injected.parts.insert(.text(summaryText), at: lastToolResult + 1)
+                } else {
+                    injected.parts.insert(.text(summaryText), at: 0)
+                }
                 result.append(injected)
                 if firstUserOffset + 1 < postAnchor.count {
                     result.append(contentsOf: postAnchor[(firstUserOffset + 1)...])
@@ -2122,10 +2413,10 @@ extension AIChatViewModel {
         // ─── v1 (legacy) markers ───────────────────────────────────────
         // Resolve boundary with same priority as Phase 2.5 restore.
         if let fkmId = marker.firstKeptMessageId ?? marker.boundaryMessageId,
-           let keepStart = agentHistory.firstIndex(where: { $0.dbMessageId == fkmId }) {
+           let keepStart = history.firstIndex(where: { $0.dbMessageId == fkmId }) {
             let summaryMsg = Self.summaryAsAgentMessage(marker.summary)
             var result: [AgentMessage] = [summaryMsg]
-            result.append(contentsOf: agentHistory[keepStart...])
+            result.append(contentsOf: history[keepStart...])
             return result
         }
         // compactAll marker (nil firstKeptMessageId): summary + (anchor user
@@ -2154,9 +2445,9 @@ extension AIChatViewModel {
             // strictly after it = (anchor user turns kept by compact) + (new
             // messages added since compact).
             if let lcmId = marker.lastCompactedMessageId,
-               let lcmIdx = agentHistory.lastIndex(where: { $0.dbMessageId == lcmId }) {
-                if lcmIdx + 1 < agentHistory.count {
-                    result.append(contentsOf: agentHistory[(lcmIdx + 1)...])
+               let lcmIdx = history.lastIndex(where: { $0.dbMessageId == lcmId }) {
+                if lcmIdx + 1 < history.count {
+                    result.append(contentsOf: history[(lcmIdx + 1)...])
                 }
                 return result
             }
@@ -2171,29 +2462,29 @@ extension AIChatViewModel {
             // last 5 entries' dbMessageId + role + a short content preview so
             // we can spot whether the lcm is just the wrong id, or whether
             // entries near the boundary lost their dbMessageId entirely.
-            let withDbId = agentHistory.filter { $0.dbMessageId != nil }.count
-            let tailSlice = agentHistory.suffix(5).enumerated().map { (offset, m) -> String in
-                let absoluteIdx = agentHistory.count - 5 + offset
+            let withDbId = history.filter { $0.dbMessageId != nil }.count
+            let tailSlice = history.suffix(5).enumerated().map { (offset, m) -> String in
+                let absoluteIdx = history.count - 5 + offset
                 let preview: String = m.parts.first.map { part -> String in
                     switch part {
                     case .text(let t):                 return "text(\(t.prefix(40)))"
-                    case .toolUse(_, let name, _):     return "tool_use(\(name))"
-                    case .toolResult(let id, _, _, _, _, _, _, _): return "tool_result(id=\(id.prefix(8)))"
+                    case .toolUse(_, let name, _, _):     return "tool_use(\(name))"
+                    case .toolResult(let id, _, _, _, _, _, _, _, _): return "tool_result(id=\(id.prefix(8)))"
                     case .imageData:                   return "imageData"
                     }
                 } ?? "(empty)"
                 return "[\(absoluteIdx)] role=\(m.role) dbId=\(m.dbMessageId?.prefix(8) ?? "nil") \(preview)"
             }.joined(separator: " | ")
-            logger.warning("[Compact] effectiveAgentHistory DIAG: marker.id=\(marker.id.prefix(8)) marker.lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") agentHistory.count=\(agentHistory.count) entriesWithDbId=\(withDbId) tail5=\(tailSlice)")
+            logger.warning("[Compact] effectiveAgentHistory DIAG: marker.id=\(marker.id.prefix(8)) marker.lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") agentHistory.count=\(history.count) entriesWithDbId=\(withDbId) tail5=\(tailSlice)")
 
-            if let nthIdx = Self.indexOfNthFromLastUserText(Self.compactKeepRecentUserTurns, in: agentHistory) {
-                result.append(contentsOf: agentHistory[nthIdx...])
-                logger.warning("[Compact] effectiveAgentHistory: lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(agentHistory.count)); falling back to last \(Self.compactKeepRecentUserTurns) user turns (anchorIdx=\(nthIdx), kept=\(agentHistory.count - nthIdx))")
+            if let nthIdx = indexOfNthFromLastUserText(Self.compactKeepRecentUserTurns) {
+                result.append(contentsOf: history[nthIdx...])
+                logger.warning("[Compact] effectiveAgentHistory: lcmId=\(marker.lastCompactedMessageId?.prefix(8) ?? "nil") not in agentHistory(count=\(history.count)); falling back to last \(Self.compactKeepRecentUserTurns) user turns (anchorIdx=\(nthIdx), kept=\(history.count - nthIdx))")
             } else {
                 // Not even N user-text turns available — append full history
                 // rather than risk the empty-context loop.
-                result.append(contentsOf: agentHistory)
-                logger.warning("[Compact] effectiveAgentHistory: lcmId unresolved AND <\(Self.compactKeepRecentUserTurns) user turns in agentHistory(count=\(agentHistory.count)); falling back to full history")
+                result.append(contentsOf: history)
+                logger.warning("[Compact] effectiveAgentHistory: lcmId unresolved AND <\(Self.compactKeepRecentUserTurns) user turns in agentHistory(count=\(history.count)); falling back to full history")
             }
             return result
         }
@@ -2201,19 +2492,7 @@ extension AIChatViewModel {
         // don't carry sort_order directly, so give up on marker filtering and
         // return full history.
         logger.warning("[Compact] effectiveAgentHistory: marker id=\(marker.id.prefix(8)) unresolvable in agentHistory — returning full history")
-        return agentHistory
-    }
-
-    /// Thin MainActor wrapper around `effectiveAgentHistorySlice`. Kept as an
-    /// instance method so existing main-thread callers are unchanged; the heavy
-    /// O(n) slice logic lives in the nonisolated static function above.
-    func effectiveAgentHistoryUncounted() -> [AgentMessage] {
-        guard let marker = cachedLatestMarker else { return agentHistory }
-        return Self.effectiveAgentHistorySlice(
-            agentHistory: agentHistory,
-            marker: marker,
-            logger: logger
-        )
+        return history
     }
 
     /// Persist an agent message to DB. Returns the assigned DB row id on success,
@@ -2222,10 +2501,10 @@ extension AIChatViewModel {
     /// Callers should write the returned id back to `agentHistory[i].dbMessageId`
     /// so compact logic can later resolve boundaries by id.
     @discardableResult
-    func persistAgentMessage(_ msg: AgentMessage, tokenUsage: TokenUsage? = nil, snapshots: [String: (toolName: String, snapshot: ToolSnapshot)] = [:], thoughtSignatures: [String: String] = [:], reasoningContent: String? = nil, streamInterruptCount: Int = 0) async -> String? {
+    func persistAgentMessage(_ msg: AgentMessage, tokenUsage: TokenUsage? = nil, snapshots: [String: (toolName: String, snapshot: ToolSnapshot)] = [:], thoughtSignatures: [String: String] = [:], reasoningContent: String? = nil, streamInterruptCount: Int = 0, modelEntryId: String? = nil, pastedParts: [String: [ContentPart]] = [:]) async -> String? {
         let sid = self.sessionId ?? "nil"
         logger.info("[Persist] enter sid=\(sid.prefix(8)) role=\(msg.role.rawValue) parts=\(msg.parts.count)")
-        guard let raw = await buildRawMessage(msg, tokenUsage: tokenUsage, snapshots: snapshots, thoughtSignatures: thoughtSignatures, reasoningContent: reasoningContent, streamInterruptCount: streamInterruptCount) else {
+        guard let raw = await buildRawMessage(msg, tokenUsage: tokenUsage, snapshots: snapshots, thoughtSignatures: thoughtSignatures, reasoningContent: reasoningContent, streamInterruptCount: streamInterruptCount, modelEntryId: modelEntryId, pastedParts: pastedParts) else {
             logger.warning("[Persist] buildRawMessage returned nil sid=\(sid.prefix(8)) role=\(msg.role.rawValue) — NOT WRITTEN")
             return nil
         }
@@ -2235,8 +2514,13 @@ extension AIChatViewModel {
         let stats = await ChatStore.shared.sessionWriteStats(sessionId: raw.sessionId)
         logger.info("[Persist] post-write sid=\(raw.sessionId.prefix(8)) dbCount=\(stats.count) dbMaxSortOrder=\(stats.maxSortOrder)")
         // Bump baseline so iCloud sync doesn't mistake our own persisted messages for remote ones.
+        // The count is capped at what the store now holds: past ChatStore's prune
+        // threshold the same append deletes the oldest row(s), so a plain += 1
+        // runs ahead of the real count and the next reload takes the
+        // "hasRemovedMessages" branch - a full rebuild of the chat (~450 ms on a
+        // 2048-row session) for messages this view model wrote itself.
         lastKnownDbSortOrder += 1
-        lastKnownDbCount += 1
+        lastKnownDbCount = min(lastKnownDbCount + 1, stats.count)
         return raw.id
     }
 
@@ -2267,7 +2551,29 @@ extension AIChatViewModel {
     /// context-exhausted case (`ChatMessage(role: .assistant, content: "")` with
     /// `.error` set).
     func persistErrorInfo(_ error: String?) async {
-        if let dbId = agentHistory.last(where: { $0.role == .assistant && $0.dbMessageId != nil })?.dbMessageId {
+        // [T-error-persist-current-turn] GH#263. An error belongs to the turn
+        // that failed. When this turn has no persisted assistant row yet (it
+        // died before any output), the last persisted row is the PREVIOUS
+        // turn's good reply, and stamping the error there pins the banner
+        // under an answer that succeeded. Writes are therefore limited to this
+        // turn's rows. Clears (`nil`) keep targeting the last row: clearing a
+        // superseded error from an earlier turn is exactly what
+        // `clearSupersededErrors` needs.
+        //
+        // [T-error-persist-turn2-carrier] Not stamping the previous reply
+        // must not mean dropping the error: an early failure on turn 2+ has
+        // exactly the same "only copy is in memory" problem the carrier row
+        // below exists for on turn 1. So such a turn skips the last-row
+        // UPDATE and falls through to the carrier path instead of returning.
+        var thisTurnHasRow = true
+        if error != nil {
+            let turnStart = Self.currentTurnStartIndex(in: agentHistory)
+            thisTurnHasRow = agentHistory.indices.contains {
+                $0 >= turnStart && agentHistory[$0].role == .assistant && agentHistory[$0].dbMessageId != nil
+            }
+        }
+        if thisTurnHasRow,
+           let dbId = agentHistory.last(where: { $0.role == .assistant && $0.dbMessageId != nil })?.dbMessageId {
             let ok = await ChatStore.shared.updateMessageErrorInfo(messageId: dbId, errorInfo: error)
             logger.info("[ErrorPersist] wrote error_info to msg=\(dbId.prefix(8)) cleared=\(error == nil) ok=\(ok)")
             return
@@ -2304,3 +2610,28 @@ extension AIChatViewModel {
     }
 
 }
+
+// MARK: - Images when a turn is persisted [T-image-real-seams]
+
+// BEGIN PersistImageParts
+extension AIChatViewModel {
+    /// The mediaRef stored with a tool result: the tool snapshot's image, but
+    /// only when the result actually carried image data to the model.
+    static func toolResultMediaRef(imageData: Data?, snapshot: ToolSnapshot?) -> MediaRef? {
+        // Only persist mediaRef for tool results that carried image data to the model
+        // (i.e. screenshot action). Snapshot images are for display only and should
+        // NOT be resent to the model on session reload.
+        imageData != nil ? snapshot?.mediaRef : nil
+    }
+
+    /// A user-message `.imageData` part written to the session's media store;
+    /// the returned ref replaces the bytes in the stored message.
+    static func persistedUserImageRef(data: Data, mimeType: String, sessionId: String, linuxPath: String?,
+                                      store: ChatStore = .shared) async -> MediaRef {
+        await store.saveMedia(
+            data: data, mimeType: mimeType, sessionId: sessionId,
+            linuxPath: linuxPath
+        )
+    }
+}
+// END PersistImageParts
