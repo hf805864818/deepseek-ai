@@ -20,7 +20,8 @@ extension AIChatViewModel {
         let effectiveTimeout = timeout ?? defaultCommandTimeout
         logger.info("Executing command via coordinator (timeout: \(Int(effectiveTimeout))s): \(command)")
 
-        guard let sid = sessionId else {
+        // [T-p2-shared-workspace] A helper's shell runs in its parent's bucket.
+        guard let sid = fsSessionId else {
             return CommandResult(output: "Error: no session", exitCode: -1)
         }
 
@@ -162,6 +163,9 @@ extension AIChatViewModel {
                 envProfileId: profileId,
                 command: command,
                 timeout: effectiveTimeout,
+                // [T-shell-stop-owner] Filed under the shared workspace (`sid`)
+                // but owned by THIS session, so its Stop kills only its own.
+                ownerId: sessionId,
                 // ISHShellExecutor dispatches every line on the main queue
                 // already (ISHShellExecutor.m:780/812), so we're guaranteed to
                 // run on the main thread here. Calling the MainActor-isolated
