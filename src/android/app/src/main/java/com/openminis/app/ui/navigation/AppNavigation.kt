@@ -68,6 +68,14 @@ import com.openminis.app.ui.settings.SkillsManagementScreen
 import com.openminis.app.ui.settings.GoogleDriveSyncScreen
 import com.openminis.app.ui.settings.LocalSyncScreen
 import com.openminis.app.ui.settings.OtherSyncScreen
+import com.openminis.app.ui.settings.AgentToolsSettingsScreen
+import com.openminis.app.ui.settings.NetworkPage
+import com.openminis.app.ui.settings.NetworkProviderRow
+import com.openminis.app.ui.settings.NetworkSettingsScreen
+import com.openminis.app.ui.settings.SubAgentsScreen
+import com.openminis.app.ui.settings.SubAgentDetailScreen
+import com.openminis.app.ui.sandbox.ContainerDnsScreen
+import com.openminis.app.ui.chat.AgentTranscriptScreen
 import com.openminis.app.data.repository.EnvVarRepository
 import com.openminis.app.data.repository.MemoryRepository
 import com.openminis.app.data.repository.SkillRepository
@@ -131,6 +139,9 @@ object Routes {
     const val CONTAINER_DNS = "container_dns"
     const val BACKUP_INITIAL_TAB_KEY = "backup_initial_tab"
     const val AGENTS = "agents"
+    const val SUB_AGENTS = "sub_agents"
+    const val SUB_AGENT_DETAIL = "sub_agent/{agentId}"
+    const val AGENT_TOOLS = "agent_tools"
     fun agentTranscript(sessionId: String) = "agent_transcript/$sessionId"
 
     fun skillDetail(skillId: String) = "skill/$skillId"
@@ -608,6 +619,12 @@ fun AppNavigation(
                 onBackgroundClick = { navController.safeNavigate(Routes.BACKGROUND) },
                 onLogsClick = { navController.safeNavigate(Routes.LOGS) },
                 onAboutClick = { navController.safeNavigate(Routes.ABOUT) },
+                onNetworkClick = { navController.safeNavigate(Routes.NETWORK) },
+                onTailscaleClick = { navController.safeNavigate(Routes.NETWORK_TAILSCALE) },
+                onProxiesClick = { navController.safeNavigate(Routes.NETWORK_PROXIES) },
+                onContainerDnsClick = { navController.safeNavigate(Routes.CONTAINER_DNS) },
+                onAgentsClick = { navController.safeNavigate(Routes.AGENTS) },
+                onAgentToolsClick = { navController.safeNavigate(Routes.AGENT_TOOLS) },
                 onOtherSyncClick = { navController.safeNavigate(Routes.OTHER_SYNC) },
                 onMountedFoldersClick = { navController.safeNavigate(Routes.MOUNTED_FOLDERS) },
                 onSharedFoldersClick = { navController.safeNavigate(Routes.SHARED_FOLDERS) },
@@ -1239,6 +1256,70 @@ fun AppNavigation(
 
         composable(Routes.ABOUT) {
             AboutScreen(onBack = { navController.safePopBackStack() })
+        }
+
+        // [FEAT-261021-04] Network section: Routing / Tailscale / Proxies /
+        // Shell Container DNS. Screens exist but were never re-wired after the
+        // Settings entry rows were dropped — re-register so they're reachable.
+        composable(Routes.NETWORK) {
+            NetworkSettingsScreen(
+                onBack = { navController.safePopBackStack() },
+                providers = providerRepository.instances.map { NetworkProviderRow(it.id, it.label) },
+            )
+        }
+        composable(Routes.NETWORK_TAILSCALE) {
+            NetworkSettingsScreen(
+                onBack = { navController.safePopBackStack() },
+                page = NetworkPage.TAILSCALE,
+            )
+        }
+        composable(Routes.NETWORK_PROXIES) {
+            NetworkSettingsScreen(
+                onBack = { navController.safePopBackStack() },
+                page = NetworkPage.PROXIES,
+            )
+        }
+        composable(Routes.CONTAINER_DNS) {
+            ContainerDnsScreen(onBack = { navController.safePopBackStack() })
+        }
+
+        // [T-p2-agent-settings] Agents roster + per-tool switches. AGENTS and
+        // SUB_AGENTS both resolve to the roster; AGENTS is the deep-link alias.
+        composable(Routes.AGENTS) {
+            SubAgentsScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpen = { id -> navController.safeNavigate("sub_agent/$id") },
+            )
+        }
+        composable(Routes.SUB_AGENTS) {
+            SubAgentsScreen(
+                onBack = { navController.safePopBackStack() },
+                onOpen = { id -> navController.safeNavigate("sub_agent/$id") },
+            )
+        }
+        composable(
+            route = Routes.SUB_AGENT_DETAIL,
+            arguments = listOf(navArgument("agentId") { type = NavType.StringType }),
+        ) { entry ->
+            SubAgentDetailScreen(
+                agentId = entry.arguments?.getString("agentId").orEmpty(),
+                onBack = { navController.safePopBackStack() },
+            )
+        }
+        composable(Routes.AGENT_TOOLS) {
+            AgentToolsSettingsScreen(
+                onBack = { navController.safePopBackStack() },
+            )
+        }
+        composable(
+            route = "agent_transcript/{sessionId}",
+            arguments = listOf(navArgument("sessionId") { type = NavType.StringType }),
+        ) { entry ->
+            val sessionId = entry.arguments?.getString("sessionId") ?: return@composable
+            AgentTranscriptScreen(
+                sessionId = sessionId,
+                onBack = { navController.safePopBackStack() },
+            )
         }
 
         composable(Routes.OTHER_SYNC) {

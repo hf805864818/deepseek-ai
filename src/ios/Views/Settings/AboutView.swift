@@ -83,7 +83,7 @@ struct AboutView: View {
                                     .stroke(Color(UIColor.separator), lineWidth: 0.5)
                             )
                     }
-                    Text("Minis")
+                    Text("龙虾Ai")
                         .font(.title2.bold())
                     Text("Version \(appVersion)")
                         .font(.subheadline)
@@ -100,7 +100,7 @@ struct AboutView: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .textSelection(.enabled)
-                    Text("Minis is Your Fully Local, Fully Private On-Device Agent.")
+                    Text("龙虾Ai 是完全本地、完全私密的设备端 Agent。")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -111,7 +111,7 @@ struct AboutView: View {
 
             // MARK: - Links
             Section("Links") {
-                Link(destination: URL(string: "https://github.com/OpenMinis")!) {
+                Link(destination: URL(string: "https://github.com/vbox-Ai/Lobster-APP")!) {
                     Label {
                         HStack {
                             Text("GitHub Repository")
@@ -125,7 +125,7 @@ struct AboutView: View {
                         Image(systemName: "link.circle.fill")
                     }
                 }
-                Link(destination: URL(string: "https://github.com/OpenMinis/OpenMinis/issues")!) {
+                Link(destination: URL(string: "https://github.com/vbox-Ai/Lobster-APP/issues")!) {
                     Label {
                         HStack {
                             Text("Report an Issue")

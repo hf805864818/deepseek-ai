@@ -45,6 +45,11 @@ struct SettingsSheet: View {
     @ObservedObject private var deepLink = DeepLinkCoordinator.shared
     @State private var navPath = NavigationPath()
     @State private var showFeedbackDialog = false
+    // [T-deep-mode-ios-settings] Deep Mode master switch + Spec Mode toggle,
+    // persisted to the same UserDefaults keys the agent reads ("deepMode.enabled"
+    // / "deepMode.specMode"). @AppStorage keeps the toggle in sync with the VM.
+    @AppStorage("deepMode.enabled") private var deepModeEnabled = false
+    @AppStorage("deepMode.specMode") private var specModeEnabled = false
 
     var body: some View {
         NavigationStack(path: $navPath) {
@@ -94,6 +99,34 @@ struct SettingsSheet: View {
                 }
 
                 Section("Agent Runtime") {
+                    // [T-deep-mode-ios-settings] Deep Mode master switch + Spec
+                    // Mode, above Agent Tools to match Android ordering. Flipping
+                    // the master posts deepModeDidChange so live VMs hard-reset.
+                    Toggle(isOn: $deepModeEnabled) {
+                        Label {
+                            Text(AppLocalized("Deep Mode"))
+                        } icon: {
+                            Image(systemName: "sparkles.rectangle.stack")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.orange, in: Circle())
+                        }
+                    }
+                    .onChange(of: deepModeEnabled) { _ in
+                        NotificationCenter.default.post(name: .deepModeDidChange, object: nil)
+                    }
+                    Toggle(isOn: $specModeEnabled) {
+                        Label {
+                            Text(AppLocalized("Spec Mode"))
+                        } icon: {
+                            Image(systemName: "checklist")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.indigo, in: Circle())
+                        }
+                    }
                     // [T-tools-granular-switches] First row: per-tool switches.
                     NavigationLink {
                         ToolsSettingsView()
@@ -195,6 +228,21 @@ struct SettingsSheet: View {
                                 .background(.green, in: Circle())
                         }
                     }
+                    // [T-deep-mode-phase-e] Scheduled Tasks — list/manage the
+                    // repeating tasks the agent created in deep mode.
+                    NavigationLink {
+                        ScheduledTasksSettingsView()
+                    } label: {
+                        Label {
+                            Text(AppLocalized("Scheduled Tasks"))
+                        } icon: {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white)
+                                .frame(width: 21, height: 21)
+                                .background(.purple, in: Circle())
+                        }
+                    }
                 }
 
                 Section("Storage") {
@@ -274,6 +322,26 @@ struct SettingsSheet: View {
                     }
                 }
 
+                // [Merge-v1.13] Other Sync (Local Sync / Google Drive / Backup).
+                // Mirrors Android's Settings › Other Sync section.
+                if #available(iOS 17.0, *) {
+                    Section("Other Sync") {
+                        NavigationLink {
+                            OtherSyncSettingsView()
+                        } label: {
+                            Label {
+                                Text(AppLocalized("Other Sync"))
+                            } icon: {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 21, height: 21)
+                                    .background(.indigo, in: Circle())
+                            }
+                        }
+                    }
+                }
+
                 Section("Permissions") {
                     NavigationLink {
                         OffloadPermissionSettingsView()
@@ -328,7 +396,7 @@ struct SettingsSheet: View {
                         AboutView()
                     } label: {
                         Label {
-                            Text("About Minis")
+                            Text("About LobsterAI")
                         } icon: {
                             Image(systemName: "info")
                                 .font(.system(size: 9))
@@ -337,7 +405,7 @@ struct SettingsSheet: View {
                                 .background(.indigo, in: Circle())
                         }
                     }
-                    Link(destination: URL(string: "https://openminis.github.io/privacy-policy.html")!) {
+                    Link(destination: URL(string: "https://vbox-ai.github.io/Lobster-APP/privacy.html")!) {
                         Label {
                             Text("Privacy Policy")
                         } icon: {
@@ -367,7 +435,7 @@ struct SettingsSheet: View {
                             if let url = Self.makeBugReportURL() { UIApplication.shared.open(url) }
                         }
                         Button("Feedback (Telegram)") {
-                            if let url = URL(string: "https://t.me/+2NzhOJuzRyI1YmM1") { UIApplication.shared.open(url) }
+                            if let url = URL(string: "https://t.me/hfkj520") { UIApplication.shared.open(url) }
                         }
                         Button("Feedback (Email)") {
                             if let url = Self.makeFeedbackEmailURL() { UIApplication.shared.open(url) }
@@ -561,9 +629,9 @@ struct SettingsSheet: View {
 
         var components = URLComponents()
         components.scheme = "mailto"
-        components.path = "dev@openminis.app"
+        components.path = "q2787244398@gmail.com"
         components.queryItems = [
-            URLQueryItem(name: "subject", value: "Minis Feedback"),
+            URLQueryItem(name: "subject", value: "LobsterAI Feedback"),
             URLQueryItem(name: "body", value: body),
         ]
         return components.url
@@ -614,7 +682,7 @@ struct SettingsSheet: View {
 
         """
 
-        var components = URLComponents(string: "https://github.com/OpenMinis/OpenMinis/issues/new")
+        var components = URLComponents(string: "https://github.com/vbox-Ai/Lobster-APP/issues/new")
         components?.queryItems = [
             URLQueryItem(name: "template", value: "bug_report.md"),
             URLQueryItem(name: "title", value: "[Bug] "),

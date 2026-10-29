@@ -1,4 +1,4 @@
-import java.util.Properties
+﻿import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -37,7 +37,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 295
-        versionName = "1.0.27"
+        versionName = "1.0.237"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

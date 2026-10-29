@@ -77,7 +77,7 @@ struct AIDataSharingConsentView: View {
                         }
                     }
 
-                    Link("Read our full Privacy Policy", destination: URL(string: "https://openminis.github.io/privacy-policy.html")!)
+                    Link("Read our full Privacy Policy", destination: URL(string: "https://vbox-ai.github.io/Lobster-APP/privacy.html")!)
                         .font(.footnote)
 
                     Spacer(minLength: 80)

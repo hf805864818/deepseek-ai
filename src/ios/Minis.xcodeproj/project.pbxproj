@@ -1,4 +1,4 @@
-// !$*UTF8*$!
+﻿// !$*UTF8*$!
 {
 	archiveVersion = 1;
 	classes = {
@@ -3857,7 +3857,7 @@
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -3877,7 +3877,7 @@
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -3920,7 +3920,7 @@
 					"$(BUILT_PRODUCTS_DIR)/Minis.app/Frameworks",
 					"$(BUILT_PRODUCTS_DIR)/PackageFrameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/Minis.app/Minis.debug.dylib",
@@ -3964,7 +3964,7 @@
 					"$(BUILT_PRODUCTS_DIR)/Minis.app/Frameworks",
 					"$(BUILT_PRODUCTS_DIR)/PackageFrameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/Minis.app/Minis.debug.dylib",
@@ -4149,7 +4149,7 @@
 				ISH_LIBS_DIR = "$(SRCROOT)/../../deps/libs";
 				"ISH_LIBS_DIR[sdk=iphonesimulator*]" = "$(SRCROOT)/../../deps/libs/iphonesimulator";
 				LIBRARY_SEARCH_PATHS = "$(ISH_LIBS_DIR)";
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				OTHER_LDFLAGS = (
 					"-lish_emu",
 					"-lish",
@@ -4208,7 +4208,7 @@
 				ISH_LIBS_DIR = "$(SRCROOT)/../../deps/libs";
 				"ISH_LIBS_DIR[sdk=iphonesimulator*]" = "$(SRCROOT)/../../deps/libs/iphonesimulator";
 				LIBRARY_SEARCH_PATHS = "$(ISH_LIBS_DIR)";
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				OTHER_LDFLAGS = (
 					"-lish_emu",
 					"-lish",
@@ -4243,7 +4243,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -4270,7 +4270,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -4297,7 +4297,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.FileProvider;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -4324,7 +4324,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.FileProvider;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -4351,7 +4351,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.AgentWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -4378,7 +4378,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.app.AgentWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -4403,7 +4403,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisTestHost;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -4428,7 +4428,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0.27;
+				MARKETING_VERSION = 1.0.237;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openminis.MinisTestHost;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;

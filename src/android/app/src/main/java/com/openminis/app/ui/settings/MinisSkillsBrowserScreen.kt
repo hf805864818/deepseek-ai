@@ -71,7 +71,7 @@ fun MinisSkillsBrowserScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    var currentUrl by remember { mutableStateOf("https://github.com/OpenMinis/MinisSkills") }
+    var currentUrl by remember { mutableStateOf("https://github.com/vbox-Ai/Lobsterskills") }
     var hudState by remember { mutableStateOf(HudState.HIDDEN) }
     var hudMessage by remember { mutableStateOf("") }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }

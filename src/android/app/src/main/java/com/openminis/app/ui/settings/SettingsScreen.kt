@@ -29,22 +29,28 @@ import androidx.compose.material.icons.outlined.BatteryFull
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Email
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Feedback
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderShared
 import androidx.compose.material.icons.outlined.FrontHand
+import androidx.compose.material.icons.outlined.Groups
+import androidx.compose.material.icons.outlined.Handyman
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Inventory2
+import androidx.compose.material.icons.outlined.Lan
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.outlined.Router
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.VpnLock
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -109,6 +115,16 @@ fun SettingsScreen(
     // About row below still has a TODO onClick in HEAD; future settings-bucket
     // work will wire this through.
     onAboutClick: () -> Unit = {},
+    // [T-net-android-phase2] Settings › Network › Network Routing + the other
+    // rows of the Network section (Tailscale / Proxies / Shell Container DNS).
+    onNetworkClick: () -> Unit = {},
+    onTailscaleClick: () -> Unit = {},
+    onProxiesClick: () -> Unit = {},
+    onContainerDnsClick: () -> Unit = {},
+    // [T-p2-agent-settings] Settings › Agents (delegation roster) + Agent Tools
+    // (per-tool switches), below the Deep Mode / Spec Mode switches.
+    onAgentsClick: () -> Unit = {},
+    onAgentToolsClick: () -> Unit = {},
     onOtherSyncClick: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -216,7 +232,21 @@ fun SettingsScreen(
                         specModeOn = enabled
                         com.openminis.app.data.DeepModePrefs.setSpecModeEnabled(context, enabled)
                     },
-                    showDivider = false,
+                )
+                // [T-tools-granular-switches] Which optional tools the agent may use.
+                SettingsItem(
+                    icon = Icons.Outlined.Handyman,
+                    iconColor = Color(0xFF5E5CE6),
+                    title = stringResource(R.string.settings_agent_tools),
+                    subtitle = stringResource(R.string.settings_agent_tools_subtitle),
+                    onClick = onAgentToolsClick,
+                )
+                SettingsItem(
+                    icon = Icons.Outlined.Groups,
+                    iconColor = com.openminis.app.ui.chat.HelperAccentStatic,
+                    title = stringResource(R.string.settings_agents),
+                    subtitle = stringResource(R.string.settings_agents_subtitle),
+                    onClick = onAgentsClick,
                 )
                 SettingsItem(
                     icon = Icons.Outlined.Extension,
@@ -283,6 +313,40 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_mount_external_folders),
                     subtitle = stringResource(R.string.settings_mount_external_folders_subtitle),
                     onClick = onMountedFoldersClick,
+                    showDivider = false,
+                )
+            }
+
+            // -- Network -- [FEAT-261021-04] its own section below Storage:
+            // Network Routing, Tailscale, Proxies and the Shell Container DNS.
+            SettingsSection(title = stringResource(R.string.network_title)) {
+                SettingsItem(
+                    icon = Icons.Outlined.Lan,
+                    iconColor = Color(0xFF007AFF),
+                    title = stringResource(R.string.network_routing_title),
+                    subtitle = null,
+                    onClick = onNetworkClick,
+                )
+                SettingsItem(
+                    icon = Icons.Outlined.VpnLock,
+                    iconColor = Color(0xFF5856D6),
+                    title = stringResource(R.string.network_tailscale),
+                    subtitle = null,
+                    onClick = onTailscaleClick,
+                )
+                SettingsItem(
+                    icon = Icons.Outlined.Router,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.network_proxies),
+                    subtitle = null,
+                    onClick = onProxiesClick,
+                )
+                SettingsItem(
+                    icon = Icons.Outlined.Dns,
+                    iconColor = Color(0xFF8E8E93),
+                    title = stringResource(R.string.network_container_dns),
+                    subtitle = null,
+                    onClick = onContainerDnsClick,
                     showDivider = false,
                 )
             }
