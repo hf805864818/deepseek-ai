@@ -1166,7 +1166,9 @@ struct InlineVoiceInputView: View {
                 Circle()
                     .fill(Color.white)
                     .frame(width: micDiameter, height: micDiameter)
-                    .shadow(color: .black.opacity(0.18), radius: expanded ? 7 : 5, y: expanded ? 3 : 2)
+                    // [T-fork-floatbtn-no-shadow] Flat, no drop shadow — a faint
+                    // border only, matching the scroll-to-bottom pill.
+                    .overlay(Circle().stroke(Color.gray.opacity(0.25), lineWidth: 0.5))
 
                 if viewModel.isTranscribing {
                     TimelineView(.animation) { context in

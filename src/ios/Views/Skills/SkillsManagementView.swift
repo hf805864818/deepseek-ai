@@ -73,38 +73,31 @@ struct SkillsManagementView: View {
                 }
             }
 
-            ForEach(filteredSkills) { skill in
-                NavigationLink {
-                    SkillDetailView(skillId: skill.id)
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                Text(skill.name).font(.body)
-                                importSourceBadge(skill.importSource)
-                            }
-                            if !skill.description.isEmpty {
-                                Text(skill.description)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                        }
-                        Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { skill.isEnabled },
-                            set: { store.setEnabled(skill.id, enabled: $0) }
-                        ))
-                        .labelsHidden()
+            // [T-fork-skill-group] Group by source: built-in (bundled) vs
+            // user-imported (url / file / paste / session).
+            let bundledSkills = filteredSkills.filter { $0.importSource == .bundled }
+            let importedSkills = filteredSkills.filter { $0.importSource != .bundled }
+
+            if !bundledSkills.isEmpty {
+                Section("Built-in Skills") {
+                    ForEach(bundledSkills) { skill in
+                        skillRow(skill)
+                    }
+                    .onDelete { offsets in
+                        for idx in offsets { store.deleteSkill(bundledSkills[idx].id) }
                     }
                 }
-                .modifier(SkillSourceURLContextMenu(url: skill.importSource.copyableURL) {
-                    showToast(AppLocalized("Source URL copied"))
-                })
             }
-            .onDelete { offsets in
-                let ids = offsets.map { filteredSkills[$0].id }
-                for id in ids { store.deleteSkill(id) }
+
+            if !importedSkills.isEmpty {
+                Section("Imported Skills") {
+                    ForEach(importedSkills) { skill in
+                        skillRow(skill)
+                    }
+                    .onDelete { offsets in
+                        for idx in offsets { store.deleteSkill(importedSkills[idx].id) }
+                    }
+                }
             }
         }
         .navigationTitle("Skills")
@@ -200,6 +193,37 @@ struct SkillsManagementView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
             if toastToken == token { toastMessage = nil }
         }
+    }
+
+    @ViewBuilder
+    private func skillRow(_ skill: Skill) -> some View {
+        NavigationLink {
+            SkillDetailView(skillId: skill.id)
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(skill.name).font(.body)
+                        importSourceBadge(skill.importSource)
+                    }
+                    if !skill.description.isEmpty {
+                        Text(skill.description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { skill.isEnabled },
+                    set: { store.setEnabled(skill.id, enabled: $0) }
+                ))
+                .labelsHidden()
+            }
+        }
+        .modifier(SkillSourceURLContextMenu(url: skill.importSource.copyableURL) {
+            showToast(AppLocalized("Source URL copied"))
+        })
     }
 
     @ViewBuilder

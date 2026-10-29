@@ -1237,11 +1237,9 @@ private fun MicCircleButton(
     Box(
         modifier = Modifier
             .size(diameter)
-            // [T-android-voice-mic-shadow] Same white circle and same soft
-            // halo as before; only the downward cast is gone. See
-            // micShadowNoOffset for why this is drawn rather than expressed as
-            // an elevation.
-            .micShadowNoOffset(10.dp)
+            // [T-fork-floatbtn-no-shadow] Flat, no drop shadow — a faint border
+            // only, matching the iOS scroll-to-bottom pill.
+            .border(0.5.dp, Color.Black.copy(alpha = 0.12f), CircleShape)
             .background(Color.White, CircleShape)
             .clip(CircleShape)
             .clickable(enabled = enabled) { onTap() },

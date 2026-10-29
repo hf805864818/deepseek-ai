@@ -284,60 +284,35 @@ fun SkillsManagementScreen(
                         .padding(horizontal = 16.dp, vertical = 24.dp),
                 )
             } else {
-                filteredSkills.forEachIndexed { index, skill ->
-                    val (badgeIcon, badgeColor) = sourceIconAndColor(skill.importSource)
-                    // [T-android-skill-copy-source-url] Long-press offers "Copy
-                    // Source URL" for a skill installed from one; the others
-                    // keep a plain tappable row.
-                    val sourceUrl = SkillSourceUrl.copyable(skill)
-                    var menuExpanded by remember(skill.id) { mutableStateOf(false) }
-                    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
-                    Box {
-                    SettingsRow(
-                        title = skill.name,
-                        subtitle = skill.description.takeIf { it.isNotEmpty() }?.let { stripMarkdown(it) },
-                        showChevron = true,
-                        showDivider = index < filteredSkills.size - 1,
-                        onClick = { onSkillClick(skill.id) },
-                        onLongClick = sourceUrl?.let {
-                            {
-                                haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
-                                menuExpanded = true
-                            }
-                        },
-                        trailing = {
-                            // Source badge + Switch. Wrapping in a Row keeps
-                            // them visually grouped before the row's chevron.
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    badgeIcon,
-                                    contentDescription = null,
-                                    tint = badgeColor,
-                                    modifier = Modifier.size(14.dp),
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                SettingsSwitch(
-                                    checked = skill.isEnabled,
-                                    onCheckedChange = { skillRepository.setEnabled(skill.id, it) },
-                                )
-                            }
-                        },
-                    )
-                    if (sourceUrl != null) {
-                        com.openminis.app.ui.components.MinisMenu(
-                            expanded = menuExpanded,
-                            onDismissRequest = { menuExpanded = false },
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.skill_copy_source_url)) },
-                                leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
-                                onClick = {
-                                    menuExpanded = false
-                                    SkillSourceUrl.copy(context, sourceUrl)
-                                },
+                // [T-fork-skill-group] Group by source: built-in (bundled) vs
+                // user-imported (url / file / paste / session).
+                val bundledSkills = filteredSkills.filter { it.importSource == SkillRepository.ImportSource.BUNDLED }
+                val importedSkills = filteredSkills.filter { it.importSource != SkillRepository.ImportSource.BUNDLED }
+
+                if (bundledSkills.isNotEmpty()) {
+                    SettingsSection(header = stringResource(R.string.skill_group_builtin)) {
+                        bundledSkills.forEachIndexed { index, skill ->
+                            SkillManagementRow(
+                                skill = skill,
+                                index = index,
+                                total = bundledSkills.size,
+                                onSkillClick = onSkillClick,
+                                skillRepository = skillRepository,
                             )
                         }
                     }
+                }
+                if (importedSkills.isNotEmpty()) {
+                    SettingsSection(header = stringResource(R.string.skill_group_imported)) {
+                        importedSkills.forEachIndexed { index, skill ->
+                            SkillManagementRow(
+                                skill = skill,
+                                index = index,
+                                total = importedSkills.size,
+                                onSkillClick = onSkillClick,
+                                skillRepository = skillRepository,
+                            )
+                        }
                     }
                 }
             }
@@ -1124,6 +1099,71 @@ private fun SettingsActionIcon(
             tint = Color.White,
             modifier = Modifier.size(16.dp),
         )
+    }
+}
+
+/**
+ * [T-fork-skill-group] A single skill row, shared by the Built-in / Imported
+ * sections. Holds the long-press "Copy Source URL" menu and the enable switch.
+ */
+@Composable
+private fun SkillManagementRow(
+    skill: SkillRepository.Skill,
+    index: Int,
+    total: Int,
+    onSkillClick: (String) -> Unit,
+    skillRepository: SkillRepository,
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val (badgeIcon, badgeColor) = sourceIconAndColor(skill.importSource)
+    // [T-android-skill-copy-source-url] Long-press offers "Copy Source URL".
+    val sourceUrl = SkillSourceUrl.copyable(skill)
+    var menuExpanded by remember(skill.id) { mutableStateOf(false) }
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+    Box {
+        SettingsRow(
+            title = skill.name,
+            subtitle = skill.description.takeIf { it.isNotEmpty() }?.let { stripMarkdown(it) },
+            showChevron = true,
+            showDivider = index < total - 1,
+            onClick = { onSkillClick(skill.id) },
+            onLongClick = sourceUrl?.let {
+                {
+                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                    menuExpanded = true
+                }
+            },
+            trailing = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        badgeIcon,
+                        contentDescription = null,
+                        tint = badgeColor,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    SettingsSwitch(
+                        checked = skill.isEnabled,
+                        onCheckedChange = { skillRepository.setEnabled(skill.id, it) },
+                    )
+                }
+            },
+        )
+        if (sourceUrl != null) {
+            com.openminis.app.ui.components.MinisMenu(
+                expanded = menuExpanded,
+                onDismissRequest = { menuExpanded = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.skill_copy_source_url)) },
+                    leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
+                    onClick = {
+                        menuExpanded = false
+                        SkillSourceUrl.copy(context, sourceUrl)
+                    },
+                )
+            }
+        }
     }
 }
 

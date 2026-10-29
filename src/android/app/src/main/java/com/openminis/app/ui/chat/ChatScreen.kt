@@ -4309,7 +4309,6 @@ fun ChatScreen(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
                             .padding(end = 12.dp, bottom = upBaseBottom + 46.dp)
-                            .shadow(4.dp, CircleShape)
                             .size(36.dp),
                         colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
                             containerColor = ChatColors.inputBg,
@@ -4361,7 +4360,6 @@ fun ChatScreen(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
                             .padding(end = 12.dp, bottom = fabBottomPadding)
-                            .shadow(4.dp, CircleShape)
                             .size(36.dp),
                         colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
                             containerColor = ChatColors.inputBg,

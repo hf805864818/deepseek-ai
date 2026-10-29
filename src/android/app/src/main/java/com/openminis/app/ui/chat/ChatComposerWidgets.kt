@@ -1130,7 +1130,6 @@ internal fun FloatingToolStatusBar(
                 .fillMaxWidth()
                 .height(barHeight)
                 .align(Alignment.BottomCenter)
-                .shadow(elevation = 8.dp, shape = RoundedCornerShape(10.dp), ambientColor = Color.Black.copy(alpha = 0.06f), spotColor = Color.Black.copy(alpha = 0.12f))
                 .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
                 .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp))
                 .padding(start = barStartPadding, end = 12.dp),

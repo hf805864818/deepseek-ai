@@ -220,6 +220,12 @@ fun SettingsScreen(
                     onCheckedChange = { enabled ->
                         deepModeOn = enabled
                         com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, enabled)
+                        // [T-fork-deep-skill-sync] Keep the deep-* skill pack
+                        // aligned with the master toggle.
+                        (context.applicationContext as? com.openminis.app.MinisApp)
+                            ?.takeIf { it.subsystemsReady() }
+                            ?.skillRepository
+                            ?.syncDeepModeSkills()
                     },
                 )
                 SettingsSwitchRow(

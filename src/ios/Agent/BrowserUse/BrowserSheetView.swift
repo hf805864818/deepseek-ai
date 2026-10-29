@@ -1,4 +1,4 @@
-﻿import SwiftUI
+import SwiftUI
 
 /// Sheet view for observing the browser's live WKWebView(s) via a tab pool.
 struct BrowserSheetView: View {

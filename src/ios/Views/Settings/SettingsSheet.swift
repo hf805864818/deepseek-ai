@@ -115,6 +115,10 @@ struct SettingsSheet: View {
                     }
                     .onChange(of: deepModeEnabled) { _ in
                         NotificationCenter.default.post(name: .deepModeDidChange, object: nil)
+                        // [T-fork-deep-skill-sync] Keep the deep-* skill pack's
+                        // enabled state aligned with the master toggle (restored
+                        // fork behaviour — the source merge had dropped it).
+                        SkillStore.shared.syncDeepModeSkills()
                     }
                     Toggle(isOn: $specModeEnabled) {
                         Label {

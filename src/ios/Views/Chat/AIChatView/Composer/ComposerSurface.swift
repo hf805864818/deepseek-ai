@@ -1,4 +1,4 @@
-﻿//
+//
 //  ComposerSurface.swift
 //  Minis - chat page (AIChatView)
 //

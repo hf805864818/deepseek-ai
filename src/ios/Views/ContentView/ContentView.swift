@@ -840,11 +840,12 @@ struct ContentView: View {
             .presentationDetents([.medium])
         }
         .sheet(item: $sessionToEdit) { session in
-            SessionEditSheet(session: session) { newTitle, newCategory in
+            SessionEditSheet(session: session) { newTitle, newCategory, newEnvProfileId in
                 // [T-ios-state-publish-offmain-crash] @MainActor so the @State
                 // write after the actor-hop await stays on the main thread.
                 Task { @MainActor in
                     await ChatStore.shared.updateSessionTitle(session.id, title: newTitle, category: newCategory)
+                    await ChatStore.shared.updateSessionEnvProfileId(session.id, envProfileId: newEnvProfileId)
                     refreshSessionList()
                 }
                 sessionToEdit = nil

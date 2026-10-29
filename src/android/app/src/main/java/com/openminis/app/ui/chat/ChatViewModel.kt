@@ -3233,6 +3233,9 @@ class ChatViewModel(
         // Save to global prefs (per-session DB persistence to be added later
         // with a schema migration; for now the global default is the source of truth).
         com.openminis.app.data.DeepModePrefs.setGlobalEnabled(context, newValue)
+        // [T-fork-deep-skill-sync] Keep the deep-* skill pack's enabled state
+        // aligned with the master toggle (mirrors iOS SkillStore.syncDeepModeSkills).
+        skillRepository?.syncDeepModeSkills()
         viewModelScope.launch {
             ensureSession()
             // Per-session DB persistence to be added later with a schema migration;
