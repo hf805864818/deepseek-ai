@@ -330,7 +330,20 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        // 14 → 15: index sessions.updated_at (upstream perf).
+        /**
+         * [T-android-moveto-perf] Index `sessions.updated_at`.
+         *
+         * Every session listing orders by this column; with no index SQLite
+         * scans the whole table and sorts, which is what made the "Move to"
+         * sheet visibly pause on large histories.
+         *
+         * The index name and column list must match what Room derives from the
+         * entity's @Index EXACTLY — Room validates the live schema on open and
+         * aborts with IllegalStateException on any difference. In particular
+         * this is `(updated_at)`, not `(updated_at DESC)`: Room's annotation
+         * cannot express a sort order, and SQLite reads a B-tree index in
+         * either direction anyway.
+         */
         val MIGRATION_14_15 = object : Migration(14, 15) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
@@ -340,7 +353,17 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        // 15 → 14: drop the index (derived data, safe to undo).
+        /**
+         * [T-android-moveto-perf] Downgrade counterpart of [MIGRATION_14_15].
+         *
+         * This one is NOT a no-op, unlike the ADD COLUMN downgrades above. An
+         * older build's entity does not declare index_sessions_updated_at, and
+         * Room's open-time validation rejects an index it finds on disk but
+         * does not expect just as firmly as one that is missing — leaving it in
+         * place would make the older build fail to start. Dropping an index
+         * destroys no data (it is derived entirely from the column), so unlike
+         * DROP COLUMN this is safe to undo; re-upgrading simply recreates it.
+         */
         val MIGRATION_15_14 = object : Migration(15, 14) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("DROP INDEX IF EXISTS index_sessions_updated_at")
