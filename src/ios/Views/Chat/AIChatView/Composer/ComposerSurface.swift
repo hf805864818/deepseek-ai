@@ -1,4 +1,4 @@
-//
+﻿//
 //  ComposerSurface.swift
 //  Minis - chat page (AIChatView)
 //
@@ -40,11 +40,13 @@ import WebKit
 /// half-transparent white disc was invisible over plain reply text, so the
 /// fill is near-opaque with a readable border and shadow. Callers with their
 /// own historical values pass them in.
+/// [T-fork-floatbtn-no-shadow] Restored fork behaviour: flat, no drop shadow —
+/// a faint border only, matching the scroll-to-bottom pill (see
+/// Voice/SpeechPlayerControl.swift "No shadow — a faint border instead").
+/// The source-era drop shadow read as a dark halo under the floating buttons.
 struct FloatingCircleButtonSurface: ViewModifier {
     var legacyLightOpacity: Double = 0.92
     var legacyStrokeOpacity: Double = 0.35
-    var legacyShadowOpacity: Double = 0.18
-    var legacyShadowRadius: CGFloat = 5
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -71,7 +73,6 @@ struct FloatingCircleButtonSurface: ViewModifier {
                         .clipShape(Circle())
                 }
                 .overlay(Circle().stroke(Color.gray.opacity(legacyStrokeOpacity), lineWidth: 0.5))
-                .shadow(color: .black.opacity(legacyShadowOpacity), radius: legacyShadowRadius, y: 2)
         }
     }
 }

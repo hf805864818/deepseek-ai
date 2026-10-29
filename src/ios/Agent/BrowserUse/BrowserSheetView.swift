@@ -1,4 +1,4 @@
-import SwiftUI
+﻿import SwiftUI
 
 /// Sheet view for observing the browser's live WKWebView(s) via a tab pool.
 struct BrowserSheetView: View {
@@ -447,9 +447,7 @@ struct BrowserDownloadFloatingButton: View {
                     .frame(width: 36, height: 36)
                     .modifier(FloatingCircleButtonSurface(
                         legacyLightOpacity: 0.5,
-                        legacyStrokeOpacity: 0.25,
-                        legacyShadowOpacity: 0.12,
-                        legacyShadowRadius: 4
+                        legacyStrokeOpacity: 0.25
                     ))
                     .overlay(alignment: .topTrailing) {
                         if badge > 0 {
