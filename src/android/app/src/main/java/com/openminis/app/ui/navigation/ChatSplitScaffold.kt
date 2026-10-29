@@ -908,6 +908,9 @@ fun ChatSplitScaffoldRoute(
     memoryRepository: com.openminis.app.data.repository.MemoryRepository?,
     skillRepository: com.openminis.app.data.repository.SkillRepository?,
     mcpRepository: com.openminis.app.data.repository.MCPRepository?,
+    // [DeepMode] Fork-owned cognitive framework store; threaded through so the
+    // chat's DeepMode toggle still reaches the ViewModel (upstream dropped it).
+    deepModeStore: com.openminis.app.agent.DeepModeStore? = null,
 ) {
     ChatSplitScaffold(
         initialSessionId = initialSessionId,
@@ -956,6 +959,7 @@ fun ChatSplitScaffoldRoute(
                 memoryRepository = memoryRepository,
                 skillRepository = skillRepository,
                 mcpRepository = mcpRepository,
+                deepModeStore = deepModeStore,
                 // Back inside the pair is the pane navigator's job (it knows
                 // whether that means "hide the detail" or "pop to the list").
                 onBack = onBackInPane,
