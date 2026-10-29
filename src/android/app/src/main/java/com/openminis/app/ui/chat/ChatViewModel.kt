@@ -1060,6 +1060,10 @@ class ChatViewModel(
                 providerRepository, context,
             ),
             memoryEnabled = _memoryEnabled.value,
+            // [T-sub-agents-v1] Thread the live roster into the subagent_task
+            // schema so the model can address every enabled sub agent by name
+            // (renames take effect next request; the schema is not cached).
+            rosterNames = providerRepository.subAgents.map { it.name },
             deepModeEnabled = _deepModeEnabled.value,
         )
 
@@ -1166,6 +1170,21 @@ class ChatViewModel(
     }
 
     internal fun clearDelegateOverride(toolId: String) { delegateBlockOverrides.remove(toolId) }
+
+    /**
+     * [T-sub-agents-v1] System-prompt disclosure of the enabled sub agents:
+     * names + descriptions + pinned model, so the model can pick the right one
+     * without trial-and-error. Empty for a helper (child) vm, and empty when
+     * Settings › Agents is off (the tool itself is then absent too).
+     */
+    private fun subAgentRosterPromptSection(): String {
+        if (isHelper) return ""
+        if (!com.openminis.app.tools.AgentToolSwitch.AGENTS.isEnabled(context)) return ""
+        return com.openminis.app.agent.jobs.HelperRunner.subAgentRosterSection(
+            roster = providerRepository.subAgents,
+            groupName = { id -> providerRepository.group(id)?.name },
+        )
+    }
 
     // ── subagent_task: resume / control / queue ─────────────────────────
     private fun executeResumeAgents(argsJson: String): ToolExecutionResult {
@@ -12333,7 +12352,7 @@ Available tools:
 - file_write: Create new files or overwrite existing files (faster than echo/tee).
 - file_edit: Edit existing files with exact string replacement (old_string → new_string). Preferred over file_write for modifications — always file_read first.
 - browser_use: Web browsing (navigate, screenshot, click, type, get_text, scroll, scroll_and_collect, get_readable, get_backbone, fetch, etc.). Starts with a desktop Chrome user agent. Use screenshot to see the page.
-  当 browser_use 触达 Google 登录 / OAuth 页（accounts.google.com、signin.google.com、myaccount.google.com、oauth2.googleapis.com 等）或网页返回 "disallowed_useragent" / 403 包含 "browser is not secure" 字样时，**不要重试或尝试登录** — Google 永久禁止 in-app WebView 完成登录，重试只会浪费 turn。改为告诉用户："此页面需要在系统 Chrome 完成登录" 并给出可点击的 Markdown link [在 Chrome 中打开](https://accounts.google.com/...)。点该 link 时 app 会跳出 Custom Tab；用户在 Chrome 完成操作后，请他**把所需结果（邮件正文 / 文档摘要 / 表格数据）粘贴回 chat**，你再继续帮他处理。这是 Android 平台限制，不是 bug。${toolListMemoryBullets}
+  当 browser_use 触达 Google 登录 / OAuth 页（accounts.google.com、signin.google.com、myaccount.google.com、oauth2.googleapis.com 等）或网页返回 "disallowed_useragent" / 403 包含 "browser is not secure" 字样时，**不要重试或尝试登录** — Google 永久禁止 in-app WebView 完成登录，重试只会浪费 turn。改为告诉用户："此页面需要在系统 Chrome 完成登录" 并给出可点击的 Markdown link [在 Chrome 中打开](https://accounts.google.com/...)。点该 link 时 app 会跳出 Custom Tab；用户在 Chrome 完成操作后，请他**把所需结果（邮件正文 / 文档摘要 / 表格数据）粘贴回 chat**，你再继续帮他处理。这是 Android 平台限制，不是 bug。${com.openminis.app.agent.jobs.HelperRunner.systemPromptBullet(!isHelper && com.openminis.app.agent.jobs.AgentSettings.isEnabled(context))}${subAgentRosterPromptSection()}${toolListMemoryBullets}
 
 Shared directory /var/minis/ (bidirectional read/write between shell and app):
   /var/minis/attachments/ — Media files (images, audio, video). Display inline with ![desc](minis://attachments/filename).
