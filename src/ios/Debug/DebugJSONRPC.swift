@@ -177,6 +177,46 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try await handleShellExecute(params: params)
         case "debug.appInfo":
             return handleAppInfo(params: params)
+        case "debug.ish.memStats":
+            return handleISHMemStats()
+        case "debug.loadtest.getLimits":
+            return await Self.loadTestLimits()
+        case "debug.loadtest.setLimits":
+            // [T-loadtest-limits] Any subset; a value <= 0 or "default" restores
+            // the shipping limit. In memory only (a relaunch restores defaults).
+            func pick(_ k: String) -> Int?? {
+                guard let v = params[k] else { return .none }
+                if let n = v as? Int, n > 0 { return .some(n) }
+                return .some(nil)
+            }
+            // [T-limits-per-parent] `childJobs` / `queuedDelegations` keep their
+            // names for the existing load-test scripts but are now PER PARENT;
+            // the `...PerParent` spellings are accepted as aliases.
+            if let v = pick("sessions") { LoadTestLimits.sessionSlots = v }
+            if let v = pick("childJobs") ?? pick("childJobsPerParent") { LoadTestLimits.childJobs = v }
+            if let v = pick("queuedDelegations") ?? pick("queuedDelegationsPerParent") { LoadTestLimits.queuedDelegations = v }
+            if let v = pick("tools") { LoadTestLimits.toolsPerTurn = v }
+            return await Self.loadTestLimits()
+        case "debug.loadtest.sample":
+            return await Self.loadTestSample()
+        case "debug.backup.export":
+            return try await DebugRPCBackup.export(params: params)
+        case "debug.backup.inspect":
+            return try await DebugRPCBackup.inspect(params: params)
+        case "debug.backup.cleanup":
+            return try await DebugRPCBackup.cleanup(params: params)
+        case "debug.backup.open":
+            return try await DebugRPCBackup.open(params: params)
+        case "debug.backup.destinations":
+            return try await DebugRPCBackup.destinations(params: params)
+        case "debug.backup.rescue":
+            return try await DebugRPCBackup.rescue(params: params)
+        case "debug.rclone.info":
+            return try await DebugRPCBackup.rcloneInfo(params: params)
+        case "debug.rclone.remote":
+            return try await DebugRPCBackup.rcloneRemote(params: params)
+        case "debug.backup.restore":
+            return try await DebugRPCBackup.restore(params: params)
         case "debug.auth.list":
             return ["tokens": DebugAuthenticator.shared.listTokens(),
                     "authRequired": DebugAuthenticator.shared.authRequired]
@@ -193,6 +233,9 @@ final class DebugJSONRPC: @unchecked Sendable {
             }
             DebugAuthenticator.shared.setAuthRequired(required)
             return ["authRequired": required]
+        case "debug.chatSearch":
+            // [T-in-chat-search] Drive / inspect "Search in Chat" on the chat on screen.
+            return try await ChatSearchDebugRPC.handle(params)
         case "debug.scrollMetrics":
             // [T-ios-scroll-metrics-ring] Recording is OFF by default; pass
             // enabled=true/false to arm/disarm (disarming empties the ring).
@@ -263,6 +306,10 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try handleToolExecSetEnabled(params: params)
         case "debug.toolExec.getStatus":
             return handleToolExecGetStatus()
+        case "debug.crashDiag.list":
+            return handleCrashDiagList()
+        case "debug.crashDiag.read":
+            return try handleCrashDiagRead(params: params)
         case "debug.screenshot":
             return try await handleScreenshot(params: params)
         case "debug.screenshot.capture":
@@ -307,6 +354,12 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try await handleScrollOffset(params: params)
         case "debug.openSession":
             return try await handleOpenSession(params: params)
+        case "debug.helper.openSheet":
+            return try await handleOpenHelperSheet(params: params)
+        case "debug.agentCallback.openSheet":
+            return try await handleOpenAgentCallbackSheet(params: params)
+        case "debug.agent.openToolSheet":
+            return try await handleOpenAgentToolSheet(params: params)
         // MARK: Hang detector
         case "debug.hangDetector.start":
             return DebugRPCHangDetector.start(params: params)
@@ -431,6 +484,43 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try await DebugRPCChat.foldersRename(params: params)
         case "debug.sessions.badge":
             return try await DebugRPCChat.sessionsBadge(params: params)
+        case "debug.location.setAutoRetract":
+            // [T-bka-orphan-retract-exp] true = automatic orphan retracts run (the default).
+            let enabled = (params["enabled"] as? Bool) ?? true
+            UserDefaults.standard.set(!enabled, forKey: BackgroundKeepAliveManager.debugAutoRetractDisabledKey)
+            return ["autoRetract": enabled]
+        case "debug.bka.getProfile":
+            // [T-bka-debug-profile]
+            return await BackgroundKeepAliveManager.shared.debugProfile()
+        case "debug.bka.setProfile":
+            do {
+                return try await BackgroundKeepAliveManager.shared.debugApplyProfile(params)
+            } catch let e as BackgroundKeepAliveManager.DebugProfileError {
+                throw DebugRPCErr(-32602, e.description)
+            }
+        case "debug.bka.setLocationMode":
+            // [T-bka-loc-pulse] continuous | off | default (clear override)
+            let mode = (params["mode"] as? String) ?? "default"
+            if mode == "default" {
+                UserDefaults.standard.removeObject(forKey: BackgroundKeepAliveManager.locationLAModeKey)
+            } else {
+                guard BackgroundKeepAliveManager.LocationLAMode(rawValue: mode) != nil else {
+                    throw DebugRPCErr(-32602, "mode must be continuous / off / default")
+                }
+                UserDefaults.standard.set(mode, forKey: BackgroundKeepAliveManager.locationLAModeKey)
+            }
+            return ["mode": BackgroundKeepAliveManager.locationLAMode.rawValue]
+        case "debug.bka.setContinuedMode":
+            // [T-bka-continued-preferred-switch] preferred (default) | fallback | off
+            let mode = (params["mode"] as? String) ?? "preferred"
+            guard BackgroundKeepAliveManager.ContinuedMode(rawValue: mode) != nil else {
+                throw DebugRPCErr(-32602, "mode must be preferred / fallback / off")
+            }
+            UserDefaults.standard.set(mode, forKey: BackgroundKeepAliveManager.continuedModeKey)
+            return ["mode": mode]
+        case "debug.location.retractExperiment":
+            let strategy = (params["strategy"] as? String) ?? ""
+            return await BackgroundKeepAliveManager.shared.debugRetractExperiment(strategy: strategy)
         case "debug.appearance.set":
             return try await DebugRPCChat.appearanceSet(params: params)
         case "debug.sessions.pin":
@@ -439,6 +529,8 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try await DebugRPCChat.foldersPin(params: params)
         case "debug.folders.setAutoGrouping":
             return try await DebugRPCChat.foldersSetAutoGrouping(params: params)
+        case "chat.title.regenerate":
+            return try await DebugRPCChat.titleRegenerate(params: params)
         case "chat.compact.markers.list":
             return try await DebugRPCChat.compactMarkersList(params: params)
         case "chat.compact.before":
@@ -447,6 +539,10 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try await DebugRPCChat.compactRevert(params: params)
         case "chat.simulateLongMessage":
             return try await DebugRPCChat.simulateLongMessage(params: params)
+        case "chat.debugRemoveMessages":
+            return try await DebugRPCChat.debugRemoveMessages(params: params)
+        case "chat.deleteFromMessage":
+            return try await DebugRPCChat.deleteFromMessage(params: params)
         #if DEBUG
         // MARK: Voice correction (design §10) — DEBUG-only, like the rest of this block.
         case "debug.voiceCorrection.confusionList":
@@ -467,6 +563,20 @@ final class DebugJSONRPC: @unchecked Sendable {
             return try await VoiceCorrectionDebugRPC.rebuildVocabulary(params: params)
         case "debug.voiceCorrection.metrics":
             return try await VoiceCorrectionDebugRPC.metrics(params: params)
+        case "debug.voiceCorrection.vocabularyStats":
+            return try await VoiceCorrectionDebugRPC.vocabularyStats(params: params)
+        case "debug.voiceCorrection.traceList":
+            return try await VoiceCorrectionDebugRPC.traceList(params: params)
+        case "debug.voiceCorrection.viewportContext":
+            return try await VoiceCorrectionDebugRPC.viewportContext(params: params)
+        case "debug.chatExport.render":
+            return try await ChatExportDebugRPC.render(params: params)
+        case "debug.chatShare.openPicker":
+            return try await ChatExportDebugRPC.openPicker(params: params)
+        case "debug.voiceCorrection.traceManualEdits":
+            return try await VoiceCorrectionDebugRPC.traceManualEdits(params: params)
+        case "debug.voiceCorrection.traceClear":
+            return try await VoiceCorrectionDebugRPC.traceClear(params: params)
         case "debug.voiceCorrection.injectConfusionRecord":
             return try await VoiceCorrectionDebugRPC.injectConfusionRecord(params: params)
         case "debug.voiceCorrection.recordManualEdit":
@@ -965,6 +1075,32 @@ final class DebugJSONRPC: @unchecked Sendable {
     /// you feed it.
     private func handleToolExecGetStatus() -> Any {
         CrashReporter.toolBreadcrumbStatus()
+    }
+
+    // MARK: - Crash diagnostics [T-crash-diag-export]
+
+    private func handleCrashDiagList() -> Any {
+        let iso = ISO8601DateFormatter()
+        return ["items": CrashDiagnostics.items().map { item -> [String: Any] in
+            var d: [String: Any] = ["id": item.id, "kind": item.kind.rawValue, "title": item.title, "size": item.size]
+            if let m = item.modified { d["modified"] = iso.string(from: m) }
+            return d
+        }]
+    }
+
+    /// Same sanitised text the Settings view shows; capped like logs.read.
+    private func handleCrashDiagRead(params: [String: Any]) throws -> Any {
+        guard let id = params["id"] as? String else {
+            throw DebugRPCErr(-32602, "Missing required param: id (from debug.crashDiag.list)")
+        }
+        guard let text = CrashDiagnostics.read(id: id) else {
+            throw DebugRPCErr(-32602, "Unknown id: \(id) - call debug.crashDiag.list")
+        }
+        let cap = (params["limit"] as? Int).map { max(1, min($0, 1_048_576)) } ?? 524_288
+        let utf8 = Array(text.utf8)
+        let truncated = utf8.count > cap
+        let body = truncated ? String(decoding: utf8.prefix(cap), as: UTF8.self) : text
+        return ["id": id, "text": body, "bytes": utf8.count, "truncated": truncated]
     }
 
     // MARK: - Screenshot Handler
@@ -1728,10 +1864,7 @@ final class DebugJSONRPC: @unchecked Sendable {
             }
             return ["result": NSNull()] as [String: Any]
         } catch {
-            let nsError = error as NSError
-            let detail = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String
-                ?? error.localizedDescription
-            throw RPCError(code: -32000, message: "JavaScript error: \(detail)")
+            throw RPCError(code: -32000, message: BrowserJSErrorFormatter.message(error))
         }
     }
 
@@ -1750,7 +1883,7 @@ final class DebugJSONRPC: @unchecked Sendable {
             }
             return ["result": String(describing: raw ?? "null")]
         } catch {
-            throw RPCError(code: -32000, message: "JavaScript error: \(error.localizedDescription)")
+            throw RPCError(code: -32000, message: BrowserJSErrorFormatter.message(error))
         }
     }
 
@@ -2090,6 +2223,12 @@ final class DebugJSONRPC: @unchecked Sendable {
                     let waitResult = ctx.sem.wait(timeout: .now() + timeout)
                     if waitResult == .timedOut {
                         ISHShellExecutor.killProcess(pid, withSignal: 9)
+                        // [T-ish-shell-timeout-leak] Same self-heal as the
+                        // agent path: don't leave teardown to an exit
+                        // notification that a zombie-reaped task never sends,
+                        // or this context and its reader threads leak for the
+                        // life of the process.
+                        ISHShellExecutor.finalizeTimedOutPid(pid)
                         continuation.resume(returning: (ctx.result, true))
                         return
                     }
@@ -2170,6 +2309,143 @@ final class DebugJSONRPC: @unchecked Sendable {
         var result: ISHShellExecutionResult?
     }
 
+    /// [T-ish-cluster-hitrate] Cluster-commit effectiveness, read live during a
+    /// workload. Reports the hit rate AND the reason for every miss, plus the
+    /// all-paths anonymous mmap totals the rate has to be read against, plus
+    /// the host footprint so the guest/host ratio can be computed from one
+    /// consistent sample instead of correlating two clocks by hand.
+    /// [T-loadtest-limits] The effective limits and their overrides.
+    @MainActor
+    static func loadTestLimits() -> [String: Any] {
+        [
+            "sessions": SessionConcurrencyManager.shared.maxConcurrent,
+            "childJobs": AgentJobRegistry.maxChildJobsPerParent,
+            "queuedDelegations": AgentJobRegistry.maxQueuedDelegationsPerParent,
+            "tools": AIChatViewModel.maxConcurrentTools,
+            // [T-limits-per-parent] What each number counts, and the shipping values.
+            "scope": [
+                "sessions": "global, per session; sub agent runs are exempt",
+                "childJobs": "per parent conversation",
+                "queuedDelegations": "per parent conversation",
+                "tools": "per turn",
+            ],
+            "shipping": [
+                "sessions": ConcurrencyLimits.shippingSessionSlots,
+                "childJobs": ConcurrencyLimits.shippingChildJobsPerParent,
+                "queuedDelegations": ConcurrencyLimits.shippingQueuedDelegationsPerParent,
+                "tools": ConcurrencyLimits.shippingToolsPerTurn,
+            ],
+            "overridden": [
+                "sessions": LoadTestLimits.sessionSlots as Any,
+                "childJobs": LoadTestLimits.childJobs as Any,
+                "queuedDelegations": LoadTestLimits.queuedDelegations as Any,
+                "tools": LoadTestLimits.toolsPerTurn as Any,
+            ],
+        ]
+    }
+
+    /// [T-loadtest-limits] One resource snapshot for the load test: jetsam
+    /// footprint, distance to the jetsam line, threads, iSH guest processes /
+    /// memory, thermal state, battery, and the concurrency state.
+    @MainActor
+    static func loadTestSample() -> [String: Any] {
+        let vm = ResourceSampler.vmInfo()
+        var guestProcs: Int32 = -1
+        var guestAnon: Int64 = 0
+        if ISHKernel.shared.isBooted { ISHKernel.shared.getGuestProcessCount(&guestProcs, anonBytes: &guestAnon) }
+        let device = UIDevice.current
+        device.isBatteryMonitoringEnabled = true
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermal = "nominal"
+        case .fair: thermal = "fair"
+        case .serious: thermal = "serious"
+        case .critical: thermal = "critical"
+        @unknown default: thermal = "unknown"
+        }
+        let scm = SessionConcurrencyManager.shared
+        return [
+            "t": Date().timeIntervalSince1970,
+            "footprintMB": Double(vm.footprint) / 1_048_576,
+            "virtualMB": Double(vm.virtual) / 1_048_576,
+            "availMB": Double(os_proc_available_memory()) / 1_048_576,
+            "threads": ResourceSampler.threadCount(),
+            "guestProcs": Int(guestProcs),
+            "guestAnonMB": Double(guestAnon) / 1_048_576,
+            "thermal": thermal,
+            "battery": Double(device.batteryLevel),
+            "batteryState": device.batteryState.rawValue,
+            "lowPower": ProcessInfo.processInfo.isLowPowerModeEnabled,
+            "appState": UIApplication.shared.applicationState.rawValue,
+            "runningSessions": scm.runningSessions.count,
+            "suspendedSessions": scm.suspendedSessions.count,
+            "runningChildJobs": AgentJobRegistry.shared.runningChildJobCount,
+            // [T-limits-per-parent] The allowance is per parent, so the total
+            // alone no longer says whether anything is blocked.
+            "childJobsByParent": Dictionary(grouping: AgentJobRegistry.shared.jobs.values.filter {
+                $0.target.isChildOfCurrent && $0.state == .running
+            }, by: { $0.target.parentSessionId ?? "-" }).mapValues(\.count),
+            "queuedByParent": Dictionary(grouping: AgentJobRegistry.shared.queuedDelegations,
+                                         by: \.parentSessionId).mapValues(\.count),
+            "childStartReservations": AgentJobRegistry.shared.childStartReservations.count,
+            "limits": loadTestLimits(),
+        ]
+    }
+
+    private func handleISHMemStats() -> Any {
+        var calls: UInt64 = 0, full: UInt64 = 0, single: UInt64 = 0
+        var whyMapped: UInt64 = 0, whyFlags: UInt64 = 0
+        var whyNoCluster: UInt64 = 0, whyEnomem: UInt64 = 0
+        var pagesCommitted: UInt64 = 0
+        ish_cluster_stats(&calls, &full, &single, &whyMapped, &whyFlags,
+                          &whyNoCluster, &whyEnomem, &pagesCommitted)
+
+        var anonMmaps: UInt64 = 0, anonPages: UInt64 = 0
+        ish_anon_mmap_stats(&anonMmaps, &anonPages)
+
+        let hostPage = UInt64(getpagesize())
+        let guestPage: UInt64 = 4096
+        // What the anonymous mappings cost the host vs what the guest got.
+        // Multi-page mappings pack perfectly; only single-page ones waste.
+        let guestBytes = anonPages * guestPage
+        let hostBytes = anonMmaps > 0
+            ? (anonPages &* guestPage &+ (anonMmaps &* (hostPage &- 1)))
+            : 0
+
+        var footprintMB: Double = 0
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS {
+            footprintMB = Double(info.phys_footprint) / (1024 * 1024)
+        }
+
+        let decided = full &+ single
+        return [
+            "clusterCalls": calls,
+            "clusterFull": full,
+            "clusterSingle": single,
+            "clusterHitRatePct": decided > 0 ? Double(full) * 100.0 / Double(decided) : 0,
+            "missWhyNeighbourMapped": whyMapped,
+            "missWhySameFlagsRefused": whyFlags,
+            "missWhyHostPageEqualsGuest": whyNoCluster,
+            "missWhyClusterMmapFailed": whyEnomem,
+            "clusterPagesCommitted": pagesCommitted,
+            "avgPagesPerClusterCall": decided > 0 ? Double(pagesCommitted) / Double(decided) : 0,
+            "anonMmapCalls": anonMmaps,
+            "anonPagesMapped": anonPages,
+            "anonGuestMB": Double(guestBytes) / (1024 * 1024),
+            "anonHostMBUpperBound": Double(hostBytes) / (1024 * 1024),
+            "avgPagesPerAnonMmap": anonMmaps > 0 ? Double(anonPages) / Double(anonMmaps) : 0,
+            "hostPageSize": hostPage,
+            "appFootprintMB": footprintMB,
+        ]
+    }
+
     private func handleAppInfo(params: [String: Any] = [:]) -> Any {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -2196,6 +2472,11 @@ final class DebugJSONRPC: @unchecked Sendable {
             "dataPath": dataPath.path,
             "rootfsPath": docs.appendingPathComponent("alpine-rootfs").path,
             "bundlePath": bundlePath,
+            // [T-ish-shell-timeout-leak] Reader-thread accounting. `liveReaders`
+            // should sit at 0 between commands; a value that only grows is the
+            // shell timeout leak recurring, and it ends with the app unable to
+            // run any command until the device restarts.
+            "shellLeakGuard": ISHShellExecutor.leakGuardStatus(),
             "buildDate": buildDate,
         ]
 
@@ -2668,6 +2949,73 @@ final class DebugJSONRPC: @unchecked Sendable {
     ///
     /// The session id is validated first so a typo fails loudly instead of
     /// posting a notification that silently does nothing.
+    /// debug.agentCallback.openSheet — open the detail sheet for an
+    /// `<agent_callback>` message. [T-p3-agent-callback-cell] Params:
+    /// `text` (the raw callback XML), or `sessionId` — the last callback
+    /// message of that (cached, on-screen) session is used. Synthesized taps
+    /// cannot reach the SwiftUI cell, so this posts the same notification.
+    private func handleOpenAgentCallbackSheet(params: [String: Any]) async throws -> Any {
+        let callback: AgentCallback? = await MainActor.run {
+            if let text = params["text"] as? String, !text.isEmpty {
+                return AgentCallback.parse(text)
+            }
+            guard let sid = params["sessionId"] as? String,
+                  let vm = ViewModelCache.shared.get(for: sid) else { return nil }
+            return vm.messages.reversed().lazy.compactMap { $0.agentCallback }.first
+        }
+        guard let callback else {
+            throw RPCError(code: -32602, message: "No agent callback message found")
+        }
+        await MainActor.run {
+            NotificationCenter.default.post(name: .openAgentCallback, object: nil,
+                                            userInfo: ["callback": callback])
+        }
+        return ["ok": true, "kind": callback.kind.rawValue, "job": callback.jobId, "status": callback.status]
+    }
+
+    /// debug.agent.openToolSheet — open the regular tool sheet (ToolLiveSheet
+    /// + HelperDetailCard) for the LAST delegate_task block of `sessionId`,
+    /// i.e. what a tap on the inline block or the tool bar opens.
+    /// [T-agent-tool-sheet-unified] Synthesized taps cannot reach SwiftUI.
+    private func handleOpenAgentToolSheet(params: [String: Any]) async throws -> Any {
+        guard let sid = params["sessionId"] as? String else {
+            throw RPCError(code: -32602, message: "Missing required param: sessionId")
+        }
+        let block: AssistantBlock? = await MainActor.run {
+            guard let vm = ViewModelCache.shared.get(for: sid) else { return nil }
+            for msg in vm.messages.reversed() where msg.role == .assistant {
+                if let b = msg.blocks.last(where: { if case .delegateTool = $0.kind { return true }; return false }) { return b }
+            }
+            return nil
+        }
+        guard let block else { throw RPCError(code: -32602, message: "No delegate_task block in that session") }
+        await MainActor.run {
+            NotificationCenter.default.post(name: .openAgentCallback, object: nil, userInfo: ["block": block])
+        }
+        return ["ok": true, "toolUseId": block.toolUseId ?? ""]
+    }
+
+    /// debug.helper.openSheet — open the read-only helper mirror sheet for a
+    /// child session on whatever chat is on screen. [T-p1-delegate-task]
+    /// The capsule and the delegate block are SwiftUI tap targets that the
+    /// synthesized-tap ladder cannot reach without iCTRL; this is the same
+    /// notification the P2 notification-tap path will post.
+    private func handleOpenHelperSheet(params: [String: Any]) async throws -> Any {
+        guard let childId = params["childSessionId"] as? String, !childId.isEmpty else {
+            throw RPCError(code: -32602, message: "Missing required param: childSessionId")
+        }
+        guard let child = await ChatStore.shared.getSession(childId) else {
+            throw RPCError(code: -32602, message: "Session not found: \(childId)")
+        }
+        let title = AgentJobRegistry.stripChildSessionTitlePrefix(child.title ?? "")
+        await MainActor.run {
+            NotificationCenter.default.post(name: .openHelperSheet, object: nil,
+                                            userInfo: ["childSessionId": childId, "title": title,
+                                                       "parentSessionId": child.parentSessionId ?? ""])
+        }
+        return ["ok": true, "childSessionId": childId, "parentSessionId": child.parentSessionId ?? ""] as [String: Any]
+    }
+
     private func handleOpenSession(params: [String: Any]) async throws -> Any {
         guard let sessionId = params["sessionId"] as? String, !sessionId.isEmpty else {
             throw RPCError(code: -32602, message: "Missing required param: sessionId")
@@ -2804,6 +3152,7 @@ final class DebugJSONRPC: @unchecked Sendable {
             // callers can rely on the field being present.
             "updatedAt": iso.string(from: entry.createdAt),
             "hasValue": hasValue,
+            "enabled": EnvVarStore.shared.isEnabled(id: entry.id),  // [T-envvar-disable]
         ]
         if includeValue {
             dict["value"] = stored ?? ""
@@ -2830,6 +3179,7 @@ final class DebugJSONRPC: @unchecked Sendable {
         let value = params["value"] as? String
         let note = params["note"] as? String
         let idParam = params["id"] as? String
+        let enabledParam = params["enabled"] as? Bool  // [T-envvar-disable]
 
         return await MainActor.run { () -> [String: Any] in
             let store = EnvVarStore.shared
@@ -2854,6 +3204,7 @@ final class DebugJSONRPC: @unchecked Sendable {
                     newValue = EnvVarStore.loadValueSync(forKey: existing.key) ?? ""
                 }
                 store.update(id: existing.id, key: newKey, value: newValue, note: note)
+                if let enabledParam { store.setEnabled(id: existing.id, enabledParam) }
                 if let updated = store.entry(id: existing.id) {
                     return self.encodeEnvVarEntry(updated, includeValue: false)
                 }
@@ -2865,6 +3216,7 @@ final class DebugJSONRPC: @unchecked Sendable {
                 store.add(key: key, value: value ?? "", note: note ?? "")
                 let upper = key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
                 if let created = store.entries.first(where: { $0.key == upper }) {
+                    if let enabledParam { store.setEnabled(id: created.id, enabledParam) }
                     return self.encodeEnvVarEntry(created, includeValue: false)
                 }
                 return ["error": "add failed (invalid key or duplicate)"]
