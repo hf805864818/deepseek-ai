@@ -11874,13 +11874,49 @@ class ChatViewModel(
 
     // ─── UI Helpers ──────────────────────────────────────────────────────
 
+    /**
+     * [T-android-orphaned-running-tool-spin] Re-apply the in-memory delegate
+     * override map on top of rebuilt blocks, but drop a spinner override whose
+     * sub-agent job is already dead — otherwise an orphaned RUNNING shimmer
+     * re-stamps itself on every reload forever (measured 91fps / ~1 core idle).
+     */
+    private fun mergeDelegateOverrides(blocks: List<AssistantBlock>): List<AssistantBlock> {
+        if (delegateBlockOverrides.isEmpty()) return blocks
+        return blocks.map { b ->
+            delegateBlockOverrides[b.id]?.let { o ->
+                val status = if (OrphanedRunningToolGate.overrideMayApply(
+                        o.toolStatus, isLiveRun = _isStreaming.value, jobIsAlive = delegateJobIsAlive(o.content),
+                    )
+                ) {
+                    o.toolStatus ?: b.toolStatus
+                } else {
+                    b.toolStatus
+                }
+                b.copy(content = o.content, toolStatus = status)
+            } ?: b
+        }
+    }
+
+    /**
+     * [T-android-orphaned-running-tool-spin] Whether the sub-agent job named by
+     * a delegate block's JSON payload (`job_id`, see HelperRunner.progressJson)
+     * is still live. Unparseable → not alive: the cost of being wrong is a
+     * spinner that stops, versus one that never does.
+     */
+    private fun delegateJobIsAlive(content: String): Boolean {
+        val jobId = runCatching { org.json.JSONObject(content).optString("job_id", "") }.getOrNull()
+        if (jobId.isNullOrEmpty()) return false
+        return com.openminis.app.agent.jobs.AgentJobRegistry.job(jobId)?.isActive == true
+    }
+
     private fun updateAssistantMessage(
         id: String,
         content: String,
         isStreaming: Boolean,
-        toolBlocks: List<AssistantBlock>,
+        toolBlocksIn: List<AssistantBlock>,
         isAwaitingModelResponse: Boolean = false,
     ) {
+        val toolBlocks = mergeDelegateOverrides(toolBlocksIn)
         // T-streaming-side-channel: during a live turn, write high-frequency
         // fields into [_streamingById] instead of mutating the canonical
         // message list. This keeps the `messages` StateFlow reference stable
@@ -11893,6 +11929,7 @@ class ChatViewModel(
         // clear the side-channel entry so post-turn reads (history rebuild,
         // persist, agent loop) see the canonical truth.
         if (isStreaming) {
+            com.openminis.app.diagnostics.JankDiag.onStreamChunk(content.length)
             val toolBlocksImmutable = toolBlocks.toList()
 
             // [T-android-stream-flush-dualpath] Dual-path flush at the
@@ -11936,6 +11973,7 @@ class ChatViewModel(
                 unflushed >= NEWLINE_FLUSH_MIN_CHARS
 
             fun publish(text: String, blocks: List<AssistantBlock>, awaiting: Boolean) {
+                com.openminis.app.diagnostics.JankDiag.onStreamPublish()
                 _streamingById.value = _streamingById.value + (
                     id to StreamingDelta(
                         content = text,
@@ -13808,6 +13846,7 @@ C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use i
     }
 
     fun cancelStream() {
+        com.openminis.app.diagnostics.JankDiag.onCancelStreamStart()
         AppLogger.info(TAG_STREAM, "cancelStream invoked _isStreaming=false (sid=$activeSessionId)")
         streamJob?.cancel()
         _isStreaming.value = false
@@ -13875,6 +13914,7 @@ C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use i
             AppLogger.info(TAG_STREAM, "cancel — ${pending.size} queued prompt(s) remain, restarting drain")
             resumeQueueAfterCancel()
         }
+        com.openminis.app.diagnostics.JankDiag.onCancelStreamEnd()
     }
 
     /**
