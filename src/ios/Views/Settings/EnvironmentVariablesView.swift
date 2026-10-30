@@ -366,7 +366,7 @@ struct EnvironmentVariablesView: View {
 
 // MARK: - Form Sheet
 
-private struct EnvVarFormSheet: View {
+struct EnvVarFormSheet: View {
     enum Mode { case add, edit }
 
     let mode: Mode

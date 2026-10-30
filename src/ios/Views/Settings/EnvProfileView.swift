@@ -228,7 +228,7 @@ struct EnvProfileVarsView: View {
             }
         }
         .sheet(isPresented: $showingAddSheet) {
-            EnvVarFormSheet(mode: .add) { key, value, note in
+            EnvVarFormSheet(mode: .add) { key, value, note, _ in
                 store.addVar(to: profile.id, key: key, value: value, note: note)
             }
         }
@@ -238,7 +238,7 @@ struct EnvProfileVarsView: View {
                 initialKey: entry.key,
                 initialValue: store.value(for: profile.id, key: entry.key) ?? "",
                 initialNote: entry.note
-            ) { key, value, note in
+            ) { key, value, note, _ in
                 store.updateVar(id: entry.id, key: key, value: value, note: note)
             } onDelete: {
                 store.deleteVar(id: entry.id)

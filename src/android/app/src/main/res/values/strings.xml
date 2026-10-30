@@ -646,7 +646,6 @@
     <string name="thinking_fmt_custom_desc">Escape hatch: a dotted path plus a value at High for an endpoint not covered above.</string>
     <string name="common_share">Share</string>
     <string name="common_copy">Copy</string>
-    <string name="image_copied_toast">Copied</string>
     <string name="appearance_title">Appearance</string>
     <string name="appearance_section_theme">Theme</string>
     <string name="appearance_theme_footer">Override the system appearance for this app.</string>
