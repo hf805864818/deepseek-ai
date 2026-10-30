@@ -3457,13 +3457,223 @@ class ChatViewModel(
         // no-op: upstream buildSystemPrompt has no cache to invalidate.
     }
 
+    // [T-perf-scope-cache-android] Cache for extractScopeContext() result.
+    private var _cachedScopeContext: com.openminis.app.agent.DeepModeScopeContext? = null
+    private var _cachedScopeLastUserMessage: String = ""
+
+    // [T-deep-mode-v61-static-fragment-cache] Static portion of the deep mode
+    // fragment, cached on level + specMode switch.
+    private var cachedDeepModeStaticFragment: String? = null
+    private var cachedDeepModeStaticLevel: com.openminis.app.agent.DeepModeLevel? = null
+    private var cachedDeepModeStaticSpec = false
+
+    // [T-deep-mode-perf-fragment-cache-android] Full fragment cache keyed on
+    // level + memory + scope signature + rules file mod-time.
+    private var _cachedDeepModeFragment: String? = null
+    private var _cachedDeepModeFragmentKey: String? = null
+
+    private fun deepModeCognitiveRulesFragment(): String {
+        val level = _deepModeLevel.value
+        return buildString {
+            append("## 认知能力 (Cognitive Capabilities)\n\n")
+            append(
+                """
+C6 — HEARTBEAT SELF-CHECK: Every 3-5 tool calls, pause briefly and ask yourself:
+  • Am I making real progress toward the goal?
+  • Am I repeating the same action or pattern?
+  • Is there a simpler approach I'm missing?
+  • Should I pivot or ask the user for guidance?
+If you detect you're stuck in a loop or not making progress, stop and rethink.
+Use <<GOAL_STATE>> need_more_context if you need user input to get unstuck.
+
+"""
+            )
+            if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
+                append(
+                    """
+C8 — PROACTIVE WEB RESEARCH: When you need information that:
+  • Is time-sensitive (news, prices, status, versions, dates)
+  • May have changed since your training data
+  • Requires specific facts you're uncertain about
+  • Involves documentation, APIs, or technical specifications
+DO NOT guess or rely on your training knowledge. Instead:
+  1. Use web_search to find the information
+  2. Use WebFetch to read relevant pages in detail
+  3. Cite your sources (URLs) in your answer
+Better to search once than to hallucinate wrong information.
+
+"""
+                )
+            }
+            append(
+                """
+C5 — FAIL-THREE-TIMES RULE: If the same tool or approach fails 3 times in a row:
+  1. STOP using that approach immediately
+  2. Think of at least one alternative method
+  3. Try the alternative approach
+  4. If you can't think of a good alternative, emit <<GOAL_STATE>> need_more_context: <what you tried and what you need>
+Do NOT keep banging your head against the same wall. Creativity over brute force.
+
+"""
+            )
+            append(
+                """
+SKILL ACCUMULATION — If about the 3rd time in this session you're handling the SAME type of task (a recurring workflow: producing a docx report, generating a slide deck, the same class of code fix), that workflow is a candidate for a reusable skill. Mention it to the user in one line and offer to create one using the skill format. Do NOT propose a skill on the first or second occurrence — only when a reliable pattern has clearly emerged.
+"""
+            )
+            append(
+                """
+C16 — VISUALIZATION: You have a `render_widget` tool that renders an SVG diagram/chart or an isolated HTML widget INLINE in the chat (not saved as a file). Use it when a visual communicates better than prose: for flowcharts and architecture/sequence diagrams, comparison tables, small data charts, or interactive demos. Provide well-formed inline SVG for 'diagram'/'chart'/'comparison' and self-contained HTML (inline <script> allowed, NO external network assets) for 'interactive'. Keep it compact and readable; width auto-fits the container. Fall back to normal markdown text when prose or a table is clearer. Do NOT use render_widget for content that is better as a real saved file the user can open elsewhere.
+"""
+            )
+            append(
+                """
+C17 — SCHEDULED AUTOMATION: You have a `schedule_task` tool. PROACTIVELY use it when the user asks for something to run on a delay or a repeating schedule — phrases like 'set a reminder', 'daily briefing', 'every weekday at 9am', 'schedule X for tomorrow'. Parse the user's natural-language request into the structured parameters: a self-contained `prompt` describing exactly what the agent should do each run, a 24-hour `time` (HH:MM), and a `repeat` mode ('once' | 'daily' | 'weekdays' | 'custom'). Use custom + `days` (Sun,Mon,Tue,Wed,Thu,Fri,Sat) for specific weekdays. Confirm the created task (label, time, repeat, next trigger) back to the user in one line. Do NOT schedule tasks the user did not ask to schedule. Once created, tasks run independently of this session and are managed from the Scheduled Tasks settings UI.
+"""
+            )
+        }
+    }
+
+    private fun extractScopeContext(): com.openminis.app.agent.DeepModeScopeContext {
+        val lastUserMessage = agentHistory.lastOrNull { it.role == LLMMessage.Role.USER }?.content ?: ""
+        _cachedScopeContext?.let { cached ->
+            if (lastUserMessage == _cachedScopeLastUserMessage) {
+                return cached
+            }
+        }
+        val filePaths = mutableSetOf<String>()
+        val keywords = mutableSetOf<String>()
+        for (msg in agentHistory.takeLast(20)) {
+            for (part in msg.contentParts) {
+                if (part is AgentContentPart.ToolUse) {
+                    val args = part.input
+                    if (part.name in setOf("file_read", "file_write", "file_edit")) {
+                        try {
+                            val path = args.optString("path", "")
+                            if (path.isNotBlank()) filePaths.add(path)
+                        } catch (_: Exception) { }
+                    }
+                    if (part.name == "shell_execute") {
+                        try {
+                            val cmd = args.optString("command", "")
+                            val filePattern = Regex("""[\w./\-]+\.(kt|kts|java|py|sh|bash|zsh|js|ts|tsx|jsx|css|html|xml|json|md|yaml|yml|go|rs|c|cpp|h|swift|rb|php)""", RegexOption.IGNORE_CASE)
+                            filePattern.findAll(cmd).forEach { match -> filePaths.add(match.value) }
+                        } catch (_: Exception) { }
+                    }
+                }
+            }
+        }
+        if (lastUserMessage.isNotBlank()) {
+            val keywordCandidates = listOf(
+                "android" to listOf("android", "kotlin", "jetpack", "compose", "apk", "viewmodel", "activity", "fragment"),
+                "python" to listOf("python", "pip", "django", "flask", "pandas", "numpy", "script"),
+                "shell" to listOf("shell", "bash", "script", "terminal", "command line", "linux", "cli"),
+                "web" to listOf("web", "browser", "html", "css", "javascript", "frontend", "website"),
+                "ios" to listOf("ios", "swift", "uikit", "swiftui", "xcode"),
+            )
+            val lowerMsg = lastUserMessage.lowercase()
+            for ((keyword, variants) in keywordCandidates) {
+                if (variants.any { lowerMsg.contains(it) }) {
+                    keywords.add(keyword)
+                }
+            }
+        }
+        val ctx = com.openminis.app.agent.DeepModeScopeContext(
+            filePaths = filePaths.toList(),
+            userKeywords = keywords.toList(),
+            level = _deepModeLevel.value,
+        )
+        _cachedScopeContext = ctx
+        _cachedScopeLastUserMessage = lastUserMessage
+        return ctx
+    }
+
+    private fun getDeepModeStaticFragment(level: com.openminis.app.agent.DeepModeLevel): String {
+        val specOn = specEnabled()
+        cachedDeepModeStaticFragment?.let { cached ->
+            if (cachedDeepModeStaticLevel == level && cachedDeepModeStaticSpec == specOn) return cached
+        }
+        val fragment = buildString {
+            append("## 深度龙虾Ai (Deep Agent Mode) — ACTIVE\n")
+            append("You are in **Deep Agent Mode** — a higher-autonomy, higher-rigor operating mode.\n")
+            append("Follow the behavior rules below in addition to all other instructions above.\n\n")
+            append(com.openminis.app.agent.PlanGate.systemPromptFragment)
+            append("\n\n")
+            append(com.openminis.app.agent.GoalRunner.systemPromptFragment)
+            append("\n\n")
+            append(com.openminis.app.agent.VerifyGate.systemPromptFragment)
+            append("\n\n")
+            if (specOn) {
+                append(com.openminis.app.agent.SpecGate.systemPromptFragment)
+                append("\n\n")
+            }
+            if (level >= com.openminis.app.agent.DeepModeLevel.STANDARD) {
+                append(com.openminis.app.agent.CognitiveLoadMonitor.systemPromptFragment)
+                append("\n\n")
+            }
+            append(deepModeCognitiveRulesFragment())
+        }
+        cachedDeepModeStaticFragment = fragment
+        cachedDeepModeStaticLevel = level
+        cachedDeepModeStaticSpec = specOn
+        return fragment
+    }
+
+    private fun getDeepModeFragment(): String? {
+        if (!_deepModeEnabled.value || deepModeStore == null) return null
+        val scopeCtx = extractScopeContext()
+        val level = _deepModeLevel.value
+        val memoryOn = _memoryEnabled.value
+        val rulesModTime = deepModeStore.rulesFileModTime() ?: -1L
+        val cacheKey = buildString {
+            append(level.name)
+            append('|')
+            append(memoryOn)
+            append('|')
+            append(scopeCtx.userKeywords.joinToString(","))
+            append('|')
+            append(scopeCtx.filePaths.joinToString(","))
+            append('|')
+            append(rulesModTime)
+        }
+        _cachedDeepModeFragment?.let { cached ->
+            if (_cachedDeepModeFragmentKey == cacheKey) return cached
+        }
+        val rulesFragment = deepModeStore.rulesFragment(scopeCtx)
+        if (rulesFragment.isEmpty()) {
+            _cachedDeepModeFragment = ""
+            _cachedDeepModeFragmentKey = cacheKey
+            return ""
+        }
+        val fragment = buildString {
+            append("\n\n")
+            append(rulesFragment)
+            append("\n\n")
+            append(getDeepModeStaticFragment(level))
+            com.openminis.app.agent.CrossSessionContextStore.contextFragment(context)
+                ?.let { ctxFragment ->
+                    append("\n\n")
+                    append(ctxFragment)
+                }
+        }
+        _cachedDeepModeFragment = fragment
+        _cachedDeepModeFragmentKey = cacheKey
+        return fragment
+    }
+
     /**
-     * [T-deep-mode-v61-scope-context] Fork cache invalidation seam. The
-     * deep-mode fragment caches (static / scope / full) are wired in the
-     * D-phase fragment stitching; until then there is nothing to clear.
+     * Invalidate all deep mode caches (scope context + static fragment +
+     * full fragment). Called when deep mode is toggled, level changes,
+     * chat is cleared, or rules are edited.
      */
     private fun invalidateDeepModeCaches() {
-        // no-op: deep-mode fragment caches land with the D-phase wiring.
+        cachedDeepModeStaticFragment = null
+        cachedDeepModeStaticLevel = null
+        cachedDeepModeStaticSpec = false
+        _cachedDeepModeFragment = null
+        _cachedDeepModeFragmentKey = null
+        _cachedScopeContext = null
+        _cachedScopeLastUserMessage = ""
     }
 
     /**
@@ -10124,6 +10334,59 @@ class ChatViewModel(
         // here — clearing at this point would strip the content out from under
         // a send that then bails on the context-check paths below.
         val trimmed = text.trim()
+        // [T-deep-mode-session-workflow] Session-scoped workflow: only a fresh
+        // task (.idle) resets the workflow-affine budgets (goal/verify/
+        // retrospective). When a workflow is already in flight (.executing) or
+        // under review (.verifying), a new user message is an INTERJECTION
+        // merged into the current session workflow — goal & verify context is
+        // preserved. Total-switch safe: phase is .IDLE when deep mode is off.
+        val inFlightWorkflow =
+            sessionWorkflowEnabled &&
+                (_workflowPhase.value == com.openminis.app.agent.WorkflowPhase.EXECUTING ||
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.VERIFYING)
+        if (!inFlightWorkflow) {
+            savedWorkflowState = null
+            _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.IDLE
+            _workflowSteps.value = emptyList()
+            goalRunnerRoundsLeft = com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS
+            pendingGoalSentinel = null
+            verifyPhase = VerifyPhase.IDLE
+            verifyRoundsLeft = com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS
+            pendingVerifySentinel = null
+            resetSpecState()
+            retrospectiveHasRun = false
+            isRetrospectiveRunning = false
+        } else {
+            // Interjection merges into the active workflow; drop only the stale
+            // pause snapshot (phase/steps/budgets stay intact).
+            savedWorkflowState = null
+        }
+        _planGateState.value = com.openminis.app.agent.PlanGate.State.IDLE
+        pendingPlanText = null
+        totalToolCallsInLoop = 0
+        verifyFailures = 0
+        lastModelLoadSignal = null
+        _cognitiveLoadState.value = com.openminis.app.agent.CognitiveLoadState.empty
+        _needMoreContextState.value = null
+        expectingRootCauseRule = false
+
+        // [T-deep-mode-clarify-gate] Clarification gate: if deep mode is on and
+        // the request has high-confidence ambiguity, pause for clarification
+        // instead of guessing. Fail-safe: no ambiguity → proceed normally.
+        if (_deepModeEnabled.value) {
+            val ambiguity = com.openminis.app.agent.ClarifyGate.detectAmbiguity(trimmed)
+            if (ambiguity != null) {
+                pendingClarifyQuestion = ambiguity.question
+                pendingOriginalRequest = ambiguity.originalRequest
+                _clarifyState.value = com.openminis.app.agent.ClarifyGate.State.AWAITING_CLARIFICATION
+                _isStreaming.value = false
+                appendSystemInfo(
+                    text = ambiguity.question,
+                    iconKind = "help",
+                )
+                return SubmitOutcome.Rejected("clarify_gate")
+            }
+        }
         // While streaming, enqueue instead of silently dropping (iOS: send vs enqueuePrompt).
         if (_isStreaming.value) {
             // enqueuePrompt has its own blank/attachment guard and returns Unit;
@@ -13515,6 +13778,53 @@ class ChatViewModel(
                         }
                     }
                 }
+                // [T-deep-mode-goal-runner] Parse & strip <<GOAL_STATE>> /
+                // <<VERIFY_STATE>> sentinels BEFORE the final UI update + persist,
+                // so the sentinel never shows in the UI or survives a DB reload.
+                val deepModeOn = _deepModeEnabled.value
+                var goalSentinel: com.openminis.app.agent.GoalRunner.ParsedSentinel? = null
+                var verifySentinel: com.openminis.app.agent.VerifyGate.ParsedSentinel? = null
+                if (deepModeOn && accumulatedText.isNotBlank()) {
+                    goalSentinel = com.openminis.app.agent.GoalRunner.parse(accumulatedText)
+                    if (goalSentinel != null) {
+                        com.openminis.app.agent.GoalRunner.textWithoutSentinel(accumulatedText)
+                            ?.let { accumulatedText = it }
+                    }
+                    if (verifyPhase == VerifyPhase.VERIFYING && goalSentinel == null) {
+                        verifySentinel = com.openminis.app.agent.VerifyGate.parse(accumulatedText)
+                        if (verifySentinel != null) {
+                            com.openminis.app.agent.VerifyGate.textWithoutSentinel(accumulatedText)
+                                ?.let { accumulatedText = it }
+                        }
+                    }
+                }
+                pendingGoalSentinel = goalSentinel
+                pendingVerifySentinel = verifySentinel
+                // [T-deep-mode-spec-gate] Phase F: collect spec products from a
+                // SPEC_WRITING turn. Strip the sentinel, harvest file_write paths,
+                // move SPEC_WRITING → SPEC_REVIEWING (awaitingReview).
+                if (specEnabled() &&
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.SPEC_WRITING &&
+                    accumulatedText.contains(com.openminis.app.agent.SpecGate.SPEC_MARKER, ignoreCase = true)
+                ) {
+                    com.openminis.app.agent.SpecGate.textWithoutSentinel(accumulatedText)?.let { accumulatedText = it }
+                    val writes = allToolBlocks.mapNotNull { b ->
+                        when {
+                            b.kind == "tool_use" && b.toolName == "file_write" -> b.toolName to b.toolArgs
+                            else -> null
+                        }
+                    }
+                    val files = com.openminis.app.agent.SpecGate.detectSpecFiles(writes)
+                    pendingSpecSentinel = true
+                    pendingSpecText = accumulatedText
+                    _pendingSpecFiles.value = files
+                    _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.SPEC_REVIEWING
+                    _specGateState.value = com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW
+                    AppLogger.info(
+                        TAG_STREAM,
+                        "SpecGate: spec docs generated (${files.size} files) → awaiting review",
+                    )
+                }
                 withContext(Dispatchers.Main) {
                     updateAssistantMessage(assistantId, accumulatedText, false, allToolBlocks)
                 }
@@ -13956,6 +14266,360 @@ class ChatViewModel(
                 }
                 // Auto-title after first exchange
                 if (turn == 0) generateSessionTitleIfNeeded()
+                // [T-deep-mode-plan-gate] Plan confirmation gate: on the first turn
+                // of a deep-mode session, a plan-only reply (no tool calls, ```plan
+                // marker) pauses for user approval. Fail-safe: no plan → proceed.
+                val gateEligiblePhase =
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.IDLE ||
+                        _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.PLANNING
+                if (deepModeOn && turn == 0 && gateEligiblePhase && accumulatedText.isNotBlank()) {
+                    val plan = com.openminis.app.agent.PlanGate.detectPlan(
+                        text = accumulatedText,
+                        hasToolCalls = allToolBlocks.any { it.kind == "tool_use" },
+                    )
+                    if (plan != null) {
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "PlanGate: plan detected on turn 0 — awaiting approval (${plan.length} chars)",
+                        )
+                        val multiResult = com.openminis.app.agent.MultiPathPlanner.parse(plan)
+                        val detectedPaths: List<com.openminis.app.agent.MultiPathPlanner.CandidatePath>
+                        val detectedRecommended: Int
+                        when (multiResult) {
+                            is com.openminis.app.agent.MultiPathPlanner.Result.MultiPath -> {
+                                detectedPaths = multiResult.paths
+                                detectedRecommended = multiResult.recommendedIndex
+                            }
+                            is com.openminis.app.agent.MultiPathPlanner.Result.SinglePath -> {
+                                detectedPaths = emptyList()
+                                detectedRecommended = 1
+                            }
+                        }
+                        pendingPlanText = plan
+                        _pendingPlanPaths.value = detectedPaths
+                        _pendingRecommendedIndex.value = detectedRecommended
+                        _selectedPathIndexes.value = emptySet()
+                        if (detectedPaths.isNotEmpty() &&
+                            detectedPaths.any { it.index == detectedRecommended }
+                        ) {
+                            _selectedPathIndexes.value = setOf(detectedRecommended)
+                        }
+                        _workflowPhase.value = com.openminis.app.agent.WorkflowPhase.PLANNING
+                        _workflowSteps.value = com.openminis.app.agent.WorkflowPlanParser.parseSteps(plan)
+                        _planGateState.value = com.openminis.app.agent.PlanGate.State.AWAITING_APPROVAL
+                        loopExitedNormally = true
+                        break
+                    }
+                }
+
+                // [T-deep-mode-goal-runner] Goal auto-continuation decision.
+                // Sentinel was parsed & stripped before persist.
+                if (goalSentinel != null) {
+                    when (goalSentinel.result) {
+                        com.openminis.app.agent.GoalRunner.ParseResult.PENDING -> {
+                            if (goalRunnerRoundsLeft > 0) {
+                                goalRunnerRoundsLeft--
+                                AppLogger.info(
+                                    TAG_STREAM,
+                                    "GoalRunner: pending → auto-continue " +
+                                        "(roundsLeft=$goalRunnerRoundsLeft, " +
+                                        "reason=${goalSentinel.reason ?: "none"})",
+                                )
+                                val reminderText = buildString {
+                                    append(
+                                        "<system-reminder>Goal auto-continue " +
+                                            "(${com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS - goalRunnerRoundsLeft}" +
+                                            "/${com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS}): "
+                                    )
+                                    append(goalSentinel.reason ?: "Continue working on the task.")
+                                    append(
+                                        ". You are in deep agent mode — keep going until the task is fully done. " +
+                                            "If you need more information from the user, " +
+                                            "emit <<GOAL_STATE>> need_more_context: <reason> instead of guessing.</system-reminder>"
+                                    )
+                                }
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = reminderText,
+                                        contentParts = listOf(AgentContentPart.Text(reminderText)),
+                                    )
+                                )
+                                if (_deepModeEnabled.value) {
+                                    advanceWorkflowStep()
+                                }
+                                continue
+                            } else {
+                                AppLogger.info(TAG_STREAM, "GoalRunner: pending but rounds exhausted — stopping")
+                            }
+                        }
+                        com.openminis.app.agent.GoalRunner.ParseResult.NEED_MORE_CONTEXT -> {
+                            AppLogger.info(
+                                TAG_STREAM,
+                                "GoalRunner: need_more_context → stopping " +
+                                    "(reason=${goalSentinel.reason ?: "none"})",
+                            )
+                            _needMoreContextState.value = goalSentinel.reason ?: "需要更多信息"
+                            withContext(Dispatchers.Main) {
+                                appendSystemInfo(
+                                    text = "深度龙虾Ai 需要更多信息：${goalSentinel.reason ?: "请补充相关上下文"}",
+                                    iconKind = "help",
+                                )
+                            }
+                        }
+                        com.openminis.app.agent.GoalRunner.ParseResult.DONE -> {
+                            val stepsSnapshot = _workflowSteps.value
+                            if (stepsSnapshot.isNotEmpty()) {
+                                val verdict = com.openminis.app.agent.GoalCompletionEvaluator.evaluate(
+                                    steps = stepsSnapshot,
+                                    broad = false,
+                                    roundsLeft = goalRunnerRoundsLeft,
+                                )
+                                if (verdict == com.openminis.app.agent.GoalCompletionEvaluator.Verdict.CONTINUE) {
+                                    AppLogger.info(TAG_STREAM, "GoalRunner: done claimed but steps remain — continuing")
+                                    goalRunnerRoundsLeft--
+                                    advanceWorkflowStep()
+                                    val reminderText = buildString {
+                                        append(
+                                            "<system-reminder>Goal auto-continue " +
+                                                "(${com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS - goalRunnerRoundsLeft}" +
+                                                "/${com.openminis.app.agent.GoalRunner.MAX_AUTO_ROUNDS}): "
+                                        )
+                                        append(
+                                            "You marked the task done in your last reply, but some plan steps are still not executed. " +
+                                                "Please continue and finish the remaining steps, then end with <<GOAL_STATE>> done.</system-reminder>"
+                                        )
+                                    }
+                                    agentHistory.add(
+                                        LLMMessage(
+                                            role = LLMMessage.Role.USER,
+                                            content = reminderText,
+                                            contentParts = listOf(AgentContentPart.Text(reminderText)),
+                                        )
+                                    )
+                                    continue
+                                }
+                            }
+                            AppLogger.info(TAG_STREAM, "GoalRunner: done → checking VerifyGate")
+                            if (_deepModeEnabled.value) {
+                                completeWorkflowSteps()
+                            }
+                            if (verifyPhase == VerifyPhase.IDLE && verifyRoundsLeft > 0) {
+                                verifyPhase = VerifyPhase.VERIFYING
+                                AppLogger.info(
+                                    TAG_STREAM,
+                                    "VerifyGate: entering verification phase (roundsLeft=$verifyRoundsLeft)",
+                                )
+                                val verifyReminder = buildString {
+                                    append(
+                                        "<system-reminder>VERIFICATION PHASE " +
+                                            "(${com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS - verifyRoundsLeft + 1}" +
+                                            "/${com.openminis.app.agent.VerifyGate.MAX_VERIFY_ROUNDS}): "
+                                    )
+                                    append(
+                                        "You just said the task is done. Now verify your work: run tests, " +
+                                            "preview results, read back the files you changed, confirm everything " +
+                                            "works correctly. Use tools to ACTUALLY verify — do NOT just write text " +
+                                            "saying it's fine."
+                                    )
+                                    append(" At the END of this turn, append one line:")
+                                    append("\n<<VERIFY_STATE>> passed — if everything checks out")
+                                    append("\n<<VERIFY_STATE>> failed: <reason + fix plan> — if you found issues")
+                                    append("</system-reminder>")
+                                }
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = verifyReminder,
+                                        contentParts = listOf(AgentContentPart.Text(verifyReminder)),
+                                    )
+                                )
+                                continue
+                            }
+                        }
+                    }
+                }
+
+                // [T-deep-mode-verify-gate] Handle verification phase result.
+                if (verifyPhase == VerifyPhase.VERIFYING && verifySentinel != null) {
+                    when (verifySentinel.result) {
+                        com.openminis.app.agent.VerifyGate.ParseResult.PASSED -> {
+                            verifyPhase = VerifyPhase.IDLE
+                            if (specEnabled()) {
+                                AppLogger.info(TAG_STREAM, "SpecGate: verify passed + spec mode on → entering SPEC_WRITING")
+                                beginSpecWriting()
+                                continue
+                            }
+                            if (!retrospectiveHasRun) {
+                                retrospectiveHasRun = true
+                                isRetrospectiveRunning = true
+                                AppLogger.info(TAG_STREAM, "C7 Retrospective: starting post-task review")
+                                val retroPrompt = buildString {
+                                    append("<system-reminder>深度模式任务后复盘（C7）：本次任务已完成，请快速复盘以下四个维度：\n")
+                                    append("1. 意图理解准确吗？（用户要什么 vs 你做了什么）\n")
+                                    append("2. 难度评估准吗？（预估难度 vs 实际难度）\n")
+                                    append("3. 工具选择最优吗？（有无更优工具/路径）\n")
+                                    append("4. 边界声明到位吗？（做了什么 / 没做什么 / 为什么）\n")
+                                    append("请简洁回答，提炼一条可复用的经验教训。如果你的复盘包含值得长期记住的经验，请使用 memory_write 工具保存。</system-reminder>")
+                                }
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = retroPrompt,
+                                        contentParts = listOf(AgentContentPart.Text(retroPrompt)),
+                                    )
+                                )
+                                continue
+                            }
+                            AppLogger.info(TAG_STREAM, "VerifyGate: passed → finishing workflow")
+                            if (_deepModeEnabled.value) {
+                                clearWorkflowTracker()
+                            }
+                        }
+                        com.openminis.app.agent.VerifyGate.ParseResult.FAILED -> {
+                            verifyRoundsLeft--
+                            verifyFailures++
+                            AppLogger.info(
+                                TAG_STREAM,
+                                "VerifyGate: failed → " +
+                                    (if (_deepModeLevel.value >= com.openminis.app.agent.DeepModeLevel.AGGRESSIVE) "root cause analysis"
+                                     else "re-entering execution") +
+                                    " (roundsLeft=$verifyRoundsLeft, reason=${verifySentinel.reason ?: "none"})",
+                            )
+                            verifyPhase = VerifyPhase.IDLE
+                            if (_deepModeLevel.value >= com.openminis.app.agent.DeepModeLevel.AGGRESSIVE) {
+                                val analysisPrompt = com.openminis.app.agent.RootCauseAnalyzer.buildAnalysisPrompt(verifySentinel.reason)
+                                agentHistory.add(
+                                    LLMMessage(
+                                        role = LLMMessage.Role.USER,
+                                        content = analysisPrompt,
+                                        contentParts = listOf(AgentContentPart.Text(analysisPrompt)),
+                                    )
+                                )
+                                expectingRootCauseRule = true
+                                continue
+                            }
+                            if (goalRunnerRoundsLeft <= 0) {
+                                goalRunnerRoundsLeft = 1
+                            }
+                            val fixReminder = buildString {
+                                append("<system-reminder>Verification FAILED: ")
+                                append(verifySentinel.reason ?: "Issues found.")
+                                append(
+                                    " Go back and fix the problems. This is the execution phase — call tools to make fixes, " +
+                                        "then end with <<GOAL_STATE>> done when you're ready for another verification round.</system-reminder>"
+                                )
+                            }
+                            agentHistory.add(
+                                LLMMessage(
+                                    role = LLMMessage.Role.USER,
+                                    content = fixReminder,
+                                    contentParts = listOf(AgentContentPart.Text(fixReminder)),
+                                )
+                            )
+                            continue
+                        }
+                    }
+                }
+
+                // [T-deep-mode-verify-gate] Edge case: verifying phase but no
+                // sentinel found — fail-safe: treat as passed and finish.
+                if (verifyPhase == VerifyPhase.VERIFYING && verifySentinel == null) {
+                    AppLogger.info(TAG_STREAM, "VerifyGate: no sentinel in verify turn → treating as passed (fail-safe)")
+                    verifyPhase = VerifyPhase.IDLE
+                }
+
+                // [T-deep-mode-cognitive-p2-c14] C14: save workflow summary after
+                // the retrospective turn completes.
+                if (isRetrospectiveRunning && accumulatedText.isNotBlank()) {
+                    isRetrospectiveRunning = false
+                    val summary = accumulatedText.trim().take(200)
+                    com.openminis.app.agent.CrossSessionContextStore.appendWorkflowSummary(
+                        context, summary, sessionId = sessionId,
+                    )
+                    invalidateSystemPromptCache()
+                    AppLogger.info(TAG_STREAM, "C14: workflow summary saved (${summary.length} chars)")
+                }
+
+                // [T-deep-mode-cognitive-p2-c13] C13: after root cause analysis
+                // turn, extract the rule, save it, then re-enter execution.
+                if (expectingRootCauseRule && accumulatedText.isNotBlank()) {
+                    expectingRootCauseRule = false
+                    val rule = com.openminis.app.agent.RootCauseAnalyzer.extractRule(accumulatedText)
+                    if (rule != null) {
+                        com.openminis.app.agent.RootCauseAnalyzer.saveRule(context, rule)
+                        invalidateSystemPromptCache()
+                        AppLogger.info(TAG_STREAM, "C13: root cause rule saved (${rule.length} chars)")
+                    } else {
+                        AppLogger.info(TAG_STREAM, "C13: no root cause rule found in reply (fail-safe)")
+                    }
+                    if (goalRunnerRoundsLeft <= 0) {
+                        goalRunnerRoundsLeft = 1
+                    }
+                    val fixReminder = buildString {
+                        append(
+                            "<system-reminder>Root cause analysis complete. Now go fix the problems you identified. " +
+                                "This is the execution phase — call tools to make fixes, then end with <<GOAL_STATE>> done " +
+                                "when you're ready for another verification round.</system-reminder>"
+                        )
+                    }
+                    agentHistory.add(
+                        LLMMessage(
+                            role = LLMMessage.Role.USER,
+                            content = fixReminder,
+                            contentParts = listOf(AgentContentPart.Text(fixReminder)),
+                        )
+                    )
+                    continue
+                }
+
+                // [T-deep-mode-spec-gate] Spec documents awaiting review — stop the
+                // loop so the SpecReviewPanel takes over.
+                if (_specGateState.value == com.openminis.app.agent.SpecGate.State.AWAITING_REVIEW) {
+                    AppLogger.info(TAG_STREAM, "SpecGate: awaiting review → exiting agent loop")
+                    loopExitedNormally = true
+                    break
+                }
+
+                // [T-deep-mode-session-workflow] P1: if the execution turn ended
+                // with no goal sentinel, run the client completion evaluator.
+                if (_deepModeEnabled.value &&
+                    _workflowPhase.value == com.openminis.app.agent.WorkflowPhase.EXECUTING &&
+                    goalSentinel == null
+                ) {
+                    val verdict = com.openminis.app.agent.GoalCompletionEvaluator.evaluate(
+                        steps = _workflowSteps.value,
+                        broad = false,
+                        roundsLeft = goalRunnerRoundsLeft,
+                    )
+                    if (verdict == com.openminis.app.agent.GoalCompletionEvaluator.Verdict.PASSED) {
+                        AppLogger.info(TAG_STREAM, "GoalRunner: no sentinel but all steps done — completing workflow")
+                        completeWorkflowSteps()
+                        if (verifyPhase == VerifyPhase.IDLE && verifyRoundsLeft > 0) {
+                            verifyPhase = VerifyPhase.VERIFYING
+                            val verifyReminder = buildString {
+                                append("<system-reminder>VERIFICATION PHASE: ")
+                                append(
+                                    "You just finished the task. Now verify your work: run tests, preview results, " +
+                                        "read back the files you changed, confirm everything works correctly. Use tools to " +
+                                        "ACTUALLY verify — do NOT just write text saying it's fine."
+                                )
+                                append(" At the END of this turn, append one line:")
+                                append("\n<<VERIFY_STATE>> passed — if everything checks out")
+                                append("\n<<VERIFY_STATE>> failed: <reason + fix plan> — if you found issues")
+                                append("</system-reminder>")
+                            }
+                            agentHistory.add(
+                                LLMMessage(
+                                    role = LLMMessage.Role.USER,
+                                    content = verifyReminder,
+                                    contentParts = listOf(AgentContentPart.Text(verifyReminder)),
+                                )
+                            )
+                            continue
+                        }
+                    }
+                }
                 stopDiagExit = if (isEmptyTurn) "empty-turn" else "no-tool-calls"
                 loopExitedNormally = true
                 break
@@ -14404,6 +15068,10 @@ class ChatViewModel(
                         }
 
                         resultParts.add(ToolResultWrap.part(id, name, outputForLLMWithNote, result))
+                        // [T-deep-mode-session-workflow] Event-level refresh: one
+                        // advance per completed tool so the capsule ticks during the
+                        // round. Safe: triple guard never finalizes the last step.
+                        advanceStepOnToolEvent()
                             } finally {
                                 SessionActivityTracker.toolFinished()
                             }
@@ -17117,6 +17785,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 append("\n\n")
                 append(dailyMemoryFragment)
             }
+            // [T-deep-mode-android] Deep Mode fragment (scoped rules + static
+            // portion + cross-session context) lands after memory, before the
+            // runtime suffix. The fragment already leads with "\n\n" on a hit.
+            getDeepModeFragment()?.takeIf { it.isNotEmpty() }?.let { append(it) }
             // Runtime context goes last so the prefix above stays byte-stable
             // across requests within the same day. Keep ordering deterministic
             // (date → tz → lang → model count) — any reorder defeats the cache.
@@ -18062,6 +18734,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             _autoRetryCountdown.value = 0
             clearInlineError()
         }
+        // [T-deep-mode-session-workflow] Snapshot the in-flight workflow BEFORE
+        // handleUserCancelledCleanup runs, so a Stop → resume round-trip restores
+        // the SAME session workflow (phase / steps / verify budget). Only on a
+        // real user stop (not keepBackground) and only when a workflow is in
+        // flight. Total-switch safe via sessionWorkflowEnabled.
+        if (!keepBackground && sessionWorkflowEnabled &&
+            _workflowPhase.value != com.openminis.app.agent.WorkflowPhase.IDLE
+        ) {
+            savedWorkflowState = SavedWorkflowSnapshot(
+                phase = _workflowPhase.value,
+                steps = _workflowSteps.value,
+                verifyRoundsLeft = verifyRoundsLeft,
+            )
+            AppLogger.info(
+                TAG_STREAM,
+                "cancelStream: saved workflow state phase=${_workflowPhase.value} " +
+                    "steps=${_workflowSteps.value.size}",
+            )
+        }
         handleUserCancelledCleanup()
 
         // T189: iOS parity (AIChatViewModel.swift L2592-2610). If the user
@@ -18589,6 +19280,25 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // turn-limit banner on the next reload.
         clearPersistedLastAssistantError()
         AppLogger.info(TAG, "▶️ resume: continuing partial assistant message (no new header emitted)")
+        // [T-deep-mode-session-workflow] Restore a paused workflow snapshot saved
+        // on Stop so resume continues the SAME session workflow. Total-switch
+        // safe: only restored when session workflow is active; toggle-off
+        // cleanup nulls the snapshot. Fallback mode clears the tracker.
+        if (sessionWorkflowEnabled && savedWorkflowState != null) {
+            val saved = savedWorkflowState!!
+            _workflowPhase.value = saved.phase
+            _workflowSteps.value = saved.steps
+            verifyRoundsLeft = saved.verifyRoundsLeft
+            savedWorkflowState = null
+            AppLogger.info(
+                TAG_STREAM,
+                "resume: restored workflow state phase=${saved.phase} steps=${saved.steps.size}",
+            )
+        } else {
+            savedWorkflowState = null
+            clearWorkflowTracker()
+            _workflowBusy.value = false
+        }
         // [T-android-tool-autoscroll] Start-of-turn snap. The thinking
         // placeholder is the only visible delta until the model's first
         // token, and the auto-follow tuple won't advance until content
