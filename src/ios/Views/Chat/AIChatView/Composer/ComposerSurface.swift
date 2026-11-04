@@ -113,8 +113,7 @@ struct ComposerSurface: ViewModifier {
             content
                 .background(shape.fill(ChatColors.inputBg))
                 .clipShape(shape)
-                .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 2)
-                .shadow(color: Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0, alpha: 0.5) : UIColor(white: 0, alpha: 0) }), radius: 8, x: 0, y: -4)
+                .overlay(shape.stroke(ChatColors.inputBorder.opacity(0.6), lineWidth: 0.5))
         }
     }
 }
