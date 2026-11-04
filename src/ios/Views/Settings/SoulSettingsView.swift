@@ -113,7 +113,7 @@ struct SoulSettingsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button(AppLocalized("Save")) { save() }
-                    .disabled(!isDirty || isBodyOverLimit)
+                    .disabled(!isDirty)
             }
         }
         .onAppear(perform: reload)
@@ -287,7 +287,7 @@ struct SoulSettingsView: View {
     /// Counter shown when the body is within budget.
     private func soulBodyCountText(_ body: String) -> String {
         let count = SoulStore.tokenCount(body)
-        return AppLocalized("\(count) / \(SoulStore.bodyTokenLimit) tokens")
+        return AppLocalized("\(count) tokens")
     }
 
     private var isBodyOverLimit: Bool {

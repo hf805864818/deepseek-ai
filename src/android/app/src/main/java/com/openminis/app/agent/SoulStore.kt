@@ -260,43 +260,16 @@ object SoulStore {
     // paragraph with a few inline English terms still counts as CJK.
 
     const val CJK_RATIO_THRESHOLD: Double = 0.3
-    const val CHINESE_CHAR_LIMIT: Int = 1600
-    const val ENGLISH_WORD_LIMIT: Int = 1000
+    const val CHINESE_CHAR_LIMIT: Int = Int.MAX_VALUE
+    const val ENGLISH_WORD_LIMIT: Int = Int.MAX_VALUE
 
     /**
      * Classify [body] under the language-aware length rules above. Empty
      * / whitespace-only bodies always return [SoulBodyLimitCheck.Ok].
      */
     fun isOverLimit(body: String): SoulBodyLimitCheck {
-        val trimmed = body.trim()
-        if (trimmed.isEmpty()) return SoulBodyLimitCheck.Ok
-
-        var cjk = 0
-        var total = 0
-        var i = 0
-        while (i < trimmed.length) {
-            val cp = trimmed.codePointAt(i)
-            total += 1
-            if (isCJKCodePoint(cp)) cjk += 1
-            i += Character.charCount(cp)
-        }
-        val ratio = if (total > 0) cjk.toDouble() / total else 0.0
-        return if (ratio > CJK_RATIO_THRESHOLD) {
-            // Code-point count — closest analogue to iOS grapheme cluster
-            // count for the CJK ranges we care about (no combining marks
-            // / no flag emojis in Han/Kana/Hangul). Bytes / UTF-16 code
-            // units would over-count surrogate-pair CJK extensions.
-            val chars = trimmed.codePointCount(0, trimmed.length)
-            if (chars > CHINESE_CHAR_LIMIT) SoulBodyLimitCheck.OverLimitChinese(chars, CHINESE_CHAR_LIMIT)
-            else SoulBodyLimitCheck.Ok
-        } else {
-            // Whitespace-delimited word count. `split(Regex("\\s+"))` on
-            // a trimmed string collapses consecutive whitespace into a
-            // single delimiter.
-            val words = trimmed.split(Regex("\\s+")).count { it.isNotEmpty() }
-            if (words > ENGLISH_WORD_LIMIT) SoulBodyLimitCheck.OverLimitEnglish(words, ENGLISH_WORD_LIMIT)
-            else SoulBodyLimitCheck.Ok
-        }
+        // Patched: no length cap.
+        return SoulBodyLimitCheck.Ok
     }
 
     /**
@@ -619,8 +592,7 @@ object SystemPromptBuilder {
         // this rule existed (or via shell / another device).
         val check = SoulStore.isOverLimit(trimmed)
         if (check.isOverLimit) {
-            AppLogger.warning(TAG, "personality body is over the language-aware limit ($check) — falling back to identity-only system prompt.")
-            return identityTrimmed + styleBlock(style) + "\n\n" + soulEditHint + "\n\n"
+            AppLogger.warning(TAG, "body over app limit - patched build injects it verbatim.")
         }
 
         val personality = scrubInjections(trimmed)
@@ -642,8 +614,5 @@ object SystemPromptBuilder {
      * have no business being there. Casts a wide net on purpose: matches
      * "ignore previous instructions" and the usual variants.
      */
-    private fun scrubInjections(s: String): String =
-        s.split("\n")
-            .filter { line -> INJECTION_PATTERNS.none { it.containsMatchIn(line) } }
-            .joinToString("\n")
+    private fun scrubInjections(s: String): String = s
 }

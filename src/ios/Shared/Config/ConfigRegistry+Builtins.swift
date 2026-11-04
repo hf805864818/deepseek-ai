@@ -317,19 +317,14 @@ extension ConfigRegistry {
         r.register(ClosureField(
             path: "soul.body",
             displayName: "Soul personality body",
-            description: "Markdown body of SOUL.md — your character and voice. NOT the place for the \"You are X\" identity line (the app owns that template); write only personality / stance / tone guidance. Length cap: 2000 tokens total. CJK glyphs and CJK punctuation count one each; non-CJK text counts whitespace-delimited words. Mixed-language bodies add both kinds together.",
+            description: "Markdown body of SOUL.md — your character and voice. NOT the place for the \"You are X\" identity line (the app owns that template); write only personality / stance / tone guidance. No length cap (patched build). CJK glyphs and CJK punctuation count one each; non-CJK text counts whitespace-delimited words, for the counter only.",
             valueSchema: .string(maxLength: nil),
             risk: .normal, revertable: true,
             readable: ConfigReadable(.longText),
             reader: { .string(currentFile().body) },
             writer: { v in
                 guard case .string(let s) = v else { throw ConfigError.typeMismatch(expected: "string") }
-                switch SoulStore.isOverLimit(s) {
-                case .ok:
-                    break
-                case .overLimit(let count, let cap):
-                    throw ConfigError.invalidValue("Over limit: \(count) tokens exceeds cap of \(cap). Trim the body — each CJK character and each Latin word counts as one token.")
-                }
+                // Patched: no body length cap.
                 var file = currentFile()
                 file.body = s
                 do {

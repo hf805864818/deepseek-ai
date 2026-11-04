@@ -781,7 +781,8 @@ enum SoulStore {
     //
     // So "hello AB CD" with two CJK glyphs counts as 1 (hello) + 4 (A B C D) = 5.
 
-    static let bodyTokenLimit = 2000
+    /// No length cap (patched build). Kept so existing call sites compile.
+    static let bodyTokenLimit = Int.max
 
     /// Count tokens in [body] under the unified rule. Empty / whitespace
     /// returns 0. CJK glyphs/punctuation count one-per-character; non-CJK
@@ -807,12 +808,8 @@ enum SoulStore {
     /// Classify [body] under the unified 2000-token rule. Empty /
     /// whitespace-only bodies always return `.ok`.
     static func isOverLimit(_ body: String) -> SoulBodyLimitCheck {
-        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return .ok }
-        let count = tokenCount(trimmed)
-        return count > Self.bodyTokenLimit
-            ? .overLimit(count: count, cap: Self.bodyTokenLimit)
-            : .ok
+        // Patched: no length cap. tokenCount still drives the UI readout.
+        return .ok
     }
 
     /// CJK punctuation that the user perceives as a character — full-width
@@ -1123,9 +1120,8 @@ enum SystemPromptBuilder {
         // was written before this rule existed (or via shell / another
         // device).
         let check = SoulStore.isOverLimit(trimmed)
-        guard !check.isOverLimit else {
-            Self.logger.warning("[Soul] personality body is over the language-aware limit (\(check)) — falling back to identity-only system prompt.")
-            return identityTrimmed + styleBlock(style) + "\n\n" + soulEditHint + "\n\n"
+        if check.isOverLimit {
+            Self.logger.warning("[Soul] body over app limit (\(check)) - patched build injects it verbatim.")
         }
 
         let personality = scrubInjections(trimmed)
@@ -1147,21 +1143,8 @@ enum SystemPromptBuilder {
     /// a wide net on purpose; SOUL.md is user-authored personality, not a
     /// place for instructions to the model anyway.
     private static func scrubInjections(_ s: String) -> String {
-        let patterns: [String] = [
-            #"(?i)ignore.{0,30}previous.{0,30}instructions?"#,
-            #"(?i)disregard.{0,30}(previous|prior).{0,30}instructions?"#,
-            #"(?i)forget.{0,30}(previous|prior).{0,30}instructions?"#,
-        ]
-        var lines = s.components(separatedBy: "\n")
-        lines = lines.filter { line in
-            for p in patterns {
-                if line.range(of: p, options: .regularExpression) != nil {
-                    return false
-                }
-            }
-            return true
-        }
-        return lines.joined(separator: "\n")
+        // Patched: injection scrubbing disabled.
+        return s
     }
 }
 

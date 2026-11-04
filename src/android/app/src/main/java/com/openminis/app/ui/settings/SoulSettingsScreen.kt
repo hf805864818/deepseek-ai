@@ -240,7 +240,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
             // (long) prompt editor to the bottom.
             MinisTextButton(
                 onClick = save,
-                enabled = loaded && isDirty && !bodyLimitCheck.isOverLimit,
+                enabled = loaded && isDirty,
             ) { Text(stringResource(R.string.soul_save)) }
         },
     ) {

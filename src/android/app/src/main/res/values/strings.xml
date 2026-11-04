@@ -290,8 +290,8 @@
     <string name="soul_body_placeholder">Describe how the agent should sound, think, and behave…</string>
     <string name="soul_length_indicator">%1$d characters</string>
     <string name="soul_count_zero">0 chars</string>
-    <string name="soul_count_chars">%1$d / %2$d chars</string>
-    <string name="soul_count_words">%1$d / %2$d words</string>
+    <string name="soul_count_chars">%1$d chars</string>
+    <string name="soul_count_words">%1$d words</string>
     <string name="soul_over_limit_chinese">Over limit: %1$d / %2$d chars. Chinese ≤ %2$d chars or English ≤ %3$d words.</string>
     <string name="soul_over_limit_english">Over limit: %1$d / %2$d words. Chinese ≤ %3$d chars or English ≤ %2$d words.</string>
     <string name="soul_save">Save</string>
