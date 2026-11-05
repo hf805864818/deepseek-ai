@@ -215,3 +215,12 @@ accept pull requests** — there is nowhere for them to land. Issues are the way
 to shape the product, and [AwesomeMinis](https://github.com/OpenMinis/AwesomeMinis)
 and [MinisSkills](https://github.com/OpenMinis/MinisSkills) both do take
 contributions. See [CONTRIBUTING.md](CONTRIBUTING.md).
+---
+
+## 本仓库的本地改动（fork）
+
+- [按钮「阴影」问题：清单与修复记录](docs/ui-button-shadow-fix.md) —— 根因、逐按钮台账、修复方法与验收
+- [文档索引](docs/README.md)
+
+本 fork 的构建与发版见 `BUILDING.md` 与 `.github/workflows/build-and-release.yml`
+（自动递增版本 → 构建 Android/iOS → 发布到本仓库及 `vbox-Ai/Lobster-APP`）。
