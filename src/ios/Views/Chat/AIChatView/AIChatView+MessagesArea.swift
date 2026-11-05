@@ -125,6 +125,7 @@ extension AIChatView {
                             // and iOS 26 floors).
                             scrollFloatingButtonLabel("arrow.up.to.line")
                         }
+                        .buttonStyle(.plain)
                         .transition(.opacity.combined(with: .scale(scale: 0.8)))
                     }
                     // Scroll to bottom — ORIGINAL behavior: shown whenever not
@@ -135,6 +136,7 @@ extension AIChatView {
                     } label: {
                         scrollFloatingButtonLabel("chevron.down")
                     }
+                    .buttonStyle(.plain)
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
                 .padding(.trailing, 4)

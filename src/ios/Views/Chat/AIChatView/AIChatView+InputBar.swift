@@ -169,6 +169,7 @@ extension AIChatView {
                     .padding(.trailing, 10)
                 }
             }
+            .buttonStyle(.plain)
             .modifier(ComposerSurface())
             // [T-ios-context-usage-hint] Inner glow along the glass wall.
             // An overlay ABOVE the material (so the Liquid Glass backdrop
