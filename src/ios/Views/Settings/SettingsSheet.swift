@@ -104,7 +104,7 @@ struct SettingsSheet: View {
                     // the master posts deepModeDidChange so live VMs hard-reset.
                     Toggle(isOn: $deepModeEnabled) {
                         Label {
-                            Text(AppLocalized("Deep Mode"))
+                            Text(AppLocalized("深度模式"))
                         } icon: {
                             Image(systemName: "sparkles.rectangle.stack")
                                 .font(.system(size: 9))

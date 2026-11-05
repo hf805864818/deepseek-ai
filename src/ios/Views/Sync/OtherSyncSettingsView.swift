@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Lists all available cloud sync platforms. Each platform has an icon,
 /// name, and connection status. Local Sync and Google Drive are implemented;
-/// OneDrive and WebDAV are placeholders for future support.
+
 @available(iOS 17.0, *)
 struct OtherSyncSettingsView: View {
 
@@ -52,24 +52,6 @@ struct OtherSyncSettingsView: View {
                 )
             }
             .buttonStyle(.plain)
-
-            // MARK: OneDrive (Coming Soon)
-
-            platformRow(
-                icon: "externaldrive.fill",
-                color: .blue,
-                name: "OneDrive",
-                status: .comingSoon
-            )
-
-            // MARK: WebDAV (Coming Soon)
-
-            platformRow(
-                icon: "server.rack",
-                color: .gray,
-                name: "WebDAV",
-                status: .comingSoon
-            )
         }
         .navigationTitle(AppLocalized("Other Sync", comment: "Navigation title for third-party cloud sync settings"))
         .navigationBarTitleDisplayMode(.inline)

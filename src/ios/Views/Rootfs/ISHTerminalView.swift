@@ -506,6 +506,7 @@ struct QuickCommandButton: View {
             .foregroundColor(isActive ? .white : .green)
             .cornerRadius(6)
         }
+        .buttonStyle(.plain)
     }
 }
 
