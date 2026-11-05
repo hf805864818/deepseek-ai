@@ -68,6 +68,9 @@ struct AboutView: View {
         return fmt.string(from: mod)
     }()
 
+    @State private var isCheckingUpdate = false
+    @State private var updateResult: UpdateChecker.CheckResult? = nil
+
     var body: some View {
         List {
             // MARK: - Project Info
@@ -109,6 +112,29 @@ struct AboutView: View {
                 .listRowBackground(Color.clear)
             }
 
+            // MARK: - Update
+            Section {
+                Button {
+                    Task { await runUpdateCheck() }
+                } label: {
+                    HStack {
+                        Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundStyle(Color(UIColor.label))
+                        Spacer()
+                        if isCheckingUpdate {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(isCheckingUpdate)
+
+                if let updateResult {
+                    updateRow(updateResult)
+                }
+            } header: {
+                Text("更新")
+            }
+
             // MARK: - Links
             Section("Links") {
                 Link(destination: URL(string: "https://github.com/vbox-Ai/Lobster-APP")!) {
@@ -143,5 +169,45 @@ struct AboutView: View {
         }
         .navigationTitle("About")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @MainActor
+    private func runUpdateCheck() async {
+        isCheckingUpdate = true
+        let result = await UpdateChecker.shared.check()
+        UpdateChecker.shared.touchLastCheckDate()
+        updateResult = result
+        isCheckingUpdate = false
+    }
+
+    @ViewBuilder
+    private func updateRow(_ result: UpdateChecker.CheckResult) -> some View {
+        switch result {
+        case .updateAvailable(let version, let ipaURL, _):
+            Button {
+                if !UpdateChecker.shared.installViaTrollStore(ipaURL: ipaURL) {
+                    UpdateChecker.shared.openReleasesPage()
+                }
+            } label: {
+                HStack {
+                    Text("发现新版本 v\(version)")
+                        .foregroundStyle(Color(UIColor.label))
+                    Spacer()
+                    Image(systemName: "arrow.down.circle.fill")
+                }
+            }
+        case .upToDate:
+            Text("已是最新版本").foregroundStyle(.secondary)
+        case .noReleaseAvailable:
+            Text("暂无可用版本").foregroundStyle(.secondary)
+        case .noIPAAsset(let version):
+            Text("v\(version) 未附带 IPA").foregroundStyle(.secondary)
+        case .forbidden:
+            Text("GitHub 拒绝了请求（限流或地区限制）").foregroundStyle(.secondary)
+        case .networkUnreachable:
+            Text("网络不可达，请检查连接").foregroundStyle(.secondary)
+        case .error(let message):
+            Text("检查失败：\(message)").foregroundStyle(.secondary)
+        }
     }
 }
