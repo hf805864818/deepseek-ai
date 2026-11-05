@@ -79,7 +79,7 @@ struct SkillsManagementView: View {
             let importedSkills = filteredSkills.filter { $0.importSource != .bundled }
 
             if !bundledSkills.isEmpty {
-                Section("Built-in Skills") {
+                Section(AppLocalized("默认深度技能")) {
                     ForEach(bundledSkills) { skill in
                         skillRow(skill)
                     }
@@ -90,7 +90,7 @@ struct SkillsManagementView: View {
             }
 
             if !importedSkills.isEmpty {
-                Section("Imported Skills") {
+                Section(AppLocalized("其他技能")) {
                     ForEach(importedSkills) { skill in
                         skillRow(skill)
                     }

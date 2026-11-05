@@ -85,6 +85,53 @@ struct SessionSkillsView: View {
         }
     }
 
+    /// One skill row: tap opens the detail, the toggle writes the session override.
+    private func sessionSkillRow(_ skill: Skill) -> some View {
+        NavigationLink {
+            SessionSkillDetailView(skill: skill)
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(skill.name).font(.body)
+                    if !skill.description.isEmpty {
+                        Text(skill.description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { isEnabled(skill) },
+                    set: { setOverride(skill, $0) }
+                ))
+                .labelsHidden()
+            }
+        }
+        .modifier(SkillSourceURLContextMenu(url: skill.importSource.copyableURL) {})
+    }
+
+    /// One grouped section: title + bulk toggle over the group's own scope.
+    @ViewBuilder
+    private func sessionSkillSection(_ scope: [Skill], title: String) -> some View {
+        Section {
+            ForEach(scope) { skill in
+                sessionSkillRow(skill)
+            }
+        } header: {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                SessionBulkToggleHeader(
+                    availability: SessionBulkToggleRules.availability(scope.map { isEnabled($0) })
+                ) { applyToAll(scope, enabled: $0) }
+            }
+        } footer: {
+            SessionOverrideListFooter(
+                note: Text("Toggles override the skill's default for this session only."),
+                searchQuery: searchQuery)
+        }
+    }
+
     var body: some View {
         // Reference the version counter so SwiftUI refreshes on override changes.
         let _ = store.sessionOverrideVersion
@@ -103,45 +150,7 @@ struct SessionSkillsView: View {
                             .foregroundStyle(.secondary)
                             .font(.subheadline)
                     }
-                } else {
-                    Section {
-                        ForEach(filteredSkills) { skill in
-                            NavigationLink {
-                                SessionSkillDetailView(skill: skill)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(skill.name).font(.body)
-                                        if !skill.description.isEmpty {
-                                            Text(skill.description)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(2)
-                                        }
-                                    }
-                                    Spacer()
-                                    Toggle("", isOn: Binding(
-                                        get: { isEnabled(skill) },
-                                        set: { setOverride(skill, $0) }
-                                    ))
-                                    .labelsHidden()
-                                }
-                            }
-                            // [T-skill-copy-source-url] Same long-press as the
-                            // Settings list; the success haptic is the feedback.
-                            .modifier(SkillSourceURLContextMenu(url: skill.importSource.copyableURL) {})
-                        }
-                    } header: {
-                        let scope = filteredSkills
-                        SessionBulkToggleHeader(
-                            availability: SessionBulkToggleRules.availability(scope.map { isEnabled($0) })
-                        ) { applyToAll(scope, enabled: $0) }
-                    } footer: {
-                        SessionOverrideListFooter(
-                            note: Text("Toggles override the skill's default for this session only."),
-                            searchQuery: searchQuery)
-                    }
-                }
+                } else {                     let bundledSkills = filteredSkills.filter { $0.importSource == .bundled }                     let importedSkills = filteredSkills.filter { $0.importSource != .bundled }                      if !bundledSkills.isEmpty {                         sessionSkillSection(bundledSkills, title: AppLocalized("默认深度技能"))                     }                      if !importedSkills.isEmpty {                         sessionSkillSection(importedSkills, title: AppLocalized("其他技能"))                     }                 }
             }
             .navigationTitle("Skills in Session")
             .navigationBarTitleDisplayMode(.inline)
