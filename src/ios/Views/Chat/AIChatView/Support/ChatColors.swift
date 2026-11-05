@@ -24,7 +24,7 @@ import WebKit
 enum ChatColors {
     static let background = Color(UIColor.systemBackground)
     static let secondaryBg = Color(UIColor.secondarySystemBackground)
-    static let inputIconBg = Color(UIColor.systemBackground)
+    static let inputIconBg = Color.clear
     static let inputIconBorder = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.35, alpha: 1) : UIColor(white: 0.78, alpha: 1) })
     static let inputBg = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.12, alpha: 1) : .white })
     static let inputBorder = Color(UIColor.separator)
